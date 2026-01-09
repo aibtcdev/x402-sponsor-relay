@@ -1,0 +1,57 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "x402stacks-sponsor-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-08",
+  // nodejs_compat_v2 includes RPC support for service bindings
+  "compatibility_flags": ["nodejs_compat_v2"],
+
+  // Observability for debugging
+  "observability": {
+    "enabled": true
+  },
+
+  /**
+   * Service Bindings
+   * LOGS: Universal logging service (RPC, no API key needed)
+   */
+  "services": [
+    { "binding": "LOGS", "service": "worker-logs", "entrypoint": "LogsRPC" }
+  ],
+
+  /**
+   * Environment Variables
+   * Secrets should be set via `wrangler secret put` or Cloudflare dashboard:
+   * - SPONSOR_PRIVATE_KEY: Private key for sponsoring transactions
+   */
+  "vars": {
+    "STACKS_NETWORK": "testnet"
+  },
+
+  /**
+   * Preview Environment (local dev)
+   */
+  // [env.preview] - uses default bindings
+
+  /**
+   * Staging Environment
+   */
+  "env": {
+    "staging": {
+      "routes": [{ "pattern": "x402-staging.aibtc.dev", "custom_domain": true }],
+      "vars": {
+        "STACKS_NETWORK": "testnet"
+      }
+    },
+
+    /**
+     * Production Environment
+     */
+    "production": {
+      "routes": [{ "pattern": "x402.aibtc.dev", "custom_domain": true }],
+      "vars": {
+        "STACKS_NETWORK": "mainnet"
+      }
+    }
+  }
+}

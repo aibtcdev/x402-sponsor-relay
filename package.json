@@ -1,0 +1,21 @@
+{
+  "name": "x402stacks-sponsor-relay",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "check": "tsc --noEmit",
+    "wrangler": "set -a && . ./.env && set +a && npx wrangler",
+    "cf-typegen": "wrangler types"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250106.0",
+    "typescript": "^5.7.2",
+    "wrangler": "^3.101.0"
+  },
+  "dependencies": {
+    "@stacks/transactions": "^7.0.0"
+  }
+}
