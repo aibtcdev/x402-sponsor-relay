@@ -43,7 +43,8 @@ The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard th
 
 ### Pending
 
-- [ ] Deploy to testnet staging
+- [ ] Deploy to testnet staging (x402-relay.aibtc.dev)
+- [ ] Deploy to mainnet production (x402-relay.aibtc.com)
 - [ ] End-to-end test with real transactions
 - [ ] SIP-018 signature verification
 - [ ] x402 payment flow for fee recovery

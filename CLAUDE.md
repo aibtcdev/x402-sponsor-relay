@@ -56,12 +56,34 @@ scripts/
   test-relay.ts     # Test script for building and submitting sponsored tx
 ```
 
+## Deployment URLs
+
+- **Testnet (staging)**: https://x402-relay.aibtc.dev
+- **Mainnet (production)**: https://x402-relay.aibtc.com
+
 ## Configuration
 
-- `wrangler.jsonc` - Cloudflare Workers config (service bindings, routes)
+- `wrangler.jsonc` - Cloudflare Workers config (service bindings, routes, environments)
 - `.dev.vars` - Local development secrets (not committed)
 - Secrets set via `wrangler secret put`:
   - `SPONSOR_PRIVATE_KEY` - Private key for sponsoring transactions
+
+## Deployment
+
+```bash
+# Authenticate with Cloudflare
+npx wrangler login
+
+# Set secrets for staging
+npx wrangler secret put SPONSOR_PRIVATE_KEY --env staging
+
+# Deploy to staging (testnet)
+npx wrangler deploy --env staging
+
+# Deploy to production (mainnet)
+npx wrangler secret put SPONSOR_PRIVATE_KEY --env production
+npx wrangler deploy --env production
+```
 
 ## Service Bindings
 
