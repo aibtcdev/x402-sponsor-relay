@@ -14,7 +14,7 @@
    * These are NOT inherited by environments - each env must define its own.
    */
   "services": [
-    { "binding": "LOGS", "service": "worker-logs", "entrypoint": "LogsRPC" }
+    { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
   ],
   "vars": {
     "STACKS_NETWORK": "testnet"
@@ -39,7 +39,7 @@
       },
       // Bindings must be duplicated per environment
       "services": [
-        { "binding": "LOGS", "service": "worker-logs", "entrypoint": "LogsRPC" }
+        { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
       ]
     },
     "production": {
@@ -52,7 +52,7 @@
       },
       // Bindings must be duplicated per environment
       "services": [
-        { "binding": "LOGS", "service": "worker-logs", "entrypoint": "LogsRPC" }
+        { "binding": "LOGS", "service": "worker-logs-production", "entrypoint": "LogsRPC" }
       ]
     }
   }
