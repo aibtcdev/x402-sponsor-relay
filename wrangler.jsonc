@@ -1,60 +1,56 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "x402stacks-sponsor-relay",
+  "name": "x402-sponsor-relay",
   "main": "src/index.ts",
-  "compatibility_date": "2025-01-08",
-  // nodejs_compat_v2 includes RPC support for service bindings
+  "compatibility_date": "2026-01-01",
   "compatibility_flags": ["nodejs_compat_v2"],
-
-  // Observability for debugging
-  "observability": {
-    "enabled": true
-  },
+  // Local development settings
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": { "enabled": false },
 
   /**
-   * Service Bindings
-   * LOGS: Universal logging service (RPC, no API key needed)
+   * Top-level bindings are for local development only (wrangler dev).
+   * These are NOT inherited by environments - each env must define its own.
    */
   "services": [
     { "binding": "LOGS", "service": "worker-logs", "entrypoint": "LogsRPC" }
   ],
-
-  /**
-   * Environment Variables
-   * Secrets should be set via `wrangler secret put` or Cloudflare dashboard:
-   * - SPONSOR_PRIVATE_KEY: Private key for sponsoring transactions
-   */
   "vars": {
     "STACKS_NETWORK": "testnet"
   },
 
   /**
-   * Preview Environment (local dev)
-   */
-  // [env.preview] - uses default bindings
-
-  /**
-   * Staging Environment
+   * Environments
+   * Note: services are NOT inherited by environments.
+   * Each environment must explicitly define all bindings it needs.
+   *
+   * Secrets (set via `wrangler secret put --env <env>`):
+   * - SPONSOR_PRIVATE_KEY: Private key for sponsoring transactions
    */
   "env": {
     "staging": {
+      "name": "x402-sponsor-relay-staging",
+      "workers_dev": false,
       "routes": [{ "pattern": "x402-relay.aibtc.dev", "custom_domain": true }],
+      "observability": { "enabled": true },
       "vars": {
         "STACKS_NETWORK": "testnet"
       },
+      // Bindings must be duplicated per environment
       "services": [
         { "binding": "LOGS", "service": "worker-logs", "entrypoint": "LogsRPC" }
       ]
     },
-
-    /**
-     * Production Environment
-     */
     "production": {
+      "name": "x402-sponsor-relay-production",
+      "workers_dev": false,
       "routes": [{ "pattern": "x402-relay.aibtc.com", "custom_domain": true }],
+      "observability": { "enabled": true },
       "vars": {
         "STACKS_NETWORK": "mainnet"
       },
+      // Bindings must be duplicated per environment
       "services": [
         { "binding": "LOGS", "service": "worker-logs", "entrypoint": "LogsRPC" }
       ]
