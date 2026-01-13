@@ -1,15 +1,28 @@
 /**
  * Test script for the sponsor relay endpoint
  *
- * Usage:
- *   npx tsx scripts/test-relay.ts <private-key> [relay-url]
+ * Usage (recommended - use .env file):
+ *   npm run test:relay [relay-url]
+ *
+ * Environment variables (in .env):
+ *   AGENT_MNEMONIC      24-word mnemonic phrase (recommended)
+ *   AGENT_ACCOUNT_INDEX Account index to derive (default: 0)
+ *   AGENT_PRIVATE_KEY   Hex-encoded private key (alternative to mnemonic)
+ *   RELAY_URL           Relay endpoint URL (optional)
+ *
+ * Argument handling:
+ *   - If AGENT_MNEMONIC or AGENT_PRIVATE_KEY is set: args[0] = relay URL (optional)
+ *   - If neither is set: args[0] = private key, args[1] = relay URL (legacy)
  *
  * Examples:
- *   # Test against local dev server
- *   npx tsx scripts/test-relay.ts your-private-key-hex http://localhost:8787
+ *   # Recommended: Set AGENT_MNEMONIC in .env
+ *   npm run test:relay
  *
- *   # Test against deployed staging
- *   npx tsx scripts/test-relay.ts your-private-key-hex https://x402-relay-staging.your-domain.workers.dev
+ *   # Override relay URL via argument
+ *   npm run test:relay -- https://x402-relay.aibtc.dev
+ *
+ *   # Use specific account index
+ *   AGENT_ACCOUNT_INDEX=1 npm run test:relay
  */
 
 import {
@@ -18,26 +31,82 @@ import {
   TransactionVersion,
   AnchorMode,
 } from "@stacks/transactions";
+import {
+  generateNewAccount,
+  generateWallet,
+  getStxAddress,
+} from "@stacks/wallet-sdk";
 
 const TESTNET_FAUCET = "ST000000000000000000002AMW42H"; // Testnet faucet address
+
+/**
+ * Derive a child account from a mnemonic phrase
+ */
+async function deriveChildAccount(mnemonic: string, index: number) {
+  if (index < 0) {
+    throw new Error(`Account index must be non-negative, got ${index}`);
+  }
+
+  const wallet = await generateWallet({
+    secretKey: mnemonic,
+    password: "",
+  });
+
+  // Only generate accounts up to the needed index
+  const currentCount = wallet.accounts.length;
+  for (let i = currentCount; i <= index; i++) {
+    generateNewAccount(wallet);
+  }
+
+  const account = wallet.accounts[index];
+  if (!account) {
+    throw new Error(`Failed to derive account at index ${index}`);
+  }
+
+  return {
+    address: getStxAddress({
+      account,
+      network: "testnet",
+    }),
+    key: account.stxPrivateKey,
+  };
+}
 
 async function main() {
   const args = process.argv.slice(2);
 
-  if (args.length < 1) {
-    console.error("Usage: npx tsx scripts/test-relay.ts <private-key> [relay-url]");
+  // Handle arg positions based on whether credentials are in env
+  const hasEnvCredentials = !!(process.env.AGENT_MNEMONIC || process.env.AGENT_PRIVATE_KEY);
+  const relayArg = hasEnvCredentials ? args[0] : args[1];
+  const relayUrl = process.env.RELAY_URL || relayArg || "http://localhost:8787";
+
+  // Derive credentials from mnemonic or use private key directly
+  let privateKey: string;
+  let senderAddress: string;
+
+  if (process.env.AGENT_MNEMONIC) {
+    const accountIndex = parseInt(process.env.AGENT_ACCOUNT_INDEX || "0", 10);
+    console.log(`Deriving account ${accountIndex} from mnemonic...`);
+    const account = await deriveChildAccount(process.env.AGENT_MNEMONIC, accountIndex);
+    privateKey = account.key;
+    senderAddress = account.address;
+  } else if (process.env.AGENT_PRIVATE_KEY) {
+    privateKey = process.env.AGENT_PRIVATE_KEY;
+    senderAddress = getAddressFromPrivateKey(privateKey, TransactionVersion.Testnet);
+  } else if (args[0]) {
+    // Legacy: private key as first argument
+    privateKey = args[0];
+    senderAddress = getAddressFromPrivateKey(privateKey, TransactionVersion.Testnet);
+  } else {
+    console.error("Error: No credentials provided");
     console.error("");
-    console.error("Arguments:");
-    console.error("  private-key  Hex-encoded private key for signing");
-    console.error("  relay-url    Relay endpoint URL (default: http://localhost:8787)");
+    console.error("Copy .env.example to .env and fill in your credentials:");
+    console.error("  cp .env.example .env");
+    console.error("  # Edit .env with your AGENT_MNEMONIC or AGENT_PRIVATE_KEY");
+    console.error("  npm run test:relay");
     process.exit(1);
   }
 
-  const privateKey = args[0];
-  const relayUrl = args[1] || "http://localhost:8787";
-
-  // Derive sender address
-  const senderAddress = getAddressFromPrivateKey(privateKey, TransactionVersion.Testnet);
   console.log(`Sender address: ${senderAddress}`);
 
   // Build a sponsored STX transfer (small amount to faucet)
