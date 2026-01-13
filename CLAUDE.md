@@ -103,14 +103,14 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 | Flow | Agent calls relay directly |
 | Abuse prevention | Rate limits (10 req/min per sender) |
 | Payment tokens | STX, sBTC, USDCx |
-| Facilitator | facilitator.x402stacks.xyz (existing) |
+| Facilitator | facilitator.stacksx402.com (existing) |
 
 ## Related Projects
 
 **x402 Stacks Ecosystem:**
 - `~/dev/whoabuddy/stx402/` - x402 implementation (stx402.com)
 - `~/dev/tony1908/x402Stacks/` - x402-stacks npm package (PR #8 adds sponsored tx)
-- Facilitator: facilitator.x402stacks.xyz
+- Facilitator: facilitator.stacksx402.com
 
 **aibtcdev Resources:**
 - `../erc-8004-stacks/` - Agent identity contracts (future integration)
