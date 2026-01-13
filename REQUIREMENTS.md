@@ -53,13 +53,13 @@ The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard th
 
 ## Decisions Made
 
-| Question | Decision |
-|----------|----------|
-| Agent identity | Start with any Stacks address; ERC-8004 as future milestone |
-| Flow origin | Agent calls relay directly |
-| Abuse prevention | Rate limits (10 req/min per sender) |
-| Payment token | STX, sBTC, USDCx (via x402-stacks) |
-| Facilitator | Use existing facilitator.x402stacks.xyz |
+| Question         | Decision                                                    |
+| ---------------- | ----------------------------------------------------------- |
+| Agent identity   | Start with any Stacks address; ERC-8004 as future milestone |
+| Flow origin      | Agent calls relay directly                                  |
+| Abuse prevention | Rate limits (10 req/min per sender)                         |
+| Payment token    | STX, sBTC, USDCx (via x402-stacks)                          |
+| Facilitator      | Use existing facilitator.stacksx402.com                     |
 
 ## Architecture
 
@@ -90,6 +90,7 @@ Agent                          Relay                         Stacks Network
 ### POST /relay
 
 Request:
+
 ```json
 {
   "transaction": "<hex-encoded-sponsored-stacks-transaction>"
@@ -97,6 +98,7 @@ Request:
 ```
 
 Response (success):
+
 ```json
 {
   "txid": "0x..."
@@ -104,6 +106,7 @@ Response (success):
 ```
 
 Response (error):
+
 ```json
 {
   "error": "Transaction must be sponsored",
@@ -114,6 +117,7 @@ Response (error):
 ### GET /health
 
 Response:
+
 ```json
 {
   "status": "ok",
@@ -126,11 +130,12 @@ Response:
 
 ### Protocol Design
 
-1. ~~**Facilitator location**~~: Using existing facilitator.x402stacks.xyz
+1. ~~**Facilitator location**~~: Using existing facilitator.stacksx402.com
 
 2. ~~**Payment token**~~: STX, sBTC, USDCx supported via x402-stacks
 
 3. **Payment timing**: Pre-pay (deposit) or pay-per-transaction?
+
    - Currently: Free sponsorship with rate limits
    - Future: x402 payment flow for fee recovery
 
@@ -149,9 +154,11 @@ Response:
 ### Operations
 
 7. **Sponsor key management**: Currently Cloudflare Secrets
+
    - Future: Key rotation? Multiple keys?
 
 8. ~~**Rate limits**~~: 10 req/min per sender (in-memory)
+
    - Future: Persistent via KV or Durable Objects
 
 9. **Monitoring**: Using worker-logs service
@@ -162,18 +169,22 @@ Response:
 ### Existing Work
 
 **x402 Stacks Ecosystem:**
+
 - **stx402** (`~/dev/whoabuddy/stx402/`): Full x402 implementation at stx402.com
 - **x402-stacks** (`~/dev/tony1908/x402Stacks/`): npm package, PR #8 adds sponsored tx
-- **Facilitator**: facilitator.x402stacks.xyz (testnet + mainnet)
+- **Facilitator**: facilitator.stacksx402.com (testnet + mainnet)
 
 **Sponsored Transactions:**
+
 - **`agent-tools-ts/src/stacks-alex/`**: ALEX SDK sponsored transaction examples
 - **Stacks.js docs**: https://docs.stacks.co/stacks.js/build-transactions#sponsored-transactions
 
 **Agent Identity:**
+
 - **`erc-8004-stacks/`**: ERC-8004 agent identity/reputation contracts (testnet deployed)
 
 **Infrastructure:**
+
 - **worker-logs** (`~/dev/whoabuddy/worker-logs/`): Universal logging at logs.wbd.host
 
 ## Next Steps
@@ -189,16 +200,19 @@ Response:
 ## Resources
 
 ### x402 Protocol
+
 - [x402 Protocol](https://www.x402.org/)
 - [x402 GitHub](https://github.com/coinbase/x402)
 - [x402 Documentation](https://docs.cdp.coinbase.com/x402/welcome)
 
 ### Stacks
+
 - [Sponsored Transactions](https://docs.stacks.co/stacks.js/build-transactions#sponsored-transactions)
 - [SIP-018 Signed Structured Data](https://github.com/stacksgov/sips/blob/main/sips/sip-018/sip-018-signed-structured-data.md)
 - [Stacks.js Transactions](https://stacks.js.org/packages/transactions)
 
 ### Local Resources
+
 - [x402-stacks PR #8](https://github.com/tony1908/x402Stacks/pull/8) - Sponsored tx support
 - [stx402 Implementation](~/dev/whoabuddy/stx402/) - Reference patterns
 - [Universal Logger](~/dev/whoabuddy/worker-logs/) - logs.wbd.host
