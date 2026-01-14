@@ -4,6 +4,7 @@ import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
 import { loggerMiddleware } from "./middleware";
 import { Health, Relay } from "./endpoints";
+import { VERSION } from "./version";
 
 // Create Hono app with type safety
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -19,7 +20,7 @@ const openapi = fromHono(app, {
   schema: {
     info: {
       title: "x402 Stacks Sponsor Relay",
-      version: "0.2.0",
+      version: VERSION,
       description:
         "A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, and calls the x402 facilitator for settlement verification.",
     },
@@ -49,7 +50,7 @@ openapi.post("/relay", Relay as unknown as typeof Relay);
 app.get("/", (c) => {
   return c.json({
     service: "x402-sponsor-relay",
-    version: "0.2.0",
+    version: VERSION,
     description:
       "Gasless transactions for AI agents on the Stacks blockchain",
     docs: "/docs",

@@ -45,25 +45,27 @@ export interface FacilitatorFailure {
 export type FacilitatorResult = FacilitatorSuccess | FacilitatorFailure;
 
 /**
- * Validation success result
+ * Settle options validation success
  */
-export interface ValidationSuccess {
+export interface SettleValidationSuccess {
   valid: true;
 }
 
 /**
- * Validation failure result
+ * Settle options validation failure
  */
-export interface ValidationFailure {
+export interface SettleValidationFailure {
   valid: false;
   error: string;
   details: string;
 }
 
 /**
- * Combined validation result type
+ * Result of settle options validation (discriminated union)
  */
-export type ValidationResult = ValidationSuccess | ValidationFailure;
+export type SettleValidationResult =
+  | SettleValidationSuccess
+  | SettleValidationFailure;
 
 /**
  * Service for interacting with the x402 facilitator
@@ -80,7 +82,7 @@ export class FacilitatorService {
   /**
    * Validate settle options
    */
-  validateSettleOptions(settle: SettleOptions): ValidationResult {
+  validateSettleOptions(settle: SettleOptions): SettleValidationResult {
     if (!settle.expectedRecipient || !settle.minAmount) {
       return {
         valid: false,

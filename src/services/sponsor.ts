@@ -10,7 +10,7 @@ import type { Env, Logger } from "../types";
 /**
  * Successful transaction validation result
  */
-export interface ValidationSuccess {
+export interface TransactionValidationSuccess {
   valid: true;
   transaction: StacksTransactionWire;
   senderAddress: string;
@@ -19,7 +19,7 @@ export interface ValidationSuccess {
 /**
  * Failed transaction validation result
  */
-export interface ValidationFailure {
+export interface TransactionValidationFailure {
   valid: false;
   error: string;
   details: string;
@@ -28,7 +28,9 @@ export interface ValidationFailure {
 /**
  * Result of transaction validation (discriminated union)
  */
-export type ValidationResult = ValidationSuccess | ValidationFailure;
+export type TransactionValidationResult =
+  | TransactionValidationSuccess
+  | TransactionValidationFailure;
 
 /**
  * Successful sponsoring result
@@ -76,7 +78,7 @@ export class SponsorService {
   /**
    * Validate and deserialize a transaction
    */
-  validateTransaction(txHex: string): ValidationResult {
+  validateTransaction(txHex: string): TransactionValidationResult {
     // Remove 0x prefix if present
     const cleanHex = txHex.startsWith("0x") ? txHex.slice(2) : txHex;
 
