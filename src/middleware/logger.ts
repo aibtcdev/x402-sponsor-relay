@@ -4,6 +4,20 @@ import type { Env, Logger, LogsRPC, AppVariables } from "../types";
 const APP_ID = "x402-relay";
 
 /**
+ * Type guard to check if LOGS binding has required RPC methods
+ */
+function isLogsRPC(logs: unknown): logs is LogsRPC {
+  return (
+    typeof logs === "object" &&
+    logs !== null &&
+    typeof (logs as LogsRPC).info === "function" &&
+    typeof (logs as LogsRPC).warn === "function" &&
+    typeof (logs as LogsRPC).error === "function" &&
+    typeof (logs as LogsRPC).debug === "function"
+  );
+}
+
+/**
  * Create a logger that sends to worker-logs RPC service
  */
 function createRpcLogger(
@@ -65,9 +79,9 @@ export async function loggerMiddleware(
     method: c.req.method,
   };
 
-  // Use RPC logger if available, else console fallback
-  const logger = c.env.LOGS
-    ? createRpcLogger(c.env.LOGS as LogsRPC, c.executionCtx, baseContext)
+  // Use RPC logger if LOGS binding is available and valid, else console fallback
+  const logger = isLogsRPC(c.env.LOGS)
+    ? createRpcLogger(c.env.LOGS, c.executionCtx, baseContext)
     : createConsoleLogger(baseContext);
 
   c.set("requestId", requestId);

@@ -8,25 +8,49 @@ import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import type { Env, Logger } from "../types";
 
 /**
- * Result of transaction validation
+ * Successful transaction validation result
  */
-export interface ValidationResult {
-  valid: boolean;
-  transaction?: StacksTransactionWire;
-  senderAddress?: string;
-  error?: string;
-  details?: string;
+export interface ValidationSuccess {
+  valid: true;
+  transaction: StacksTransactionWire;
+  senderAddress: string;
 }
 
 /**
- * Result of transaction sponsoring
+ * Failed transaction validation result
  */
-export interface SponsorResult {
-  success: boolean;
-  sponsoredTxHex?: string;
-  error?: string;
-  details?: string;
+export interface ValidationFailure {
+  valid: false;
+  error: string;
+  details: string;
 }
+
+/**
+ * Result of transaction validation (discriminated union)
+ */
+export type ValidationResult = ValidationSuccess | ValidationFailure;
+
+/**
+ * Successful sponsoring result
+ */
+export interface SponsorSuccess {
+  success: true;
+  sponsoredTxHex: string;
+}
+
+/**
+ * Failed sponsoring result
+ */
+export interface SponsorFailure {
+  success: false;
+  error: string;
+  details: string;
+}
+
+/**
+ * Result of transaction sponsoring (discriminated union)
+ */
+export type SponsorResult = SponsorSuccess | SponsorFailure;
 
 /**
  * Service for validating and sponsoring Stacks transactions

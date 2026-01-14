@@ -203,17 +203,17 @@ export class Relay extends BaseEndpoint {
 
       // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
-      if (!validation.valid) {
+      if (validation.valid === false) {
         return this.errorResponse(
           c,
-          validation.error!,
+          validation.error,
           400,
           validation.details
         );
       }
 
       // Check rate limit using sender address from transaction
-      if (!checkRateLimit(validation.senderAddress!)) {
+      if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
         return this.errorResponse(
           c,
@@ -225,12 +225,12 @@ export class Relay extends BaseEndpoint {
 
       // Sponsor the transaction
       const sponsorResult = await sponsorService.sponsorTransaction(
-        validation.transaction!
+        validation.transaction
       );
-      if (!sponsorResult.success) {
+      if (sponsorResult.success === false) {
         return this.errorResponse(
           c,
-          sponsorResult.error!,
+          sponsorResult.error,
           500,
           sponsorResult.details
         );
@@ -238,14 +238,14 @@ export class Relay extends BaseEndpoint {
 
       // Call facilitator to settle
       const settleResult = await facilitatorService.settle(
-        sponsorResult.sponsoredTxHex!,
+        sponsorResult.sponsoredTxHex,
         body.settle
       );
 
-      if (!settleResult.success) {
+      if (settleResult.success === false) {
         return this.errorResponse(
           c,
-          settleResult.error!,
+          settleResult.error,
           settleResult.httpStatus || 500,
           settleResult.details
         );

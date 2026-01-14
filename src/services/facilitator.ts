@@ -21,16 +21,28 @@ const TOKEN_TYPE_MAP: Record<TokenType, FacilitatorTokenType> = {
 };
 
 /**
- * Result of facilitator settle call
+ * Successful facilitator result
  */
-export interface FacilitatorResult {
-  success: boolean;
-  txid?: string;
-  settlement?: SettlementResult;
-  error?: string;
-  details?: string;
-  httpStatus?: number;
+export interface FacilitatorSuccess {
+  success: true;
+  txid: string;
+  settlement: SettlementResult;
 }
+
+/**
+ * Failed facilitator result
+ */
+export interface FacilitatorFailure {
+  success: false;
+  error: string;
+  details: string;
+  httpStatus: number;
+}
+
+/**
+ * Result of facilitator settle call (discriminated union)
+ */
+export type FacilitatorResult = FacilitatorSuccess | FacilitatorFailure;
 
 /**
  * Validation success result
