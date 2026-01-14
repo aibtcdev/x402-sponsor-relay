@@ -502,7 +502,7 @@ export default {
     }
 
     // Default response
-    return new Response("x402 Stacks Sponsor Relay\n\nPOST /relay - Submit sponsored transaction\nGET /health - Health check", {
+    return new Response("x402 Stacks Sponsor Relay\n\nPOST /relay - Submit sponsored transaction for settlement\nGET /health - Health check\n\nDocs: https://github.com/aibtcdev/x402-sponsor-relay", {
       headers: { "Content-Type": "text/plain", ...corsHeaders },
     });
   },
