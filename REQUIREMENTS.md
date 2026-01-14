@@ -17,7 +17,7 @@ The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard th
 
 - [x] **Gasless agent transactions**: Agents can submit transactions without holding STX for fees
 - [ ] **Signature-based auth**: Validate agent identity using SIP-018 structured data signatures (optional)
-- [ ] **x402 compatibility**: Integrate with x402 protocol flow for payment verification
+- [x] **x402 compatibility**: Integrate with x402 facilitator for payment settlement verification
 - [x] **Stacks-native**: Full support for Stacks transaction types
 
 ### Secondary Goals
@@ -34,20 +34,19 @@ The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard th
 - [x] Core `/relay` POST endpoint
 - [x] Transaction deserialization and sponsored type validation
 - [x] `sponsorTransaction()` integration with @stacks/transactions
-- [x] Broadcasting to Stacks network
+- [x] Facilitator integration for settlement verification
 - [x] In-memory rate limiting per sender
 - [x] CORS headers for cross-origin requests
 - [x] worker-logs integration for observability
-- [x] Test script for end-to-end validation
+- [x] Test script with mnemonic/private key support
 - [x] x402-stacks fork with `sponsored: true` support (PR #8)
+- [x] Deploy to testnet staging (x402-relay.aibtc.dev)
 
 ### Pending
 
-- [ ] Deploy to testnet staging (x402-relay.aibtc.dev)
 - [ ] Deploy to mainnet production (x402-relay.aibtc.com)
 - [ ] End-to-end test with real transactions
 - [ ] SIP-018 signature verification
-- [ ] x402 payment flow for fee recovery
 - [ ] ERC-8004 agent registry integration
 - [ ] Persistent rate limiting (KV or Durable Objects)
 
@@ -64,25 +63,25 @@ The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard th
 ## Architecture
 
 ```
-Agent                          Relay                         Stacks Network
-  │                              │                                  │
-  │ 1. Build tx with             │                                  │
-  │    sponsored: true, fee: 0   │                                  │
-  │                              │                                  │
-  │ 2. POST /relay               │                                  │
-  │    { transaction: hex }      │                                  │
-  │─────────────────────────────▶│                                  │
-  │                              │ 3. Deserialize & validate       │
-  │                              │    (must be AuthType.Sponsored) │
-  │                              │                                  │
-  │                              │ 4. sponsorTransaction()         │
-  │                              │    (add sponsor sig + fee)      │
-  │                              │                                  │
-  │                              │ 5. broadcastTransaction()       │
-  │                              │─────────────────────────────────▶│
-  │                              │                                  │
-  │◀─────────────────────────────│◀─────────────────────────────────│
-  │ { txid: "0x..." }            │                                  │
+Agent                    Relay                    Facilitator              Stacks
+  │                        │                           │                     │
+  │ 1. Build tx with       │                           │                     │
+  │    sponsored: true     │                           │                     │
+  │                        │                           │                     │
+  │ 2. POST /relay         │                           │                     │
+  │    { transaction,      │                           │                     │
+  │      settle: {...} }   │                           │                     │
+  │───────────────────────▶│                           │                     │
+  │                        │ 3. Validate & sponsor    │                     │
+  │                        │                           │                     │
+  │                        │ 4. POST /api/v1/settle   │                     │
+  │                        │───────────────────────────▶│                     │
+  │                        │                           │ 5. Broadcast        │
+  │                        │                           │────────────────────▶│
+  │                        │                           │◀────────────────────│
+  │                        │◀───────────────────────────│ 6. Settlement      │
+  │◀───────────────────────│ 7. Return { txid,        │                     │
+  │                        │    settlement: {...} }   │                     │
 ```
 
 ## API
@@ -93,7 +92,15 @@ Request:
 
 ```json
 {
-  "transaction": "<hex-encoded-sponsored-stacks-transaction>"
+  "transaction": "<hex-encoded-sponsored-stacks-transaction>",
+  "settle": {
+    "expectedRecipient": "SP...",
+    "minAmount": "1000000",
+    "tokenType": "STX",
+    "expectedSender": "SP...",
+    "resource": "/api/endpoint",
+    "method": "GET"
+  }
 }
 ```
 
@@ -101,7 +108,15 @@ Response (success):
 
 ```json
 {
-  "txid": "0x..."
+  "txid": "0x...",
+  "settlement": {
+    "success": true,
+    "status": "confirmed",
+    "sender": "SP...",
+    "recipient": "SP...",
+    "amount": "1000000",
+    "blockHeight": 12345
+  }
 }
 ```
 
@@ -139,9 +154,9 @@ Response:
    - Currently: Free sponsorship with rate limits
    - Future: x402 payment flow for fee recovery
 
-4. **Settlement**: On-chain or off-chain accounting?
-   - Currently: No settlement (free tier)
-   - Future: Clarity contract for deposits/withdrawals?
+4. **Settlement**: Via x402 facilitator
+   - Settlement verification delegated to facilitator.stacksx402.com
+   - Facilitator handles broadcast and returns settlement status
 
 ### Authentication
 
@@ -191,11 +206,11 @@ Response:
 
 1. ~~Research existing x402 facilitator implementations~~ ✓
 2. ~~Implement basic relay without 402 flow~~ ✓
-3. Deploy to testnet staging environment
-4. End-to-end test with real testnet transactions
-5. Add SIP-018 signature verification (optional auth)
-6. Add x402 payment layer for fee recovery
-7. Design Clarity contract for deposits (if needed)
+3. ~~Integrate x402 facilitator for settlement verification~~ ✓
+4. ~~Deploy to testnet staging environment~~ ✓
+5. End-to-end test with real testnet transactions
+6. Add SIP-018 signature verification (optional auth)
+7. Deploy to mainnet production environment
 
 ## Resources
 

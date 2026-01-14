@@ -4,9 +4,9 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-x402 Stacks Sponsor Relay - A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them with our key, and broadcasts to the Stacks network.
+x402 Stacks Sponsor Relay - A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, and calls the x402 facilitator for settlement verification.
 
-**Status**: Core relay endpoint implemented. Ready for testnet deployment and testing.
+**Status**: Core relay with facilitator integration complete. Deployed to testnet staging.
 
 ## Commands
 
@@ -23,8 +23,9 @@ npm run check
 # Dry-run deploy (verify build)
 npm run deploy:dry-run
 
-# Test relay endpoint
-npm run test:relay -- <private-key> [relay-url]
+# Test relay endpoint (requires .env with AGENT_MNEMONIC or AGENT_PRIVATE_KEY)
+npm run test:relay
+npm run test:relay -- [relay-url]
 
 # DO NOT run npm run deploy - commit and push for automatic deployment
 ```
@@ -39,13 +40,36 @@ npm run test:relay -- <private-key> [relay-url]
 
 **Endpoints:**
 - `GET /health` - Health check with network info
-- `POST /relay` - Submit sponsored transaction for sponsorship and broadcast
+- `POST /relay` - Submit sponsored transaction for sponsorship and settlement
 
 **Request/Response:**
 ```typescript
 // POST /relay
-Request: { transaction: "hex-encoded-sponsored-tx" }
-Response: { txid: "0x..." } | { error: "...", details: "..." }
+Request: {
+  transaction: "hex-encoded-sponsored-tx",
+  settle: {
+    expectedRecipient: "SP...",
+    minAmount: "1000000",
+    tokenType?: "STX" | "sBTC" | "USDCx",
+    expectedSender?: "SP...",
+    resource?: "/api/endpoint",
+    method?: "GET"
+  }
+}
+
+Response (success): {
+  txid: "0x...",
+  settlement: {
+    success: true,
+    status: "pending" | "confirmed" | "failed",
+    sender: "SP...",
+    recipient: "SP...",
+    amount: "1000000",
+    blockHeight?: 12345
+  }
+}
+
+Response (error): { error: "...", details: "..." }
 ```
 
 **Project Structure:**
@@ -64,7 +88,8 @@ scripts/
 ## Configuration
 
 - `wrangler.jsonc` - Cloudflare Workers config (service bindings, routes, environments)
-- `.dev.vars` - Local development secrets (not committed)
+- `.env` - Local development secrets (not committed, loaded by wrangler)
+- `.env.example` - Template for required environment variables
 - Secrets set via `wrangler secret put`:
   - `SPONSOR_PRIVATE_KEY` - Private key for sponsoring transactions
 
@@ -121,40 +146,40 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 
 ## Development Workflow
 
-1. Start dev server: `npm run dev`
-2. Set `SPONSOR_PRIVATE_KEY` in `.dev.vars`
-3. Test with: `npm run test:relay -- <agent-private-key> http://localhost:8787`
-4. Check logs at logs.wbd.host
+1. Copy `.env.example` to `.env` and fill in credentials
+2. Set `SPONSOR_PRIVATE_KEY` in `.env`
+3. Start dev server: `npm run dev`
+4. Test with: `npm run test:relay -- http://localhost:8787`
+5. Check logs at logs.wbd.host
 
 ## Sponsored Transaction Flow
 
 ```
-Agent                          Relay                         Stacks Network
-  │                              │                                  │
-  │ 1. Build tx with             │                                  │
-  │    sponsored: true, fee: 0   │                                  │
-  │                              │                                  │
-  │ 2. POST /relay               │                                  │
-  │    { transaction: hex }      │                                  │
-  │─────────────────────────────▶│                                  │
-  │                              │ 3. Deserialize & validate       │
-  │                              │    (must be AuthType.Sponsored) │
-  │                              │                                  │
-  │                              │ 4. sponsorTransaction()         │
-  │                              │    (add sponsor sig + fee)      │
-  │                              │                                  │
-  │                              │ 5. broadcastTransaction()       │
-  │                              │─────────────────────────────────▶│
-  │                              │                                  │
-  │                              │◀─────────────────────────────────│
-  │◀─────────────────────────────│ 6. Return txid                  │
-  │ { txid: "0x..." }            │                                  │
+Agent                    Relay                    Facilitator              Stacks
+  │                        │                           │                     │
+  │ 1. Build tx with       │                           │                     │
+  │    sponsored: true     │                           │                     │
+  │                        │                           │                     │
+  │ 2. POST /relay         │                           │                     │
+  │    { transaction,      │                           │                     │
+  │      settle: {...} }   │                           │                     │
+  │───────────────────────▶│                           │                     │
+  │                        │ 3. Validate & sponsor    │                     │
+  │                        │                           │                     │
+  │                        │ 4. POST /api/v1/settle   │                     │
+  │                        │───────────────────────────▶│                     │
+  │                        │                           │ 5. Broadcast        │
+  │                        │                           │────────────────────▶│
+  │                        │                           │◀────────────────────│
+  │                        │◀───────────────────────────│ 6. Settlement      │
+  │◀───────────────────────│ 7. Return { txid,        │                     │
+  │                        │    settlement: {...} }   │                     │
 ```
 
 ## Next Steps
 
-- [ ] Deploy to testnet staging environment
+- [x] Deploy to testnet staging environment
+- [x] Integrate x402 facilitator for settlement verification
 - [ ] End-to-end test with real testnet transactions
 - [ ] Add SIP-018 signature verification (optional auth layer)
-- [ ] Integrate x402 payment flow for fee recovery
 - [ ] Add ERC-8004 agent registry lookup
