@@ -47,15 +47,25 @@ openapi.post("/relay", Relay as unknown as typeof Relay);
 
 // Root endpoint - service info
 app.get("/", (c) => {
-  return c.text(
-    `x402 Stacks Sponsor Relay
-
-POST /relay - Submit sponsored transaction for settlement
-GET /health - Health check
-GET /docs - API documentation
-
-Docs: https://github.com/aibtcdev/x402-sponsor-relay`
-  );
+  return c.json({
+    service: "x402-sponsor-relay",
+    version: "0.2.0",
+    description:
+      "Gasless transactions for AI agents on the Stacks blockchain",
+    docs: "/docs",
+    endpoints: {
+      relay: "POST /relay - Submit sponsored transaction for settlement",
+      health: "GET /health - Health check with network info",
+    },
+    payment: {
+      tokens: ["STX", "sBTC", "USDCx"],
+      flow: "Agent signs sponsored tx -> Relay sponsors -> Facilitator settles",
+    },
+    related: {
+      facilitator: "https://facilitator.stacksx402.com",
+      github: "https://github.com/aibtcdev/x402-sponsor-relay",
+    },
+  });
 });
 
 // Global error handling
