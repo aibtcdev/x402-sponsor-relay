@@ -64,4 +64,4 @@ export function rateLimitMiddleware(
   };
 }
 
-export { RATE_LIMIT, RATE_WINDOW_MS };
+export { checkRateLimit, RATE_LIMIT, RATE_WINDOW_MS };

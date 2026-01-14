@@ -34,12 +34,16 @@ npm run test:relay -- [relay-url]
 
 **Stack:**
 - Cloudflare Workers for deployment
+- Hono web framework with Chanfana for OpenAPI documentation
 - @stacks/transactions for Stacks transaction handling
 - x402-stacks (fork) for building sponsored transactions
 - worker-logs service binding for centralized logging
 
 **Endpoints:**
+- `GET /` - Service info
 - `GET /health` - Health check with network info
+- `GET /docs` - Swagger UI API documentation
+- `GET /openapi.json` - OpenAPI specification
 - `POST /relay` - Submit sponsored transaction for sponsorship and settlement
 
 **Request/Response:**
@@ -75,9 +79,23 @@ Response (error): { error: "...", details: "..." }
 **Project Structure:**
 ```
 src/
-  index.ts          # Worker entry point with /relay endpoint
+  index.ts              # Hono app entry point with Chanfana OpenAPI setup
+  types.ts              # Centralized type definitions
+  endpoints/
+    index.ts            # Barrel exports
+    BaseEndpoint.ts     # Base class extending OpenAPIRoute
+    health.ts           # GET /health endpoint
+    relay.ts            # POST /relay endpoint
+  middleware/
+    index.ts            # Barrel exports
+    logger.ts           # Request-scoped logging middleware
+    rate-limit.ts       # Rate limiting utilities
+  services/
+    index.ts            # Barrel exports
+    sponsor.ts          # Transaction sponsoring logic
+    facilitator.ts      # x402 facilitator API client
 scripts/
-  test-relay.ts     # Test script for building and submitting sponsored tx
+  test-relay.ts         # Test script for building and submitting sponsored tx
 ```
 
 ## Deployment URLs
@@ -113,9 +131,12 @@ npx wrangler deploy --env production
 ## Service Bindings
 
 **LOGS** - Universal logging service (RPC binding to worker-logs)
+
+The logger middleware automatically creates a request-scoped logger available in endpoints:
 ```typescript
-const logs = env.LOGS as unknown as LogsRPC;
-ctx.waitUntil(logs.info('x402-relay', 'Transaction sponsored', { txid }));
+// In endpoint handlers
+const logger = this.getLogger(c);
+logger.info('Transaction sponsored', { txid });
 ```
 
 See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration.md) for details.
@@ -180,6 +201,7 @@ Agent                    Relay                    Facilitator              Stack
 
 - [x] Deploy to testnet staging environment
 - [x] Integrate x402 facilitator for settlement verification
+- [x] Refactor to Hono + Chanfana for auto-generated docs
 - [ ] End-to-end test with real testnet transactions
 - [ ] Add SIP-018 signature verification (optional auth layer)
 - [ ] Add ERC-8004 agent registry lookup

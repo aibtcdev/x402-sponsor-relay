@@ -1,6 +1,6 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService } from "../services/sponsor";
-import { FacilitatorService } from "../services/facilitator";
+import { SponsorService, FacilitatorService } from "../services";
+import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest } from "../types";
 
 /**
@@ -212,8 +212,16 @@ export class Relay extends BaseEndpoint {
         );
       }
 
-      // Store sender address in context for rate limiting middleware
-      // (already handled before this endpoint is called)
+      // Check rate limit using sender address from transaction
+      if (!checkRateLimit(validation.senderAddress!)) {
+        logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
+        return this.errorResponse(
+          c,
+          "Rate limit exceeded",
+          429,
+          `Maximum ${RATE_LIMIT} requests per minute`
+        );
+      }
 
       // Sponsor the transaction
       const sponsorResult = await sponsorService.sponsorTransaction(

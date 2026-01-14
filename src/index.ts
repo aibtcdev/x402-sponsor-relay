@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
-import { loggerMiddleware } from "./middleware/logger";
+import { loggerMiddleware } from "./middleware";
 import { Health, Relay } from "./endpoints";
 
 // Create Hono app with type safety
