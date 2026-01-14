@@ -1,6 +1,6 @@
 {
   "name": "x402-sponsor-relay",
-  "version": "0.0.1",
+  "version": "0.2.0",
   "private": true,
   "scripts": {
     "dev": "npm run wrangler -- dev",
@@ -21,6 +21,8 @@
   "dependencies": {
     "@stacks/transactions": "^7.3.1",
     "@stacks/wallet-sdk": "^7.2.0",
+    "chanfana": "^3.0.0",
+    "hono": "^4.11.4",
     "x402-stacks": "github:whoabuddy/x402Stacks#feat/sponsored-transactions"
   }
 }

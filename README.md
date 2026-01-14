@@ -75,9 +75,17 @@ Health check endpoint.
 {
   "status": "ok",
   "network": "testnet",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
 ```
+
+### GET /docs
+
+Interactive API documentation (Swagger UI).
+
+### GET /openapi.json
+
+OpenAPI 3.1 specification for programmatic access.
 
 ## Usage
 
@@ -125,17 +133,35 @@ console.log(`Transaction: https://explorer.stacks.co/txid/${txid}?chain=testnet`
 console.log(`Settlement status: ${settlement.status}`);
 ```
 
-## Endpoints
+## Deployments
 
 | Environment | URL | Network |
 |-------------|-----|---------|
 | Staging | https://x402-relay.aibtc.dev | Testnet |
 | Production | https://x402-relay.aibtc.com | Mainnet |
 
+## All Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | Service info |
+| GET | `/health` | Health check with version and network |
+| GET | `/docs` | Swagger UI documentation |
+| GET | `/openapi.json` | OpenAPI specification |
+| POST | `/relay` | Submit sponsored transaction |
+
 ## Rate Limits
 
 - 10 requests per minute per sender address
 - Rate limiting is based on the transaction sender, not IP
+
+## Stack
+
+- **Cloudflare Workers** - Serverless deployment
+- **Hono** - Lightweight web framework
+- **Chanfana** - OpenAPI documentation generator
+- **@stacks/transactions** - Stacks transaction handling
+- **x402-stacks** - x402 protocol implementation for Stacks
 
 ## Development
 
