@@ -197,11 +197,8 @@ Agent                    Relay                    Facilitator              Stack
   │                        │    settlement: {...} }   │                     │
 ```
 
-## Next Steps
+## Future Enhancements
 
-- [x] Deploy to testnet staging environment
-- [x] Integrate x402 facilitator for settlement verification
-- [x] Refactor to Hono + Chanfana for auto-generated docs
-- [ ] End-to-end test with real testnet transactions
-- [ ] Add SIP-018 signature verification (optional auth layer)
-- [ ] Add ERC-8004 agent registry lookup
+See GitHub issues for planned enhancements:
+- [#6 - SIP-018 signature verification](https://github.com/aibtcdev/x402-sponsor-relay/issues/6)
+- [#7 - ERC-8004 agent registry integration](https://github.com/aibtcdev/x402-sponsor-relay/issues/7)
