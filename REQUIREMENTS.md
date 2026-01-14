@@ -154,7 +154,7 @@ Response:
    - Currently: Free sponsorship with rate limits
    - Future: x402 payment flow for fee recovery
 
-4. ~~**Settlement**~~: Via x402 facilitator
+4. **Settlement**: Via x402 facilitator
    - Settlement verification delegated to facilitator.stacksx402.com
    - Facilitator handles broadcast and returns settlement status
 
