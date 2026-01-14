@@ -58,15 +58,30 @@ async function main() {
   console.log(`Transaction hex: ${txHex.slice(0, 50)}...`);
   console.log(`Transaction length: ${txHex.length} chars`);
 
+  // Build request with settle options
+  const requestBody = {
+    transaction: txHex,
+    settle: {
+      expectedRecipient: TESTNET_FAUCET,
+      minAmount: "1000", // Same as amount we're sending
+      tokenType: "STX" as const,
+      expectedSender: senderAddress,
+      resource: "/test",
+      method: "POST",
+    },
+  };
+
   // Send to relay
   console.log(`\nSending to relay: ${relayUrl}/relay`);
+  console.log(`Settlement options:`, JSON.stringify(requestBody.settle, null, 2));
+
   try {
     const response = await fetch(`${relayUrl}/relay`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ transaction: txHex }),
+      body: JSON.stringify(requestBody),
     });
 
     const result = await response.json();
@@ -75,6 +90,17 @@ async function main() {
       console.log("\n=== SUCCESS ===");
       console.log(`Transaction ID: ${result.txid}`);
       console.log(`Explorer: https://explorer.stacks.co/txid/${result.txid}?chain=testnet`);
+      if (result.settlement) {
+        console.log("\n=== SETTLEMENT ===");
+        console.log(`Status: ${result.settlement.status}`);
+        console.log(`Success: ${result.settlement.success}`);
+        console.log(`Sender: ${result.settlement.sender}`);
+        console.log(`Recipient: ${result.settlement.recipient}`);
+        console.log(`Amount: ${result.settlement.amount}`);
+        if (result.settlement.blockHeight) {
+          console.log(`Block Height: ${result.settlement.blockHeight}`);
+        }
+      }
     } else {
       console.error("\n=== ERROR ===");
       console.error(`Status: ${response.status}`);

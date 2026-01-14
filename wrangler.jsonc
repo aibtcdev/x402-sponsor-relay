@@ -17,7 +17,8 @@
     { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
   ],
   "vars": {
-    "STACKS_NETWORK": "testnet"
+    "STACKS_NETWORK": "testnet",
+    "FACILITATOR_URL": "https://facilitator.stacksx402.com"
   },
 
   /**
@@ -35,7 +36,8 @@
       "routes": [{ "pattern": "x402-relay.aibtc.dev", "custom_domain": true }],
       "observability": { "enabled": true },
       "vars": {
-        "STACKS_NETWORK": "testnet"
+        "STACKS_NETWORK": "testnet",
+        "FACILITATOR_URL": "https://facilitator.stacksx402.com"
       },
       // Bindings must be duplicated per environment
       "services": [
@@ -48,7 +50,8 @@
       "routes": [{ "pattern": "x402-relay.aibtc.com", "custom_domain": true }],
       "observability": { "enabled": true },
       "vars": {
-        "STACKS_NETWORK": "mainnet"
+        "STACKS_NETWORK": "mainnet",
+        "FACILITATOR_URL": "https://facilitator.stacksx402.com"
       },
       // Bindings must be duplicated per environment
       "services": [
