@@ -1,9 +1,15 @@
 export { SponsorService } from "./sponsor";
-export type { ValidationResult, SponsorResult } from "./sponsor";
+export type {
+  TransactionValidationResult,
+  TransactionValidationSuccess,
+  TransactionValidationFailure,
+  SponsorResult,
+} from "./sponsor";
 
 export { FacilitatorService } from "./facilitator";
 export type {
   FacilitatorResult,
-  ValidationSuccess,
-  ValidationFailure,
+  SettleValidationResult,
+  SettleValidationSuccess,
+  SettleValidationFailure,
 } from "./facilitator";

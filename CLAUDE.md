@@ -81,6 +81,7 @@ Response (error): { error: "...", details: "..." }
 src/
   index.ts              # Hono app entry point with Chanfana OpenAPI setup
   types.ts              # Centralized type definitions
+  version.ts            # Single source of truth for VERSION constant
   endpoints/
     index.ts            # Barrel exports
     BaseEndpoint.ts     # Base class extending OpenAPIRoute

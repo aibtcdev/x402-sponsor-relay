@@ -22,7 +22,7 @@ function isLogsRPC(logs: unknown): logs is LogsRPC {
  */
 function createRpcLogger(
   logs: LogsRPC,
-  ctx: ExecutionContext,
+  ctx: Pick<ExecutionContext, "waitUntil">,
   baseContext: Record<string, unknown>
 ): Logger {
   return {

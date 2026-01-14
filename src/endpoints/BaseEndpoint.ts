@@ -13,13 +13,6 @@ export class BaseEndpoint extends OpenAPIRoute {
   }
 
   /**
-   * Get the request ID from context
-   */
-  protected getRequestId(c: AppContext): string {
-    return c.get("requestId");
-  }
-
-  /**
    * Return a standardized error response
    */
   protected errorResponse(
@@ -33,15 +26,5 @@ export class BaseEndpoint extends OpenAPIRoute {
       response.details = details;
     }
     return c.json(response, status as 400 | 401 | 402 | 404 | 429 | 500 | 502 | 504);
-  }
-
-  /**
-   * Return a standardized success response
-   */
-  protected successResponse<T extends Record<string, unknown>>(
-    c: AppContext,
-    data: T
-  ) {
-    return c.json(data);
   }
 }

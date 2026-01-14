@@ -1,7 +1,6 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import type { AppContext } from "../types";
-
-const VERSION = "0.2.0";
+import { VERSION } from "../version";
 
 /**
  * Health check endpoint
