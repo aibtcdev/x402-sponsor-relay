@@ -1,15 +1,16 @@
 import {
   sponsorTransaction,
   deserializeTransaction,
-  broadcastTransaction,
   AuthType,
 } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 
-// Augment Env with secrets (set via wrangler secret put)
+// Augment Env with secrets and config
 declare global {
   interface Env {
     SPONSOR_PRIVATE_KEY: string;
+    STACKS_NETWORK: string;
+    FACILITATOR_URL: string;
   }
 }
 
@@ -25,11 +26,60 @@ interface LogsRPC {
 }
 
 /**
+ * Settlement options for x402 payment verification
+ */
+interface SettleOptions {
+  /** Expected recipient address */
+  expectedRecipient: string;
+  /** Minimum amount required (in smallest unit - microSTX, sats, etc.) */
+  minAmount: string;
+  /** Token type (defaults to STX) */
+  tokenType?: "STX" | "sBTC" | "USDCx";
+  /** Expected sender address (optional) */
+  expectedSender?: string;
+  /** API resource being accessed (optional, for tracking) */
+  resource?: string;
+  /** HTTP method being used (optional, for tracking) */
+  method?: string;
+}
+
+/**
  * Request body for /relay endpoint
  */
 interface RelayRequest {
   /** Hex-encoded signed sponsored transaction */
   transaction: string;
+  /** Settlement options for x402 payment verification */
+  settle: SettleOptions;
+}
+
+/**
+ * Facilitator settle request format
+ */
+interface FacilitatorSettleRequest {
+  signed_transaction: string;
+  expected_recipient: string;
+  min_amount: number;
+  network: string;
+  token_type: "STX" | "SBTC" | "USDCX";
+  expected_sender?: string;
+  resource?: string;
+  method?: string;
+}
+
+/**
+ * Facilitator settle response format
+ */
+interface FacilitatorSettleResponse {
+  success: boolean;
+  tx_id?: string;
+  status?: "pending" | "confirmed" | "failed";
+  sender_address?: string;
+  recipient_address?: string;
+  amount?: number;
+  block_height?: number;
+  error?: string;
+  validation_errors?: string[];
 }
 
 /**
@@ -38,6 +88,15 @@ interface RelayRequest {
 interface RelayResponse {
   /** Transaction ID if successful */
   txid?: string;
+  /** Settlement status */
+  settlement?: {
+    success: boolean;
+    status: string;
+    sender?: string;
+    recipient?: string;
+    amount?: string;
+    blockHeight?: number;
+  };
   /** Error message if failed */
   error?: string;
   /** Additional details */
@@ -125,6 +184,23 @@ export default {
         if (!body.transaction) {
           return new Response(
             JSON.stringify({ error: "Missing transaction field" } as RelayResponse),
+            { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+
+        if (!body.settle) {
+          return new Response(
+            JSON.stringify({ error: "Missing settle options" } as RelayResponse),
+            { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+
+        if (!body.settle.expectedRecipient || !body.settle.minAmount) {
+          return new Response(
+            JSON.stringify({
+              error: "Invalid settle options",
+              details: "expectedRecipient and minAmount are required",
+            } as RelayResponse),
             { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
           );
         }
@@ -230,60 +306,109 @@ export default {
           );
         }
 
-        // Broadcast the transaction
-        let broadcastResult: { txid?: string; error?: string; reason?: string };
+        // Serialize sponsored transaction for facilitator
+        const sponsoredTxHex = Buffer.from(sponsoredTx.serialize()).toString("hex");
+
+        // Map token type to facilitator format
+        const tokenTypeMap: Record<string, "STX" | "SBTC" | "USDCX"> = {
+          STX: "STX",
+          sBTC: "SBTC",
+          USDCx: "USDCX",
+        };
+
+        // Build facilitator settle request
+        const settleRequest: FacilitatorSettleRequest = {
+          signed_transaction: sponsoredTxHex,
+          expected_recipient: body.settle.expectedRecipient,
+          min_amount: parseInt(body.settle.minAmount, 10),
+          network: env.STACKS_NETWORK || "testnet",
+          token_type: tokenTypeMap[body.settle.tokenType || "STX"],
+          expected_sender: body.settle.expectedSender,
+          resource: body.settle.resource,
+          method: body.settle.method,
+        };
+
+        // Call facilitator settle endpoint
+        let settleResponse: FacilitatorSettleResponse;
         try {
-          const result = await broadcastTransaction({ transaction: sponsoredTx, network });
-          // Cast to simple object to avoid type inference issues
-          broadcastResult = result as { txid?: string; error?: string; reason?: string };
+          ctx.waitUntil(
+            logs.info(APP_ID, "Calling facilitator settle", {
+              request_id: requestId,
+              facilitator_url: env.FACILITATOR_URL,
+              expected_recipient: settleRequest.expected_recipient,
+              min_amount: settleRequest.min_amount,
+            })
+          );
+
+          const response = await fetch(`${env.FACILITATOR_URL}/api/v1/settle`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(settleRequest),
+          });
+
+          settleResponse = (await response.json()) as FacilitatorSettleResponse;
+
+          if (!response.ok) {
+            ctx.waitUntil(
+              logs.error(APP_ID, "Facilitator settle failed", {
+                request_id: requestId,
+                status: response.status,
+                error: settleResponse.error,
+                validation_errors: settleResponse.validation_errors,
+              })
+            );
+            return new Response(
+              JSON.stringify({
+                error: "Settlement failed",
+                details: settleResponse.validation_errors?.join(", ") || settleResponse.error || "Unknown error",
+              } as RelayResponse),
+              { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
         } catch (e) {
           ctx.waitUntil(
-            logs.error(APP_ID, "Failed to broadcast transaction", {
+            logs.error(APP_ID, "Failed to call facilitator", {
               request_id: requestId,
               error: e instanceof Error ? e.message : "Unknown error",
             })
           );
           return new Response(
             JSON.stringify({
-              error: "Failed to broadcast transaction",
+              error: "Failed to settle transaction",
               details: e instanceof Error ? e.message : "Unknown error",
             } as RelayResponse),
             { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
           );
         }
 
-        // Check for broadcast errors (rejected results have 'error' property)
-        if (broadcastResult.error) {
-          ctx.waitUntil(
-            logs.error(APP_ID, "Broadcast rejected", {
-              request_id: requestId,
-              error: broadcastResult.error,
-              reason: broadcastResult.reason,
-            })
-          );
-          return new Response(
-            JSON.stringify({
-              error: "Broadcast rejected",
-              details: broadcastResult.reason || broadcastResult.error,
-            } as RelayResponse),
-            { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
-          );
-        }
-
-        // Success
-        const txid = broadcastResult.txid!;
+        // Success - return txid and settlement info
+        const txid = settleResponse.tx_id!;
         ctx.waitUntil(
-          logs.info(APP_ID, "Transaction sponsored and broadcast", {
+          logs.info(APP_ID, "Transaction sponsored and settled", {
             request_id: requestId,
             txid,
             sender: senderHex,
+            settlement_status: settleResponse.status,
           })
         );
 
-        return new Response(JSON.stringify({ txid } as RelayResponse), {
-          status: 200,
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        });
+        return new Response(
+          JSON.stringify({
+            txid,
+            settlement: {
+              success: settleResponse.success,
+              status: settleResponse.status || "unknown",
+              sender: settleResponse.sender_address,
+              recipient: settleResponse.recipient_address,
+              amount: settleResponse.amount?.toString(),
+              blockHeight: settleResponse.block_height,
+            },
+          } as RelayResponse),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json", ...corsHeaders },
+          }
+        );
       } catch (e) {
         ctx.waitUntil(
           logs.error(APP_ID, "Unexpected error", {
