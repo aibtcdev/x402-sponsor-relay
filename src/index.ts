@@ -309,26 +309,63 @@ export default {
         // Serialize sponsored transaction for facilitator
         const sponsoredTxHex = Buffer.from(sponsoredTx.serialize()).toString("hex");
 
-        // Map token type to facilitator format
+        // Validate and parse minimum amount
+        const rawMinAmount = body.settle.minAmount;
+        if (!/^\d+$/.test(rawMinAmount)) {
+          ctx.waitUntil(
+            logs.warn(APP_ID, "Invalid minimum amount", {
+              request_id: requestId,
+              raw_min_amount: rawMinAmount,
+            })
+          );
+          return new Response(
+            JSON.stringify({
+              error: "Invalid minimum amount",
+              details: "settle.minAmount must be a numeric string",
+            } as RelayResponse),
+            { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
+        const minAmount = parseInt(rawMinAmount, 10);
+
+        // Validate and map token type to facilitator format
         const tokenTypeMap: Record<string, "STX" | "SBTC" | "USDCX"> = {
           STX: "STX",
           sBTC: "SBTC",
           USDCx: "USDCX",
         };
+        const rawTokenType = body.settle.tokenType || "STX";
+        const mappedTokenType = tokenTypeMap[rawTokenType];
+        if (!mappedTokenType) {
+          ctx.waitUntil(
+            logs.warn(APP_ID, "Unsupported token type", {
+              request_id: requestId,
+              token_type: rawTokenType,
+            })
+          );
+          return new Response(
+            JSON.stringify({
+              error: "Invalid token type",
+              details: `Unsupported token type: ${rawTokenType}. Valid types: STX, sBTC, USDCx`,
+            } as RelayResponse),
+            { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
 
         // Build facilitator settle request
         const settleRequest: FacilitatorSettleRequest = {
           signed_transaction: sponsoredTxHex,
           expected_recipient: body.settle.expectedRecipient,
-          min_amount: parseInt(body.settle.minAmount, 10),
+          min_amount: minAmount,
           network: env.STACKS_NETWORK || "testnet",
-          token_type: tokenTypeMap[body.settle.tokenType || "STX"],
+          token_type: mappedTokenType,
           expected_sender: body.settle.expectedSender,
           resource: body.settle.resource,
           method: body.settle.method,
         };
 
-        // Call facilitator settle endpoint
+        // Call facilitator settle endpoint with timeout
+        const FACILITATOR_TIMEOUT_MS = 30000; // 30 seconds
         let settleResponse: FacilitatorSettleResponse;
         try {
           ctx.waitUntil(
@@ -344,7 +381,29 @@ export default {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(settleRequest),
+            signal: AbortSignal.timeout(FACILITATOR_TIMEOUT_MS),
           });
+
+          // Handle non-JSON responses (e.g., 502/504 gateway errors)
+          const contentType = response.headers.get("content-type") || "";
+          if (!contentType.includes("application/json")) {
+            const text = await response.text();
+            ctx.waitUntil(
+              logs.error(APP_ID, "Facilitator returned non-JSON response", {
+                request_id: requestId,
+                status: response.status,
+                content_type: contentType,
+                body_preview: text.slice(0, 200),
+              })
+            );
+            return new Response(
+              JSON.stringify({
+                error: "Facilitator error",
+                details: `Unexpected response (${response.status}): ${text.slice(0, 100)}`,
+              } as RelayResponse),
+              { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            );
+          }
 
           settleResponse = (await response.json()) as FacilitatorSettleResponse;
 
@@ -366,23 +425,39 @@ export default {
             );
           }
         } catch (e) {
+          const isTimeout = e instanceof Error && e.name === "TimeoutError";
           ctx.waitUntil(
-            logs.error(APP_ID, "Failed to call facilitator", {
+            logs.error(APP_ID, isTimeout ? "Facilitator request timed out" : "Failed to call facilitator", {
               request_id: requestId,
               error: e instanceof Error ? e.message : "Unknown error",
             })
           );
           return new Response(
             JSON.stringify({
-              error: "Failed to settle transaction",
+              error: isTimeout ? "Facilitator timeout" : "Failed to settle transaction",
               details: e instanceof Error ? e.message : "Unknown error",
             } as RelayResponse),
-            { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+            { status: isTimeout ? 504 : 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
           );
         }
 
-        // Success - return txid and settlement info
-        const txid = settleResponse.tx_id!;
+        // Validate response has txid
+        const txid = settleResponse.tx_id;
+        if (!txid) {
+          ctx.waitUntil(
+            logs.error(APP_ID, "Facilitator response missing tx_id", {
+              request_id: requestId,
+              settlement_status: settleResponse.status,
+            })
+          );
+          return new Response(
+            JSON.stringify({
+              error: "Settlement response invalid",
+              details: "Missing transaction ID in facilitator response",
+            } as RelayResponse),
+            { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders } }
+          );
+        }
         ctx.waitUntil(
           logs.info(APP_ID, "Transaction sponsored and settled", {
             request_id: requestId,
