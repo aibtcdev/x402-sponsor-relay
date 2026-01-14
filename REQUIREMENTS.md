@@ -41,6 +41,7 @@ The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard th
 - [x] Test script with mnemonic/private key support
 - [x] x402-stacks fork with `sponsored: true` support (PR #8)
 - [x] Deploy to testnet staging (x402-relay.aibtc.dev)
+- [x] Refactor to Hono + Chanfana for auto-generated OpenAPI docs
 
 ### Pending
 
@@ -137,9 +138,17 @@ Response:
 {
   "status": "ok",
   "network": "testnet",
-  "version": "0.1.0"
+  "version": "0.2.0"
 }
 ```
+
+### GET /docs
+
+Interactive API documentation (Swagger UI).
+
+### GET /openapi.json
+
+OpenAPI 3.1 specification.
 
 ## Open Questions (Remaining)
 
@@ -208,9 +217,10 @@ Response:
 2. ~~Implement basic relay without 402 flow~~ ✓
 3. ~~Integrate x402 facilitator for settlement verification~~ ✓
 4. ~~Deploy to testnet staging environment~~ ✓
-5. End-to-end test with real testnet transactions
-6. Add SIP-018 signature verification (optional auth)
-7. Deploy to mainnet production environment
+5. ~~Refactor to Hono + Chanfana for auto-generated docs~~ ✓
+6. End-to-end test with real testnet transactions
+7. Add SIP-018 signature verification (optional auth)
+8. Deploy to mainnet production environment
 
 ## Resources
 
