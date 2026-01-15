@@ -13,3 +13,8 @@ export type {
   SettleValidationSuccess,
   SettleValidationFailure,
 } from "./facilitator";
+
+export { StatsService } from "./stats";
+
+export { HealthMonitor } from "./health-monitor";
+export type { HealthStatus } from "./health-monitor";

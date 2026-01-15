@@ -1,5 +1,5 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, FacilitatorService } from "../services";
+import { SponsorService, FacilitatorService, StatsService } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest } from "../types";
 
@@ -176,16 +176,21 @@ export class Relay extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("Relay request received");
 
+    // Initialize stats service for metrics recording
+    const statsService = new StatsService(c.env.RELAY_KV, logger);
+
     try {
       // Parse request body
       const body = (await c.req.json()) as RelayRequest;
 
       // Validate required fields
       if (!body.transaction) {
+        await statsService.recordError("validation");
         return this.errorResponse(c, "Missing transaction field", 400);
       }
 
       if (!body.settle) {
+        await statsService.recordError("validation");
         return this.errorResponse(c, "Missing settle options", 400);
       }
 
@@ -198,12 +203,14 @@ export class Relay extends BaseEndpoint {
         body.settle
       );
       if (settleValidation.valid === false) {
+        await statsService.recordError("validation");
         return this.errorResponse(c, settleValidation.error, 400, settleValidation.details);
       }
 
       // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
+        await statsService.recordError("validation");
         return this.errorResponse(
           c,
           validation.error,
@@ -215,6 +222,7 @@ export class Relay extends BaseEndpoint {
       // Check rate limit using sender address from transaction
       if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
+        await statsService.recordError("rateLimit");
         return this.errorResponse(
           c,
           "Rate limit exceeded",
@@ -228,6 +236,7 @@ export class Relay extends BaseEndpoint {
         validation.transaction
       );
       if (sponsorResult.success === false) {
+        await statsService.recordError("sponsoring");
         return this.errorResponse(
           c,
           sponsorResult.error,
@@ -243,6 +252,7 @@ export class Relay extends BaseEndpoint {
       );
 
       if (settleResult.success === false) {
+        await statsService.recordError("facilitator");
         return this.errorResponse(
           c,
           settleResult.error,
@@ -250,6 +260,14 @@ export class Relay extends BaseEndpoint {
           settleResult.details
         );
       }
+
+      // Record successful transaction
+      const tokenType = body.settle.tokenType || "STX";
+      await statsService.recordTransaction({
+        success: true,
+        tokenType,
+        amount: body.settle.minAmount,
+      });
 
       logger.info("Transaction sponsored and settled", {
         txid: settleResult.txid,

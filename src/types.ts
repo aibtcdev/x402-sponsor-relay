@@ -46,6 +46,8 @@ export interface Env {
   FACILITATOR_URL: string;
   // LOGS is a service binding to worker-logs, typed loosely to avoid complex Service<> generics
   LOGS?: unknown;
+  // KV namespace for dashboard stats storage
+  RELAY_KV?: KVNamespace;
 }
 
 /**
@@ -153,3 +155,100 @@ export interface AppVariables {
  * Typed Hono context for this application
  */
 export type AppContext = Context<{ Bindings: Env; Variables: AppVariables }>;
+
+// =============================================================================
+// Dashboard Types
+// =============================================================================
+
+/**
+ * Token stats for dashboard display
+ */
+export interface TokenStats {
+  count: number;
+  volume: string;
+  percentage: number;
+}
+
+/**
+ * Daily statistics stored in KV
+ */
+export interface DailyStats {
+  date: string;
+  transactions: {
+    total: number;
+    success: number;
+    failed: number;
+  };
+  tokens: {
+    STX: { count: number; volume: string };
+    sBTC: { count: number; volume: string };
+    USDCx: { count: number; volume: string };
+  };
+  errors: {
+    validation: number;
+    rateLimit: number;
+    sponsoring: number;
+    facilitator: number;
+  };
+}
+
+/**
+ * Hourly stats for granular 24h view
+ */
+export interface HourlyStats {
+  hour: string;
+  transactions: number;
+  success: number;
+  failed: number;
+  tokens: {
+    STX: number;
+    sBTC: number;
+    USDCx: number;
+  };
+}
+
+/**
+ * Facilitator health check record
+ */
+export interface FacilitatorHealthCheck {
+  timestamp: string;
+  status: "healthy" | "degraded" | "down";
+  latencyMs: number;
+  httpStatus: number;
+  error?: string;
+}
+
+/**
+ * Dashboard overview data for API response
+ */
+export interface DashboardOverview {
+  period: "24h" | "7d";
+  transactions: {
+    total: number;
+    success: number;
+    failed: number;
+    trend: "up" | "down" | "stable";
+    previousTotal: number;
+  };
+  tokens: {
+    STX: TokenStats;
+    sBTC: TokenStats;
+    USDCx: TokenStats;
+  };
+  facilitator: {
+    status: "healthy" | "degraded" | "down" | "unknown";
+    avgLatencyMs: number;
+    uptime24h: number;
+    lastCheck: string | null;
+  };
+  hourlyData: Array<{ hour: string; transactions: number; success: number }>;
+}
+
+/**
+ * Error categories for metrics tracking
+ */
+export type ErrorCategory =
+  | "validation"
+  | "rateLimit"
+  | "sponsoring"
+  | "facilitator";

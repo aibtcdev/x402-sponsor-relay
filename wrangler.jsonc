@@ -16,6 +16,9 @@
   "services": [
     { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
   ],
+  "kv_namespaces": [
+    { "binding": "RELAY_KV", "id": "local-dev-placeholder" }
+  ],
   "vars": {
     "STACKS_NETWORK": "testnet",
     "FACILITATOR_URL": "https://facilitator.stacksx402.com"
@@ -42,6 +45,10 @@
       // Bindings must be duplicated per environment
       "services": [
         { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
+      ],
+      // KV namespace for dashboard stats
+      "kv_namespaces": [
+        { "binding": "RELAY_KV", "id": "3851254fa8f9494189689ce5a726b773" }
       ]
     },
     "production": {
@@ -56,6 +63,10 @@
       // Bindings must be duplicated per environment
       "services": [
         { "binding": "LOGS", "service": "worker-logs-production", "entrypoint": "LogsRPC" }
+      ],
+      // KV namespace for dashboard stats
+      "kv_namespaces": [
+        { "binding": "RELAY_KV", "id": "56f3b1596357434291161238d40cbd81" }
       ]
     }
   }
