@@ -72,6 +72,10 @@ function calculateTrend(
   return "stable";
 }
 
+// Time constants
+const HOUR_MS = 60 * 60 * 1000; // 1 hour in milliseconds
+const DAY_MS = 24 * HOUR_MS; // 24 hours in milliseconds
+
 // TTL values in seconds
 const HOURLY_TTL = 48 * 60 * 60; // 48 hours
 const DAILY_TTL = 90 * 24 * 60 * 60; // 90 days
@@ -131,8 +135,13 @@ export class StatsService {
       const stats = existing || createEmptyDailyStats(dateKey);
 
       stats.errors[category]++;
-      stats.transactions.total++;
-      stats.transactions.failed++;
+
+      // Only count errors from actual transaction attempts as failed transactions
+      // Validation and rate limit errors never become actual transactions
+      if (category === "sponsoring" || category === "facilitator") {
+        stats.transactions.total++;
+        stats.transactions.failed++;
+      }
 
       await this.kv.put(key, JSON.stringify(stats), {
         expirationTtl: DAILY_TTL,
@@ -179,7 +188,7 @@ export class StatsService {
     try {
       // Get today and yesterday stats for trend calculation
       const today = getDateKey();
-      const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000)
+      const yesterday = new Date(Date.now() - DAY_MS)
         .toISOString()
         .split("T")[0];
 
@@ -261,7 +270,7 @@ export class StatsService {
       const now = Date.now();
 
       for (let i = 0; i < days; i++) {
-        const date = new Date(now - i * 24 * 60 * 60 * 1000)
+        const date = new Date(now - i * DAY_MS)
           .toISOString()
           .split("T")[0];
         const data = await this.kv.get<DailyStats>(
@@ -295,7 +304,7 @@ export class StatsService {
       const now = Date.now();
 
       for (let i = 23; i >= 0; i--) {
-        const hourDate = new Date(now - i * 60 * 60 * 1000);
+        const hourDate = new Date(now - i * HOUR_MS);
         const date = hourDate.toISOString().split("T")[0];
         const hour = hourDate.getUTCHours().toString().padStart(2, "0");
         const key = `stats:hourly:${date}:${hour}`;

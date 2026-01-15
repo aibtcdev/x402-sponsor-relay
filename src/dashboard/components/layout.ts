@@ -1,4 +1,4 @@
-import { dashboardCss } from "../styles";
+import { dashboardCss, escapeHtml } from "../styles";
 import { VERSION } from "../../version";
 
 /**
@@ -10,7 +10,7 @@ export function htmlDocument(content: string, title: string): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title}</title>
+  <title>${escapeHtml(title)}</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -74,12 +74,12 @@ export function footer(lastUpdated: string): string {
       <div class="flex items-center space-x-4">
         <span>v${VERSION}</span>
         <span class="text-gray-600">|</span>
-        <span>Last updated: ${lastUpdated}</span>
+        <span>Last updated: ${escapeHtml(lastUpdated)}</span>
       </div>
-      <div x-data="{ autoRefresh: true }" class="flex items-center space-x-2">
+      <div x-data="{ autoRefresh: localStorage.getItem('dashboardAutoRefresh') !== 'false' }" class="flex items-center space-x-2">
         <span>Auto-refresh:</span>
         <button
-          @click="autoRefresh = !autoRefresh; if(autoRefresh) location.reload()"
+          @click="autoRefresh = !autoRefresh; localStorage.setItem('dashboardAutoRefresh', autoRefresh.toString()); if(autoRefresh) location.reload()"
           :class="autoRefresh ? 'bg-green-600' : 'bg-gray-600'"
           class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors">
           <span

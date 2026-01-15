@@ -283,6 +283,7 @@ export class Relay extends BaseEndpoint {
       logger.error("Unexpected error", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
+      await statsService.recordError("validation");
       return this.errorResponse(
         c,
         "Internal server error",

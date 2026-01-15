@@ -11,7 +11,7 @@ import {
   transactionChartConfig,
   tokenPieChartConfig,
 } from "../components/charts";
-import { formatNumber } from "../styles";
+import { formatNumber, formatTokenAmount, escapeHtml } from "../styles";
 
 /**
  * Generate the main dashboard overview page
@@ -99,11 +99,11 @@ ${header()}
         </div>
         <div class="flex justify-between items-center">
           <span class="text-gray-400">Total Volume (STX)</span>
-          <span class="text-purple-400 font-medium">${data.tokens.STX.volume !== "0" ? (BigInt(data.tokens.STX.volume) / BigInt(1_000_000)).toLocaleString() : "0"} STX</span>
+          <span class="text-purple-400 font-medium">${formatTokenAmount(data.tokens.STX.volume, "STX")} STX</span>
         </div>
         <div class="flex justify-between items-center">
           <span class="text-gray-400">Period</span>
-          <span class="text-gray-300">${data.period}</span>
+          <span class="text-gray-300">${escapeHtml(data.period)}</span>
         </div>
       </div>
     </div>
