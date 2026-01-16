@@ -122,8 +122,8 @@ async function main() {
     fee: 0n, // Sponsor will pay
   });
 
-  // Serialize to hex
-  const txHex = Buffer.from(transaction.serialize()).toString("hex");
+  // Serialize to hex (v7: serialize() returns hex string directly)
+  const txHex = transaction.serialize();
   console.log(`Transaction hex: ${txHex.slice(0, 50)}...`);
   console.log(`Transaction length: ${txHex.length} chars`);
 

@@ -145,9 +145,8 @@ export class SponsorService {
         network,
       });
 
-      const sponsoredTxHex = Buffer.from(sponsoredTx.serialize()).toString(
-        "hex"
-      );
+      // v7: serialize() returns hex string directly
+      const sponsoredTxHex = sponsoredTx.serialize();
 
       return {
         success: true,
