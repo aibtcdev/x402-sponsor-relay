@@ -8,6 +8,7 @@ import type {
   FacilitatorSettleResponse,
   SettlementResult,
 } from "../types";
+import { HealthMonitor } from "./health-monitor";
 
 const FACILITATOR_TIMEOUT_MS = 30000; // 30 seconds
 
@@ -73,10 +74,12 @@ export type SettleValidationResult =
 export class FacilitatorService {
   private env: Env;
   private logger: Logger;
+  private healthMonitor: HealthMonitor;
 
   constructor(env: Env, logger: Logger) {
     this.env = env;
     this.logger = logger;
+    this.healthMonitor = new HealthMonitor(env.RELAY_KV, logger);
   }
 
   /**
@@ -141,6 +144,8 @@ export class FacilitatorService {
       min_amount: settleRequest.min_amount,
     });
 
+    const startTime = performance.now();
+
     try {
       const response = await fetch(
         `${this.env.FACILITATOR_URL}/api/v1/settle`,
@@ -152,6 +157,8 @@ export class FacilitatorService {
         }
       );
 
+      const latencyMs = Math.round(performance.now() - startTime);
+
       // Handle non-JSON responses (e.g., 502/504 gateway errors)
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) {
@@ -161,6 +168,15 @@ export class FacilitatorService {
           content_type: contentType,
           body_preview: text.slice(0, 200),
         });
+
+        // Record health check for non-JSON response
+        await this.healthMonitor.recordCheck({
+          status: HealthMonitor.determineCheckStatus(response.status, latencyMs),
+          latencyMs,
+          httpStatus: response.status,
+          error: `Non-JSON response: ${text.slice(0, 50)}`,
+        });
+
         return {
           success: false,
           error: "Facilitator error",
@@ -178,6 +194,15 @@ export class FacilitatorService {
           error: settleResponse.error,
           validation_errors: settleResponse.validation_errors,
         });
+
+        // Record health check for failed response
+        await this.healthMonitor.recordCheck({
+          status: HealthMonitor.determineCheckStatus(response.status, latencyMs),
+          latencyMs,
+          httpStatus: response.status,
+          error: settleResponse.error,
+        });
+
         return {
           success: false,
           error: "Settlement failed",
@@ -194,6 +219,15 @@ export class FacilitatorService {
         this.logger.error("Facilitator response missing tx_id", {
           settlement_status: settleResponse.status,
         });
+
+        // Record health check for invalid response
+        await this.healthMonitor.recordCheck({
+          status: "degraded",
+          latencyMs,
+          httpStatus: response.status,
+          error: "Missing tx_id in response",
+        });
+
         return {
           success: false,
           error: "Settlement response invalid",
@@ -201,6 +235,13 @@ export class FacilitatorService {
           httpStatus: 502,
         };
       }
+
+      // Record successful health check
+      await this.healthMonitor.recordCheck({
+        status: HealthMonitor.determineCheckStatus(response.status, latencyMs),
+        latencyMs,
+        httpStatus: response.status,
+      });
 
       return {
         success: true,
@@ -215,11 +256,22 @@ export class FacilitatorService {
         },
       };
     } catch (e) {
+      const latencyMs = Math.round(performance.now() - startTime);
       const isTimeout = e instanceof Error && e.name === "TimeoutError";
+
       this.logger.error(
         isTimeout ? "Facilitator request timed out" : "Failed to call facilitator",
         { error: e instanceof Error ? e.message : "Unknown error" }
       );
+
+      // Record health check for error/timeout
+      await this.healthMonitor.recordCheck({
+        status: "down",
+        latencyMs,
+        httpStatus: isTimeout ? 504 : 500,
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+
       return {
         success: false,
         error: isTimeout ? "Facilitator timeout" : "Failed to settle transaction",

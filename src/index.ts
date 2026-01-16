@@ -3,7 +3,8 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
 import { loggerMiddleware } from "./middleware";
-import { Health, Relay } from "./endpoints";
+import { Health, Relay, DashboardStats } from "./endpoints";
+import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
 
 // Create Hono app with type safety
@@ -27,6 +28,7 @@ const openapi = fromHono(app, {
     tags: [
       { name: "Health", description: "Service health endpoints" },
       { name: "Relay", description: "Transaction relay endpoints" },
+      { name: "Dashboard", description: "Public statistics endpoints" },
     ],
     servers: [
       {
@@ -45,6 +47,10 @@ const openapi = fromHono(app, {
 // Type cast needed as Chanfana expects endpoint classes
 openapi.get("/health", Health as unknown as typeof Health);
 openapi.post("/relay", Relay as unknown as typeof Relay);
+openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
+
+// Mount dashboard routes (HTML pages, not OpenAPI)
+app.route("/dashboard", dashboard);
 
 // Root endpoint - service info
 app.get("/", (c) => {
@@ -54,9 +60,12 @@ app.get("/", (c) => {
     description:
       "Gasless transactions for AI agents on the Stacks blockchain",
     docs: "/docs",
+    dashboard: "/dashboard",
     endpoints: {
       relay: "POST /relay - Submit sponsored transaction for settlement",
       health: "GET /health - Health check with network info",
+      stats: "GET /stats - Relay statistics (JSON)",
+      dashboard: "GET /dashboard - Public dashboard (HTML)",
     },
     payment: {
       tokens: ["STX", "sBTC", "USDCx"],
