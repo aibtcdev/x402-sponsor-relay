@@ -100,8 +100,8 @@ export function transactionChartConfig(
         {
           label: "Total",
           data: transactions,
-          borderColor: colors.tokens.STX,
-          backgroundColor: `${colors.tokens.STX}20`,
+          borderColor: colors.brand.orange,
+          backgroundColor: `${colors.brand.orange}20`,
           fill: true,
           tension: 0.3,
         },
