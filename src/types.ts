@@ -141,6 +141,37 @@ export interface RelayResponse {
   error?: string;
   /** Additional details */
   details?: string;
+  /** Whether the client can retry the request */
+  retryable?: boolean;
+}
+
+/**
+ * Error codes for structured error responses
+ */
+export type RelayErrorCode =
+  | "MISSING_TRANSACTION"
+  | "MISSING_SETTLE_OPTIONS"
+  | "INVALID_SETTLE_OPTIONS"
+  | "INVALID_TRANSACTION"
+  | "NOT_SPONSORED"
+  | "RATE_LIMIT_EXCEEDED"
+  | "SPONSOR_CONFIG_ERROR"
+  | "SPONSOR_FAILED"
+  | "FACILITATOR_TIMEOUT"
+  | "FACILITATOR_ERROR"
+  | "FACILITATOR_INVALID_RESPONSE"
+  | "SETTLEMENT_FAILED"
+  | "INTERNAL_ERROR";
+
+/**
+ * Structured error response with retry guidance
+ */
+export interface RelayErrorResponse {
+  error: string;
+  code: RelayErrorCode;
+  details?: string;
+  retryable: boolean;
+  retryAfter?: number; // seconds
 }
 
 /**
@@ -170,6 +201,20 @@ export interface TokenStats {
 }
 
 /**
+ * Fee statistics for tracking sponsor costs
+ */
+export interface FeeStats {
+  /** Total fees paid in microSTX */
+  total: string;
+  /** Number of transactions with fee data */
+  count: number;
+  /** Minimum fee paid */
+  min: string;
+  /** Maximum fee paid */
+  max: string;
+}
+
+/**
  * Daily statistics stored in KV
  */
 export interface DailyStats {
@@ -189,7 +234,10 @@ export interface DailyStats {
     rateLimit: number;
     sponsoring: number;
     facilitator: number;
+    internal: number;
   };
+  /** Fee statistics for the day */
+  fees?: FeeStats;
 }
 
 /**
@@ -205,6 +253,8 @@ export interface HourlyStats {
     sBTC: number;
     USDCx: number;
   };
+  /** Total fees paid this hour in microSTX */
+  fees?: string;
 }
 
 /**
@@ -235,13 +285,27 @@ export interface DashboardOverview {
     sBTC: TokenStats;
     USDCx: TokenStats;
   };
+  fees: {
+    /** Total fees paid today in microSTX */
+    total: string;
+    /** Average fee per transaction in microSTX */
+    average: string;
+    /** Minimum fee paid today */
+    min: string;
+    /** Maximum fee paid today */
+    max: string;
+    /** Fee trend vs previous day */
+    trend: "up" | "down" | "stable";
+    /** Total fees paid previous day */
+    previousTotal: string;
+  };
   facilitator: {
     status: "healthy" | "degraded" | "down" | "unknown";
     avgLatencyMs: number;
     uptime24h: number;
     lastCheck: string | null;
   };
-  hourlyData: Array<{ hour: string; transactions: number; success: number }>;
+  hourlyData: Array<{ hour: string; transactions: number; success: number; fees?: string }>;
 }
 
 /**
@@ -251,4 +315,5 @@ export type ErrorCategory =
   | "validation"
   | "rateLimit"
   | "sponsoring"
-  | "facilitator";
+  | "facilitator"
+  | "internal";

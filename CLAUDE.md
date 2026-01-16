@@ -73,7 +73,13 @@ Response (success): {
   }
 }
 
-Response (error): { error: "...", details: "..." }
+Response (error): {
+  error: "...",
+  code: "FACILITATOR_TIMEOUT" | "RATE_LIMIT_EXCEEDED" | ...,
+  details: "...",
+  retryable: true | false,
+  retryAfter?: 5  // seconds, also sent as Retry-After header
+}
 ```
 
 **Project Structure:**
@@ -93,10 +99,15 @@ src/
     rate-limit.ts       # Rate limiting utilities
   services/
     index.ts            # Barrel exports
-    sponsor.ts          # Transaction sponsoring logic
+    sponsor.ts          # Transaction sponsoring logic (extracts fee)
     facilitator.ts      # x402 facilitator API client
+    stats.ts            # Dashboard statistics with fee tracking
+    health-monitor.ts   # Facilitator health monitoring
 scripts/
   test-relay.ts         # Test script for building and submitting sponsored tx
+docs/
+  state-machine.md      # Transaction state machine diagram
+  feature-roadmap.md    # Feature implementation status and plans
 ```
 
 ## Deployment URLs
