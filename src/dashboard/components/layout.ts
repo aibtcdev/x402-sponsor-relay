@@ -12,6 +12,7 @@ export function htmlDocument(content: string, title: string): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)}</title>
   <link rel="icon" type="image/png" sizes="32x32" href="https://aibtc.com/favicon-32x32.png">
+  <link rel="dns-prefetch" href="https://aibtc.com">
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -20,7 +21,7 @@ export function htmlDocument(content: string, title: string): string {
     [x-cloak] { display: none !important; }
   </style>
 </head>
-<body class="bg-gray-900 text-gray-100 min-h-screen">
+<body class="text-gray-100 min-h-screen">
   ${content}
 </body>
 </html>`;
@@ -35,7 +36,7 @@ export function header(): string {
   <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
     <div class="flex items-center justify-between">
       <div class="flex items-center space-x-3">
-        <img src="https://aibtc.com/Primary_Logo/SVG/AIBTC_PrimaryLogo_KO.svg" alt="AIBTC" class="h-8">
+        <img src="https://aibtc.com/Primary_Logo/SVG/AIBTC_PrimaryLogo_KO.svg" alt="AIBTC" class="h-8" width="32" height="32">
         <div>
           <h1 class="text-xl font-bold text-white">x402 Sponsor Relay</h1>
           <p class="text-sm text-gray-400">Dashboard</p>
