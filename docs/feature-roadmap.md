@@ -45,6 +45,8 @@ All error responses now include structured retry guidance:
 | `SETTLEMENT_FAILED` | 400 | No | - |
 | `INTERNAL_ERROR` | 500 | Yes | 5s |
 
+**Note:** When settlement fails after successful sponsoring, the fee is still recorded since the sponsor has already paid.
+
 ### Future: Server-Side Queue (Optional)
 
 If needed for unreliable clients, can add Durable Objects queue:

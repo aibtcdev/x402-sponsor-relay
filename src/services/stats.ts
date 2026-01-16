@@ -42,6 +42,7 @@ function createEmptyDailyStats(date: string): DailyStats {
       rateLimit: 0,
       sponsoring: 0,
       facilitator: 0,
+      internal: 0,
     },
   };
 }
@@ -141,7 +142,7 @@ export class StatsService {
 
       // Only count errors from actual transaction attempts as failed transactions
       // Validation and rate limit errors never become actual transactions
-      if (category === "sponsoring" || category === "facilitator") {
+      if (category === "sponsoring" || category === "facilitator" || category === "internal") {
         stats.transactions.total++;
         stats.transactions.failed++;
       }

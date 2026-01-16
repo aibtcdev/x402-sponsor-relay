@@ -311,6 +311,16 @@ export class Relay extends BaseEndpoint {
 
       if (settleResult.success === false) {
         await statsService.recordError("facilitator");
+
+        // Record fee even for failed settlements - sponsor already paid
+        const tokenType = body.settle.tokenType || "STX";
+        await statsService.recordTransaction({
+          success: false,
+          tokenType,
+          amount: body.settle.minAmount,
+          fee: sponsorResult.fee,
+        });
+
         // Determine error code and retry guidance based on HTTP status
         let code: "FACILITATOR_TIMEOUT" | "FACILITATOR_ERROR" | "FACILITATOR_INVALID_RESPONSE" | "SETTLEMENT_FAILED";
         let retryable = false;
@@ -333,10 +343,13 @@ export class Relay extends BaseEndpoint {
           retryable = false; // Settlement validation failures are not retryable
         }
 
+        // SETTLEMENT_FAILED is a 400 (bad request), others use httpStatus
+        const status = code === "SETTLEMENT_FAILED" ? 400 : (settleResult.httpStatus || 500);
+
         return this.structuredError(c, {
           error: settleResult.error,
           code,
-          status: settleResult.httpStatus || 500,
+          status,
           details: settleResult.details,
           retryable,
           retryAfter,
@@ -366,7 +379,7 @@ export class Relay extends BaseEndpoint {
       logger.error("Unexpected error", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
-      await statsService.recordError("validation");
+      await statsService.recordError("internal");
       return this.structuredError(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",

@@ -157,7 +157,17 @@ export class SponsorService {
         sponsoredTx.auth.authType === AuthType.Sponsored &&
         "sponsorSpendingCondition" in sponsoredTx.auth
       ) {
-        fee = sponsoredTx.auth.sponsorSpendingCondition.fee.toString();
+        const sponsorFee = sponsoredTx.auth.sponsorSpendingCondition.fee;
+        const sponsorFeeStr = sponsorFee.toString();
+        // Defensive check for negative fees
+        if (sponsorFeeStr.startsWith("-")) {
+          this.logger.warn(
+            "Negative fee detected in sponsored transaction; using fee of 0 instead",
+            { rawFee: sponsorFeeStr }
+          );
+        } else {
+          fee = sponsorFeeStr;
+        }
       }
 
       this.logger.info("Transaction sponsored", { fee });

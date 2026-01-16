@@ -234,6 +234,7 @@ export interface DailyStats {
     rateLimit: number;
     sponsoring: number;
     facilitator: number;
+    internal: number;
   };
   /** Fee statistics for the day */
   fees?: FeeStats;
@@ -314,4 +315,5 @@ export type ErrorCategory =
   | "validation"
   | "rateLimit"
   | "sponsoring"
-  | "facilitator";
+  | "facilitator"
+  | "internal";
