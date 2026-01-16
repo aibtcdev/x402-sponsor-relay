@@ -10,6 +10,13 @@ export const colors = {
     USDCx: "#2775CA", // USDC blue
   },
 
+  // AIBTC brand colors
+  brand: {
+    orange: "#F7931A",
+    blue: "#7DA2FF",
+    purple: "#A855F7",
+  },
+
   // Status colors
   status: {
     healthy: "#10B981", // Green
@@ -42,6 +49,36 @@ export const colors = {
  * CSS styles for dashboard
  */
 export const dashboardCss = `
+  /* Roc Grotesk font */
+  @font-face {
+    font-family: 'Roc Grotesk';
+    src: url('https://aibtc.com/fonts/RocGrotesk-Regular.woff2') format('woff2');
+    font-weight: 400;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: 'Roc Grotesk';
+    src: url('https://aibtc.com/fonts/RocGrotesk-WideMedium.woff2') format('woff2');
+    font-weight: 500;
+    font-display: swap;
+  }
+
+  /* Background pattern */
+  body {
+    font-family: 'Roc Grotesk', system-ui, sans-serif;
+    background: linear-gradient(135deg, #000000, #0a0a0a, #050208);
+  }
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: url('https://aibtc.com/Artwork/AIBTC_Pattern1_optimized.jpg') center/cover;
+    opacity: 0.12;
+    filter: saturate(1.3);
+    pointer-events: none;
+    z-index: -1;
+  }
+
   /* Token colors */
   .token-STX { color: ${colors.tokens.STX}; }
   .token-sBTC { color: ${colors.tokens.sBTC}; }
