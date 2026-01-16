@@ -38,6 +38,8 @@ export type TransactionValidationResult =
 export interface SponsorSuccess {
   success: true;
   sponsoredTxHex: string;
+  /** Fee in microSTX paid by sponsor */
+  fee: string;
 }
 
 /**
@@ -148,9 +150,22 @@ export class SponsorService {
       // v7: serialize() returns hex string directly
       const sponsoredTxHex = sponsoredTx.serialize();
 
+      // Extract fee from the sponsor's spending condition
+      // For sponsored transactions, the fee is set by the sponsor
+      let fee = "0";
+      if (
+        sponsoredTx.auth.authType === AuthType.Sponsored &&
+        "sponsorSpendingCondition" in sponsoredTx.auth
+      ) {
+        fee = sponsoredTx.auth.sponsorSpendingCondition.fee.toString();
+      }
+
+      this.logger.info("Transaction sponsored", { fee });
+
       return {
         success: true,
         sponsoredTxHex,
+        fee,
       };
     } catch (e) {
       this.logger.error("Failed to sponsor transaction", {

@@ -107,7 +107,9 @@ export class Relay extends BaseEndpoint {
               type: "object" as const,
               properties: {
                 error: { type: "string" as const },
+                code: { type: "string" as const },
                 details: { type: "string" as const },
+                retryable: { type: "boolean" as const },
               },
             },
           },
@@ -121,9 +123,18 @@ export class Relay extends BaseEndpoint {
               type: "object" as const,
               properties: {
                 error: { type: "string" as const },
+                code: { type: "string" as const },
                 details: { type: "string" as const },
+                retryable: { type: "boolean" as const },
+                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
               },
             },
+          },
+        },
+        headers: {
+          "Retry-After": {
+            description: "Seconds to wait before retrying",
+            schema: { type: "string" as const },
           },
         },
       },
@@ -135,7 +146,9 @@ export class Relay extends BaseEndpoint {
               type: "object" as const,
               properties: {
                 error: { type: "string" as const },
+                code: { type: "string" as const },
                 details: { type: "string" as const },
+                retryable: { type: "boolean" as const },
               },
             },
           },
@@ -149,9 +162,18 @@ export class Relay extends BaseEndpoint {
               type: "object" as const,
               properties: {
                 error: { type: "string" as const },
+                code: { type: "string" as const },
                 details: { type: "string" as const },
+                retryable: { type: "boolean" as const },
+                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
               },
             },
+          },
+        },
+        headers: {
+          "Retry-After": {
+            description: "Seconds to wait before retrying",
+            schema: { type: "string" as const },
           },
         },
       },
@@ -163,9 +185,18 @@ export class Relay extends BaseEndpoint {
               type: "object" as const,
               properties: {
                 error: { type: "string" as const },
+                code: { type: "string" as const },
                 details: { type: "string" as const },
+                retryable: { type: "boolean" as const },
+                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
               },
             },
+          },
+        },
+        headers: {
+          "Retry-After": {
+            description: "Seconds to wait before retrying",
+            schema: { type: "string" as const },
           },
         },
       },
@@ -186,12 +217,22 @@ export class Relay extends BaseEndpoint {
       // Validate required fields
       if (!body.transaction) {
         await statsService.recordError("validation");
-        return this.errorResponse(c, "Missing transaction field", 400);
+        return this.structuredError(c, {
+          error: "Missing transaction field",
+          code: "MISSING_TRANSACTION",
+          status: 400,
+          retryable: false,
+        });
       }
 
       if (!body.settle) {
         await statsService.recordError("validation");
-        return this.errorResponse(c, "Missing settle options", 400);
+        return this.structuredError(c, {
+          error: "Missing settle options",
+          code: "MISSING_SETTLE_OPTIONS",
+          status: 400,
+          retryable: false,
+        });
       }
 
       // Initialize services
@@ -204,31 +245,44 @@ export class Relay extends BaseEndpoint {
       );
       if (settleValidation.valid === false) {
         await statsService.recordError("validation");
-        return this.errorResponse(c, settleValidation.error, 400, settleValidation.details);
+        return this.structuredError(c, {
+          error: settleValidation.error,
+          code: "INVALID_SETTLE_OPTIONS",
+          status: 400,
+          details: settleValidation.details,
+          retryable: false,
+        });
       }
 
       // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         await statsService.recordError("validation");
-        return this.errorResponse(
-          c,
-          validation.error,
-          400,
-          validation.details
-        );
+        // Determine error code based on validation failure
+        const code = validation.error === "Transaction must be sponsored"
+          ? "NOT_SPONSORED"
+          : "INVALID_TRANSACTION";
+        return this.structuredError(c, {
+          error: validation.error,
+          code,
+          status: 400,
+          details: validation.details,
+          retryable: false,
+        });
       }
 
       // Check rate limit using sender address from transaction
       if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
         await statsService.recordError("rateLimit");
-        return this.errorResponse(
-          c,
-          "Rate limit exceeded",
-          429,
-          `Maximum ${RATE_LIMIT} requests per minute`
-        );
+        return this.structuredError(c, {
+          error: "Rate limit exceeded",
+          code: "RATE_LIMIT_EXCEEDED",
+          status: 429,
+          details: `Maximum ${RATE_LIMIT} requests per minute`,
+          retryable: true,
+          retryAfter: 60,
+        });
       }
 
       // Sponsor the transaction
@@ -237,12 +291,16 @@ export class Relay extends BaseEndpoint {
       );
       if (sponsorResult.success === false) {
         await statsService.recordError("sponsoring");
-        return this.errorResponse(
-          c,
-          sponsorResult.error,
-          500,
-          sponsorResult.details
-        );
+        const code = sponsorResult.error === "Service not configured"
+          ? "SPONSOR_CONFIG_ERROR"
+          : "SPONSOR_FAILED";
+        return this.structuredError(c, {
+          error: sponsorResult.error,
+          code,
+          status: 500,
+          details: sponsorResult.details,
+          retryable: code === "SPONSOR_FAILED", // Config errors are not retryable
+        });
       }
 
       // Call facilitator to settle
@@ -253,20 +311,45 @@ export class Relay extends BaseEndpoint {
 
       if (settleResult.success === false) {
         await statsService.recordError("facilitator");
-        return this.errorResponse(
-          c,
-          settleResult.error,
-          settleResult.httpStatus || 500,
-          settleResult.details
-        );
+        // Determine error code and retry guidance based on HTTP status
+        let code: "FACILITATOR_TIMEOUT" | "FACILITATOR_ERROR" | "FACILITATOR_INVALID_RESPONSE" | "SETTLEMENT_FAILED";
+        let retryable = false;
+        let retryAfter: number | undefined;
+
+        if (settleResult.httpStatus === 504) {
+          code = "FACILITATOR_TIMEOUT";
+          retryable = true;
+          retryAfter = 5; // Wait 5 seconds before retrying timeout
+        } else if (settleResult.httpStatus === 502) {
+          code = "FACILITATOR_ERROR";
+          retryable = true;
+          retryAfter = 5; // Wait 5 seconds before retrying gateway error
+        } else if (settleResult.error === "Settlement response invalid") {
+          code = "FACILITATOR_INVALID_RESPONSE";
+          retryable = true;
+          retryAfter = 10;
+        } else {
+          code = "SETTLEMENT_FAILED";
+          retryable = false; // Settlement validation failures are not retryable
+        }
+
+        return this.structuredError(c, {
+          error: settleResult.error,
+          code,
+          status: settleResult.httpStatus || 500,
+          details: settleResult.details,
+          retryable,
+          retryAfter,
+        });
       }
 
-      // Record successful transaction
+      // Record successful transaction with fee
       const tokenType = body.settle.tokenType || "STX";
       await statsService.recordTransaction({
         success: true,
         tokenType,
         amount: body.settle.minAmount,
+        fee: sponsorResult.fee,
       });
 
       logger.info("Transaction sponsored and settled", {
@@ -284,12 +367,14 @@ export class Relay extends BaseEndpoint {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       await statsService.recordError("validation");
-      return this.errorResponse(
-        c,
-        "Internal server error",
-        500,
-        e instanceof Error ? e.message : "Unknown error"
-      );
+      return this.structuredError(c, {
+        error: "Internal server error",
+        code: "INTERNAL_ERROR",
+        status: 500,
+        details: e instanceof Error ? e.message : "Unknown error",
+        retryable: true, // Unexpected errors might be transient
+        retryAfter: 5,
+      });
     }
   }
 }

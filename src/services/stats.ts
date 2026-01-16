@@ -5,6 +5,7 @@ import type {
   HourlyStats,
   DashboardOverview,
   ErrorCategory,
+  FeeStats,
 } from "../types";
 
 /**
@@ -96,6 +97,8 @@ export class StatsService {
     success: boolean;
     tokenType: TokenType;
     amount: string;
+    /** Fee paid by sponsor in microSTX */
+    fee?: string;
   }): Promise<void> {
     if (!this.kv) {
       this.logger.debug("KV not available, skipping stats recording");
@@ -158,6 +161,15 @@ export class StatsService {
    * Get dashboard overview data
    */
   async getOverview(): Promise<DashboardOverview> {
+    const emptyFees = {
+      total: "0",
+      average: "0",
+      min: "0",
+      max: "0",
+      trend: "stable" as const,
+      previousTotal: "0",
+    };
+
     const emptyOverview: DashboardOverview = {
       period: "24h",
       transactions: {
@@ -172,6 +184,7 @@ export class StatsService {
         sBTC: { count: 0, volume: "0", percentage: 0 },
         USDCx: { count: 0, volume: "0", percentage: 0 },
       },
+      fees: emptyFees,
       facilitator: {
         status: "unknown",
         avgLatencyMs: 0,
@@ -212,6 +225,28 @@ export class StatsService {
       // Get hourly data for chart
       const hourlyData = await this.getHourlyStats();
 
+      // Calculate fee metrics
+      const currentFees = current.fees || { total: "0", count: 0, min: "0", max: "0" };
+      const previousFees = previous.fees || { total: "0", count: 0, min: "0", max: "0" };
+
+      const avgFee = currentFees.count > 0
+        ? (BigInt(currentFees.total) / BigInt(currentFees.count)).toString()
+        : "0";
+
+      // Calculate fee trend using BigInt comparison
+      const currentFeeTotal = BigInt(currentFees.total);
+      const previousFeeTotal = BigInt(previousFees.total);
+      let feeTrend: "up" | "down" | "stable" = "stable";
+      if (previousFeeTotal === 0n) {
+        feeTrend = currentFeeTotal > 0n ? "up" : "stable";
+      } else {
+        // Calculate percentage change: (current - previous) / previous * 100
+        const diff = currentFeeTotal - previousFeeTotal;
+        const percentChange = (diff * 100n) / previousFeeTotal;
+        if (percentChange > 5n) feeTrend = "up";
+        else if (percentChange < -5n) feeTrend = "down";
+      }
+
       return {
         period: "24h",
         transactions: {
@@ -240,6 +275,14 @@ export class StatsService {
             volume: current.tokens.USDCx.volume,
             percentage: tokenPercentage(current.tokens.USDCx.count),
           },
+        },
+        fees: {
+          total: currentFees.total,
+          average: avgFee,
+          min: currentFees.min,
+          max: currentFees.max,
+          trend: feeTrend,
+          previousTotal: previousFees.total,
         },
         facilitator: {
           status: "unknown", // Will be populated by health monitor
@@ -293,14 +336,14 @@ export class StatsService {
    * Get hourly stats for last 24 hours
    */
   async getHourlyStats(): Promise<
-    Array<{ hour: string; transactions: number; success: number }>
+    Array<{ hour: string; transactions: number; success: number; fees?: string }>
   > {
     if (!this.kv) {
       return [];
     }
 
     try {
-      const stats: Array<{ hour: string; transactions: number; success: number }> = [];
+      const stats: Array<{ hour: string; transactions: number; success: number; fees?: string }> = [];
       const now = Date.now();
 
       for (let i = 23; i >= 0; i--) {
@@ -314,6 +357,7 @@ export class StatsService {
           hour: `${hour}:00`,
           transactions: data?.transactions || 0,
           success: data?.success || 0,
+          fees: data?.fees,
         });
       }
 
@@ -331,7 +375,7 @@ export class StatsService {
    */
   private async updateDailyStats(
     dateKey: string,
-    data: { success: boolean; tokenType: TokenType; amount: string }
+    data: { success: boolean; tokenType: TokenType; amount: string; fee?: string }
   ): Promise<void> {
     if (!this.kv) return;
 
@@ -353,6 +397,28 @@ export class StatsService {
       BigInt(tokenStats.volume) + BigInt(data.amount)
     ).toString();
 
+    // Update fee stats if fee is provided
+    if (data.fee && data.success) {
+      const feeValue = BigInt(data.fee);
+      if (!stats.fees) {
+        stats.fees = {
+          total: "0",
+          count: 0,
+          min: data.fee,
+          max: data.fee,
+        };
+      }
+      stats.fees.total = (BigInt(stats.fees.total) + feeValue).toString();
+      stats.fees.count++;
+      // Update min/max
+      if (feeValue < BigInt(stats.fees.min)) {
+        stats.fees.min = data.fee;
+      }
+      if (feeValue > BigInt(stats.fees.max)) {
+        stats.fees.max = data.fee;
+      }
+    }
+
     await this.kv.put(key, JSON.stringify(stats), {
       expirationTtl: DAILY_TTL,
     });
@@ -363,7 +429,7 @@ export class StatsService {
    */
   private async updateHourlyStats(
     hourKey: string,
-    data: { success: boolean; tokenType: TokenType; amount: string }
+    data: { success: boolean; tokenType: TokenType; amount: string; fee?: string }
   ): Promise<void> {
     if (!this.kv) return;
 
@@ -378,6 +444,12 @@ export class StatsService {
       stats.failed++;
     }
     stats.tokens[data.tokenType]++;
+
+    // Track fees for the hour
+    if (data.fee && data.success) {
+      const currentFees = BigInt(stats.fees || "0");
+      stats.fees = (currentFees + BigInt(data.fee)).toString();
+    }
 
     await this.kv.put(key, JSON.stringify(stats), {
       expirationTtl: HOURLY_TTL,
