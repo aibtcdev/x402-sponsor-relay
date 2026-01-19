@@ -129,7 +129,7 @@ const response = await fetch("https://x402-relay.aibtc.dev/relay", {
 });
 
 const { txid, settlement } = await response.json();
-console.log(`Transaction: https://explorer.stacks.co/txid/${txid}?chain=testnet`);
+console.log(`Transaction: https://explorer.hiro.so/txid/${txid}?chain=testnet`);
 console.log(`Settlement status: ${settlement.status}`);
 ```
 

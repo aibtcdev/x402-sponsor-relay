@@ -9,6 +9,7 @@
  *   AGENT_ACCOUNT_INDEX Account index to derive (default: 0)
  *   AGENT_PRIVATE_KEY   Hex-encoded private key (alternative to mnemonic)
  *   RELAY_URL           Relay endpoint URL (optional)
+ *   TEST_RECIPIENT      Recipient address (default: AIBTC testnet server)
  *
  * Argument handling:
  *   - If AGENT_MNEMONIC or AGENT_PRIVATE_KEY is set: args[0] = relay URL (optional)
@@ -37,7 +38,9 @@ import {
   getStxAddress,
 } from "@stacks/wallet-sdk";
 
-const TESTNET_FAUCET = "ST000000000000000000002AMW42H"; // Testnet faucet address
+// AIBTC server addresses for test transactions
+const AIBTC_TESTNET = "ST37NMC4HGFQ1H2JSFP4H3TMNQBF4PY0MVSD1GV7Z"; // x402.aibtc.dev
+const AIBTC_MAINNET = "SP37NMC4HGFQ1H2JSFP4H3TMNQBF4PY0MVRHQXGQE"; // x402.aibtc.com
 
 /**
  * Derive a child account from a mnemonic phrase
@@ -109,10 +112,14 @@ async function main() {
 
   console.log(`Sender address: ${senderAddress}`);
 
-  // Build a sponsored STX transfer (small amount to faucet)
+  // Use AIBTC server as recipient for testing
+  const recipient = process.env.TEST_RECIPIENT || AIBTC_TESTNET;
+  console.log(`Recipient address: ${recipient}`);
+
+  // Build a sponsored STX transfer
   console.log("\nBuilding sponsored transaction...");
   const transaction = await makeSTXTokenTransfer({
-    recipient: TESTNET_FAUCET,
+    recipient,
     amount: 1000n, // 0.001 STX in microSTX
     senderKey: privateKey,
     network: "testnet",
@@ -131,7 +138,7 @@ async function main() {
   const requestBody = {
     transaction: txHex,
     settle: {
-      expectedRecipient: TESTNET_FAUCET,
+      expectedRecipient: recipient,
       minAmount: "1000", // Same as amount we're sending
       tokenType: "STX" as const,
       expectedSender: senderAddress,
@@ -158,7 +165,7 @@ async function main() {
     if (response.ok) {
       console.log("\n=== SUCCESS ===");
       console.log(`Transaction ID: ${result.txid}`);
-      console.log(`Explorer: https://explorer.stacks.co/txid/${result.txid}?chain=testnet`);
+      console.log(`Explorer: https://explorer.hiro.so/txid/${result.txid}?chain=testnet`);
       if (result.settlement) {
         console.log("\n=== SETTLEMENT ===");
         console.log(`Status: ${result.settlement.status}`);
