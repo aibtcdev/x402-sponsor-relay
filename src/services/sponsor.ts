@@ -60,9 +60,13 @@ export interface SponsorFailure {
  */
 export type SponsorResult = SponsorSuccess | SponsorFailure;
 
-// Module-level cache for derived sponsor key (persists across requests in same worker instance)
+// Module-level cache for derived sponsor key.
+// NOTE: This cache is shared across all requests handled by the same worker instance
+// and assumes a single, stable Env configuration per instance (one environment per
+// deployed worker). Cloudflare Workers deploy separate instances per environment,
+// so this is safe in practice.
 let cachedSponsorKey: string | null = null;
-let cachedMnemonicHash: string | null = null;
+let cachedConfigHash: string | null = null;
 
 /**
  * Service for validating and sponsoring Stacks transactions
@@ -85,17 +89,32 @@ export class SponsorService {
       return null;
     }
 
-    // Simple hash to detect mnemonic changes (just use first/last words + length)
-    const mnemonicHash = `${this.env.SPONSOR_MNEMONIC.slice(0, 20)}-${this.env.SPONSOR_MNEMONIC.length}`;
+    // Parse and validate account index
+    const rawAccountIndex = this.env.SPONSOR_ACCOUNT_INDEX;
+    const accountIndex = parseInt(rawAccountIndex || "0", 10);
+    const MAX_ACCOUNT_INDEX = 1000;
 
-    // Return cached key if mnemonic hasn't changed
-    if (cachedSponsorKey && cachedMnemonicHash === mnemonicHash) {
+    if (
+      !Number.isInteger(accountIndex) ||
+      accountIndex < 0 ||
+      accountIndex > MAX_ACCOUNT_INDEX
+    ) {
+      this.logger.error(
+        "Invalid SPONSOR_ACCOUNT_INDEX; must be 0-1000",
+        { valid: false }
+      );
+      return null;
+    }
+
+    // Create config hash including full mnemonic and account index
+    const configHash = `${this.env.SPONSOR_MNEMONIC}:${accountIndex}`;
+
+    // Return cached key if config hasn't changed
+    if (cachedSponsorKey && cachedConfigHash === configHash) {
       return cachedSponsorKey;
     }
 
-    const accountIndex = parseInt(this.env.SPONSOR_ACCOUNT_INDEX || "0", 10);
-
-    this.logger.info("Deriving sponsor key from mnemonic", { accountIndex });
+    this.logger.info("Deriving sponsor key from mnemonic");
 
     try {
       const wallet = await generateWallet({
@@ -116,7 +135,7 @@ export class SponsorService {
 
       // Cache the derived key
       cachedSponsorKey = account.stxPrivateKey;
-      cachedMnemonicHash = mnemonicHash;
+      cachedConfigHash = configHash;
 
       this.logger.info("Sponsor key derived successfully");
       return cachedSponsorKey;
