@@ -66,6 +66,10 @@ export type SponsorResult = SponsorSuccess | SponsorFailure;
 let cachedSponsorKey: string | null = null;
 let cachedAccountIndex: number | null = null;
 
+// Validation constants
+const MAX_ACCOUNT_INDEX = 1000;
+const VALID_MNEMONIC_LENGTHS = [12, 24];
+
 /**
  * Service for validating and sponsoring Stacks transactions
  */
@@ -87,9 +91,15 @@ export class SponsorService {
       return null;
     }
 
+    // Validate mnemonic format (12 or 24 words)
+    const words = this.env.SPONSOR_MNEMONIC.trim().split(/\s+/);
+    if (!VALID_MNEMONIC_LENGTHS.includes(words.length)) {
+      this.logger.error("Invalid SPONSOR_MNEMONIC; must be 12 or 24 words");
+      return null;
+    }
+
     // Parse and validate account index
     const accountIndex = parseInt(this.env.SPONSOR_ACCOUNT_INDEX || "0", 10);
-    const MAX_ACCOUNT_INDEX = 1000;
 
     if (
       !Number.isInteger(accountIndex) ||
@@ -110,6 +120,8 @@ export class SponsorService {
     try {
       const wallet = await generateWallet({
         secretKey: this.env.SPONSOR_MNEMONIC,
+        // Empty password is intentional: the mnemonic is the sole secret in this
+        // server-side context, no additional user passphrase is used.
         password: "",
       });
 
