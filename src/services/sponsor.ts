@@ -61,12 +61,10 @@ export interface SponsorFailure {
 export type SponsorResult = SponsorSuccess | SponsorFailure;
 
 // Module-level cache for derived sponsor key.
-// NOTE: This cache is shared across all requests handled by the same worker instance
-// and assumes a single, stable Env configuration per instance (one environment per
-// deployed worker). Cloudflare Workers deploy separate instances per environment,
-// so this is safe in practice.
+// Env vars cannot change during a worker instance's lifetime - when secrets are
+// updated via `wrangler secret put`, workers restart with fresh instances.
 let cachedSponsorKey: string | null = null;
-let cachedConfigHash: string | null = null;
+let cachedAccountIndex: number | null = null;
 
 /**
  * Service for validating and sponsoring Stacks transactions
@@ -90,8 +88,7 @@ export class SponsorService {
     }
 
     // Parse and validate account index
-    const rawAccountIndex = this.env.SPONSOR_ACCOUNT_INDEX;
-    const accountIndex = parseInt(rawAccountIndex || "0", 10);
+    const accountIndex = parseInt(this.env.SPONSOR_ACCOUNT_INDEX || "0", 10);
     const MAX_ACCOUNT_INDEX = 1000;
 
     if (
@@ -99,18 +96,12 @@ export class SponsorService {
       accountIndex < 0 ||
       accountIndex > MAX_ACCOUNT_INDEX
     ) {
-      this.logger.error(
-        "Invalid SPONSOR_ACCOUNT_INDEX; must be 0-1000",
-        { valid: false }
-      );
+      this.logger.error("Invalid SPONSOR_ACCOUNT_INDEX; must be 0-1000");
       return null;
     }
 
-    // Create config hash including full mnemonic and account index
-    const configHash = `${this.env.SPONSOR_MNEMONIC}:${accountIndex}`;
-
-    // Return cached key if config hasn't changed
-    if (cachedSponsorKey && cachedConfigHash === configHash) {
+    // Return cached key if available (env can't change during worker lifetime)
+    if (cachedSponsorKey !== null && cachedAccountIndex === accountIndex) {
       return cachedSponsorKey;
     }
 
@@ -135,7 +126,7 @@ export class SponsorService {
 
       // Cache the derived key
       cachedSponsorKey = account.stxPrivateKey;
-      cachedConfigHash = configHash;
+      cachedAccountIndex = accountIndex;
 
       this.logger.info("Sponsor key derived successfully");
       return cachedSponsorKey;
