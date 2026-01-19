@@ -45,6 +45,8 @@ npm run test:relay -- [relay-url]
 - `GET /docs` - Swagger UI API documentation
 - `GET /openapi.json` - OpenAPI specification
 - `POST /relay` - Submit sponsored transaction for sponsorship and settlement
+- `GET /stats` - Relay statistics (JSON API)
+- `GET /dashboard` - Public dashboard (HTML)
 
 **Request/Response:**
 ```typescript
@@ -82,33 +84,12 @@ Response (error): {
 }
 ```
 
-**Project Structure:**
-```
-src/
-  index.ts              # Hono app entry point with Chanfana OpenAPI setup
-  types.ts              # Centralized type definitions
-  version.ts            # Single source of truth for VERSION constant
-  endpoints/
-    index.ts            # Barrel exports
-    BaseEndpoint.ts     # Base class extending OpenAPIRoute
-    health.ts           # GET /health endpoint
-    relay.ts            # POST /relay endpoint
-  middleware/
-    index.ts            # Barrel exports
-    logger.ts           # Request-scoped logging middleware
-    rate-limit.ts       # Rate limiting utilities
-  services/
-    index.ts            # Barrel exports
-    sponsor.ts          # Transaction sponsoring logic (extracts fee)
-    facilitator.ts      # x402 facilitator API client
-    stats.ts            # Dashboard statistics with fee tracking
-    health-monitor.ts   # Facilitator health monitoring
-scripts/
-  test-relay.ts         # Test script for building and submitting sponsored tx
-docs/
-  state-machine.md      # Transaction state machine diagram
-  feature-roadmap.md    # Feature implementation status and plans
-```
+**Key Files:**
+- `src/index.ts` - Hono app entry point with Chanfana OpenAPI setup
+- `src/version.ts` - Single source of truth for VERSION constant
+- `src/types.ts` - Centralized type definitions
+- `scripts/test-relay.ts` - Test script for building and submitting sponsored tx
+- `docs/` - State machine diagram and feature roadmap
 
 ## Deployment URLs
 
@@ -121,7 +102,9 @@ docs/
 - `.env` - Local development secrets (not committed, loaded by wrangler)
 - `.env.example` - Template for required environment variables
 - Secrets set via `wrangler secret put`:
-  - `SPONSOR_PRIVATE_KEY` - Private key for sponsoring transactions
+  - `SPONSOR_MNEMONIC` - 24-word mnemonic phrase for sponsor wallet (preferred)
+  - `SPONSOR_ACCOUNT_INDEX` - Account index to derive (default: 0, optional)
+  - `SPONSOR_PRIVATE_KEY` - Hex private key (fallback, not recommended)
 
 ## Deployment
 
@@ -129,14 +112,16 @@ docs/
 # Authenticate with Cloudflare
 npx wrangler login
 
-# Set secrets for staging
-npx wrangler secret put SPONSOR_PRIVATE_KEY --env staging
+# Set secrets for staging (use mnemonic - preferred)
+npx wrangler secret put SPONSOR_MNEMONIC --env staging
+# Optional: set account index if not using default (0)
+npx wrangler secret put SPONSOR_ACCOUNT_INDEX --env staging
 
 # Deploy to staging (testnet)
 npx wrangler deploy --env staging
 
 # Deploy to production (mainnet)
-npx wrangler secret put SPONSOR_PRIVATE_KEY --env production
+npx wrangler secret put SPONSOR_MNEMONIC --env production
 npx wrangler deploy --env production
 ```
 
@@ -180,7 +165,7 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 ## Development Workflow
 
 1. Copy `.env.example` to `.env` and fill in credentials
-2. Set `SPONSOR_PRIVATE_KEY` in `.env`
+2. Set `SPONSOR_MNEMONIC` in `.env` (preferred) or `SPONSOR_PRIVATE_KEY` (fallback)
 3. Start dev server: `npm run dev`
 4. Test with: `npm run test:relay -- http://localhost:8787`
 5. Check logs at logs.wbd.host

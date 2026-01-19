@@ -5,6 +5,10 @@ import {
   type StacksTransactionWire,
 } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
+import {
+  generateNewAccount,
+  generateWallet,
+} from "@stacks/wallet-sdk";
 import type { Env, Logger } from "../types";
 
 /**
@@ -56,6 +60,16 @@ export interface SponsorFailure {
  */
 export type SponsorResult = SponsorSuccess | SponsorFailure;
 
+// Module-level cache for derived sponsor key.
+// Env vars cannot change during a worker instance's lifetime - when secrets are
+// updated via `wrangler secret put`, workers restart with fresh instances.
+let cachedSponsorKey: string | null = null;
+let cachedAccountIndex: number | null = null;
+
+// Validation constants
+const MAX_ACCOUNT_INDEX = 1000;
+const VALID_MNEMONIC_LENGTHS = [12, 24];
+
 /**
  * Service for validating and sponsoring Stacks transactions
  */
@@ -66,6 +80,91 @@ export class SponsorService {
   constructor(env: Env, logger: Logger) {
     this.env = env;
     this.logger = logger;
+  }
+
+  /**
+   * Derive private key from mnemonic phrase
+   * Results are cached at module level to avoid re-derivation per request
+   */
+  private async deriveSponsorKey(): Promise<string | null> {
+    if (!this.env.SPONSOR_MNEMONIC) {
+      return null;
+    }
+
+    // Validate mnemonic format (12 or 24 words)
+    const words = this.env.SPONSOR_MNEMONIC.trim().split(/\s+/);
+    if (!VALID_MNEMONIC_LENGTHS.includes(words.length)) {
+      this.logger.error("Invalid SPONSOR_MNEMONIC; must be 12 or 24 words");
+      return null;
+    }
+
+    // Parse and validate account index
+    const accountIndex = parseInt(this.env.SPONSOR_ACCOUNT_INDEX || "0", 10);
+
+    if (
+      !Number.isInteger(accountIndex) ||
+      accountIndex < 0 ||
+      accountIndex > MAX_ACCOUNT_INDEX
+    ) {
+      this.logger.error("Invalid SPONSOR_ACCOUNT_INDEX; must be 0-1000");
+      return null;
+    }
+
+    // Return cached key if available (env can't change during worker lifetime)
+    if (cachedSponsorKey !== null && cachedAccountIndex === accountIndex) {
+      return cachedSponsorKey;
+    }
+
+    this.logger.info("Deriving sponsor key from mnemonic");
+
+    try {
+      const wallet = await generateWallet({
+        secretKey: this.env.SPONSOR_MNEMONIC,
+        // Empty password is intentional: the mnemonic is the sole secret in this
+        // server-side context, no additional user passphrase is used.
+        password: "",
+      });
+
+      // Generate accounts up to the needed index
+      for (let i = wallet.accounts.length; i <= accountIndex; i++) {
+        generateNewAccount(wallet);
+      }
+
+      const account = wallet.accounts[accountIndex];
+      if (!account) {
+        this.logger.error("Failed to derive account", { accountIndex });
+        return null;
+      }
+
+      // Cache the derived key
+      cachedSponsorKey = account.stxPrivateKey;
+      cachedAccountIndex = accountIndex;
+
+      this.logger.info("Sponsor key derived successfully");
+      return cachedSponsorKey;
+    } catch (e) {
+      this.logger.error("Failed to derive sponsor key from mnemonic", {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Get the sponsor private key (from mnemonic or direct config)
+   */
+  private async getSponsorKey(): Promise<string | null> {
+    // Prefer mnemonic derivation
+    if (this.env.SPONSOR_MNEMONIC) {
+      return this.deriveSponsorKey();
+    }
+
+    // Fall back to direct private key
+    if (this.env.SPONSOR_PRIVATE_KEY) {
+      return this.env.SPONSOR_PRIVATE_KEY;
+    }
+
+    return null;
   }
 
   /**
@@ -129,12 +228,14 @@ export class SponsorService {
   async sponsorTransaction(
     transaction: StacksTransactionWire
   ): Promise<SponsorResult> {
-    if (!this.env.SPONSOR_PRIVATE_KEY) {
+    const sponsorKey = await this.getSponsorKey();
+
+    if (!sponsorKey) {
       this.logger.error("Sponsor key not configured");
       return {
         success: false,
         error: "Service not configured",
-        details: "Sponsor key missing",
+        details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
       };
     }
 
@@ -143,7 +244,7 @@ export class SponsorService {
     try {
       const sponsoredTx = await sponsorTransaction({
         transaction,
-        sponsorPrivateKey: this.env.SPONSOR_PRIVATE_KEY,
+        sponsorPrivateKey: sponsorKey,
         network,
       });
 

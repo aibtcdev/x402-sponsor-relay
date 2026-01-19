@@ -41,7 +41,12 @@ export interface Logger {
  * Environment bindings for Cloudflare Worker
  */
 export interface Env {
-  SPONSOR_PRIVATE_KEY: string;
+  /** 24-word mnemonic phrase for sponsor wallet (preferred) */
+  SPONSOR_MNEMONIC?: string;
+  /** Account index to derive from mnemonic (default: 0) */
+  SPONSOR_ACCOUNT_INDEX?: string;
+  /** Hex-encoded private key (fallback if no mnemonic) */
+  SPONSOR_PRIVATE_KEY?: string;
   STACKS_NETWORK: "mainnet" | "testnet";
   FACILITATOR_URL: string;
   // LOGS is a service binding to worker-logs, typed loosely to avoid complex Service<> generics
