@@ -40,8 +40,6 @@ import {
 
 // AIBTC server addresses for test transactions
 const AIBTC_TESTNET = "ST37NMC4HGFQ1H2JSFP4H3TMNQBF4PY0MVSD1GV7Z"; // x402.aibtc.dev
-const AIBTC_MAINNET = "SP37NMC4HGFQ1H2JSFP4H3TMNQBF4PY0MVRHQXGQE"; // x402.aibtc.com
-
 /**
  * Derive a child account from a mnemonic phrase
  */
