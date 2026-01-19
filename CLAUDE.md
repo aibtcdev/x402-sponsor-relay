@@ -45,6 +45,8 @@ npm run test:relay -- [relay-url]
 - `GET /docs` - Swagger UI API documentation
 - `GET /openapi.json` - OpenAPI specification
 - `POST /relay` - Submit sponsored transaction for sponsorship and settlement
+- `GET /stats` - Relay statistics (JSON API)
+- `GET /dashboard` - Public dashboard (HTML)
 
 **Request/Response:**
 ```typescript
@@ -82,33 +84,12 @@ Response (error): {
 }
 ```
 
-**Project Structure:**
-```
-src/
-  index.ts              # Hono app entry point with Chanfana OpenAPI setup
-  types.ts              # Centralized type definitions
-  version.ts            # Single source of truth for VERSION constant
-  endpoints/
-    index.ts            # Barrel exports
-    BaseEndpoint.ts     # Base class extending OpenAPIRoute
-    health.ts           # GET /health endpoint
-    relay.ts            # POST /relay endpoint
-  middleware/
-    index.ts            # Barrel exports
-    logger.ts           # Request-scoped logging middleware
-    rate-limit.ts       # Rate limiting utilities
-  services/
-    index.ts            # Barrel exports
-    sponsor.ts          # Transaction sponsoring logic (extracts fee)
-    facilitator.ts      # x402 facilitator API client
-    stats.ts            # Dashboard statistics with fee tracking
-    health-monitor.ts   # Facilitator health monitoring
-scripts/
-  test-relay.ts         # Test script for building and submitting sponsored tx
-docs/
-  state-machine.md      # Transaction state machine diagram
-  feature-roadmap.md    # Feature implementation status and plans
-```
+**Key Files:**
+- `src/index.ts` - Hono app entry point with Chanfana OpenAPI setup
+- `src/version.ts` - Single source of truth for VERSION constant
+- `src/types.ts` - Centralized type definitions
+- `scripts/test-relay.ts` - Test script for building and submitting sponsored tx
+- `docs/` - State machine diagram and feature roadmap
 
 ## Deployment URLs
 

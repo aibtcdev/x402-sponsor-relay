@@ -75,7 +75,7 @@ Health check endpoint.
 {
   "status": "ok",
   "network": "testnet",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }
 ```
 
@@ -149,6 +149,8 @@ console.log(`Settlement status: ${settlement.status}`);
 | GET | `/docs` | Swagger UI documentation |
 | GET | `/openapi.json` | OpenAPI specification |
 | POST | `/relay` | Submit sponsored transaction |
+| GET | `/stats` | Relay statistics (JSON) |
+| GET | `/dashboard` | Public dashboard (HTML) |
 
 ## Rate Limits
 
