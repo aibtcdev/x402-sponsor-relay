@@ -1,11 +1,6 @@
-import type { Logger, AuthContext, RateLimitTier } from "../types";
-import { TIER_LIMITS } from "../types";
-import { AuthService, type RateLimitResult } from "../services/auth";
-
 /**
- * Simple rate limiting using in-memory map
- * Used for unauthenticated requests (grace period)
- * For authenticated requests, use checkKeyRateLimit with KV-based limiting
+ * Simple in-memory rate limiting for unauthenticated requests (grace period)
+ * For authenticated requests, use AuthService.checkRateLimit directly
  */
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
 
@@ -53,18 +48,4 @@ export function checkSenderRateLimit(address: string): SenderRateLimitResult {
  */
 export function checkRateLimit(address: string): boolean {
   return checkSenderRateLimit(address).allowed;
-}
-
-/**
- * Check rate limit for authenticated API key
- * Uses KV-based distributed rate limiting via AuthService
- */
-export async function checkKeyRateLimit(
-  kv: KVNamespace | undefined,
-  logger: Logger,
-  keyId: string,
-  tier: RateLimitTier
-): Promise<RateLimitResult> {
-  const authService = new AuthService(kv, logger);
-  return authService.checkRateLimit(keyId, tier);
 }

@@ -34,6 +34,20 @@ export interface UsageData {
 const API_KEY_REGEX = /^x402_sk_(test|live)_[a-f0-9]{32}$/;
 
 /**
+ * Hash an API key for secure storage
+ * Uses SHA-256 to generate a deterministic hash
+ */
+async function hashApiKey(apiKey: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(apiKey);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const hashArray = new Uint8Array(hashBuffer);
+  return Array.from(hashArray)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/**
  * AuthService handles API key validation, rate limiting, and usage tracking
  */
 export class AuthService {
@@ -80,8 +94,11 @@ export class AuthService {
       };
     }
 
-    // Lookup key in KV
-    const metadata = await this.kv.get<ApiKeyMetadata>(`key:${apiKey}`, "json");
+    // Hash the API key for secure lookup (keys are stored by hash, not plaintext)
+    const keyHash = await hashApiKey(apiKey);
+
+    // Lookup key in KV by hash
+    const metadata = await this.kv.get<ApiKeyMetadata>(`key:${keyHash}`, "json");
 
     if (!metadata) {
       return {
@@ -327,14 +344,17 @@ export class AuthService {
       active: true,
     };
 
-    // Store key -> metadata mapping
-    await this.kv.put(`key:${apiKey}`, JSON.stringify(metadata));
+    // Hash the API key for secure storage (plaintext key is only shown once)
+    const keyHash = await hashApiKey(apiKey);
+
+    // Store hash -> metadata mapping (key is never stored in plaintext)
+    await this.kv.put(`key:${keyHash}`, JSON.stringify(metadata));
 
     // Store app -> keyId mapping (for lookup by name)
     await this.kv.put(`app:${appName}`, keyId);
 
-    // Store keyId -> apiKey mapping (for admin operations)
-    await this.kv.put(`keyId:${keyId}`, apiKey);
+    // Store keyId -> keyHash mapping (for admin operations like revoke/renew)
+    await this.kv.put(`keyId:${keyId}`, keyHash);
 
     this.logger.info("API key created", { appName, keyId, tier });
 
@@ -349,13 +369,14 @@ export class AuthService {
       throw new Error("API_KEYS_KV not configured");
     }
 
-    const metadata = await this.kv.get<ApiKeyMetadata>(`key:${apiKey}`, "json");
+    const keyHash = await hashApiKey(apiKey);
+    const metadata = await this.kv.get<ApiKeyMetadata>(`key:${keyHash}`, "json");
     if (!metadata) {
       return false;
     }
 
     metadata.active = false;
-    await this.kv.put(`key:${apiKey}`, JSON.stringify(metadata));
+    await this.kv.put(`key:${keyHash}`, JSON.stringify(metadata));
 
     this.logger.info("API key revoked", { keyId: metadata.keyId, appName: metadata.appName });
     return true;
@@ -369,7 +390,8 @@ export class AuthService {
       throw new Error("API_KEYS_KV not configured");
     }
 
-    const metadata = await this.kv.get<ApiKeyMetadata>(`key:${apiKey}`, "json");
+    const keyHash = await hashApiKey(apiKey);
+    const metadata = await this.kv.get<ApiKeyMetadata>(`key:${keyHash}`, "json");
     if (!metadata) {
       return null;
     }
@@ -379,7 +401,7 @@ export class AuthService {
     expiresAt.setDate(expiresAt.getDate() + 30);
 
     metadata.expiresAt = expiresAt.toISOString();
-    await this.kv.put(`key:${apiKey}`, JSON.stringify(metadata));
+    await this.kv.put(`key:${keyHash}`, JSON.stringify(metadata));
 
     this.logger.info("API key renewed", { keyId: metadata.keyId, expiresAt: metadata.expiresAt });
     return metadata;
@@ -392,7 +414,8 @@ export class AuthService {
     if (!this.kv) {
       return null;
     }
-    return this.kv.get<ApiKeyMetadata>(`key:${apiKey}`, "json");
+    const keyHash = await hashApiKey(apiKey);
+    return this.kv.get<ApiKeyMetadata>(`key:${keyHash}`, "json");
   }
 
   /**

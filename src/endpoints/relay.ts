@@ -1,6 +1,6 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import { SponsorService, FacilitatorService, StatsService, AuthService } from "../services";
-import { checkSenderRateLimit, checkKeyRateLimit, RATE_LIMIT } from "../middleware";
+import { checkSenderRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest, AuthContext } from "../types";
 import { TIER_LIMITS } from "../types";
 
@@ -276,6 +276,7 @@ export class Relay extends BaseEndpoint {
       // Initialize services
       const sponsorService = new SponsorService(c.env, logger);
       const facilitatorService = new FacilitatorService(c.env, logger);
+      const authService = new AuthService(c.env.API_KEYS_KV, logger);
 
       // Validate settle options
       const settleValidation = facilitatorService.validateSettleOptions(
@@ -315,9 +316,7 @@ export class Relay extends BaseEndpoint {
       // Check rate limits based on authentication status
       if (auth?.metadata) {
         // Authenticated: use per-key KV-based rate limits
-        const keyRateLimit = await checkKeyRateLimit(
-          c.env.API_KEYS_KV,
-          logger,
+        const keyRateLimit = await authService.checkRateLimit(
           auth.metadata.keyId,
           auth.metadata.tier
         );
@@ -399,7 +398,6 @@ export class Relay extends BaseEndpoint {
 
         // Record per-key usage if authenticated
         if (auth?.metadata) {
-          const authService = new AuthService(c.env.API_KEYS_KV, logger);
           await authService.recordUsage(auth.metadata.keyId, {
             success: false,
             tokenType,
@@ -454,7 +452,6 @@ export class Relay extends BaseEndpoint {
 
       // Record per-key usage if authenticated
       if (auth?.metadata) {
-        const authService = new AuthService(c.env.API_KEYS_KV, logger);
         await authService.recordUsage(auth.metadata.keyId, {
           success: true,
           tokenType,

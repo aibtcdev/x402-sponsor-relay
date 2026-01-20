@@ -30,8 +30,10 @@ export async function authMiddleware(
 
   // No API key provided - grace period
   if (!apiKey) {
+    // Sanitize path to avoid logging query parameters
+    const sanitizedPath = c.req.path.split("?")[0];
     logger.warn("No API key provided (grace period active)", {
-      path: c.req.path,
+      path: sanitizedPath,
       method: c.req.method,
     });
 

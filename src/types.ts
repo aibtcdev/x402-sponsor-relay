@@ -96,7 +96,7 @@ export interface ApiKeyMetadata {
   createdAt: string;
   /** When the key expires (30 days from creation by default) */
   expiresAt: string;
-  /** Whether the key is active (can be revoked) */
+  /** Whether the key is active (false if revoked) */
   active: boolean;
 }
 

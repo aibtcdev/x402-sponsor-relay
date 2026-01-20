@@ -37,6 +37,15 @@ import { TIER_LIMITS } from "../src/types";
 // API Key format: x402_sk_<env>_<32-char-hex>
 const API_KEY_REGEX = /^x402_sk_(test|live)_[a-f0-9]{32}$/;
 
+// Valid rate limit tiers
+const VALID_TIERS: RateLimitTier[] = ["free", "standard", "unlimited"];
+
+// Valid key environments
+const VALID_ENVS: Array<"test" | "live"> = ["test", "live"];
+
+// Basic email validation regex
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 // Get environment from WRANGLER_ENV or default to local
 const wranglerEnv = process.env.WRANGLER_ENV || "";
 const envFlag = wranglerEnv ? `--env ${wranglerEnv}` : "";
@@ -68,17 +77,13 @@ function kvGet<T>(key: string): T | null {
 
 /**
  * Put a value to KV
+ * Note: Escapes single quotes in value to prevent shell injection
  */
 function kvPut(key: string, value: string, ttl?: number): void {
   const ttlArg = ttl ? `--ttl ${ttl}` : "";
-  wranglerKv("put", `"${key}" '${value}' ${ttlArg}`);
-}
-
-/**
- * Delete a key from KV
- */
-function kvDelete(key: string): void {
-  wranglerKv("delete", `"${key}"`);
+  // Escape single quotes in value to prevent shell injection
+  const escapedValue = value.replace(/'/g, "'\\''");
+  wranglerKv("put", `"${key}" '${escapedValue}' ${ttlArg}`);
 }
 
 /**
@@ -107,16 +112,24 @@ function generateRandomHex(): string {
 }
 
 /**
- * Generate a key ID (hash of the API key)
+ * Hash an API key (full SHA-256 hash for secure storage)
  */
-async function generateKeyId(apiKey: string): Promise<string> {
+async function hashApiKey(apiKey: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(apiKey);
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashArray = new Uint8Array(hashBuffer);
-  return Array.from(hashArray.slice(0, 8))
+  return Array.from(hashArray)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/**
+ * Generate a key ID (short hash of the API key for display)
+ */
+async function generateKeyId(apiKey: string): Promise<string> {
+  const fullHash = await hashApiKey(apiKey);
+  return fullHash.slice(0, 16);
 }
 
 /**
@@ -141,6 +154,7 @@ async function createKey(
   const hex = generateRandomHex();
   const apiKey = `x402_sk_${environment}_${hex}`;
   const keyId = await generateKeyId(apiKey);
+  const keyHash = await hashApiKey(apiKey);
 
   // Set expiration (30 days)
   const now = new Date();
@@ -157,10 +171,10 @@ async function createKey(
     active: true,
   };
 
-  // Store in KV
-  kvPut(`key:${apiKey}`, JSON.stringify(metadata));
+  // Store in KV (key is stored by hash, never in plaintext)
+  kvPut(`key:${keyHash}`, JSON.stringify(metadata));
   kvPut(`app:${appName}`, keyId);
-  kvPut(`keyId:${keyId}`, apiKey);
+  kvPut(`keyId:${keyId}`, keyHash);
 
   console.log("\n=== API KEY CREATED ===");
   console.log(`API Key: ${apiKey}`);
@@ -212,13 +226,14 @@ function listKeys(): void {
 /**
  * Get info about an API key
  */
-function getKeyInfo(apiKey: string): void {
+async function getKeyInfo(apiKey: string): Promise<void> {
   if (!API_KEY_REGEX.test(apiKey)) {
     console.error("Error: Invalid API key format");
     process.exit(1);
   }
 
-  const metadata = kvGet<ApiKeyMetadata>(`key:${apiKey}`);
+  const keyHash = await hashApiKey(apiKey);
+  const metadata = kvGet<ApiKeyMetadata>(`key:${keyHash}`);
   if (!metadata) {
     console.error("Error: API key not found");
     process.exit(1);
@@ -244,13 +259,14 @@ function getKeyInfo(apiKey: string): void {
 /**
  * Revoke an API key
  */
-function revokeKey(apiKey: string): void {
+async function revokeKey(apiKey: string): Promise<void> {
   if (!API_KEY_REGEX.test(apiKey)) {
     console.error("Error: Invalid API key format");
     process.exit(1);
   }
 
-  const metadata = kvGet<ApiKeyMetadata>(`key:${apiKey}`);
+  const keyHash = await hashApiKey(apiKey);
+  const metadata = kvGet<ApiKeyMetadata>(`key:${keyHash}`);
   if (!metadata) {
     console.error("Error: API key not found");
     process.exit(1);
@@ -262,7 +278,7 @@ function revokeKey(apiKey: string): void {
   }
 
   metadata.active = false;
-  kvPut(`key:${apiKey}`, JSON.stringify(metadata));
+  kvPut(`key:${keyHash}`, JSON.stringify(metadata));
 
   console.log("=== API KEY REVOKED ===");
   console.log(`Key ID: ${metadata.keyId}`);
@@ -273,13 +289,14 @@ function revokeKey(apiKey: string): void {
 /**
  * Renew an API key (extend expiration by 30 days)
  */
-function renewKey(apiKey: string): void {
+async function renewKey(apiKey: string): Promise<void> {
   if (!API_KEY_REGEX.test(apiKey)) {
     console.error("Error: Invalid API key format");
     process.exit(1);
   }
 
-  const metadata = kvGet<ApiKeyMetadata>(`key:${apiKey}`);
+  const keyHash = await hashApiKey(apiKey);
+  const metadata = kvGet<ApiKeyMetadata>(`key:${keyHash}`);
   if (!metadata) {
     console.error("Error: API key not found");
     process.exit(1);
@@ -290,7 +307,7 @@ function renewKey(apiKey: string): void {
   expiresAt.setDate(expiresAt.getDate() + 30);
 
   metadata.expiresAt = expiresAt.toISOString();
-  kvPut(`key:${apiKey}`, JSON.stringify(metadata));
+  kvPut(`key:${keyHash}`, JSON.stringify(metadata));
 
   console.log("=== API KEY RENEWED ===");
   console.log(`Key ID: ${metadata.keyId}`);
@@ -451,19 +468,36 @@ async function main(): Promise<void> {
   const { command, args } = parseArgs();
 
   switch (command) {
-    case "create":
+    case "create": {
       if (!args.app || !args.email) {
         console.error("Error: --app and --email are required");
         console.error("Usage: npm run keys -- create --app <name> --email <email>");
         process.exit(1);
       }
-      await createKey(
-        args.app,
-        args.email,
-        (args.tier as RateLimitTier) || "free",
-        (args.env as "test" | "live") || "test"
-      );
+
+      // Validate email format
+      if (!EMAIL_REGEX.test(args.email)) {
+        console.error(`Error: Invalid email format "${args.email}"`);
+        process.exit(1);
+      }
+
+      // Validate tier
+      const tier = args.tier || "free";
+      if (!VALID_TIERS.includes(tier as RateLimitTier)) {
+        console.error(`Error: Invalid tier "${tier}". Valid tiers are: ${VALID_TIERS.join(", ")}`);
+        process.exit(1);
+      }
+
+      // Validate environment
+      const env = args.env || "test";
+      if (!VALID_ENVS.includes(env as "test" | "live")) {
+        console.error(`Error: Invalid env "${env}". Valid environments are: ${VALID_ENVS.join(", ")}`);
+        process.exit(1);
+      }
+
+      await createKey(args.app, args.email, tier as RateLimitTier, env as "test" | "live");
       break;
+    }
 
     case "list":
       listKeys();
@@ -475,7 +509,7 @@ async function main(): Promise<void> {
         console.error("Usage: npm run keys -- info <api-key>");
         process.exit(1);
       }
-      getKeyInfo(args._positional);
+      await getKeyInfo(args._positional);
       break;
 
     case "revoke":
@@ -484,7 +518,7 @@ async function main(): Promise<void> {
         console.error("Usage: npm run keys -- revoke <api-key>");
         process.exit(1);
       }
-      revokeKey(args._positional);
+      await revokeKey(args._positional);
       break;
 
     case "renew":
@@ -493,7 +527,7 @@ async function main(): Promise<void> {
         console.error("Usage: npm run keys -- renew <api-key>");
         process.exit(1);
       }
-      renewKey(args._positional);
+      await renewKey(args._positional);
       break;
 
     case "usage":
