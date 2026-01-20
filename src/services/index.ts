@@ -18,3 +18,6 @@ export { StatsService } from "./stats";
 
 export { HealthMonitor } from "./health-monitor";
 export type { HealthStatus } from "./health-monitor";
+
+export { AuthService } from "./auth";
+export type { RateLimitResult, UsageData } from "./auth";

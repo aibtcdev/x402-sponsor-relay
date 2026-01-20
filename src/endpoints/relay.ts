@@ -1,7 +1,8 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, FacilitatorService, StatsService } from "../services";
-import { checkRateLimit, RATE_LIMIT } from "../middleware";
-import type { AppContext, RelayRequest } from "../types";
+import { SponsorService, FacilitatorService, StatsService, AuthService } from "../services";
+import { checkSenderRateLimit, checkKeyRateLimit, RATE_LIMIT } from "../middleware";
+import type { AppContext, RelayRequest, AuthContext } from "../types";
+import { TIER_LIMITS } from "../types";
 
 /**
  * Relay endpoint - sponsors and settles transactions
@@ -12,7 +13,8 @@ export class Relay extends BaseEndpoint {
     tags: ["Relay"],
     summary: "Submit sponsored transaction for settlement",
     description:
-      "Accepts a pre-signed sponsored transaction, sponsors it with the relay's key, and calls the x402 facilitator for settlement verification.",
+      "Accepts a pre-signed sponsored transaction, sponsors it with the relay's key, and calls the x402 facilitator for settlement verification. " +
+      "Authentication via API key is optional during grace period but will be required in the future.",
     request: {
       body: {
         content: {
@@ -110,6 +112,42 @@ export class Relay extends BaseEndpoint {
                 code: { type: "string" as const },
                 details: { type: "string" as const },
                 retryable: { type: "boolean" as const },
+              },
+            },
+          },
+        },
+      },
+      "401": {
+        description: "Authentication failed - invalid or missing API key",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object" as const,
+              properties: {
+                error: { type: "string" as const, example: "Invalid API key" },
+                code: {
+                  type: "string" as const,
+                  enum: ["MISSING_API_KEY", "INVALID_API_KEY"],
+                },
+                retryable: { type: "boolean" as const, example: false },
+              },
+            },
+          },
+        },
+      },
+      "403": {
+        description: "Authorization failed - API key expired or revoked",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object" as const,
+              properties: {
+                error: { type: "string" as const, example: "API key has expired" },
+                code: {
+                  type: "string" as const,
+                  enum: ["EXPIRED_API_KEY", "REVOKED_API_KEY"],
+                },
+                retryable: { type: "boolean" as const, example: false },
               },
             },
           },
@@ -271,18 +309,56 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Check rate limit using sender address from transaction
-      if (!checkRateLimit(validation.senderAddress)) {
-        logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
-        await statsService.recordError("rateLimit");
-        return this.structuredError(c, {
-          error: "Rate limit exceeded",
-          code: "RATE_LIMIT_EXCEEDED",
-          status: 429,
-          details: `Maximum ${RATE_LIMIT} requests per minute`,
-          retryable: true,
-          retryAfter: 60,
-        });
+      // Get auth context from middleware
+      const auth = c.get("auth") as AuthContext | undefined;
+
+      // Check rate limits based on authentication status
+      if (auth?.metadata) {
+        // Authenticated: use per-key KV-based rate limits
+        const keyRateLimit = await checkKeyRateLimit(
+          c.env.API_KEYS_KV,
+          logger,
+          auth.metadata.keyId,
+          auth.metadata.tier
+        );
+
+        if (!keyRateLimit.allowed) {
+          logger.warn("Rate limit exceeded (API key)", {
+            keyId: auth.metadata.keyId,
+            appName: auth.metadata.appName,
+            code: keyRateLimit.code,
+          });
+          await statsService.recordError("rateLimit");
+
+          const isDaily = keyRateLimit.code === "DAILY_LIMIT_EXCEEDED";
+          const limits = TIER_LIMITS[auth.metadata.tier];
+
+          return this.structuredError(c, {
+            error: isDaily ? "Daily limit exceeded" : "Rate limit exceeded",
+            code: keyRateLimit.code,
+            status: 429,
+            details: isDaily
+              ? `Maximum ${limits.dailyLimit} requests per day`
+              : `Maximum ${limits.requestsPerMinute} requests per minute`,
+            retryable: true,
+            retryAfter: keyRateLimit.retryAfter,
+          });
+        }
+      } else {
+        // Unauthenticated (grace period): use in-memory sender-based rate limits
+        const senderRateLimit = checkSenderRateLimit(validation.senderAddress);
+        if (!senderRateLimit.allowed) {
+          logger.warn("Rate limit exceeded (sender)", { sender: validation.senderAddress });
+          await statsService.recordError("rateLimit");
+          return this.structuredError(c, {
+            error: "Rate limit exceeded",
+            code: "RATE_LIMIT_EXCEEDED",
+            status: 429,
+            details: `Maximum ${RATE_LIMIT} requests per minute`,
+            retryable: true,
+            retryAfter: senderRateLimit.retryAfter || 60,
+          });
+        }
       }
 
       // Sponsor the transaction
@@ -320,6 +396,17 @@ export class Relay extends BaseEndpoint {
           amount: body.settle.minAmount,
           fee: sponsorResult.fee,
         });
+
+        // Record per-key usage if authenticated
+        if (auth?.metadata) {
+          const authService = new AuthService(c.env.API_KEYS_KV, logger);
+          await authService.recordUsage(auth.metadata.keyId, {
+            success: false,
+            tokenType,
+            amount: body.settle.minAmount,
+            fee: sponsorResult.fee,
+          });
+        }
 
         // Determine error code and retry guidance based on HTTP status
         let code: "FACILITATOR_TIMEOUT" | "FACILITATOR_ERROR" | "FACILITATOR_INVALID_RESPONSE" | "SETTLEMENT_FAILED";
@@ -365,10 +452,22 @@ export class Relay extends BaseEndpoint {
         fee: sponsorResult.fee,
       });
 
+      // Record per-key usage if authenticated
+      if (auth?.metadata) {
+        const authService = new AuthService(c.env.API_KEYS_KV, logger);
+        await authService.recordUsage(auth.metadata.keyId, {
+          success: true,
+          tokenType,
+          amount: body.settle.minAmount,
+          fee: sponsorResult.fee,
+        });
+      }
+
       logger.info("Transaction sponsored and settled", {
         txid: settleResult.txid,
         sender: validation.senderAddress,
         settlement_status: settleResult.settlement?.status,
+        keyId: auth?.metadata?.keyId,
       });
 
       return c.json({

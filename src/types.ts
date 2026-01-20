@@ -53,12 +53,101 @@ export interface Env {
   LOGS?: unknown;
   // KV namespace for dashboard stats storage
   RELAY_KV?: KVNamespace;
+  // KV namespace for API key storage
+  API_KEYS_KV?: KVNamespace;
 }
 
 /**
  * Token types supported by the relay
  */
 export type TokenType = "STX" | "sBTC" | "USDCx";
+
+// =============================================================================
+// API Key Types
+// =============================================================================
+
+/**
+ * Rate limit tiers for API keys
+ */
+export type RateLimitTier = "free" | "standard" | "unlimited";
+
+/**
+ * Rate limit configuration per tier
+ */
+export const TIER_LIMITS = {
+  free: { requestsPerMinute: 10, dailyLimit: 100 },
+  standard: { requestsPerMinute: 60, dailyLimit: 10000 },
+  unlimited: { requestsPerMinute: Infinity, dailyLimit: Infinity },
+} as const;
+
+/**
+ * Metadata stored for each API key
+ */
+export interface ApiKeyMetadata {
+  /** Unique key identifier (hash of the actual key) */
+  keyId: string;
+  /** Application name */
+  appName: string;
+  /** Contact email for the key owner */
+  contactEmail: string;
+  /** Rate limit tier */
+  tier: RateLimitTier;
+  /** When the key was created */
+  createdAt: string;
+  /** When the key expires (30 days from creation by default) */
+  expiresAt: string;
+  /** Whether the key is active (can be revoked) */
+  active: boolean;
+}
+
+/**
+ * Usage statistics for an API key (stored per day)
+ */
+export interface ApiKeyUsage {
+  /** Date in YYYY-MM-DD format */
+  date: string;
+  /** Total requests made */
+  requests: number;
+  /** Successful requests */
+  success: number;
+  /** Failed requests */
+  failed: number;
+  /** Volume by token type */
+  volume: {
+    STX: string;
+    sBTC: string;
+    USDCx: string;
+  };
+  /** Total fees paid in microSTX */
+  feesPaid: string;
+}
+
+/**
+ * Result of API key validation
+ */
+export type ApiKeyValidationResult =
+  | { valid: true; metadata: ApiKeyMetadata }
+  | { valid: false; code: ApiKeyErrorCode; error: string };
+
+/**
+ * API key error codes
+ */
+export type ApiKeyErrorCode =
+  | "MISSING_API_KEY"
+  | "INVALID_API_KEY"
+  | "EXPIRED_API_KEY"
+  | "REVOKED_API_KEY"
+  | "DAILY_LIMIT_EXCEEDED";
+
+/**
+ * Auth context stored in Hono variables
+ */
+export interface AuthContext {
+  /** API key metadata if authenticated */
+  metadata: ApiKeyMetadata | null;
+  /** Whether auth is in grace period (no key provided but allowed) */
+  gracePeriod: boolean;
+}
 
 /**
  * Token types as expected by the facilitator API
@@ -160,13 +249,18 @@ export type RelayErrorCode =
   | "INVALID_TRANSACTION"
   | "NOT_SPONSORED"
   | "RATE_LIMIT_EXCEEDED"
+  | "DAILY_LIMIT_EXCEEDED"
   | "SPONSOR_CONFIG_ERROR"
   | "SPONSOR_FAILED"
   | "FACILITATOR_TIMEOUT"
   | "FACILITATOR_ERROR"
   | "FACILITATOR_INVALID_RESPONSE"
   | "SETTLEMENT_FAILED"
-  | "INTERNAL_ERROR";
+  | "INTERNAL_ERROR"
+  | "MISSING_API_KEY"
+  | "INVALID_API_KEY"
+  | "EXPIRED_API_KEY"
+  | "REVOKED_API_KEY";
 
 /**
  * Structured error response with retry guidance
@@ -185,6 +279,8 @@ export interface RelayErrorResponse {
 export interface AppVariables {
   requestId: string;
   logger: Logger;
+  /** Auth context from API key middleware (null during grace period or if not authenticated) */
+  auth?: AuthContext;
 }
 
 /**
