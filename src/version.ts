@@ -1,5 +1,5 @@
 /**
  * Single source of truth for application version
- * Update this value when releasing a new version
+ * Updated automatically by release-please
  */
-export const VERSION = "0.3.0";
+export const VERSION = "0.3.0"; // x-release-please-version
