@@ -10,7 +10,8 @@
     "check": "tsc --noEmit",
     "wrangler": "set -a && . ./.env && set +a && npx wrangler",
     "cf-typegen": "npm run wrangler -- types",
-    "test:relay": "set -a && . ./.env && set +a && tsx scripts/test-relay.ts"
+    "test:relay": "set -a && . ./.env && set +a && tsx scripts/test-relay.ts",
+    "keys": "set -a && . ./.env && set +a && tsx scripts/manage-api-keys.ts"
   },
   "devDependencies": {
     "@types/node": "^25.0.3",
