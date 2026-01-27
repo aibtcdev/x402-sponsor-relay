@@ -143,6 +143,14 @@ export const dashboardCss = `
     border-color: ${colors.bg.border};
   }
 
+  /* Brand CTA button */
+  .brand-cta-button {
+    background-color: ${colors.brand.orange};
+  }
+  .brand-cta-button:hover {
+    background-color: #e64500;
+  }
+
   /* Brand section background */
   .brand-section {
     background-color: ${colors.bg.card};

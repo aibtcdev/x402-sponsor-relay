@@ -158,7 +158,7 @@ ${header()}
     <p class="text-gray-400 mb-6">
       The relay hasn't processed any transactions yet. Stats will appear here once transactions are submitted.
     </p>
-    <a href="/docs" class="inline-flex items-center px-4 py-2 text-white rounded-lg transition-colors" style="background-color: #FF4F03" onmouseover="this.style.backgroundColor='#e64500'" onmouseout="this.style.backgroundColor='#FF4F03'">
+    <a href="/docs" class="brand-cta-button inline-flex items-center px-4 py-2 text-white rounded-lg transition-colors">
       View API Docs
       <svg class="w-4 h-4 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
