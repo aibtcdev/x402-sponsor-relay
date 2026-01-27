@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.0.0...v1.0.1) (2026-01-27)
+
+
+### Bug Fixes
+
+* apply AIBTC brand guidelines to dashboard UI ([#21](https://github.com/aibtcdev/x402-sponsor-relay/issues/21)) ([dbdc712](https://github.com/aibtcdev/x402-sponsor-relay/commit/dbdc712d267ec045572f488a582e5fb3c51ca5db)), closes [#20](https://github.com/aibtcdev/x402-sponsor-relay/issues/20)
+
 ## 1.0.0 (2026-01-23)
 
 
