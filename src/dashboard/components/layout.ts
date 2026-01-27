@@ -32,7 +32,7 @@ export function htmlDocument(content: string, title: string): string {
  */
 export function header(): string {
   return `
-<header class="bg-gray-800 border-b border-gray-700">
+<header class="brand-bar border-b">
   <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
     <div class="flex items-center justify-between">
       <div class="flex items-center space-x-3">
@@ -65,7 +65,7 @@ export function header(): string {
  */
 export function footer(lastUpdated: string): string {
   return `
-<footer class="bg-gray-800 border-t border-gray-700 mt-8">
+<footer class="brand-bar border-t mt-8">
   <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
     <div class="flex items-center justify-between text-sm text-gray-400">
       <div class="flex items-center space-x-4">

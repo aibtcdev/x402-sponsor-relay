@@ -17,7 +17,7 @@ export function statsCard(
   const color = options?.colorClass || "text-white";
 
   return `
-<div class="stat-card bg-gray-800 rounded-lg p-4 border border-gray-700">
+<div class="stat-card brand-card p-4">
   <div class="flex items-center justify-between">
     <p class="text-sm text-gray-400">${escapeHtml(label)}</p>
     ${options?.icon || ""}
@@ -40,7 +40,7 @@ export function tokenCard(
   const formattedVolume = formatTokenAmount(volume, token);
 
   return `
-<div class="stat-card bg-gray-800 rounded-lg p-4 border border-gray-700">
+<div class="stat-card brand-card p-4">
   <div class="flex items-center space-x-2">
     <div class="w-3 h-3 rounded-full" style="background-color: ${tokenColor}"></div>
     <span class="font-medium" style="color: ${tokenColor}">${token}</span>
@@ -49,7 +49,7 @@ export function tokenCard(
     <p class="text-2xl font-bold text-white">${formatNumber(count)}</p>
     <p class="text-sm text-gray-400">${percentage}% of transactions</p>
   </div>
-  <div class="mt-2 pt-2 border-t border-gray-700">
+  <div class="mt-2 pt-2" style="border-top: 1px solid ${colors.bg.border}">
     <p class="text-sm text-gray-400">Volume</p>
     <p class="text-lg font-medium text-white">${formattedVolume} ${token}</p>
   </div>
@@ -90,7 +90,7 @@ export function healthCard(
   const config = statusConfig[status];
 
   return `
-<div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+<div class="brand-card p-6">
   <h3 class="text-lg font-semibold text-white mb-4">Facilitator Health</h3>
 
   <div class="flex items-center space-x-3 mb-4">
@@ -124,10 +124,10 @@ export function successRateCard(success: number, total: number): string {
   const color = rate >= 95 ? colors.status.healthy : rate >= 80 ? colors.status.degraded : colors.status.down;
 
   return `
-<div class="stat-card bg-gray-800 rounded-lg p-4 border border-gray-700">
+<div class="stat-card brand-card p-4">
   <p class="text-sm text-gray-400">Success Rate</p>
   <p class="text-2xl font-bold mt-2" style="color: ${color}">${rate}%</p>
-  <div class="mt-2 h-2 bg-gray-700 rounded-full overflow-hidden">
+  <div class="mt-2 h-2 rounded-full overflow-hidden" style="background-color: ${colors.bg.border}">
     <div class="h-full rounded-full" style="width: ${rate}%; background-color: ${color}"></div>
   </div>
   <p class="text-xs text-gray-500 mt-1">${formatNumber(success)} / ${formatNumber(total)}</p>

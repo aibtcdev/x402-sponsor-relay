@@ -55,7 +55,7 @@ ${header()}
   <!-- Charts Row -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
     <!-- Transaction Volume Chart -->
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+    <div class="brand-section p-6">
       <h3 class="text-lg font-semibold text-white mb-4">Transaction Volume (24h)</h3>
       <div class="h-64">
         <canvas id="transactionChart"></canvas>
@@ -63,7 +63,7 @@ ${header()}
     </div>
 
     <!-- Token Distribution Chart -->
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+    <div class="brand-section p-6">
       <h3 class="text-lg font-semibold text-white mb-4">Token Distribution</h3>
       <div class="h-64">
         <canvas id="tokenChart"></canvas>
@@ -86,7 +86,7 @@ ${header()}
     ${healthCard(data.facilitator.status, data.facilitator.avgLatencyMs, data.facilitator.uptime24h)}
 
     <!-- Quick Stats -->
-    <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+    <div class="brand-section p-6">
       <h3 class="text-lg font-semibold text-white mb-4">Quick Stats</h3>
       <div class="space-y-4">
         <div class="flex justify-between items-center">
@@ -149,7 +149,7 @@ export function emptyStatePage(): string {
 ${header()}
 
 <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-  <div class="bg-gray-800 rounded-lg p-12 border border-gray-700 text-center">
+  <div class="brand-section p-12 text-center">
     <svg class="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
             d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
@@ -158,7 +158,7 @@ ${header()}
     <p class="text-gray-400 mb-6">
       The relay hasn't processed any transactions yet. Stats will appear here once transactions are submitted.
     </p>
-    <a href="/docs" class="inline-flex items-center px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition-colors">
+    <a href="/docs" class="brand-cta-button inline-flex items-center px-4 py-2 text-white rounded-lg transition-colors">
       View API Docs
       <svg class="w-4 h-4 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />

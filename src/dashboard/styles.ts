@@ -12,8 +12,8 @@ export const colors = {
 
   // AIBTC brand colors
   brand: {
-    orange: "#F7931A",
-    blue: "#7DA2FF",
+    orange: "#FF4F03",
+    blue: "#0634D0",
     purple: "#A855F7",
   },
 
@@ -34,9 +34,10 @@ export const colors = {
 
   // UI colors
   bg: {
-    primary: "#111827", // gray-900
-    secondary: "#1F2937", // gray-800
-    card: "#374151", // gray-700
+    primary: "#000000", // brand black
+    secondary: "#0a0a0a", // brand near-black
+    card: "#0a0a0a", // brand near-black
+    border: "#1a1a1a", // subtle border
   },
   text: {
     primary: "#F9FAFB", // gray-50
@@ -99,22 +100,72 @@ export const dashboardCss = `
   .trend-down { color: ${colors.trend.down}; }
   .trend-stable { color: ${colors.trend.stable}; }
 
-  /* Custom animations */
-  @keyframes pulse-slow {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.7; }
+  /* Brand animations */
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-4px); }
   }
-  .animate-pulse-slow {
-    animation: pulse-slow 2s ease-in-out infinite;
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .animate-float {
+    animation: float 3s ease-in-out infinite;
+  }
+  .animate-fade-up {
+    animation: fadeUp 0.4s ease-out;
   }
 
-  /* Card hover effect */
+  /* Brand card styles */
+  .brand-card {
+    background-color: ${colors.bg.card};
+    border: 1px solid ${colors.bg.border};
+    border-radius: 0.5rem;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+  }
+  .brand-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 20px rgba(255, 79, 3, 0.08);
+    border-color: rgba(255, 79, 3, 0.3);
+  }
+
+  /* Brand focus ring */
+  .brand-card:focus-within,
+  a:focus-visible,
+  button:focus-visible {
+    outline: 2px solid ${colors.brand.orange};
+    outline-offset: 2px;
+  }
+
+  /* Brand layout bar (header/footer) */
+  .brand-bar {
+    background-color: ${colors.bg.secondary};
+    border-color: ${colors.bg.border};
+  }
+
+  /* Brand CTA button */
+  .brand-cta-button {
+    background-color: ${colors.brand.orange};
+  }
+  .brand-cta-button:hover {
+    background-color: #e64500;
+  }
+
+  /* Brand section background */
+  .brand-section {
+    background-color: ${colors.bg.card};
+    border: 1px solid ${colors.bg.border};
+    border-radius: 0.5rem;
+  }
+
+  /* Legacy compat: stat-card maps to brand-card */
   .stat-card {
-    transition: transform 0.2s ease, box-shadow 0.2s ease;
+    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
   }
   .stat-card:hover {
     transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    box-shadow: 0 4px 20px rgba(255, 79, 3, 0.08);
+    border-color: rgba(255, 79, 3, 0.3);
   }
 `;
 
