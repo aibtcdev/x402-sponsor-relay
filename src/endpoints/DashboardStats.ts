@@ -1,6 +1,12 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { StatsService, HealthMonitor } from "../services";
+import {
+  StatsService,
+  HealthMonitor,
+  FacilitatorService,
+  AuthService,
+} from "../services";
 import type { AppContext, DashboardOverview } from "../types";
+import { Error500Response } from "../schemas";
 
 /**
  * Dashboard stats endpoint - returns stats as JSON
@@ -20,6 +26,12 @@ export class DashboardStats extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                },
                 period: {
                   type: "string" as const,
                   enum: ["24h", "7d"],
@@ -94,25 +106,55 @@ export class DashboardStats extends BaseEndpoint {
                     },
                   },
                 },
+                apiKeys: {
+                  type: "object" as const,
+                  nullable: true,
+                  description:
+                    "API key aggregate statistics (only present if API_KEYS_KV is configured)",
+                  properties: {
+                    totalActiveKeys: {
+                      type: "number" as const,
+                      description: "Total number of active API keys",
+                    },
+                    totalFeesToday: {
+                      type: "string" as const,
+                      description: "Total fees sponsored today in microSTX",
+                    },
+                    topKeys: {
+                      type: "array" as const,
+                      description: "Top keys by request count (max 5)",
+                      items: {
+                        type: "object" as const,
+                        properties: {
+                          keyPrefix: {
+                            type: "string" as const,
+                            description:
+                              "First 12 characters of keyId for anonymization",
+                          },
+                          requestsToday: {
+                            type: "number" as const,
+                            description: "Number of requests made today",
+                          },
+                          feesToday: {
+                            type: "string" as const,
+                            description: "Total fees sponsored today in microSTX",
+                          },
+                          status: {
+                            type: "string" as const,
+                            enum: ["active", "rate_limited", "capped"],
+                            description: "Current status of the key",
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
               },
             },
           },
         },
       },
-      "500": {
-        description: "Internal server error",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                error: { type: "string" as const },
-                details: { type: "string" as const },
-              },
-            },
-          },
-        },
-      },
+      "500": Error500Response,
     },
   };
 
@@ -122,10 +164,17 @@ export class DashboardStats extends BaseEndpoint {
     try {
       const statsService = new StatsService(c.env.RELAY_KV, logger);
       const healthMonitor = new HealthMonitor(c.env.RELAY_KV, logger);
+      const facilitatorService = new FacilitatorService(c.env, logger);
+      const authService = new AuthService(c.env.API_KEYS_KV, logger);
 
-      const [overview, health] = await Promise.all([
+      // Trigger a fresh health check (non-blocking - we'll still return cached data if this fails)
+      // Run health check and API key stats in parallel with data fetching
+      const [overview, health, apiKeyStats] = await Promise.all([
         statsService.getOverview(),
-        healthMonitor.getStatus(),
+        // First do a fresh health check, then get the updated status
+        facilitatorService.checkHealth().then(() => healthMonitor.getStatus()),
+        // Get API key aggregate stats (returns empty stats if KV not configured)
+        authService.getAggregateKeyStats(),
       ]);
 
       const dashboardData: DashboardOverview = {
@@ -136,19 +185,26 @@ export class DashboardStats extends BaseEndpoint {
           uptime24h: health.uptime24h,
           lastCheck: health.lastCheck?.timestamp || null,
         },
+        // Only include apiKeys if there are active keys or usage data
+        apiKeys:
+          apiKeyStats.totalActiveKeys > 0 || apiKeyStats.topKeys.length > 0
+            ? apiKeyStats
+            : undefined,
       };
 
-      return c.json(dashboardData);
+      return this.ok(c, dashboardData);
     } catch (e) {
       logger.error("Failed to get stats", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
-      return this.errorResponse(
-        c,
-        "Failed to retrieve statistics",
-        500,
-        e instanceof Error ? e.message : "Unknown error"
-      );
+      return this.err(c, {
+        error: "Failed to retrieve statistics",
+        code: "INTERNAL_ERROR",
+        status: 500,
+        details: e instanceof Error ? e.message : "Unknown error",
+        retryable: true,
+        retryAfter: 5,
+      });
     }
   }
 }

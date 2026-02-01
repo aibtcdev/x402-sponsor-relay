@@ -2,8 +2,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
-import { loggerMiddleware } from "./middleware";
-import { Health, Relay, DashboardStats } from "./endpoints";
+import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
+import { Health, Relay, Sponsor, DashboardStats } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
 
@@ -13,6 +13,12 @@ const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 // Apply global middleware
 app.use("/*", cors());
 app.use("/*", loggerMiddleware);
+
+// Apply auth middleware to /sponsor endpoint before registering routes
+// authMiddleware validates API keys and sets auth context
+// requireAuthMiddleware rejects requests without valid API key (no grace period)
+app.use("/sponsor", authMiddleware);
+app.use("/sponsor", requireAuthMiddleware);
 
 // Initialize Chanfana for OpenAPI documentation
 const openapi = fromHono(app, {
@@ -27,7 +33,8 @@ const openapi = fromHono(app, {
     },
     tags: [
       { name: "Health", description: "Service health endpoints" },
-      { name: "Relay", description: "Transaction relay endpoints" },
+      { name: "Relay", description: "Transaction relay endpoints (x402 facilitator)" },
+      { name: "Sponsor", description: "Transaction sponsor endpoints (direct broadcast)" },
       { name: "Dashboard", description: "Public statistics endpoints" },
     ],
     servers: [
@@ -40,6 +47,20 @@ const openapi = fromHono(app, {
         description: "Production (mainnet)",
       },
     ],
+    // Security scheme for API key authentication
+    // Cast needed as Chanfana types don't expose components directly
+    ...({
+      components: {
+        securitySchemes: {
+          bearerAuth: {
+            type: "http",
+            scheme: "bearer",
+            bearerFormat: "API Key",
+            description: "API key in format: x402_sk_<env>_<32-char-hex>",
+          },
+        },
+      },
+    } as Record<string, unknown>),
   },
 });
 
@@ -47,6 +68,7 @@ const openapi = fromHono(app, {
 // Type cast needed as Chanfana expects endpoint classes
 openapi.get("/health", Health as unknown as typeof Health);
 openapi.post("/relay", Relay as unknown as typeof Relay);
+openapi.post("/sponsor", Sponsor as unknown as typeof Sponsor);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
@@ -62,7 +84,8 @@ app.get("/", (c) => {
     docs: "/docs",
     dashboard: "/dashboard",
     endpoints: {
-      relay: "POST /relay - Submit sponsored transaction for settlement",
+      relay: "POST /relay - Submit sponsored transaction for settlement (x402)",
+      sponsor: "POST /sponsor - Sponsor and broadcast transaction (direct, requires API key)",
       health: "GET /health - Health check with network info",
       stats: "GET /stats - Relay statistics (JSON)",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
@@ -81,6 +104,7 @@ app.get("/", (c) => {
 // Global error handling
 app.onError((err, c) => {
   const logger = c.get("logger");
+  const requestId = c.get("requestId") || "unknown";
   if (logger) {
     logger.error("Unhandled error", {
       error: err.message,
@@ -89,8 +113,12 @@ app.onError((err, c) => {
   }
   return c.json(
     {
+      success: false,
+      requestId,
       error: "Internal server error",
+      code: "INTERNAL_ERROR",
       details: err.message,
+      retryable: true,
     },
     500
   );
@@ -98,10 +126,15 @@ app.onError((err, c) => {
 
 // 404 handler
 app.notFound((c) => {
+  const requestId = c.get("requestId") || "unknown";
   return c.json(
     {
+      success: false,
+      requestId,
       error: "Not found",
+      code: "NOT_FOUND",
       details: `Route ${c.req.method} ${c.req.path} not found`,
+      retryable: false,
     },
     404
   );

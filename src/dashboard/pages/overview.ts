@@ -5,6 +5,7 @@ import {
   tokenCard,
   healthCard,
   successRateCard,
+  apiKeysSection,
 } from "../components/cards";
 import {
   formatTrend,
@@ -80,6 +81,9 @@ ${header()}
       ${tokenCard("USDCx", data.tokens.USDCx.count, data.tokens.USDCx.percentage, data.tokens.USDCx.volume)}
     </div>
   </div>
+
+  <!-- API Key Usage Section -->
+  ${data.apiKeys ? apiKeysSection(data.apiKeys) : ""}
 
   <!-- Facilitator Health Section -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">

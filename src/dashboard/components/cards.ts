@@ -1,4 +1,5 @@
 import { colors, formatNumber, formatTokenAmount, escapeHtml } from "../styles";
+import type { AggregateKeyStats, ApiKeyStatus } from "../../types";
 
 /**
  * Stats card component
@@ -131,5 +132,131 @@ export function successRateCard(success: number, total: number): string {
     <div class="h-full rounded-full" style="width: ${rate}%; background-color: ${color}"></div>
   </div>
   <p class="text-xs text-gray-500 mt-1">${formatNumber(success)} / ${formatNumber(total)}</p>
+</div>`;
+}
+
+// =============================================================================
+// API Key Stats Components
+// =============================================================================
+
+/**
+ * Get status badge HTML for an API key status
+ */
+function getStatusBadge(status: ApiKeyStatus): string {
+  const statusConfig = {
+    active: {
+      label: "Active",
+      color: colors.status.healthy,
+      bgColor: `${colors.status.healthy}20`,
+    },
+    rate_limited: {
+      label: "Rate Limited",
+      color: colors.status.degraded,
+      bgColor: `${colors.status.degraded}20`,
+    },
+    capped: {
+      label: "Cap Reached",
+      color: colors.status.down,
+      bgColor: `${colors.status.down}20`,
+    },
+  };
+
+  const config = statusConfig[status];
+
+  return `<span class="px-2 py-0.5 text-xs rounded-full" style="background-color: ${config.bgColor}; color: ${config.color}">${config.label}</span>`;
+}
+
+/**
+ * API key summary cards (active keys count + fees today)
+ */
+export function apiKeySummaryCards(stats: AggregateKeyStats): string {
+  const formattedFees = formatTokenAmount(stats.totalFeesToday, "STX");
+
+  return `
+<div class="grid grid-cols-2 gap-4">
+  ${statsCard("Active API Keys", stats.totalActiveKeys, {
+    icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>`,
+  })}
+
+  ${statsCard("Fees Sponsored Today", `${formattedFees} STX`, {
+    icon: `<svg class="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`,
+  })}
+</div>`;
+}
+
+/**
+ * Top API keys table showing usage breakdown
+ */
+export function topKeysTable(stats: AggregateKeyStats): string {
+  if (stats.topKeys.length === 0) {
+    return `
+<div class="brand-section p-6">
+  <h3 class="text-lg font-semibold text-white mb-4">Top Keys by Usage (Today)</h3>
+  <div class="text-center py-8">
+    <svg class="w-12 h-12 text-gray-600 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
+    </svg>
+    <p class="text-gray-400">No API key activity today</p>
+    <p class="text-sm text-gray-500 mt-1">Usage stats will appear here once API keys are used</p>
+  </div>
+</div>`;
+  }
+
+  const rows = stats.topKeys
+    .map((key) => {
+      const formattedFees = formatTokenAmount(key.feesToday, "STX");
+
+      return `
+    <tr class="border-t" style="border-color: ${colors.bg.border}">
+      <td class="py-3 px-4">
+        <code class="text-sm font-mono text-purple-400">${escapeHtml(key.keyPrefix)}...</code>
+      </td>
+      <td class="py-3 px-4 text-right">
+        <span class="text-white font-medium">${formatNumber(key.requestsToday)}</span>
+        <span class="text-gray-500 text-sm ml-1">req</span>
+      </td>
+      <td class="py-3 px-4 text-right">
+        <span class="text-white font-medium">${formattedFees}</span>
+        <span class="text-gray-500 text-sm ml-1">STX</span>
+      </td>
+      <td class="py-3 px-4 text-right">
+        ${getStatusBadge(key.status)}
+      </td>
+    </tr>`;
+    })
+    .join("");
+
+  return `
+<div class="brand-section p-6">
+  <h3 class="text-lg font-semibold text-white mb-4">Top Keys by Usage (Today)</h3>
+  <div class="overflow-x-auto">
+    <table class="w-full">
+      <thead>
+        <tr class="text-left text-gray-400 text-sm">
+          <th class="py-2 px-4 font-medium">Key ID</th>
+          <th class="py-2 px-4 font-medium text-right">Requests</th>
+          <th class="py-2 px-4 font-medium text-right">Fees</th>
+          <th class="py-2 px-4 font-medium text-right">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  </div>
+</div>`;
+}
+
+/**
+ * Complete API keys section for the dashboard
+ */
+export function apiKeysSection(stats: AggregateKeyStats): string {
+  return `
+<div class="mb-8">
+  <h3 class="text-lg font-semibold text-white mb-4">API Key Usage</h3>
+  ${apiKeySummaryCards(stats)}
+  <div class="mt-4">
+    ${topKeysTable(stats)}
+  </div>
 </div>`;
 }

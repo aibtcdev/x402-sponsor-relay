@@ -27,6 +27,14 @@ npm run deploy:dry-run
 npm run test:relay
 npm run test:relay -- [relay-url]
 
+# Test sponsor endpoint (requires .env with TEST_API_KEY)
+npm run test:sponsor
+npm run test:sponsor -- [relay-url]
+
+# API key management
+npm run keys -- list                            # List all keys
+npm run keys -- create --app "App" --email "x@y.com"  # Create key
+
 # DO NOT run npm run deploy - commit and push for automatic deployment
 ```
 
@@ -44,7 +52,8 @@ npm run test:relay -- [relay-url]
 - `GET /health` - Health check with network info
 - `GET /docs` - Swagger UI API documentation
 - `GET /openapi.json` - OpenAPI specification
-- `POST /relay` - Submit sponsored transaction for sponsorship and settlement
+- `POST /relay` - Submit sponsored transaction for settlement (x402 facilitator)
+- `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key)
 - `GET /stats` - Relay statistics (JSON API)
 - `GET /dashboard` - Public dashboard (HTML)
 
@@ -82,13 +91,36 @@ Response (error): {
   retryable: true | false,
   retryAfter?: 5  // seconds, also sent as Retry-After header
 }
+
+// POST /sponsor (requires API key)
+Request: {
+  transaction: "hex-encoded-sponsored-tx"
+}
+
+Response (success): {
+  success: true,
+  requestId: "uuid",
+  txid: "0x...",
+  explorerUrl: "https://explorer.hiro.so/txid/...",
+  fee: "1000"  // sponsored fee in microSTX
+}
+
+Response (error): {
+  success: false,
+  requestId: "uuid",
+  code: "INVALID_TRANSACTION" | "BROADCAST_FAILED" | ...,
+  error: "description",
+  retryable: boolean
+}
 ```
 
 **Key Files:**
 - `src/index.ts` - Hono app entry point with Chanfana OpenAPI setup
 - `src/version.ts` - Single source of truth for VERSION constant
 - `src/types.ts` - Centralized type definitions
-- `scripts/test-relay.ts` - Test script for building and submitting sponsored tx
+- `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
+- `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
+- `scripts/manage-api-keys.ts` - CLI for API key management
 - `docs/` - State machine diagram and feature roadmap
 
 ## Deployment URLs

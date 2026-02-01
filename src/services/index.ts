@@ -16,5 +16,8 @@ export type {
 
 export { StatsService } from "./stats";
 
+export { AuthService } from "./auth";
+export type { RateLimitResult, SpendingCapResult, UsageData } from "./auth";
+
 export { HealthMonitor } from "./health-monitor";
 export type { HealthStatus } from "./health-monitor";
