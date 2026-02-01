@@ -1,6 +1,6 @@
 # Quest State
 
-**Current Phase:** 2
+**Current Phase:** 5
 **Phase Status:** completed
 **Retry Count:** 0
 
@@ -13,6 +13,7 @@
 | 2026-02-01 | Planning | Phases 1 & 2 can run in parallel | No dependencies between them |
 | 2026-02-01 | Phase 3 | Cherry-pick from PR #17 `feature/api-key-auth` | API key infrastructure already implemented |
 | 2026-02-01 | Phase 2 | Active health check via `/health` endpoint | Fixes false "down" status on dashboard |
+| 2026-02-01 | Phase 5 | Spending caps in TIER_LIMITS with check before sponsor | Prevents runaway costs per API key |
 
 ## Existing Resources
 

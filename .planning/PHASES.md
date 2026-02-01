@@ -18,7 +18,7 @@
 
 ## Phase 5: Implement Fee Monitoring per API Key
 **Goal:** Track sponsor fees per API key with spending caps and alerts.
-**Status:** `pending`
+**Status:** `completed`
 
 ## Phase 6: Update Dashboard for API Key Stats
 **Goal:** Add API key statistics to the dashboard for monitoring usage.
