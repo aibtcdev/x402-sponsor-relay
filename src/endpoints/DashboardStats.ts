@@ -1,5 +1,10 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { StatsService, HealthMonitor, FacilitatorService } from "../services";
+import {
+  StatsService,
+  HealthMonitor,
+  FacilitatorService,
+  AuthService,
+} from "../services";
 import type { AppContext, DashboardOverview } from "../types";
 
 /**
@@ -100,6 +105,49 @@ export class DashboardStats extends BaseEndpoint {
                     },
                   },
                 },
+                apiKeys: {
+                  type: "object" as const,
+                  nullable: true,
+                  description:
+                    "API key aggregate statistics (only present if API_KEYS_KV is configured)",
+                  properties: {
+                    totalActiveKeys: {
+                      type: "number" as const,
+                      description: "Total number of active API keys",
+                    },
+                    totalFeesToday: {
+                      type: "string" as const,
+                      description: "Total fees sponsored today in microSTX",
+                    },
+                    topKeys: {
+                      type: "array" as const,
+                      description: "Top keys by request count (max 5)",
+                      items: {
+                        type: "object" as const,
+                        properties: {
+                          keyPrefix: {
+                            type: "string" as const,
+                            description:
+                              "First 12 characters of keyId for anonymization",
+                          },
+                          requestsToday: {
+                            type: "number" as const,
+                            description: "Number of requests made today",
+                          },
+                          feesToday: {
+                            type: "string" as const,
+                            description: "Total fees sponsored today in microSTX",
+                          },
+                          status: {
+                            type: "string" as const,
+                            enum: ["active", "rate_limited", "capped"],
+                            description: "Current status of the key",
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
               },
             },
           },
@@ -133,13 +181,16 @@ export class DashboardStats extends BaseEndpoint {
       const statsService = new StatsService(c.env.RELAY_KV, logger);
       const healthMonitor = new HealthMonitor(c.env.RELAY_KV, logger);
       const facilitatorService = new FacilitatorService(c.env, logger);
+      const authService = new AuthService(c.env.API_KEYS_KV, logger);
 
       // Trigger a fresh health check (non-blocking - we'll still return cached data if this fails)
-      // Run health check in parallel with data fetching
-      const [overview, health] = await Promise.all([
+      // Run health check and API key stats in parallel with data fetching
+      const [overview, health, apiKeyStats] = await Promise.all([
         statsService.getOverview(),
         // First do a fresh health check, then get the updated status
         facilitatorService.checkHealth().then(() => healthMonitor.getStatus()),
+        // Get API key aggregate stats (returns empty stats if KV not configured)
+        authService.getAggregateKeyStats(),
       ]);
 
       const dashboardData: DashboardOverview = {
@@ -150,6 +201,11 @@ export class DashboardStats extends BaseEndpoint {
           uptime24h: health.uptime24h,
           lastCheck: health.lastCheck?.timestamp || null,
         },
+        // Only include apiKeys if there are active keys or usage data
+        apiKeys:
+          apiKeyStats.totalActiveKeys > 0 || apiKeyStats.topKeys.length > 0
+            ? apiKeyStats
+            : undefined,
       };
 
       return this.ok(c, dashboardData);
