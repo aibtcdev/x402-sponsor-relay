@@ -252,6 +252,7 @@ export type RelayErrorCode =
   | "DAILY_LIMIT_EXCEEDED"
   | "SPONSOR_CONFIG_ERROR"
   | "SPONSOR_FAILED"
+  | "BROADCAST_FAILED"
   | "FACILITATOR_TIMEOUT"
   | "FACILITATOR_ERROR"
   | "FACILITATOR_INVALID_RESPONSE"
@@ -291,6 +292,28 @@ export interface RelaySuccessResponse extends BaseSuccessResponse {
   txid: string;
   explorerUrl: string;
   settlement?: SettlementResult;
+}
+
+// =============================================================================
+// Sponsor Endpoint Types
+// =============================================================================
+
+/**
+ * Request body for /sponsor endpoint
+ */
+export interface SponsorRequest {
+  /** Hex-encoded signed sponsored transaction */
+  transaction: string;
+}
+
+/**
+ * Success response for /sponsor endpoint
+ */
+export interface SponsorSuccessResponse extends BaseSuccessResponse {
+  txid: string;
+  explorerUrl: string;
+  /** Fee paid by sponsor in microSTX */
+  fee: string;
 }
 
 /**
