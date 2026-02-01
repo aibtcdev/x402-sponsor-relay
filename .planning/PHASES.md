@@ -10,7 +10,7 @@
 
 ## Phase 3: Extract Shared Utilities
 **Goal:** Extract duplicated code - empty usage factory, OpenAPI response schemas, simplify status logic
-**Status:** `pending`
+**Status:** `completed`
 
 ## Phase 4: Type Improvements
 **Goal:** Define TierConfig interface, document hashApiKey duplication
