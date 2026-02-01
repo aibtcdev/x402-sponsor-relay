@@ -3,7 +3,8 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
 import { loggerMiddleware } from "./middleware";
-import { Health, Relay, DashboardStats } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats } from "./endpoints";
+import { authMiddleware } from "./middleware";
 import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
 
@@ -13,6 +14,9 @@ const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 // Apply global middleware
 app.use("/*", cors());
 app.use("/*", loggerMiddleware);
+
+// Apply auth middleware to /sponsor endpoint before registering routes
+app.use("/sponsor", authMiddleware);
 
 // Initialize Chanfana for OpenAPI documentation
 const openapi = fromHono(app, {
@@ -27,7 +31,8 @@ const openapi = fromHono(app, {
     },
     tags: [
       { name: "Health", description: "Service health endpoints" },
-      { name: "Relay", description: "Transaction relay endpoints" },
+      { name: "Relay", description: "Transaction relay endpoints (x402 facilitator)" },
+      { name: "Sponsor", description: "Transaction sponsor endpoints (direct broadcast)" },
       { name: "Dashboard", description: "Public statistics endpoints" },
     ],
     servers: [
@@ -47,6 +52,7 @@ const openapi = fromHono(app, {
 // Type cast needed as Chanfana expects endpoint classes
 openapi.get("/health", Health as unknown as typeof Health);
 openapi.post("/relay", Relay as unknown as typeof Relay);
+openapi.post("/sponsor", Sponsor as unknown as typeof Sponsor);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
@@ -62,7 +68,8 @@ app.get("/", (c) => {
     docs: "/docs",
     dashboard: "/dashboard",
     endpoints: {
-      relay: "POST /relay - Submit sponsored transaction for settlement",
+      relay: "POST /relay - Submit sponsored transaction for settlement (x402)",
+      sponsor: "POST /sponsor - Sponsor and broadcast transaction (direct, requires API key)",
       health: "GET /health - Health check with network info",
       stats: "GET /stats - Relay statistics (JSON)",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
