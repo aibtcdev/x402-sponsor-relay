@@ -73,11 +73,12 @@ export type RateLimitTier = "free" | "standard" | "unlimited";
 
 /**
  * Rate limit configuration per tier
+ * dailyFeeCapMicroStx: Maximum sponsor fees per day (null = unlimited)
  */
 export const TIER_LIMITS = {
-  free: { requestsPerMinute: 10, dailyLimit: 100 },
-  standard: { requestsPerMinute: 60, dailyLimit: 10000 },
-  unlimited: { requestsPerMinute: Infinity, dailyLimit: Infinity },
+  free: { requestsPerMinute: 10, dailyLimit: 100, dailyFeeCapMicroStx: 100_000_000 as number | null }, // 100 STX/day
+  standard: { requestsPerMinute: 60, dailyLimit: 10000, dailyFeeCapMicroStx: 1_000_000_000 as number | null }, // 1000 STX/day
+  unlimited: { requestsPerMinute: Infinity, dailyLimit: Infinity, dailyFeeCapMicroStx: null as number | null },
 } as const;
 
 /**
@@ -123,6 +124,24 @@ export interface ApiKeyUsage {
 }
 
 /**
+ * Fee statistics for an API key
+ */
+export interface ApiKeyFeeStats {
+  /** API key ID */
+  keyId: string;
+  /** Daily fee cap for this key's tier in microSTX (null = unlimited) */
+  dailyCap: string | null;
+  /** Fees spent today in microSTX */
+  todaySpent: string;
+  /** Remaining spending capacity in microSTX (null = unlimited) */
+  remaining: string | null;
+  /** Whether the key has exceeded its spending cap */
+  capExceeded: boolean;
+  /** Last 7 days of fee data */
+  history: Array<{ date: string; feesPaid: string }>;
+}
+
+/**
  * Result of API key validation
  */
 export type ApiKeyValidationResult =
@@ -137,7 +156,8 @@ export type ApiKeyErrorCode =
   | "INVALID_API_KEY"
   | "EXPIRED_API_KEY"
   | "REVOKED_API_KEY"
-  | "DAILY_LIMIT_EXCEEDED";
+  | "DAILY_LIMIT_EXCEEDED"
+  | "SPENDING_CAP_EXCEEDED";
 
 /**
  * Auth context stored in Hono variables
@@ -262,7 +282,8 @@ export type RelayErrorCode =
   | "MISSING_API_KEY"
   | "INVALID_API_KEY"
   | "EXPIRED_API_KEY"
-  | "REVOKED_API_KEY";
+  | "REVOKED_API_KEY"
+  | "SPENDING_CAP_EXCEEDED";
 
 /**
  * Structured error response with retry guidance
