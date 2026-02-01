@@ -114,7 +114,11 @@ function generateRandomHex(): string {
 }
 
 /**
- * Hash an API key (full SHA-256 hash for secure storage)
+ * Hash an API key using SHA-256.
+ *
+ * NOTE: This function is duplicated from src/services/auth.ts because
+ * CLI scripts cannot import from src/ at runtime (they run directly via tsx
+ * against wrangler KV, not in the Worker environment).
  */
 async function hashApiKey(apiKey: string): Promise<string> {
   const encoder = new TextEncoder();

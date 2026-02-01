@@ -72,14 +72,25 @@ export type TokenType = "STX" | "sBTC" | "USDCx";
 export type RateLimitTier = "free" | "standard" | "unlimited";
 
 /**
- * Rate limit configuration per tier
- * dailyFeeCapMicroStx: Maximum sponsor fees per day (null = unlimited)
+ * Configuration for a rate limit tier
  */
-export const TIER_LIMITS = {
-  free: { requestsPerMinute: 10, dailyLimit: 100, dailyFeeCapMicroStx: 100_000_000 as number | null }, // 100 STX/day
-  standard: { requestsPerMinute: 60, dailyLimit: 10000, dailyFeeCapMicroStx: 1_000_000_000 as number | null }, // 1000 STX/day
-  unlimited: { requestsPerMinute: Infinity, dailyLimit: Infinity, dailyFeeCapMicroStx: null as number | null },
-} as const;
+export interface TierConfig {
+  /** Maximum requests allowed per minute */
+  requestsPerMinute: number;
+  /** Maximum requests allowed per day */
+  dailyLimit: number;
+  /** Maximum sponsor fees per day in microSTX (null = unlimited) */
+  dailyFeeCapMicroStx: number | null;
+}
+
+/**
+ * Rate limit configuration per tier
+ */
+export const TIER_LIMITS: Record<RateLimitTier, TierConfig> = {
+  free: { requestsPerMinute: 10, dailyLimit: 100, dailyFeeCapMicroStx: 100_000_000 }, // 100 STX/day
+  standard: { requestsPerMinute: 60, dailyLimit: 10000, dailyFeeCapMicroStx: 1_000_000_000 }, // 1000 STX/day
+  unlimited: { requestsPerMinute: Infinity, dailyLimit: Infinity, dailyFeeCapMicroStx: null },
+};
 
 /**
  * Metadata stored for each API key

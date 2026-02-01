@@ -14,7 +14,7 @@
 
 ## Phase 4: Type Improvements
 **Goal:** Define TierConfig interface, document hashApiKey duplication
-**Status:** `pending`
+**Status:** `completed`
 
 ---
 
