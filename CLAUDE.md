@@ -27,6 +27,14 @@ npm run deploy:dry-run
 npm run test:relay
 npm run test:relay -- [relay-url]
 
+# Test sponsor endpoint (requires .env with TEST_API_KEY)
+npm run test:sponsor
+npm run test:sponsor -- [relay-url]
+
+# API key management
+npm run keys -- list                            # List all keys
+npm run keys -- create --app "App" --email "x@y.com"  # Create key
+
 # DO NOT run npm run deploy - commit and push for automatic deployment
 ```
 
@@ -110,7 +118,9 @@ Response (error): {
 - `src/index.ts` - Hono app entry point with Chanfana OpenAPI setup
 - `src/version.ts` - Single source of truth for VERSION constant
 - `src/types.ts` - Centralized type definitions
-- `scripts/test-relay.ts` - Test script for building and submitting sponsored tx
+- `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
+- `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
+- `scripts/manage-api-keys.ts` - CLI for API key management
 - `docs/` - State machine diagram and feature roadmap
 
 ## Deployment URLs
