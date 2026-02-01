@@ -2,6 +2,13 @@ import { BaseEndpoint } from "./BaseEndpoint";
 import { SponsorService, FacilitatorService, StatsService } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest } from "../types";
+import {
+  Error400Response,
+  Error429Response,
+  Error500Response,
+  Error502Response,
+  Error504Response,
+} from "../schemas";
 
 /**
  * Relay endpoint - sponsors and settles transactions
@@ -111,117 +118,11 @@ export class Relay extends BaseEndpoint {
           },
         },
       },
-      "400": {
-        description: "Invalid request",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
-      "429": {
-        description: "Rate limit exceeded",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
-              },
-            },
-          },
-        },
-        headers: {
-          "Retry-After": {
-            description: "Seconds to wait before retrying",
-            schema: { type: "string" as const },
-          },
-        },
-      },
-      "500": {
-        description: "Internal server error",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
-      "502": {
-        description: "Facilitator error",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
-              },
-            },
-          },
-        },
-        headers: {
-          "Retry-After": {
-            description: "Seconds to wait before retrying",
-            schema: { type: "string" as const },
-          },
-        },
-      },
-      "504": {
-        description: "Facilitator timeout",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
-              },
-            },
-          },
-        },
-        headers: {
-          "Retry-After": {
-            description: "Seconds to wait before retrying",
-            schema: { type: "string" as const },
-          },
-        },
-      },
+      "400": Error400Response,
+      "429": { ...Error429Response, description: "Rate limit exceeded" },
+      "500": Error500Response,
+      "502": { ...Error502Response, description: "Facilitator error" },
+      "504": Error504Response,
     },
   };
 

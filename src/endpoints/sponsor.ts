@@ -4,6 +4,13 @@ import { BaseEndpoint } from "./BaseEndpoint";
 import { SponsorService, StatsService, AuthService } from "../services";
 import type { AppContext, SponsorRequest } from "../types";
 import { buildExplorerUrl } from "../utils";
+import {
+  Error400Response,
+  Error401Response,
+  Error429Response,
+  Error500Response,
+  Error502Response,
+} from "../schemas";
 
 /**
  * Sponsor endpoint - sponsors and broadcasts transactions directly
@@ -75,109 +82,11 @@ export class Sponsor extends BaseEndpoint {
           },
         },
       },
-      "400": {
-        description: "Invalid request",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
-      "401": {
-        description: "Missing or invalid API key",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
-      "429": {
-        description: "Spending cap exceeded",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const, example: "SPENDING_CAP_EXCEEDED" },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-                retryAfter: { type: "number" as const },
-              },
-            },
-          },
-        },
-        headers: {
-          "Retry-After": {
-            description: "Seconds to wait before retrying (resets at midnight UTC)",
-            schema: { type: "string" as const },
-          },
-        },
-      },
-      "500": {
-        description: "Internal server error",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
-      "502": {
-        description: "Broadcast failed",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-                retryAfter: { type: "number" as const },
-              },
-            },
-          },
-        },
-        headers: {
-          "Retry-After": {
-            description: "Seconds to wait before retrying",
-            schema: { type: "string" as const },
-          },
-        },
-      },
+      "400": Error400Response,
+      "401": Error401Response,
+      "429": { ...Error429Response, description: "Spending cap exceeded" },
+      "500": Error500Response,
+      "502": { ...Error502Response, description: "Broadcast failed" },
     },
   };
 

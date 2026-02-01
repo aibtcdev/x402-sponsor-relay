@@ -6,6 +6,7 @@ import {
   AuthService,
 } from "../services";
 import type { AppContext, DashboardOverview } from "../types";
+import { Error500Response } from "../schemas";
 
 /**
  * Dashboard stats endpoint - returns stats as JSON
@@ -153,24 +154,7 @@ export class DashboardStats extends BaseEndpoint {
           },
         },
       },
-      "500": {
-        description: "Internal server error",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
+      "500": Error500Response,
     },
   };
 
