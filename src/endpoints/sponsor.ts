@@ -135,15 +135,49 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
-      // Check spending cap before sponsoring
-      // Use a reasonable estimate for the sponsor fee (can be refined after sponsoring)
+      // Initialize auth service and get metadata
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
       const metadata = auth.metadata!;
 
-      // Estimate fee - use the fee from the transaction or a default estimate
-      // The actual sponsor fee will be determined during sponsoring
-      const estimatedFee = BigInt(validation.transaction.auth.spendingCondition?.fee || 10000);
+      // Check rate limits before processing
+      const rateLimitResult = await authService.checkRateLimit(metadata.keyId, metadata.tier);
+      if (!rateLimitResult.allowed) {
+        await statsService.recordError("rateLimit");
+        logger.warn("Rate limit exceeded", {
+          keyId: metadata.keyId,
+          tier: metadata.tier,
+          code: rateLimitResult.code,
+        });
+        return this.err(c, {
+          error: rateLimitResult.code === "DAILY_LIMIT_EXCEEDED"
+            ? "Daily request limit exceeded"
+            : "Rate limit exceeded",
+          code: rateLimitResult.code,
+          status: 429,
+          details: rateLimitResult.code === "DAILY_LIMIT_EXCEEDED"
+            ? "Your API key has exceeded its daily request limit. Limit resets at midnight UTC."
+            : `Too many requests. Please wait before trying again.`,
+          retryable: true,
+          retryAfter: rateLimitResult.retryAfter,
+        });
+      }
 
+      // Estimate fee based on transaction size since sponsored tx has fee=0
+      // Use conservative size-based estimation for spending cap check
+      const txHex = body.transaction;
+      const txByteLength = typeof txHex === "string"
+        ? Buffer.from(txHex.startsWith("0x") ? txHex.slice(2) : txHex, "hex").length
+        : 0;
+      const perByteFee = 50n; // microSTX per byte (conservative rate)
+      const baseFee = 10000n; // minimum fallback estimate (0.01 STX)
+      const sizeBasedEstimate = txByteLength > 0
+        ? BigInt(txByteLength) * perByteFee
+        : baseFee;
+      const estimatedFee = sizeBasedEstimate > baseFee ? sizeBasedEstimate : baseFee;
+
+      // Check spending cap before sponsoring
+      // Note: There's a small race window between check and record, but spending caps
+      // are soft limits with daily reset, so minor overruns are acceptable.
       const spendingCapResult = await authService.checkSpendingCap(
         metadata.keyId,
         metadata.tier,

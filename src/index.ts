@@ -47,6 +47,20 @@ const openapi = fromHono(app, {
         description: "Production (mainnet)",
       },
     ],
+    // Security scheme for API key authentication
+    // Cast needed as Chanfana types don't expose components directly
+    ...({
+      components: {
+        securitySchemes: {
+          bearerAuth: {
+            type: "http",
+            scheme: "bearer",
+            bearerFormat: "API Key",
+            description: "API key in format: x402_sk_<env>_<32-char-hex>",
+          },
+        },
+      },
+    } as Record<string, unknown>),
   },
 });
 

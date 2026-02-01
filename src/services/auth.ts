@@ -705,9 +705,9 @@ export class AuthService {
             const usage = await this.kv.get<ApiKeyUsage>(key.name, "json");
             if (usage) {
               // Extract keyId from key name: usage:daily:<keyId>:<date>
-              const parts = key.name.split(":");
-              if (parts.length >= 3) {
-                const keyId = parts[2];
+              // Use slice to handle keyIds that might contain colons
+              const keyId = key.name.slice(usagePrefix.length, -todaySuffix.length);
+              if (keyId) {
                 usageEntries.push({ keyId, usage });
               }
             }
