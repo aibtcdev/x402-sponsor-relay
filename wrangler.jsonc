@@ -17,7 +17,8 @@
     { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
   ],
   "kv_namespaces": [
-    { "binding": "RELAY_KV", "id": "5de48f1c8a1746e49d09fbf1c7072a5f" }
+    { "binding": "RELAY_KV", "id": "5de48f1c8a1746e49d09fbf1c7072a5f" },
+    { "binding": "API_KEYS_KV", "id": "3ce8d9d710884370873c561bfb98d6cf" }
   ],
   "vars": {
     "STACKS_NETWORK": "testnet",
@@ -46,9 +47,10 @@
       "services": [
         { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
       ],
-      // KV namespace for dashboard stats
+      // KV namespaces for dashboard stats and API keys
       "kv_namespaces": [
-        { "binding": "RELAY_KV", "id": "3851254fa8f9494189689ce5a726b773" }
+        { "binding": "RELAY_KV", "id": "3851254fa8f9494189689ce5a726b773" },
+        { "binding": "API_KEYS_KV", "id": "20be33ef450a4c31a128dd80a1ff3bd9" }
       ]
     },
     "production": {
@@ -64,9 +66,10 @@
       "services": [
         { "binding": "LOGS", "service": "worker-logs-production", "entrypoint": "LogsRPC" }
       ],
-      // KV namespace for dashboard stats
+      // KV namespaces for dashboard stats and API keys
       "kv_namespaces": [
-        { "binding": "RELAY_KV", "id": "56f3b1596357434291161238d40cbd81" }
+        { "binding": "RELAY_KV", "id": "56f3b1596357434291161238d40cbd81" },
+        { "binding": "API_KEYS_KV", "id": "307c3134a46e4d5a94e2d0b7f1d97cbf" }
       ]
     }
   }
