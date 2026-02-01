@@ -1,5 +1,5 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { StatsService, HealthMonitor } from "../services";
+import { StatsService, HealthMonitor, FacilitatorService } from "../services";
 import type { AppContext, DashboardOverview } from "../types";
 
 /**
@@ -122,10 +122,14 @@ export class DashboardStats extends BaseEndpoint {
     try {
       const statsService = new StatsService(c.env.RELAY_KV, logger);
       const healthMonitor = new HealthMonitor(c.env.RELAY_KV, logger);
+      const facilitatorService = new FacilitatorService(c.env, logger);
 
+      // Trigger a fresh health check (non-blocking - we'll still return cached data if this fails)
+      // Run health check in parallel with data fetching
       const [overview, health] = await Promise.all([
         statsService.getOverview(),
-        healthMonitor.getStatus(),
+        // First do a fresh health check, then get the updated status
+        facilitatorService.checkHealth().then(() => healthMonitor.getStatus()),
       ]);
 
       const dashboardData: DashboardOverview = {
