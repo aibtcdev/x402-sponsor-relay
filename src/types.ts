@@ -166,17 +166,37 @@ export type RelayErrorCode =
   | "FACILITATOR_ERROR"
   | "FACILITATOR_INVALID_RESPONSE"
   | "SETTLEMENT_FAILED"
+  | "NOT_FOUND"
   | "INTERNAL_ERROR";
 
 /**
  * Structured error response with retry guidance
  */
 export interface RelayErrorResponse {
+  success: false;
   error: string;
   code: RelayErrorCode;
   details?: string;
   retryable: boolean;
   retryAfter?: number; // seconds
+  requestId: string;
+}
+
+/**
+ * Base success response (for simple endpoints like health, stats)
+ */
+export interface BaseSuccessResponse {
+  success: true;
+  requestId: string;
+}
+
+/**
+ * Success response with transaction details
+ */
+export interface RelaySuccessResponse extends BaseSuccessResponse {
+  txid: string;
+  explorerUrl: string;
+  settlement?: SettlementResult;
 }
 
 /**
