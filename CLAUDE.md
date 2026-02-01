@@ -44,7 +44,8 @@ npm run test:relay -- [relay-url]
 - `GET /health` - Health check with network info
 - `GET /docs` - Swagger UI API documentation
 - `GET /openapi.json` - OpenAPI specification
-- `POST /relay` - Submit sponsored transaction for sponsorship and settlement
+- `POST /relay` - Submit sponsored transaction for settlement (x402 facilitator)
+- `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key)
 - `GET /stats` - Relay statistics (JSON API)
 - `GET /dashboard` - Public dashboard (HTML)
 
@@ -81,6 +82,27 @@ Response (error): {
   details: "...",
   retryable: true | false,
   retryAfter?: 5  // seconds, also sent as Retry-After header
+}
+
+// POST /sponsor (requires API key)
+Request: {
+  transaction: "hex-encoded-sponsored-tx"
+}
+
+Response (success): {
+  success: true,
+  requestId: "uuid",
+  txid: "0x...",
+  explorerUrl: "https://explorer.hiro.so/txid/...",
+  fee: "1000"  // sponsored fee in microSTX
+}
+
+Response (error): {
+  success: false,
+  requestId: "uuid",
+  code: "INVALID_TRANSACTION" | "BROADCAST_FAILED" | ...,
+  error: "description",
+  retryable: boolean
 }
 ```
 

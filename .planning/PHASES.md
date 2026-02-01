@@ -14,7 +14,7 @@
 
 ## Phase 4: Add /sponsor Endpoint
 **Goal:** Create new `/sponsor` endpoint for general transaction sponsorship (direct broadcast, no facilitator).
-**Status:** `pending`
+**Status:** `completed`
 
 ## Phase 5: Implement Fee Monitoring per API Key
 **Goal:** Track sponsor fees per API key with spending caps and alerts.
