@@ -20,6 +20,12 @@ export class DashboardStats extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                },
                 period: {
                   type: "string" as const,
                   enum: ["24h", "7d"],
@@ -106,8 +112,12 @@ export class DashboardStats extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: false },
+                requestId: { type: "string" as const, format: "uuid" },
                 error: { type: "string" as const },
+                code: { type: "string" as const },
                 details: { type: "string" as const },
+                retryable: { type: "boolean" as const },
               },
             },
           },
@@ -142,17 +152,19 @@ export class DashboardStats extends BaseEndpoint {
         },
       };
 
-      return c.json(dashboardData);
+      return this.ok(c, dashboardData);
     } catch (e) {
       logger.error("Failed to get stats", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
-      return this.errorResponse(
-        c,
-        "Failed to retrieve statistics",
-        500,
-        e instanceof Error ? e.message : "Unknown error"
-      );
+      return this.err(c, {
+        error: "Failed to retrieve statistics",
+        code: "INTERNAL_ERROR",
+        status: 500,
+        details: e instanceof Error ? e.message : "Unknown error",
+        retryable: true,
+        retryAfter: 5,
+      });
     }
   }
 }
