@@ -1,52 +1,36 @@
 # Phases
 
-## Phase 1: Standardize Response Format
-**Goal:** Create consistent `ok()` / `err()` response helpers that all endpoints use, including txid, explorer link, and internal UUID.
+## Phase 1: Remove Dead Code
+**Goal:** Remove deprecated methods and unused imports from BaseEndpoint.ts
 **Status:** `completed`
 
-## Phase 2: Fix Facilitator Health Check Bug
-**Goal:** Fix the facilitator health check to use `/health` endpoint instead of relying on `/api/v1/settle` responses.
-**Status:** `completed`
+## Phase 2: Use Auth Middleware Properly
+**Goal:** Apply `requireAuthMiddleware` to /sponsor route, remove inline auth check from endpoint handler
+**Status:** `pending`
 
-## Phase 3: Add API Key Infrastructure
-**Goal:** Implement API key storage, validation, and per-key rate limiting infrastructure.
-**Status:** `completed`
+## Phase 3: Extract Shared Utilities
+**Goal:** Extract duplicated code - empty usage factory, OpenAPI response schemas, simplify status logic
+**Status:** `pending`
 
-## Phase 4: Add /sponsor Endpoint
-**Goal:** Create new `/sponsor` endpoint for general transaction sponsorship (direct broadcast, no facilitator).
-**Status:** `completed`
-
-## Phase 5: Implement Fee Monitoring per API Key
-**Goal:** Track sponsor fees per API key with spending caps and alerts.
-**Status:** `completed`
-
-## Phase 6: Update Dashboard for API Key Stats
-**Goal:** Add API key statistics to the dashboard for monitoring usage.
-**Status:** `completed`
-
-## Phase 7: Documentation and Testing
-**Goal:** Update documentation, add test script for /sponsor, prepare for high traffic.
-**Status:** `completed`
+## Phase 4: Type Improvements
+**Goal:** Define TierConfig interface, document hashApiKey duplication
+**Status:** `pending`
 
 ---
 
 ## Dependency Graph
 
 ```
-Phase 1: Standardize Response Format ──┐
-                                       ├──► Phase 3: API Key Infrastructure
-Phase 2: Fix Facilitator Health Check ─┘              │
-                                                      ▼
-                                       Phase 4: /sponsor Endpoint
-                                                      │
-                                                      ▼
-                                       Phase 5: Fee Monitoring per Key
-                                                      │
-                                                      ▼
-                                       Phase 6: Dashboard API Key Stats
-                                                      │
-                                                      ▼
-                                       Phase 7: Documentation and Testing
+Phase 1: Remove Dead Code
+    │
+    ▼
+Phase 2: Use Auth Middleware
+    │
+    ▼
+Phase 3: Extract Shared Utilities
+    │
+    ▼
+Phase 4: Type Improvements
 ```
 
-**Note:** Phases 1 and 2 can be executed in parallel.
+All phases are sequential - each builds on clean code from the previous phase.

@@ -4,7 +4,6 @@ import type {
   Logger,
   RelayErrorCode,
   RelayErrorResponse,
-  BaseSuccessResponse,
   RelaySuccessResponse,
   SettlementResult,
 } from "../types";
@@ -94,40 +93,5 @@ export class BaseEndpoint extends OpenAPIRoute {
     }
 
     return c.json(response, opts.status as 400 | 401 | 402 | 404 | 429 | 500 | 502 | 504);
-  }
-
-  /**
-   * Return a standardized error response (legacy)
-   * @deprecated Use err() instead
-   */
-  protected errorResponse(
-    c: AppContext,
-    error: string,
-    status: number,
-    details?: string
-  ) {
-    const response: { error: string; details?: string } = { error };
-    if (details) {
-      response.details = details;
-    }
-    return c.json(response, status as 400 | 401 | 402 | 404 | 429 | 500 | 502 | 504);
-  }
-
-  /**
-   * Return a structured error response with retry guidance
-   * @deprecated Use err() instead
-   */
-  protected structuredError(
-    c: AppContext,
-    opts: {
-      error: string;
-      code: RelayErrorCode;
-      status: number;
-      details?: string;
-      retryable: boolean;
-      retryAfter?: number;
-    }
-  ) {
-    return this.err(c, opts);
   }
 }
