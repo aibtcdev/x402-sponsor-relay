@@ -1,7 +1,7 @@
 import { broadcastTransaction, deserializeTransaction } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, StatsService } from "../services";
+import { SponsorService, StatsService, AuthService } from "../services";
 import type { AppContext, SponsorRequest } from "../types";
 import { buildExplorerUrl } from "../utils";
 
@@ -110,6 +110,31 @@ export class Sponsor extends BaseEndpoint {
           },
         },
       },
+      "429": {
+        description: "Spending cap exceeded",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object" as const,
+              properties: {
+                success: { type: "boolean" as const, example: false },
+                requestId: { type: "string" as const, format: "uuid" },
+                error: { type: "string" as const },
+                code: { type: "string" as const, example: "SPENDING_CAP_EXCEEDED" },
+                details: { type: "string" as const },
+                retryable: { type: "boolean" as const },
+                retryAfter: { type: "number" as const },
+              },
+            },
+          },
+        },
+        headers: {
+          "Retry-After": {
+            description: "Seconds to wait before retrying (resets at midnight UTC)",
+            schema: { type: "string" as const },
+          },
+        },
+      },
       "500": {
         description: "Internal server error",
         content: {
@@ -210,6 +235,38 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
+      // Check spending cap before sponsoring
+      // Use a reasonable estimate for the sponsor fee (can be refined after sponsoring)
+      const authService = new AuthService(c.env.API_KEYS_KV, logger);
+      const metadata = auth.metadata!;
+
+      // Estimate fee - use the fee from the transaction or a default estimate
+      // The actual sponsor fee will be determined during sponsoring
+      const estimatedFee = BigInt(validation.transaction.auth.spendingCondition?.fee || 10000);
+
+      const spendingCapResult = await authService.checkSpendingCap(
+        metadata.keyId,
+        metadata.tier,
+        estimatedFee
+      );
+
+      if (!spendingCapResult.allowed) {
+        await statsService.recordError("rateLimit");
+        logger.warn("Spending cap exceeded", {
+          keyId: metadata.keyId,
+          tier: metadata.tier,
+          estimatedFee: estimatedFee.toString(),
+        });
+        return this.err(c, {
+          error: "Daily spending cap exceeded",
+          code: "SPENDING_CAP_EXCEEDED",
+          status: 429,
+          details: `Your API key has exceeded its daily spending limit. Limit resets at midnight UTC.`,
+          retryable: true,
+          retryAfter: spendingCapResult.retryAfter,
+        });
+      }
+
       // Sponsor the transaction
       const sponsorResult = await sponsorService.sponsorTransaction(
         validation.transaction
@@ -281,7 +338,11 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
-      // Record successful transaction
+      // Record fee spent against the API key
+      const actualFee = BigInt(sponsorResult.fee);
+      await authService.recordFeeSpent(metadata.keyId, actualFee);
+
+      // Record successful transaction in global stats
       await statsService.recordTransaction({
         success: true,
         tokenType: "STX", // Default for sponsor endpoint
@@ -289,10 +350,19 @@ export class Sponsor extends BaseEndpoint {
         fee: sponsorResult.fee,
       });
 
+      // Also record usage for the API key (for volume tracking)
+      await authService.recordUsage(metadata.keyId, {
+        success: true,
+        tokenType: "STX",
+        amount: "0",
+        fee: sponsorResult.fee,
+      });
+
       logger.info("Transaction sponsored and broadcast", {
         txid,
         sender: validation.senderAddress,
         fee: sponsorResult.fee,
+        keyId: metadata.keyId,
       });
 
       // Return success response
