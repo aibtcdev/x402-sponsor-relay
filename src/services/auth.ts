@@ -2,6 +2,7 @@ import type {
   Logger,
   ApiKeyMetadata,
   ApiKeyUsage,
+  ApiKeyFeeStats,
   ApiKeyValidationResult,
   ApiKeyErrorCode,
   RateLimitTier,
@@ -19,6 +20,13 @@ export type RateLimitResult =
       code: "RATE_LIMIT_EXCEEDED" | "DAILY_LIMIT_EXCEEDED";
       retryAfter: number;
     };
+
+/**
+ * Spending cap check result
+ */
+export type SpendingCapResult =
+  | { allowed: true; remaining: bigint | null }
+  | { allowed: false; code: "SPENDING_CAP_EXCEEDED"; retryAfter: number };
 
 /**
  * Usage data to record
@@ -308,6 +316,181 @@ export class AuthService {
     }
 
     return usage;
+  }
+
+  // =============================================================================
+  // Fee Monitoring Methods
+  // =============================================================================
+
+  /**
+   * Check if an API key has remaining spending capacity for a given fee
+   */
+  async checkSpendingCap(
+    keyId: string,
+    tier: RateLimitTier,
+    estimatedFee: bigint
+  ): Promise<SpendingCapResult> {
+    const limits = TIER_LIMITS[tier];
+
+    // Unlimited tier bypasses spending cap
+    if (limits.dailyFeeCapMicroStx === null) {
+      return { allowed: true, remaining: null };
+    }
+
+    if (!this.kv) {
+      this.logger.warn(
+        "API_KEYS_KV not configured, skipping spending cap check"
+      );
+      return { allowed: true, remaining: null };
+    }
+
+    const date = new Date().toISOString().split("T")[0];
+    const dailyKey = `usage:daily:${keyId}:${date}`;
+    const existing = await this.kv.get<ApiKeyUsage>(dailyKey, "json");
+
+    const currentSpent = BigInt(existing?.feesPaid || "0");
+    const cap = BigInt(limits.dailyFeeCapMicroStx);
+    const remaining = cap - currentSpent;
+
+    // Check if adding this fee would exceed the cap
+    if (currentSpent + estimatedFee > cap) {
+      // Calculate seconds until midnight UTC for retry
+      const now = new Date();
+      const tomorrow = new Date(now);
+      tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+      tomorrow.setUTCHours(0, 0, 0, 0);
+      const secondsUntilMidnight = Math.ceil(
+        (tomorrow.getTime() - now.getTime()) / 1000
+      );
+
+      this.logger.warn("Spending cap exceeded", {
+        keyId,
+        tier,
+        currentSpent: currentSpent.toString(),
+        estimatedFee: estimatedFee.toString(),
+        cap: cap.toString(),
+      });
+
+      return {
+        allowed: false,
+        code: "SPENDING_CAP_EXCEEDED",
+        retryAfter: secondsUntilMidnight,
+      };
+    }
+
+    return { allowed: true, remaining };
+  }
+
+  /**
+   * Record fee spent for an API key
+   * This updates the feesPaid field in the daily usage record
+   */
+  async recordFeeSpent(keyId: string, feeAmount: bigint): Promise<void> {
+    if (!this.kv) {
+      this.logger.warn("API_KEYS_KV not configured, skipping fee recording");
+      return;
+    }
+
+    const date = new Date().toISOString().split("T")[0];
+    const dailyKey = `usage:daily:${keyId}:${date}`;
+
+    // Get existing usage or create new
+    const existing = await this.kv.get<ApiKeyUsage>(dailyKey, "json");
+
+    const usage: ApiKeyUsage = existing || {
+      date,
+      requests: 0,
+      success: 0,
+      failed: 0,
+      volume: { STX: "0", sBTC: "0", USDCx: "0" },
+      feesPaid: "0",
+    };
+
+    // Add fee to total
+    const currentFees = BigInt(usage.feesPaid);
+    usage.feesPaid = (currentFees + feeAmount).toString();
+
+    // Store with 90-day TTL
+    await this.kv.put(dailyKey, JSON.stringify(usage), {
+      expirationTtl: 90 * 24 * 60 * 60,
+    });
+
+    this.logger.debug("Fee recorded for API key", {
+      keyId,
+      feeAmount: feeAmount.toString(),
+      totalToday: usage.feesPaid,
+    });
+  }
+
+  /**
+   * Get remaining spending capacity for an API key
+   * Returns null for unlimited tier
+   */
+  async getRemainingSpendingCap(
+    keyId: string,
+    tier: RateLimitTier
+  ): Promise<bigint | null> {
+    const limits = TIER_LIMITS[tier];
+
+    // Unlimited tier has no cap
+    if (limits.dailyFeeCapMicroStx === null) {
+      return null;
+    }
+
+    if (!this.kv) {
+      return null;
+    }
+
+    const date = new Date().toISOString().split("T")[0];
+    const dailyKey = `usage:daily:${keyId}:${date}`;
+    const existing = await this.kv.get<ApiKeyUsage>(dailyKey, "json");
+
+    const currentSpent = BigInt(existing?.feesPaid || "0");
+    const cap = BigInt(limits.dailyFeeCapMicroStx);
+
+    return cap - currentSpent;
+  }
+
+  /**
+   * Get fee statistics for an API key
+   */
+  async getKeyFeeStats(
+    keyId: string,
+    tier: RateLimitTier
+  ): Promise<ApiKeyFeeStats> {
+    const limits = TIER_LIMITS[tier];
+    const dailyCap = limits.dailyFeeCapMicroStx;
+
+    // Get today's usage
+    const date = new Date().toISOString().split("T")[0];
+    const todayUsage = await this.getUsage(keyId, date);
+    const todaySpent = todayUsage?.feesPaid || "0";
+
+    // Calculate remaining
+    let remaining: string | null = null;
+    let capExceeded = false;
+    if (dailyCap !== null) {
+      const cap = BigInt(dailyCap);
+      const spent = BigInt(todaySpent);
+      remaining = (cap - spent).toString();
+      capExceeded = spent >= cap;
+    }
+
+    // Get 7-day history
+    const usageHistory = await this.getUsageHistory(keyId, 7);
+    const history = usageHistory.map((u) => ({
+      date: u.date,
+      feesPaid: u.feesPaid,
+    }));
+
+    return {
+      keyId,
+      dailyCap: dailyCap !== null ? dailyCap.toString() : null,
+      todaySpent,
+      remaining,
+      capExceeded,
+      history,
+    };
   }
 
   // =============================================================================
