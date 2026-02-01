@@ -471,6 +471,39 @@ export interface DashboardOverview {
     lastCheck: string | null;
   };
   hourlyData: Array<{ hour: string; transactions: number; success: number; fees?: string }>;
+  /** API key aggregate statistics (optional, only present if API_KEYS_KV is configured) */
+  apiKeys?: AggregateKeyStats;
+}
+
+/**
+ * Status indicator for an API key
+ */
+export type ApiKeyStatus = "active" | "rate_limited" | "capped";
+
+/**
+ * Entry for a single API key in the aggregate stats
+ */
+export interface ApiKeyStatsEntry {
+  /** First 12 characters of keyId for anonymization */
+  keyPrefix: string;
+  /** Number of requests made today */
+  requestsToday: number;
+  /** Total fees sponsored today in microSTX */
+  feesToday: string;
+  /** Current status of the key */
+  status: ApiKeyStatus;
+}
+
+/**
+ * Aggregate statistics across all API keys
+ */
+export interface AggregateKeyStats {
+  /** Total number of active API keys */
+  totalActiveKeys: number;
+  /** Total fees sponsored today in microSTX */
+  totalFeesToday: string;
+  /** Top keys by request count (max 5) */
+  topKeys: ApiKeyStatsEntry[];
 }
 
 /**
