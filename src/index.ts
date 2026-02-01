@@ -2,9 +2,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
-import { loggerMiddleware } from "./middleware";
+import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
 import { Health, Relay, Sponsor, DashboardStats } from "./endpoints";
-import { authMiddleware } from "./middleware";
 import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
 
@@ -16,7 +15,10 @@ app.use("/*", cors());
 app.use("/*", loggerMiddleware);
 
 // Apply auth middleware to /sponsor endpoint before registering routes
+// authMiddleware validates API keys and sets auth context
+// requireAuthMiddleware rejects requests without valid API key (no grace period)
 app.use("/sponsor", authMiddleware);
+app.use("/sponsor", requireAuthMiddleware);
 
 // Initialize Chanfana for OpenAPI documentation
 const openapi = fromHono(app, {

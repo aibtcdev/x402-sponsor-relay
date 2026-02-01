@@ -189,17 +189,8 @@ export class Sponsor extends BaseEndpoint {
     const statsService = new StatsService(c.env.RELAY_KV, logger);
 
     try {
-      // Check API key authentication
-      const auth = c.get("auth");
-      if (!auth || auth.gracePeriod) {
-        logger.warn("API key required for /sponsor endpoint");
-        return this.err(c, {
-          error: "API key required",
-          code: "MISSING_API_KEY",
-          status: 401,
-          retryable: false,
-        });
-      }
+      // Auth is guaranteed by requireAuthMiddleware - get the auth context
+      const auth = c.get("auth")!;
 
       // Parse request body
       const body = (await c.req.json()) as SponsorRequest;

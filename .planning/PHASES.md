@@ -6,7 +6,7 @@
 
 ## Phase 2: Use Auth Middleware Properly
 **Goal:** Apply `requireAuthMiddleware` to /sponsor route, remove inline auth check from endpoint handler
-**Status:** `pending`
+**Status:** `completed`
 
 ## Phase 3: Extract Shared Utilities
 **Goal:** Extract duplicated code - empty usage factory, OpenAPI response schemas, simplify status logic
