@@ -784,42 +784,18 @@ export class AuthService {
       .sort((a, b) => b.usage.requests - a.usage.requests)
       .slice(0, 5);
 
-    // Build top keys with anonymized prefixes and status
-    const topKeys: ApiKeyStatsEntry[] = await Promise.all(
-      sortedEntries.map(async (entry) => {
-        // Determine status based on usage
-        let status: ApiKeyStatus = "active";
-
-        // Check if approaching daily limit (simple heuristic)
-        // We'd need the tier info to do proper checking, so we use usage patterns
-        const requests = entry.usage.requests;
-        const fees = BigInt(entry.usage.feesPaid || "0");
-
-        // If fees are high relative to standard tier cap, mark as potentially capped
-        // Standard tier cap: 1000 STX = 1_000_000_000 microSTX
-        // Free tier cap: 100 STX = 100_000_000 microSTX
-        if (fees >= BigInt(100_000_000)) {
-          // Approaching free tier cap
-          status = "capped";
-        }
-
-        // If requests are very high, might be rate limited
-        if (requests >= 100) {
-          // Free tier daily limit
-          // Keep current status if already capped, otherwise check rate
-          if (status !== "capped" && requests >= 1000) {
-            status = "rate_limited";
-          }
-        }
-
-        return {
-          keyPrefix: entry.keyId.slice(0, 12),
-          requestsToday: entry.usage.requests,
-          feesToday: entry.usage.feesPaid,
-          status,
-        };
-      })
-    );
+    // Build top keys with anonymized prefixes
+    // Note: Status is always "active" since we don't have tier info in usage records.
+    // Proper status checking would require looking up each key's metadata by keyId,
+    // which would add N additional KV lookups. For dashboard display purposes,
+    // the actual rate limit/cap enforcement happens at request time in checkRateLimit()
+    // and checkSpendingCap().
+    const topKeys: ApiKeyStatsEntry[] = sortedEntries.map((entry) => ({
+      keyPrefix: entry.keyId.slice(0, 12),
+      requestsToday: entry.usage.requests,
+      feesToday: entry.usage.feesPaid,
+      status: "active" as const,
+    }));
 
     return {
       totalActiveKeys,
