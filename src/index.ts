@@ -81,6 +81,7 @@ app.get("/", (c) => {
 // Global error handling
 app.onError((err, c) => {
   const logger = c.get("logger");
+  const requestId = c.get("requestId") || "unknown";
   if (logger) {
     logger.error("Unhandled error", {
       error: err.message,
@@ -89,8 +90,12 @@ app.onError((err, c) => {
   }
   return c.json(
     {
+      success: false,
+      requestId,
       error: "Internal server error",
+      code: "INTERNAL_ERROR",
       details: err.message,
+      retryable: true,
     },
     500
   );
@@ -98,10 +103,15 @@ app.onError((err, c) => {
 
 // 404 handler
 app.notFound((c) => {
+  const requestId = c.get("requestId") || "unknown";
   return c.json(
     {
+      success: false,
+      requestId,
       error: "Not found",
+      code: "NOT_FOUND",
       details: `Route ${c.req.method} ${c.req.path} not found`,
+      retryable: false,
     },
     404
   );
