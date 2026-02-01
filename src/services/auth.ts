@@ -7,6 +7,9 @@ import type {
   ApiKeyErrorCode,
   RateLimitTier,
   TokenType,
+  AggregateKeyStats,
+  ApiKeyStatsEntry,
+  ApiKeyStatus,
 } from "../types";
 import { TIER_LIMITS } from "../types";
 
@@ -651,5 +654,178 @@ export class AuthService {
     } while (cursor);
 
     return keys;
+  }
+
+  // =============================================================================
+  // Dashboard Aggregate Stats
+  // =============================================================================
+
+  /**
+   * Get aggregate statistics across all API keys for the dashboard
+   * Returns total active keys, total fees today, and top keys by usage
+   */
+  async getAggregateKeyStats(): Promise<AggregateKeyStats> {
+    const emptyStats: AggregateKeyStats = {
+      totalActiveKeys: 0,
+      totalFeesToday: "0",
+      topKeys: [],
+    };
+
+    if (!this.kv) {
+      this.logger.warn(
+        "API_KEYS_KV not configured, returning empty aggregate stats"
+      );
+      return emptyStats;
+    }
+
+    const today = new Date().toISOString().split("T")[0];
+    const usagePrefix = `usage:daily:`;
+    const todaySuffix = `:${today}`;
+
+    // Collect usage data for today
+    const usageEntries: Array<{
+      keyId: string;
+      usage: ApiKeyUsage;
+    }> = [];
+
+    let cursor: string | undefined;
+    let iterationCount = 0;
+    const maxIterations = 10; // Limit KV list operations
+
+    try {
+      do {
+        const result = await this.kv.list({
+          prefix: usagePrefix,
+          cursor,
+          limit: 50,
+        });
+
+        for (const key of result.keys) {
+          // Only process today's usage records
+          if (key.name.endsWith(todaySuffix)) {
+            const usage = await this.kv.get<ApiKeyUsage>(key.name, "json");
+            if (usage) {
+              // Extract keyId from key name: usage:daily:<keyId>:<date>
+              const parts = key.name.split(":");
+              if (parts.length >= 3) {
+                const keyId = parts[2];
+                usageEntries.push({ keyId, usage });
+              }
+            }
+          }
+        }
+
+        cursor = result.list_complete ? undefined : result.cursor;
+        iterationCount++;
+      } while (cursor && iterationCount < maxIterations);
+
+      if (iterationCount >= maxIterations) {
+        this.logger.warn("Aggregate stats: reached iteration limit", {
+          maxIterations,
+          entriesFound: usageEntries.length,
+        });
+      }
+    } catch (error) {
+      this.logger.error("Failed to fetch aggregate key stats", {
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+      return emptyStats;
+    }
+
+    // Count active keys by listing key: prefix
+    let totalActiveKeys = 0;
+
+    try {
+      let keyCursor: string | undefined = undefined;
+      let shouldContinue = true;
+      let keyIterations = 0;
+
+      while (shouldContinue && keyIterations < maxIterations) {
+        const listOptions: { prefix: string; limit: number; cursor?: string } = {
+          prefix: "key:",
+          limit: 100,
+        };
+        if (keyCursor) {
+          listOptions.cursor = keyCursor;
+        }
+
+        const keyListResult = await this.kv.list(listOptions);
+
+        for (const key of keyListResult.keys) {
+          const metadata = await this.kv.get<ApiKeyMetadata>(key.name, "json");
+          if (metadata?.active) {
+            const expiresAt = new Date(metadata.expiresAt);
+            if (expiresAt > new Date()) {
+              totalActiveKeys++;
+            }
+          }
+        }
+
+        if (keyListResult.list_complete) {
+          shouldContinue = false;
+        } else {
+          keyCursor = keyListResult.cursor;
+        }
+        keyIterations++;
+      }
+    } catch (error) {
+      this.logger.error("Failed to count active keys", {
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+
+    // Calculate total fees today
+    let totalFeesToday = BigInt(0);
+    for (const entry of usageEntries) {
+      totalFeesToday += BigInt(entry.usage.feesPaid || "0");
+    }
+
+    // Sort by requests and get top 5
+    const sortedEntries = usageEntries
+      .sort((a, b) => b.usage.requests - a.usage.requests)
+      .slice(0, 5);
+
+    // Build top keys with anonymized prefixes and status
+    const topKeys: ApiKeyStatsEntry[] = await Promise.all(
+      sortedEntries.map(async (entry) => {
+        // Determine status based on usage
+        let status: ApiKeyStatus = "active";
+
+        // Check if approaching daily limit (simple heuristic)
+        // We'd need the tier info to do proper checking, so we use usage patterns
+        const requests = entry.usage.requests;
+        const fees = BigInt(entry.usage.feesPaid || "0");
+
+        // If fees are high relative to standard tier cap, mark as potentially capped
+        // Standard tier cap: 1000 STX = 1_000_000_000 microSTX
+        // Free tier cap: 100 STX = 100_000_000 microSTX
+        if (fees >= BigInt(100_000_000)) {
+          // Approaching free tier cap
+          status = "capped";
+        }
+
+        // If requests are very high, might be rate limited
+        if (requests >= 100) {
+          // Free tier daily limit
+          // Keep current status if already capped, otherwise check rate
+          if (status !== "capped" && requests >= 1000) {
+            status = "rate_limited";
+          }
+        }
+
+        return {
+          keyPrefix: entry.keyId.slice(0, 12),
+          requestsToday: entry.usage.requests,
+          feesToday: entry.usage.feesPaid,
+          status,
+        };
+      })
+    );
+
+    return {
+      totalActiveKeys,
+      totalFeesToday: totalFeesToday.toString(),
+      topKeys,
+    };
   }
 }
