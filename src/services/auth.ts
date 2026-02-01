@@ -48,6 +48,21 @@ export interface UsageData {
 const API_KEY_REGEX = /^x402_sk_(test|live)_[a-f0-9]{32}$/;
 
 /**
+ * Create an empty ApiKeyUsage object for a given date
+ * Used when initializing usage records that don't exist yet
+ */
+function createEmptyUsage(date: string): ApiKeyUsage {
+  return {
+    date,
+    requests: 0,
+    success: 0,
+    failed: 0,
+    volume: { STX: "0", sBTC: "0", USDCx: "0" },
+    feesPaid: "0",
+  };
+}
+
+/**
  * Hash an API key for secure storage
  * Uses SHA-256 to generate a deterministic hash
  */
@@ -245,15 +260,7 @@ export class AuthService {
 
     // Get existing usage or create new
     const existing = await this.kv.get<ApiKeyUsage>(dailyKey, "json");
-
-    const usage: ApiKeyUsage = existing || {
-      date,
-      requests: 0,
-      success: 0,
-      failed: 0,
-      volume: { STX: "0", sBTC: "0", USDCx: "0" },
-      feesPaid: "0",
-    };
+    const usage: ApiKeyUsage = existing || createEmptyUsage(date);
 
     // Update counters
     usage.requests += 1;
@@ -399,15 +406,7 @@ export class AuthService {
 
     // Get existing usage or create new
     const existing = await this.kv.get<ApiKeyUsage>(dailyKey, "json");
-
-    const usage: ApiKeyUsage = existing || {
-      date,
-      requests: 0,
-      success: 0,
-      failed: 0,
-      volume: { STX: "0", sBTC: "0", USDCx: "0" },
-      feesPaid: "0",
-    };
+    const usage: ApiKeyUsage = existing || createEmptyUsage(date);
 
     // Add fee to total
     const currentFees = BigInt(usage.feesPaid);
