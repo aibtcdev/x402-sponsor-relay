@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
-import { loggerMiddleware } from "./middleware";
+import { loggerMiddleware, authMiddleware } from "./middleware";
 import { Health, Relay, DashboardStats } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
@@ -13,6 +13,8 @@ const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 // Apply global middleware
 app.use("/*", cors());
 app.use("/*", loggerMiddleware);
+// Auth middleware only on /relay endpoint (grace period active)
+app.use("/relay", authMiddleware);
 
 // Initialize Chanfana for OpenAPI documentation
 const openapi = fromHono(app, {
