@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.2.0...v1.3.0) (2026-02-12)
+
+
+### Features
+
+* add programmatic API key provisioning via BTC signature ([#31](https://github.com/aibtcdev/x402-sponsor-relay/issues/31)) ([a6b5bcc](https://github.com/aibtcdev/x402-sponsor-relay/commit/a6b5bcc5898bed3da8a96db4414cbd7120adea81))
+
 ## [1.2.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.1.0...v1.2.0) (2026-02-12)
 
 
