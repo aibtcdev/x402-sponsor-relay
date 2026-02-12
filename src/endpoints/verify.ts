@@ -1,7 +1,7 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import { ReceiptService } from "../services";
 import type { AppContext } from "../types";
-import { Error400Response, Error500Response } from "../schemas";
+import { Error400Response, Error404Response, Error500Response } from "../schemas";
 import { buildExplorerUrl } from "../utils";
 
 /**
@@ -64,23 +64,7 @@ export class Verify extends BaseEndpoint {
         },
       },
       "400": Error400Response,
-      "404": {
-        description: "Receipt not found or expired",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
+      "404": Error404Response,
       "500": Error500Response,
     },
   };
