@@ -23,3 +23,9 @@ export { HealthMonitor } from "./health-monitor";
 export type { HealthStatus } from "./health-monitor";
 
 export { ReceiptService } from "./receipt";
+
+export { BtcVerifyService, BTC_MESSAGES } from "./btc-verify";
+export type {
+  BtcVerifyResult,
+  BtcVerifyErrorCode,
+} from "./btc-verify";

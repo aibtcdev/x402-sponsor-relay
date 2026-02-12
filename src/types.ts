@@ -110,6 +110,8 @@ export interface ApiKeyMetadata {
   expiresAt: string;
   /** Whether the key is active (false if revoked) */
   active: boolean;
+  /** Bitcoin address used to provision this key (optional, only for BTC-provisioned keys) */
+  btcAddress?: string;
 }
 
 /**
@@ -329,7 +331,13 @@ export type RelayErrorCode =
   | "RECEIPT_EXPIRED"
   | "RECEIPT_CONSUMED"
   | "RESOURCE_MISMATCH"
-  | "PROXY_FAILED";
+  | "PROXY_FAILED"
+  | "ALREADY_PROVISIONED"
+  | "INVALID_SIGNATURE"
+  | "STALE_TIMESTAMP"
+  | "MISSING_BTC_ADDRESS"
+  | "MISSING_SIGNATURE"
+  | "INVALID_MESSAGE_FORMAT";
 
 /**
  * Structured error response with retry guidance
@@ -385,6 +393,32 @@ export interface SponsorSuccessResponse extends BaseSuccessResponse {
   explorerUrl: string;
   /** Fee paid by sponsor in microSTX */
   fee: string;
+}
+
+// =============================================================================
+// Provision Endpoint Types
+// =============================================================================
+
+/**
+ * Request body for POST /keys/provision endpoint
+ */
+export interface ProvisionRequest {
+  /** Bitcoin address used to sign the message */
+  btcAddress: string;
+  /** BIP-137 signature of the message */
+  signature: string;
+  /** Message that was signed (for verification) */
+  message: string;
+}
+
+/**
+ * Success response for /keys/provision endpoint
+ */
+export interface ProvisionSuccessResponse extends BaseSuccessResponse {
+  /** The generated API key (only shown once) */
+  apiKey: string;
+  /** Key metadata */
+  metadata: ApiKeyMetadata;
 }
 
 // =============================================================================
