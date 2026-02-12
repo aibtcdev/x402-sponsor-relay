@@ -2,6 +2,13 @@ import { BaseEndpoint } from "./BaseEndpoint";
 import { SponsorService, FacilitatorService, StatsService } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest } from "../types";
+import {
+  Error400Response,
+  Error429Response,
+  Error500Response,
+  Error502Response,
+  Error504Response,
+} from "../schemas";
 
 /**
  * Relay endpoint - sponsors and settles transactions
@@ -75,10 +82,22 @@ export class Relay extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                  example: "550e8400-e29b-41d4-a716-446655440000",
+                },
                 txid: {
                   type: "string" as const,
                   description: "Transaction ID",
                   example: "0x1234...",
+                },
+                explorerUrl: {
+                  type: "string" as const,
+                  description: "Link to view transaction on Hiro Explorer",
+                  example: "https://explorer.hiro.so/txid/0x1234...?chain=testnet",
                 },
                 settlement: {
                   type: "object" as const,
@@ -99,107 +118,11 @@ export class Relay extends BaseEndpoint {
           },
         },
       },
-      "400": {
-        description: "Invalid request",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
-      "429": {
-        description: "Rate limit exceeded",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
-              },
-            },
-          },
-        },
-        headers: {
-          "Retry-After": {
-            description: "Seconds to wait before retrying",
-            schema: { type: "string" as const },
-          },
-        },
-      },
-      "500": {
-        description: "Internal server error",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-              },
-            },
-          },
-        },
-      },
-      "502": {
-        description: "Facilitator error",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
-              },
-            },
-          },
-        },
-        headers: {
-          "Retry-After": {
-            description: "Seconds to wait before retrying",
-            schema: { type: "string" as const },
-          },
-        },
-      },
-      "504": {
-        description: "Facilitator timeout",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                error: { type: "string" as const },
-                code: { type: "string" as const },
-                details: { type: "string" as const },
-                retryable: { type: "boolean" as const },
-                retryAfter: { type: "number" as const, description: "Seconds to wait before retrying" },
-              },
-            },
-          },
-        },
-        headers: {
-          "Retry-After": {
-            description: "Seconds to wait before retrying",
-            schema: { type: "string" as const },
-          },
-        },
-      },
+      "400": Error400Response,
+      "429": { ...Error429Response, description: "Rate limit exceeded" },
+      "500": Error500Response,
+      "502": { ...Error502Response, description: "Facilitator error" },
+      "504": Error504Response,
     },
   };
 
@@ -217,7 +140,7 @@ export class Relay extends BaseEndpoint {
       // Validate required fields
       if (!body.transaction) {
         await statsService.recordError("validation");
-        return this.structuredError(c, {
+        return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
           status: 400,
@@ -227,7 +150,7 @@ export class Relay extends BaseEndpoint {
 
       if (!body.settle) {
         await statsService.recordError("validation");
-        return this.structuredError(c, {
+        return this.err(c, {
           error: "Missing settle options",
           code: "MISSING_SETTLE_OPTIONS",
           status: 400,
@@ -245,7 +168,7 @@ export class Relay extends BaseEndpoint {
       );
       if (settleValidation.valid === false) {
         await statsService.recordError("validation");
-        return this.structuredError(c, {
+        return this.err(c, {
           error: settleValidation.error,
           code: "INVALID_SETTLE_OPTIONS",
           status: 400,
@@ -262,7 +185,7 @@ export class Relay extends BaseEndpoint {
         const code = validation.error === "Transaction must be sponsored"
           ? "NOT_SPONSORED"
           : "INVALID_TRANSACTION";
-        return this.structuredError(c, {
+        return this.err(c, {
           error: validation.error,
           code,
           status: 400,
@@ -275,7 +198,7 @@ export class Relay extends BaseEndpoint {
       if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
         await statsService.recordError("rateLimit");
-        return this.structuredError(c, {
+        return this.err(c, {
           error: "Rate limit exceeded",
           code: "RATE_LIMIT_EXCEEDED",
           status: 429,
@@ -294,7 +217,7 @@ export class Relay extends BaseEndpoint {
         const code = sponsorResult.error === "Service not configured"
           ? "SPONSOR_CONFIG_ERROR"
           : "SPONSOR_FAILED";
-        return this.structuredError(c, {
+        return this.err(c, {
           error: sponsorResult.error,
           code,
           status: 500,
@@ -346,7 +269,7 @@ export class Relay extends BaseEndpoint {
         // SETTLEMENT_FAILED is a 400 (bad request), others use httpStatus
         const status = code === "SETTLEMENT_FAILED" ? 400 : (settleResult.httpStatus || 500);
 
-        return this.structuredError(c, {
+        return this.err(c, {
           error: settleResult.error,
           code,
           status,
@@ -371,8 +294,8 @@ export class Relay extends BaseEndpoint {
         settlement_status: settleResult.settlement?.status,
       });
 
-      return c.json({
-        txid: settleResult.txid,
+      return this.okWithTx(c, {
+        txid: settleResult.txid!,
         settlement: settleResult.settlement,
       });
     } catch (e) {
@@ -380,7 +303,7 @@ export class Relay extends BaseEndpoint {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       await statsService.recordError("internal");
-      return this.structuredError(c, {
+      return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",
         status: 500,

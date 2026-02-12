@@ -18,6 +18,12 @@ export class Health extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                },
                 status: { type: "string" as const, example: "ok" },
                 network: { type: "string" as const, example: "testnet" },
                 version: { type: "string" as const, example: VERSION },
@@ -30,7 +36,7 @@ export class Health extends BaseEndpoint {
   };
 
   async handle(c: AppContext) {
-    return c.json({
+    return this.ok(c, {
       status: "ok",
       network: c.env.STACKS_NETWORK,
       version: VERSION,

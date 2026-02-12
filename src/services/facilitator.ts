@@ -11,6 +11,7 @@ import type {
 import { HealthMonitor } from "./health-monitor";
 
 const FACILITATOR_TIMEOUT_MS = 30000; // 30 seconds
+const HEALTH_CHECK_TIMEOUT_MS = 5000; // 5 seconds for health checks
 
 /**
  * Map token types to facilitator format
@@ -80,6 +81,90 @@ export class FacilitatorService {
     this.env = env;
     this.logger = logger;
     this.healthMonitor = new HealthMonitor(env.RELAY_KV, logger);
+  }
+
+  /**
+   * Check facilitator health by calling its /health endpoint directly.
+   * Records the result in HealthMonitor for dashboard display.
+   * Returns true if healthy, false otherwise.
+   */
+  async checkHealth(): Promise<boolean> {
+    const startTime = performance.now();
+
+    try {
+      const response = await fetch(`${this.env.FACILITATOR_URL}/health`, {
+        method: "GET",
+        signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
+      });
+
+      const latencyMs = Math.round(performance.now() - startTime);
+
+      if (!response.ok) {
+        this.logger.warn("Facilitator health check failed", {
+          status: response.status,
+          latencyMs,
+        });
+
+        await this.healthMonitor.recordCheck({
+          status: HealthMonitor.determineCheckStatus(response.status, latencyMs),
+          latencyMs,
+          httpStatus: response.status,
+          error: `HTTP ${response.status}`,
+        });
+
+        return false;
+      }
+
+      // Parse response to verify it's valid JSON with status
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        const data = (await response.json()) as { status?: string };
+        if (data.status !== "ok") {
+          this.logger.warn("Facilitator reported unhealthy status", {
+            status: data.status,
+            latencyMs,
+          });
+
+          await this.healthMonitor.recordCheck({
+            status: "degraded",
+            latencyMs,
+            httpStatus: response.status,
+            error: `Reported status: ${data.status}`,
+          });
+
+          return false;
+        }
+      }
+
+      // Record healthy check
+      await this.healthMonitor.recordCheck({
+        status: HealthMonitor.determineCheckStatus(response.status, latencyMs),
+        latencyMs,
+        httpStatus: response.status,
+      });
+
+      this.logger.debug("Facilitator health check passed", { latencyMs });
+      return true;
+    } catch (e) {
+      const latencyMs = Math.round(performance.now() - startTime);
+      const isTimeout = e instanceof Error && e.name === "TimeoutError";
+
+      this.logger.error(
+        isTimeout
+          ? "Facilitator health check timed out"
+          : "Facilitator health check failed",
+        { error: e instanceof Error ? e.message : "Unknown error" }
+      );
+
+      await this.healthMonitor.recordCheck({
+        status: "down",
+        latencyMs,
+        httpStatus: isTimeout ? 504 : 500,
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+
+      return false;
+    }
   }
 
   /**
