@@ -113,6 +113,17 @@ export class Relay extends BaseEndpoint {
                     blockHeight: { type: "number" as const },
                   },
                 },
+                sponsoredTx: {
+                  type: "string" as const,
+                  description: "Hex-encoded fully-sponsored transaction (can be used as X-PAYMENT header value)",
+                  example: "0x00000001...",
+                },
+                receiptId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Receipt token for verifying payment via GET /verify/:receiptId",
+                  example: "550e8400-e29b-41d4-a716-446655440000",
+                },
               },
             },
           },
@@ -288,15 +299,21 @@ export class Relay extends BaseEndpoint {
         fee: sponsorResult.fee,
       });
 
+      // Generate receipt ID for payment verification
+      const receiptId = crypto.randomUUID();
+
       logger.info("Transaction sponsored and settled", {
         txid: settleResult.txid,
         sender: validation.senderAddress,
         settlement_status: settleResult.settlement?.status,
+        receiptId,
       });
 
       return this.okWithTx(c, {
         txid: settleResult.txid!,
         settlement: settleResult.settlement,
+        sponsoredTx: sponsorResult.sponsoredTxHex,
+        receiptId,
       });
     } catch (e) {
       logger.error("Unexpected error", {
