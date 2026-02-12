@@ -7,15 +7,18 @@
 
 ## Phase 2: AuthService.provisionKey() method
 **Goal:** Add provisionKey() method to AuthService with BTC-address-based key generation, KV storage (btc:{address} mapping), and duplicate prevention.
-**Status:** `pending`
+**Status:** `completed`
+**Commit:** 333bdc2
 
 ## Phase 3: Provision endpoint with OpenAPI docs
 **Goal:** Create POST /keys/provision endpoint tying together BTC verification and key provisioning. Wire into Hono app with Chanfana OpenAPI docs.
-**Status:** `pending`
+**Status:** `completed`
+**Commit:** 23114d4
 
 ## Phase 4: Test script, docs update, and integration verification
 **Goal:** Add test script, update CLAUDE.md, and verify end-to-end functionality.
-**Status:** `pending`
+**Status:** `completed`
+**Commits:** 2cf114b, d7c71bb
 
 ---
 

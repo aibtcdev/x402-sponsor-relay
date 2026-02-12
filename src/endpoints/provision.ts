@@ -1,8 +1,9 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import { AuthService, BtcVerifyService } from "../services";
-import type { AppContext, ProvisionRequest } from "../types";
+import type { AppContext, ApiKeyMetadata, ProvisionRequest, RelayErrorCode } from "../types";
 import {
   Error400Response,
+  Error409Response,
   Error500Response,
 } from "../schemas";
 
@@ -81,46 +82,14 @@ export class Provision extends BaseEndpoint {
                 metadata: {
                   type: "object" as const,
                   properties: {
-                    keyId: {
-                      type: "string" as const,
-                      description: "Key identifier for internal reference",
-                      example: "a1b2c3d4",
-                    },
-                    appName: {
-                      type: "string" as const,
-                      description: "Application name (BTC address prefix)",
-                      example: "btc:1A1zP1eP",
-                    },
-                    contactEmail: {
-                      type: "string" as const,
-                      description: "System-generated contact email",
-                      example: "btc+1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa@x402relay.system",
-                    },
-                    tier: {
-                      type: "string" as const,
-                      enum: ["free"],
-                      description: "Rate limit tier",
-                    },
-                    createdAt: {
-                      type: "string" as const,
-                      format: "date-time",
-                      description: "Key creation timestamp",
-                    },
-                    expiresAt: {
-                      type: "string" as const,
-                      format: "date-time",
-                      description: "Key expiration timestamp (30 days from creation)",
-                    },
-                    active: {
-                      type: "boolean" as const,
-                      description: "Whether the key is active",
-                      example: true,
-                    },
-                    btcAddress: {
-                      type: "string" as const,
-                      description: "Bitcoin address that proved ownership",
-                      example: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
-                    },
+                    keyId: { type: "string" as const, example: "a1b2c3d4" },
+                    appName: { type: "string" as const, example: "btc:1A1zP1eP" },
+                    contactEmail: { type: "string" as const, example: "btc+1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa@x402relay.system" },
+                    tier: { type: "string" as const, enum: ["free"] },
+                    createdAt: { type: "string" as const, format: "date-time" },
+                    expiresAt: { type: "string" as const, format: "date-time" },
+                    active: { type: "boolean" as const, example: true },
+                    btcAddress: { type: "string" as const, example: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" },
                   },
                 },
               },
@@ -129,23 +98,7 @@ export class Provision extends BaseEndpoint {
         },
       },
       "400": Error400Response,
-      "409": {
-        description: "BTC address already has a provisioned key",
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                requestId: { type: "string" as const, format: "uuid" },
-                error: { type: "string" as const, example: "Bitcoin address already has a provisioned API key" },
-                code: { type: "string" as const, example: "ALREADY_PROVISIONED" },
-                retryable: { type: "boolean" as const, example: false },
-              },
-            },
-          },
-        },
-      },
+      "409": Error409Response,
       "500": Error500Response,
     },
   };
@@ -155,7 +108,6 @@ export class Provision extends BaseEndpoint {
     logger.info("Provision request received");
 
     try {
-      // Parse request body
       const body = (await c.req.json()) as ProvisionRequest;
 
       // Validate required fields
@@ -186,11 +138,9 @@ export class Provision extends BaseEndpoint {
         });
       }
 
-      // Initialize BTC verification service
-      const btcVerifyService = new BtcVerifyService(logger);
-
       // Verify BTC signature
-      const verifyResult = await btcVerifyService.verify(
+      const btcVerifyService = new BtcVerifyService(logger);
+      const verifyResult = btcVerifyService.verify(
         body.btcAddress,
         body.message,
         body.signature
@@ -203,17 +153,21 @@ export class Provision extends BaseEndpoint {
           error: verifyResult.error,
         });
 
-        // Map BtcVerifyService error codes to RelayErrorCode
-        // VERIFICATION_ERROR is an internal error, map it to INTERNAL_ERROR
-        const errorCode = verifyResult.code === "VERIFICATION_ERROR"
-          ? "INTERNAL_ERROR"
-          : verifyResult.code;
+        // Map VERIFICATION_ERROR (internal) to INTERNAL_ERROR; others pass through directly
+        if (verifyResult.code === "VERIFICATION_ERROR") {
+          return this.err(c, {
+            error: verifyResult.error,
+            code: "INTERNAL_ERROR",
+            status: 500,
+            retryable: true,
+          });
+        }
 
         return this.err(c, {
           error: verifyResult.error,
-          code: errorCode,
-          status: verifyResult.code === "VERIFICATION_ERROR" ? 500 : 400,
-          retryable: verifyResult.code === "VERIFICATION_ERROR",
+          code: verifyResult.code satisfies RelayErrorCode,
+          status: 400,
+          retryable: false,
         });
       }
 
@@ -222,11 +176,11 @@ export class Provision extends BaseEndpoint {
         path: verifyResult.path,
       });
 
-      // Initialize auth service and provision key
+      // Provision API key
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
 
       let apiKey: string;
-      let metadata: any;
+      let metadata: ApiKeyMetadata;
 
       try {
         const result = await authService.provisionKey(body.btcAddress);
@@ -235,11 +189,9 @@ export class Provision extends BaseEndpoint {
       } catch (e) {
         const errorMessage = e instanceof Error ? e.message : "Unknown error";
 
-        // Check if this is a duplicate BTC address error
+        // Duplicate BTC address
         if (errorMessage.includes("already has a provisioned API key")) {
-          logger.warn("BTC address already provisioned", {
-            btcAddress: body.btcAddress,
-          });
+          logger.warn("BTC address already provisioned", { btcAddress: body.btcAddress });
           return this.err(c, {
             error: "Bitcoin address already has a provisioned API key",
             code: "ALREADY_PROVISIONED",
@@ -248,7 +200,7 @@ export class Provision extends BaseEndpoint {
           });
         }
 
-        // Check if KV is not configured
+        // KV not configured
         if (errorMessage.includes("not configured")) {
           logger.error("API_KEYS_KV not configured", { error: errorMessage });
           return this.err(c, {
@@ -260,11 +212,8 @@ export class Provision extends BaseEndpoint {
           });
         }
 
-        // Other errors are internal
-        logger.error("Failed to provision key", {
-          error: errorMessage,
-          btcAddress: body.btcAddress,
-        });
+        // Unexpected provisioning error
+        logger.error("Failed to provision key", { error: errorMessage, btcAddress: body.btcAddress });
         return this.err(c, {
           error: "Failed to provision API key",
           code: "INTERNAL_ERROR",
@@ -280,11 +229,7 @@ export class Provision extends BaseEndpoint {
         tier: metadata.tier,
       });
 
-      // Return success response
-      return this.ok(c, {
-        apiKey,
-        metadata,
-      });
+      return this.ok(c, { apiKey, metadata });
     } catch (e) {
       logger.error("Unexpected error", {
         error: e instanceof Error ? e.message : "Unknown error",

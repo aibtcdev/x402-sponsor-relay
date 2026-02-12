@@ -47,6 +47,9 @@ export interface UsageData {
  */
 const API_KEY_REGEX = /^x402_sk_(test|live)_[a-f0-9]{32}$/;
 
+/** Default key expiration period (30 days) */
+const KEY_EXPIRATION_DAYS = 30;
+
 /**
  * Create an empty ApiKeyUsage object for a given date
  * Used when initializing usage records that don't exist yet
@@ -496,6 +499,76 @@ export class AuthService {
   }
 
   // =============================================================================
+  // Key Generation Helpers
+  // =============================================================================
+
+  /**
+   * Generate an API key string and derive its keyId
+   * Shared by createKey and provisionKey to avoid duplicating crypto logic
+   */
+  private async generateKeyPair(
+    environment: "test" | "live"
+  ): Promise<{ apiKey: string; keyId: string; keyHash: string }> {
+    // Generate random 32-char hex
+    const randomBytes = new Uint8Array(16);
+    crypto.getRandomValues(randomBytes);
+    const hex = Array.from(randomBytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const apiKey = `x402_sk_${environment}_${hex}`;
+
+    // Create key ID (first 8 bytes of SHA-256 hash, hex-encoded)
+    const keyIdBytes = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(apiKey)
+    );
+    const keyId = Array.from(new Uint8Array(keyIdBytes).slice(0, 8))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    // Hash the full key for secure storage (plaintext is only shown once)
+    const keyHash = await hashApiKey(apiKey);
+
+    return { apiKey, keyId, keyHash };
+  }
+
+  /**
+   * Store key metadata and index mappings in KV
+   * Shared by createKey and provisionKey
+   */
+  private async storeKeyMetadata(
+    keyHash: string,
+    metadata: ApiKeyMetadata,
+    indexMappings: Array<{ key: string; value: string }>
+  ): Promise<void> {
+    if (!this.kv) {
+      throw new Error("API_KEYS_KV not configured");
+    }
+
+    // Store hash -> metadata mapping
+    await this.kv.put(`key:${keyHash}`, JSON.stringify(metadata));
+
+    // Store keyId -> keyHash mapping (for admin operations like revoke/renew)
+    await this.kv.put(`keyId:${metadata.keyId}`, keyHash);
+
+    // Store additional index mappings (app:name -> keyId, btc:address -> keyId, etc.)
+    for (const mapping of indexMappings) {
+      await this.kv.put(mapping.key, mapping.value);
+    }
+  }
+
+  /**
+   * Create expiration timestamps for a new key
+   */
+  private static createKeyDates(): { createdAt: string; expiresAt: string } {
+    const now = new Date();
+    const expiresAt = new Date(now);
+    expiresAt.setDate(expiresAt.getDate() + KEY_EXPIRATION_DAYS);
+    return { createdAt: now.toISOString(), expiresAt: expiresAt.toISOString() };
+  }
+
+  // =============================================================================
   // Admin methods (for CLI tool)
   // =============================================================================
 
@@ -518,52 +591,24 @@ export class AuthService {
       throw new Error(`Application "${appName}" already has an API key`);
     }
 
-    // Generate random 32-char hex
-    const randomBytes = new Uint8Array(16);
-    crypto.getRandomValues(randomBytes);
-    const hex = Array.from(randomBytes)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    const apiKey = `x402_sk_${environment}_${hex}`;
-
-    // Create key ID (hash of key for internal reference)
-    const keyIdBytes = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(apiKey)
-    );
-    const keyId = Array.from(new Uint8Array(keyIdBytes).slice(0, 8))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    const now = new Date();
-    const expiresAt = new Date(now);
-    expiresAt.setDate(expiresAt.getDate() + 30); // 30-day expiration
+    const { apiKey, keyId, keyHash } = await this.generateKeyPair(environment);
+    const { createdAt, expiresAt } = AuthService.createKeyDates();
 
     const metadata: ApiKeyMetadata = {
       keyId,
       appName,
       contactEmail,
       tier,
-      createdAt: now.toISOString(),
-      expiresAt: expiresAt.toISOString(),
+      createdAt,
+      expiresAt,
       active: true,
     };
 
-    // Hash the API key for secure storage (plaintext key is only shown once)
-    const keyHash = await hashApiKey(apiKey);
-
-    // Store hash -> metadata mapping (key is never stored in plaintext)
-    await this.kv.put(`key:${keyHash}`, JSON.stringify(metadata));
-
-    // Store app -> keyId mapping (for lookup by name)
-    await this.kv.put(`app:${appName}`, keyId);
-
-    // Store keyId -> keyHash mapping (for admin operations like revoke/renew)
-    await this.kv.put(`keyId:${keyId}`, keyHash);
+    await this.storeKeyMetadata(keyHash, metadata, [
+      { key: `app:${appName}`, value: keyId },
+    ]);
 
     this.logger.info("API key created", { appName, keyId, tier });
-
     return { apiKey, metadata };
   }
 
@@ -571,8 +616,6 @@ export class AuthService {
    * Provision a new free-tier API key for a Bitcoin address
    * Used by POST /keys/provision after BTC signature verification
    *
-   * @param btcAddress - Bitcoin address that proved ownership via signature
-   * @returns API key and metadata
    * @throws Error if BTC address already has a key or if KV not configured
    */
   async provisionKey(
@@ -590,64 +633,29 @@ export class AuthService {
       );
     }
 
-    // Generate random 32-char hex for test environment
-    const randomBytes = new Uint8Array(16);
-    crypto.getRandomValues(randomBytes);
-    const hex = Array.from(randomBytes)
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    const apiKey = `x402_sk_test_${hex}`;
-
-    // Create key ID (hash of key for internal reference)
-    const keyIdBytes = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(apiKey)
-    );
-    const keyId = Array.from(new Uint8Array(keyIdBytes).slice(0, 8))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    const now = new Date();
-    const expiresAt = new Date(now);
-    expiresAt.setDate(expiresAt.getDate() + 30); // 30-day expiration
-
-    // Generate appName from BTC address prefix for compatibility with existing tools
-    const addressPrefix = btcAddress.slice(0, 8);
-    const appName = `btc:${addressPrefix}`;
-
-    // Generate system contact email for BTC-provisioned keys
-    const contactEmail = `btc+${btcAddress}@x402relay.system`;
+    const { apiKey, keyId, keyHash } = await this.generateKeyPair("test");
+    const { createdAt, expiresAt } = AuthService.createKeyDates();
 
     const metadata: ApiKeyMetadata = {
       keyId,
-      appName,
-      contactEmail,
+      appName: `btc:${btcAddress.slice(0, 8)}`,
+      contactEmail: `btc+${btcAddress}@x402relay.system`,
       tier: "free",
-      createdAt: now.toISOString(),
-      expiresAt: expiresAt.toISOString(),
+      createdAt,
+      expiresAt,
       active: true,
       btcAddress,
     };
 
-    // Hash the API key for secure storage
-    const keyHash = await hashApiKey(apiKey);
-
-    // Store hash -> metadata mapping
-    await this.kv.put(`key:${keyHash}`, JSON.stringify(metadata));
-
-    // Store btc:{address} -> keyId mapping (for duplicate prevention)
-    await this.kv.put(`btc:${btcAddress}`, keyId);
-
-    // Store keyId -> keyHash mapping (for admin operations)
-    await this.kv.put(`keyId:${keyId}`, keyHash);
+    await this.storeKeyMetadata(keyHash, metadata, [
+      { key: `btc:${btcAddress}`, value: keyId },
+    ]);
 
     this.logger.info("API key provisioned via BTC signature", {
       btcAddress,
       keyId,
       tier: "free",
     });
-
     return { apiKey, metadata };
   }
 
