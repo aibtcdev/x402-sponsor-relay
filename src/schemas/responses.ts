@@ -81,6 +81,18 @@ export const Error401Response = {
 };
 
 /**
+ * 409 Conflict - Resource already exists
+ */
+export const Error409Response = {
+  description: "Resource already exists",
+  content: {
+    "application/json": {
+      schema: BaseErrorSchema,
+    },
+  },
+};
+
+/**
  * 404 Not Found - Resource not found
  */
 export const Error404Response = {
