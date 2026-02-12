@@ -324,6 +324,10 @@ export interface RelaySuccessResponse extends BaseSuccessResponse {
   txid: string;
   explorerUrl: string;
   settlement?: SettlementResult;
+  /** Hex-encoded fully-sponsored transaction (can be used as X-PAYMENT header value) */
+  sponsoredTx?: string;
+  /** Receipt token for verifying payment via GET /verify/:receiptId */
+  receiptId?: string;
 }
 
 // =============================================================================
