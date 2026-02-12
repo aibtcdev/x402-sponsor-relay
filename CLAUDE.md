@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 x402 Stacks Sponsor Relay - A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, and calls the x402 facilitator for settlement verification.
 
-**Status**: Core relay with facilitator integration complete. Deployed to testnet staging.
+**Status**: Core relay with facilitator integration, payment receipts, and protected resource access. Deployed to testnet staging.
 
 ## Commands
 
@@ -54,6 +54,8 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /openapi.json` - OpenAPI specification
 - `POST /relay` - Submit sponsored transaction for settlement (x402 facilitator)
 - `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key)
+- `GET /verify/:receiptId` - Verify a payment receipt
+- `POST /access` - Access protected resource with receipt token
 - `GET /stats` - Relay statistics (JSON API)
 - `GET /dashboard` - Public dashboard (HTML)
 
@@ -73,7 +75,10 @@ Request: {
 }
 
 Response (success): {
+  success: true,
+  requestId: "uuid",
   txid: "0x...",
+  explorerUrl: "https://explorer.hiro.so/txid/...",
   settlement: {
     success: true,
     status: "pending" | "confirmed" | "failed",
@@ -81,7 +86,9 @@ Response (success): {
     recipient: "SP...",
     amount: "1000000",
     blockHeight?: 12345
-  }
+  },
+  sponsoredTx: "0x00000001...",  // fully-sponsored tx hex
+  receiptId?: "uuid"  // only when KV storage succeeds
 }
 
 Response (error): {
@@ -112,12 +119,50 @@ Response (error): {
   error: "description",
   retryable: boolean
 }
+
+// GET /verify/:receiptId
+Response (success): {
+  success: true,
+  requestId: "uuid",
+  receipt: {
+    receiptId: "uuid",
+    status: "valid" | "consumed",
+    senderAddress: "SP...",
+    txid: "0x...",
+    explorerUrl: "https://...",
+    settlement: { success, status, recipient, amount },
+    resource: "/api/endpoint",
+    method: "GET",
+    accessCount: 0
+  }
+}
+
+// POST /access
+Request: {
+  receiptId: "uuid",
+  resource?: "/api/endpoint",
+  targetUrl?: "https://downstream-service.com/..."  // HTTPS only
+}
+
+Response (success): {
+  success: true,
+  requestId: "uuid",
+  granted: true,
+  receipt: { receiptId, senderAddress, resource, accessCount },
+  data?: { ... },  // relay-hosted resource
+  proxy?: { status, statusText, headers, body }  // proxied resource
+}
 ```
 
 **Key Files:**
 - `src/index.ts` - Hono app entry point with Chanfana OpenAPI setup
 - `src/version.ts` - Single source of truth for VERSION constant
 - `src/types.ts` - Centralized type definitions
+- `src/endpoints/BaseEndpoint.ts` - Base class with ok/okWithTx/err helpers
+- `src/endpoints/relay.ts` - Relay endpoint (sponsor + settle + receipt)
+- `src/endpoints/verify.ts` - Receipt verification endpoint
+- `src/endpoints/access.ts` - Protected resource access endpoint
+- `src/services/receipt.ts` - ReceiptService (store/retrieve/consume receipts in KV)
 - `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
 - `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
 - `scripts/manage-api-keys.ts` - CLI for API key management
@@ -223,7 +268,21 @@ Agent                    Relay                    Facilitator              Stack
   │                        │                           │◀────────────────────│
   │                        │◀───────────────────────────│ 6. Settlement      │
   │◀───────────────────────│ 7. Return { txid,        │                     │
-  │                        │    settlement: {...} }   │                     │
+  │                        │    settlement,           │                     │
+  │                        │    sponsoredTx,          │                     │
+  │                        │    receiptId }           │                     │
+  │                        │                           │                     │
+  │ 8. GET /verify/:id     │                           │                     │
+  │───────────────────────▶│ 9. Check KV receipt      │                     │
+  │◀───────────────────────│ 10. Return receipt       │                     │
+  │                        │     status               │                     │
+  │                        │                           │                     │
+  │ 11. POST /access       │                           │                     │
+  │     { receiptId }      │                           │                     │
+  │───────────────────────▶│ 12. Validate receipt     │                     │
+  │                        │ 13. Grant access /       │                     │
+  │                        │     proxy request         │                     │
+  │◀───────────────────────│ 14. Return data          │                     │
 ```
 
 ## Future Enhancements
@@ -231,3 +290,5 @@ Agent                    Relay                    Facilitator              Stack
 See GitHub issues for planned enhancements:
 - [#6 - SIP-018 signature verification](https://github.com/aibtcdev/x402-sponsor-relay/issues/6)
 - [#7 - ERC-8004 agent registry integration](https://github.com/aibtcdev/x402-sponsor-relay/issues/7)
+- Atomic receipt consumption (Durable Object or D1) for concurrent access safety
+- Configurable targetUrl allowlist for proxy endpoint
