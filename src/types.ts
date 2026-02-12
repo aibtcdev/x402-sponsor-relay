@@ -323,7 +323,13 @@ export type RelayErrorCode =
   | "INVALID_API_KEY"
   | "EXPIRED_API_KEY"
   | "REVOKED_API_KEY"
-  | "SPENDING_CAP_EXCEEDED";
+  | "SPENDING_CAP_EXCEEDED"
+  | "MISSING_RECEIPT_ID"
+  | "INVALID_RECEIPT"
+  | "RECEIPT_EXPIRED"
+  | "RECEIPT_CONSUMED"
+  | "RESOURCE_MISMATCH"
+  | "PROXY_FAILED";
 
 /**
  * Structured error response with retry guidance
@@ -420,17 +426,6 @@ export interface AccessSuccessResponse extends BaseSuccessResponse {
     body?: unknown;
   };
 }
-
-/**
- * Error codes specific to /access endpoint
- */
-export type AccessErrorCode =
-  | "MISSING_RECEIPT_ID"
-  | "INVALID_RECEIPT"
-  | "RECEIPT_EXPIRED"
-  | "RECEIPT_CONSUMED"
-  | "RESOURCE_MISMATCH"
-  | "PROXY_FAILED";
 
 /**
  * Variables stored in Hono context by middleware
