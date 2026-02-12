@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.0.0...v1.1.0) (2026-02-12)
+
+
+### Features
+
+* add general transaction sponsorship with API key authentication ([#24](https://github.com/aibtcdev/x402-sponsor-relay/issues/24)) ([9cf4144](https://github.com/aibtcdev/x402-sponsor-relay/commit/9cf41444f3eccd0ad107cac7461e92fe926df192))
+
+
+### Bug Fixes
+
+* apply AIBTC brand guidelines to dashboard UI ([#21](https://github.com/aibtcdev/x402-sponsor-relay/issues/21)) ([dbdc712](https://github.com/aibtcdev/x402-sponsor-relay/commit/dbdc712d267ec045572f488a582e5fb3c51ca5db)), closes [#20](https://github.com/aibtcdev/x402-sponsor-relay/issues/20)
+
 ## 1.0.0 (2026-01-23)
 
 
