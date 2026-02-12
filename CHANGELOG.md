@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.1.0...v1.2.0) (2026-02-12)
+
+
+### Features
+
+* relay-as-server architecture with payment receipts ([#27](https://github.com/aibtcdev/x402-sponsor-relay/issues/27)) ([1091808](https://github.com/aibtcdev/x402-sponsor-relay/commit/1091808217c543d55640d8da4e25d147e94ed6ef))
+
 ## [1.1.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.0.0...v1.1.0) (2026-02-12)
 
 
