@@ -381,6 +381,57 @@ export interface SponsorSuccessResponse extends BaseSuccessResponse {
   fee: string;
 }
 
+// =============================================================================
+// Access Endpoint Types
+// =============================================================================
+
+/**
+ * Request body for /access endpoint
+ */
+export interface AccessRequest {
+  /** Receipt ID from a successful relay transaction */
+  receiptId: string;
+  /** Resource path being accessed (must match receipt.settleOptions.resource) */
+  resource?: string;
+  /** Optional downstream service URL for proxying */
+  targetUrl?: string;
+}
+
+/**
+ * Success response for /access endpoint
+ */
+export interface AccessSuccessResponse extends BaseSuccessResponse {
+  /** Whether access was granted */
+  granted: boolean;
+  /** Receipt information */
+  receipt: {
+    receiptId: string;
+    senderAddress: string;
+    resource?: string;
+    accessCount: number;
+  };
+  /** Resource data (if relay-hosted) or proxy result (if proxied) */
+  data?: unknown;
+  /** Proxy response details (if targetUrl was provided) */
+  proxy?: {
+    status: number;
+    statusText: string;
+    headers?: Record<string, string>;
+    body?: unknown;
+  };
+}
+
+/**
+ * Error codes specific to /access endpoint
+ */
+export type AccessErrorCode =
+  | "MISSING_RECEIPT_ID"
+  | "INVALID_RECEIPT"
+  | "RECEIPT_EXPIRED"
+  | "RECEIPT_CONSUMED"
+  | "RESOURCE_MISMATCH"
+  | "PROXY_FAILED";
+
 /**
  * Variables stored in Hono context by middleware
  */
