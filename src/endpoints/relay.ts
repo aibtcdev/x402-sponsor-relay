@@ -1,5 +1,5 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, FacilitatorService, StatsService } from "../services";
+import { SponsorService, FacilitatorService, StatsService, ReceiptService } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest } from "../types";
 import {
@@ -301,6 +301,18 @@ export class Relay extends BaseEndpoint {
 
       // Generate receipt ID for payment verification
       const receiptId = crypto.randomUUID();
+
+      // Store payment receipt for future verification (best-effort)
+      const receiptService = new ReceiptService(c.env.RELAY_KV, logger);
+      await receiptService.storeReceipt({
+        receiptId,
+        senderAddress: validation.senderAddress,
+        sponsoredTx: sponsorResult.sponsoredTxHex,
+        fee: sponsorResult.fee,
+        txid: settleResult.txid!,
+        settlement: settleResult.settlement!,
+        settleOptions: body.settle,
+      });
 
       logger.info("Transaction sponsored and settled", {
         txid: settleResult.txid,
