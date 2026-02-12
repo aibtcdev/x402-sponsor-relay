@@ -1,29 +1,30 @@
-# General Transaction Sponsorship
+# Programmatic API Key Provisioning via BTC Signature
 
-Expand the x402 sponsor relay to support general transaction sponsorship with API key authentication.
+Add `POST /keys/provision` endpoint enabling agents to self-provision free-tier API keys by proving Bitcoin address ownership via BIP-137 signature verification.
 
 **Status:** active
-**Created:** 2026-02-01
+**Created:** 2026-02-12
 **Repos:** aibtcdev/x402-sponsor-relay
-**Branch:** feat/general-sponsorship
+**Issue:** [#30](https://github.com/aibtcdev/x402-sponsor-relay/issues/30)
 
 ## Goal
 
-Transform the x402 sponsor relay from an x402-only service into a general-purpose transaction sponsorship relay. Any authenticated agent with an API key can submit pre-signed sponsored transactions for sponsorship and broadcast.
+Enable programmatic API key provisioning for two paths:
+
+1. **Registration path** (via Landing Page): Agent signs `"Bitcoin will be the currency of AIs"` during landing page registration. Landing page forwards signature + BTC address to relay. No timestamp needed.
+
+2. **Self-service path** (Agent Direct): Agent signs `"Bitcoin will be the currency of AIs | {ISO-timestamp}"` with BTC key. Relay verifies signature + timestamp freshness (within 5 min).
+
+Both paths produce a free-tier API key (`x402_sk_test_{32-char-hex}`) with 30-day expiration, enabling the agent to use `POST /sponsor` for gasless transactions.
 
 ## Requirements
 
-1. New `/sponsor` endpoint for general transaction sponsorship (any Stacks tx)
-2. API key authentication with configurable per-key rate limiting and spending caps
-3. Tight fee monitoring and tracking per key
-4. Consistent `ok()`/`err()` response format across all endpoints
-5. `ok()` responses include: txid, explorer link, internal UUID
-6. Comprehensive logging of key stats and usage info
-7. Dashboard updates to show API key statistics
-8. Bug fix: facilitator health check should use `/health` endpoint
-9. Designed for high traffic - API keys will be handed out for testing
-
-## Related Issues
-
-- #16 - Add API key authentication for external applications
-- #23 - Sponsor relay flow: API cannot verify txid-based payment proof
+1. `POST /keys/provision` endpoint accepts btcAddress + signature
+2. Verifies BTC signature (BIP-137) against message
+3. Registration path accepts bare message (no timestamp)
+4. Self-service path validates timestamp within 5 minutes
+5. Generates API key in standard format, free tier limits
+6. Stores metadata in KV with hashed key + btc:{address} mapping
+7. Returns error if BTC address already has a key
+8. OpenAPI documented with Chanfana
+9. No authentication required (signature IS the auth)

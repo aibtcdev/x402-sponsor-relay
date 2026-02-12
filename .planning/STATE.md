@@ -1,26 +1,28 @@
 # Quest State
 
-**Current Phase:** 5
-**Phase Status:** completed
+**Current Phase:** 2
+**Phase Status:** pending
 **Retry Count:** 0
+**Last Completed:** Phase 1 (commit db74853)
 
 ## Decisions Log
 
 | Date | Phase | Decision | Rationale |
 |------|-------|----------|-----------|
-| 2026-02-01 | Setup | New branch `feat/general-sponsorship` | Clean separation from main |
-| 2026-02-01 | Planning | 7 phases identified | Atomic, independently verifiable units |
-| 2026-02-01 | Planning | Phases 1 & 2 can run in parallel | No dependencies between them |
-| 2026-02-01 | Phase 3 | Cherry-pick from PR #17 `feature/api-key-auth` | API key infrastructure already implemented |
-| 2026-02-01 | Phase 2 | Active health check via `/health` endpoint | Fixes false "down" status on dashboard |
-| 2026-02-01 | Phase 5 | Spending caps in TIER_LIMITS with check before sponsor | Prevents runaway costs per API key |
+| 2026-02-12 | Setup | 4-phase sequential plan | Each phase atomic, buildable, type-safe |
+| 2026-02-12 | Phase 1 | Try bitcoinjs-message first, noble fallback if needed | CF Workers has nodejs_compat_v2 with Buffer support |
+| 2026-02-12 | Phase 2 | Set appName to `btc:{address_prefix}` | Keeps existing list/admin tools working |
+| 2026-02-12 | Phase 3 | Skip provisionMethod tracking | Both paths produce identical keys, keep it simple |
+| 2026-02-12 | Phase 4 | Derive BTC key from AGENT_MNEMONIC | Consistent with existing test scripts |
 
-## Existing Resources
+## Key Technical Decisions
 
-**PR #17 - API Key Authentication** (`origin/feature/api-key-auth`)
-- `src/services/auth.ts` - AuthService with key validation, rate limiting, usage tracking
-- `src/middleware/auth.ts` - Auth middleware with grace period
-- `scripts/manage-api-keys.ts` - Admin CLI for key management
-- Key format: `x402_sk_<env>_<32-char-hex>`
-- Tiers: free (10/min), standard (60/min), unlimited
-- 30-day expiration, KV-based storage with hashed keys
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| BTC signature library | `bitcoinjs-message` npm package | Handles all BIP-137 address types; `nodejs_compat_v2` provides Buffer support |
+| Fallback if library fails in CF Workers | `@noble/secp256k1` (already transitive dep) | Pure JS, no Node.js APIs needed |
+| `ApiKeyMetadata` schema | Add optional `btcAddress` field only (no provisionMethod) | Non-breaking; keep it simple per user decision |
+| Duplicate prevention | New KV mapping `btc:{address} -> keyId` | O(1) lookup, matches existing `app:{name} -> keyId` pattern |
+| `provisionKey()` method | Separate from `createKey()` | Different identity models, different KV mappings, avoids admin flow risk |
+| HTTP 409 for duplicates | `ALREADY_PROVISIONED` error code | Distinguishes from 400 -- request was valid but address is taken |
+| No auth middleware | Signature is the authentication | Per issue spec |

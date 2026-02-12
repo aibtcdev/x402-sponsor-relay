@@ -568,6 +568,90 @@ export class AuthService {
   }
 
   /**
+   * Provision a new free-tier API key for a Bitcoin address
+   * Used by POST /keys/provision after BTC signature verification
+   *
+   * @param btcAddress - Bitcoin address that proved ownership via signature
+   * @returns API key and metadata
+   * @throws Error if BTC address already has a key or if KV not configured
+   */
+  async provisionKey(
+    btcAddress: string
+  ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
+    if (!this.kv) {
+      throw new Error("API_KEYS_KV not configured");
+    }
+
+    // Check if BTC address already has a key
+    const existingKeyId = await this.kv.get(`btc:${btcAddress}`);
+    if (existingKeyId) {
+      throw new Error(
+        `Bitcoin address "${btcAddress}" already has a provisioned API key`
+      );
+    }
+
+    // Generate random 32-char hex for test environment
+    const randomBytes = new Uint8Array(16);
+    crypto.getRandomValues(randomBytes);
+    const hex = Array.from(randomBytes)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const apiKey = `x402_sk_test_${hex}`;
+
+    // Create key ID (hash of key for internal reference)
+    const keyIdBytes = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(apiKey)
+    );
+    const keyId = Array.from(new Uint8Array(keyIdBytes).slice(0, 8))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    const now = new Date();
+    const expiresAt = new Date(now);
+    expiresAt.setDate(expiresAt.getDate() + 30); // 30-day expiration
+
+    // Generate appName from BTC address prefix for compatibility with existing tools
+    const addressPrefix = btcAddress.slice(0, 8);
+    const appName = `btc:${addressPrefix}`;
+
+    // Generate system contact email for BTC-provisioned keys
+    const contactEmail = `btc+${btcAddress}@x402relay.system`;
+
+    const metadata: ApiKeyMetadata = {
+      keyId,
+      appName,
+      contactEmail,
+      tier: "free",
+      createdAt: now.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      active: true,
+      btcAddress,
+    };
+
+    // Hash the API key for secure storage
+    const keyHash = await hashApiKey(apiKey);
+
+    // Store hash -> metadata mapping
+    await this.kv.put(`key:${keyHash}`, JSON.stringify(metadata));
+
+    // Store btc:{address} -> keyId mapping (for duplicate prevention)
+    await this.kv.put(`btc:${btcAddress}`, keyId);
+
+    // Store keyId -> keyHash mapping (for admin operations)
+    await this.kv.put(`keyId:${keyId}`, keyHash);
+
+    this.logger.info("API key provisioned via BTC signature", {
+      btcAddress,
+      keyId,
+      tier: "free",
+    });
+
+    return { apiKey, metadata };
+  }
+
+  /**
    * Revoke an API key
    */
   async revokeKey(apiKey: string): Promise<boolean> {
