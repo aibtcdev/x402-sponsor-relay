@@ -255,6 +255,35 @@ export interface SettlementResult {
 }
 
 /**
+ * Payment receipt stored after successful relay settlement
+ * Used for verifying payments and granting access to resources
+ */
+export interface PaymentReceipt {
+  /** Unique receipt identifier */
+  receiptId: string;
+  /** When the receipt was created (ISO 8601) */
+  createdAt: string;
+  /** When the receipt expires (ISO 8601) */
+  expiresAt: string;
+  /** Agent's Stacks address (from the signed transaction) */
+  senderAddress: string;
+  /** The fully-sponsored transaction hex */
+  sponsoredTx: string;
+  /** Fee paid by sponsor in microSTX */
+  fee: string;
+  /** Blockchain transaction ID */
+  txid: string;
+  /** Settlement details from facilitator */
+  settlement: SettlementResult;
+  /** Original settle options (resource, method, recipient, amount, tokenType) */
+  settleOptions: SettleOptions;
+  /** Whether this receipt has been consumed (for one-time-use access) */
+  consumed: boolean;
+  /** Number of times this receipt has been used for access */
+  accessCount: number;
+}
+
+/**
  * Response from /relay endpoint
  */
 export interface RelayResponse {
