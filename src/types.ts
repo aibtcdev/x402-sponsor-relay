@@ -255,6 +255,35 @@ export interface SettlementResult {
 }
 
 /**
+ * Payment receipt stored after successful relay settlement
+ * Used for verifying payments and granting access to resources
+ */
+export interface PaymentReceipt {
+  /** Unique receipt identifier */
+  receiptId: string;
+  /** When the receipt was created (ISO 8601) */
+  createdAt: string;
+  /** When the receipt expires (ISO 8601) */
+  expiresAt: string;
+  /** Agent's Stacks address (from the signed transaction) */
+  senderAddress: string;
+  /** The fully-sponsored transaction hex */
+  sponsoredTx: string;
+  /** Fee paid by sponsor in microSTX */
+  fee: string;
+  /** Blockchain transaction ID */
+  txid: string;
+  /** Settlement details from facilitator */
+  settlement: SettlementResult;
+  /** Original settle options (resource, method, recipient, amount, tokenType) */
+  settleOptions: SettleOptions;
+  /** Whether this receipt has been consumed (for one-time-use access) */
+  consumed: boolean;
+  /** Number of times this receipt has been used for access */
+  accessCount: number;
+}
+
+/**
  * Response from /relay endpoint
  */
 export interface RelayResponse {
@@ -294,7 +323,13 @@ export type RelayErrorCode =
   | "INVALID_API_KEY"
   | "EXPIRED_API_KEY"
   | "REVOKED_API_KEY"
-  | "SPENDING_CAP_EXCEEDED";
+  | "SPENDING_CAP_EXCEEDED"
+  | "MISSING_RECEIPT_ID"
+  | "INVALID_RECEIPT"
+  | "RECEIPT_EXPIRED"
+  | "RECEIPT_CONSUMED"
+  | "RESOURCE_MISMATCH"
+  | "PROXY_FAILED";
 
 /**
  * Structured error response with retry guidance
@@ -324,6 +359,10 @@ export interface RelaySuccessResponse extends BaseSuccessResponse {
   txid: string;
   explorerUrl: string;
   settlement?: SettlementResult;
+  /** Hex-encoded fully-sponsored transaction (can be used as X-PAYMENT header value) */
+  sponsoredTx?: string;
+  /** Receipt token for verifying payment via GET /verify/:receiptId */
+  receiptId?: string;
 }
 
 // =============================================================================
@@ -346,6 +385,46 @@ export interface SponsorSuccessResponse extends BaseSuccessResponse {
   explorerUrl: string;
   /** Fee paid by sponsor in microSTX */
   fee: string;
+}
+
+// =============================================================================
+// Access Endpoint Types
+// =============================================================================
+
+/**
+ * Request body for /access endpoint
+ */
+export interface AccessRequest {
+  /** Receipt ID from a successful relay transaction */
+  receiptId: string;
+  /** Resource path being accessed (must match receipt.settleOptions.resource) */
+  resource?: string;
+  /** Optional downstream service URL for proxying */
+  targetUrl?: string;
+}
+
+/**
+ * Success response for /access endpoint
+ */
+export interface AccessSuccessResponse extends BaseSuccessResponse {
+  /** Whether access was granted */
+  granted: boolean;
+  /** Receipt information */
+  receipt: {
+    receiptId: string;
+    senderAddress: string;
+    resource?: string;
+    accessCount: number;
+  };
+  /** Resource data (if relay-hosted) or proxy result (if proxied) */
+  data?: unknown;
+  /** Proxy response details (if targetUrl was provided) */
+  proxy?: {
+    status: number;
+    statusText: string;
+    headers?: Record<string, string>;
+    body?: unknown;
+  };
 }
 
 /**

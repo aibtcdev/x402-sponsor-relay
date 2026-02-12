@@ -10,7 +10,8 @@ The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard th
 2. Validating the transaction format (must be sponsored type)
 3. Sponsoring the transaction (covers gas fees)
 4. Calling the x402 facilitator for settlement verification
-5. Returning the settlement status to the agent
+5. Storing payment receipts for verification and resource access
+6. Returning the settlement status, sponsored tx hex, and receipt token to the agent
 
 ## API
 
@@ -98,7 +99,10 @@ Submit a sponsored transaction for relay and settlement.
 **Response (success):**
 ```json
 {
+  "success": true,
+  "requestId": "550e8400-e29b-41d4-a716-446655440000",
   "txid": "0x...",
+  "explorerUrl": "https://explorer.hiro.so/txid/0x...?chain=testnet",
   "settlement": {
     "success": true,
     "status": "confirmed",
@@ -106,17 +110,94 @@ Submit a sponsored transaction for relay and settlement.
     "recipient": "SP...",
     "amount": "1000000",
     "blockHeight": 12345
-  }
+  },
+  "sponsoredTx": "0x00000001...",
+  "receiptId": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
+
+> **Note:** `sponsoredTx` contains the fully-sponsored transaction hex (usable as `X-PAYMENT` header). `receiptId` is only returned when receipt storage succeeds (requires `RELAY_KV` binding).
 
 **Response (error):**
 ```json
 {
+  "success": false,
+  "requestId": "550e8400-e29b-41d4-a716-446655440000",
   "error": "Transaction must be sponsored",
-  "details": "Build transaction with sponsored: true"
+  "code": "NOT_SPONSORED",
+  "details": "Build transaction with sponsored: true",
+  "retryable": false
 }
 ```
+
+### GET /verify/:receiptId
+
+Look up a payment receipt by ID and return its status.
+
+**Response (success):**
+```json
+{
+  "success": true,
+  "requestId": "...",
+  "receipt": {
+    "receiptId": "550e8400-...",
+    "status": "valid",
+    "createdAt": "2025-01-01T00:00:00.000Z",
+    "expiresAt": "2025-01-01T01:00:00.000Z",
+    "senderAddress": "SP...",
+    "txid": "0x...",
+    "explorerUrl": "https://explorer.hiro.so/txid/0x...?chain=testnet",
+    "settlement": {
+      "success": true,
+      "status": "confirmed",
+      "recipient": "SP...",
+      "amount": "1000000"
+    },
+    "resource": "/api/endpoint",
+    "method": "GET",
+    "accessCount": 0
+  }
+}
+```
+
+**Response (not found):** `404` for unknown or expired receipts.
+
+### POST /access
+
+Access a protected resource using a payment receipt. Validates the receipt (exists, not expired, not consumed, resource matches) and either returns relay-hosted data or proxies to a downstream service.
+
+**Request:**
+```json
+{
+  "receiptId": "550e8400-...",
+  "resource": "/api/endpoint",
+  "targetUrl": "https://downstream-service.com/api/endpoint"
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `receiptId` | Yes | Receipt ID from a successful relay transaction |
+| `resource` | No | Resource path (validated against receipt) |
+| `targetUrl` | No | Downstream URL for proxying (HTTPS only, no internal hosts) |
+
+**Response (success):**
+```json
+{
+  "success": true,
+  "requestId": "...",
+  "granted": true,
+  "receipt": {
+    "receiptId": "550e8400-...",
+    "senderAddress": "SP...",
+    "resource": "/api/endpoint",
+    "accessCount": 1
+  },
+  "data": { "..." }
+}
+```
+
+> **Note:** Receipts are one-time-use — consumed after successful access. If proxying, the receipt is only consumed on a 2xx downstream response. The `targetUrl` must be HTTPS and cannot point to internal hosts.
 
 ### GET /health
 
@@ -180,9 +261,16 @@ const response = await fetch("https://x402-relay.aibtc.dev/relay", {
   }),
 });
 
-const { txid, settlement } = await response.json();
+const { txid, settlement, sponsoredTx, receiptId } = await response.json();
 console.log(`Transaction: https://explorer.hiro.so/txid/${txid}?chain=testnet`);
 console.log(`Settlement status: ${settlement.status}`);
+
+// Use receiptId to verify payment or access protected resources
+if (receiptId) {
+  const verifyResponse = await fetch(`https://x402-relay.aibtc.dev/verify/${receiptId}`);
+  const { receipt } = await verifyResponse.json();
+  console.log(`Receipt status: ${receipt.status}`);
+}
 ```
 
 ## Deployments
@@ -202,6 +290,8 @@ console.log(`Settlement status: ${settlement.status}`);
 | GET | `/openapi.json` | None | OpenAPI specification |
 | POST | `/relay` | None | Submit transaction via x402 facilitator |
 | POST | `/sponsor` | API Key | Sponsor and broadcast transaction directly |
+| GET | `/verify/:receiptId` | None | Verify a payment receipt |
+| POST | `/access` | None | Access protected resource with receipt |
 | GET | `/stats` | None | Relay statistics (JSON) |
 | GET | `/dashboard` | None | Public dashboard (HTML) |
 
@@ -288,9 +378,8 @@ const response = await fetch("https://x402-relay.aibtc.dev/sponsor", {
 # Install dependencies
 npm install
 
-# Copy .env.example and configure credentials
-cp .env.example .env
-# Edit .env with AGENT_MNEMONIC or AGENT_PRIVATE_KEY
+# Create .env and configure credentials (see Environment Variables below)
+# Required: AGENT_MNEMONIC or AGENT_PRIVATE_KEY for test scripts
 
 # Start local dev server
 npm run dev

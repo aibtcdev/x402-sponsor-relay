@@ -23,3 +23,6 @@ worker-configuration.d.ts
 # OS files
 .DS_Store
 Thumbs.db
+
+# agent planning
+.planning

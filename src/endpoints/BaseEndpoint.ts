@@ -42,13 +42,15 @@ export class BaseEndpoint extends OpenAPIRoute {
 
   /**
    * Return a success response with transaction details
-   * Includes txid, explorerUrl, and optional settlement
+   * Includes txid, explorerUrl, and optional settlement, sponsoredTx, and receiptId
    */
   protected okWithTx(
     c: AppContext,
     opts: {
       txid: string;
       settlement?: SettlementResult;
+      sponsoredTx?: string;
+      receiptId?: string;
     }
   ) {
     const response: RelaySuccessResponse = {
@@ -57,6 +59,8 @@ export class BaseEndpoint extends OpenAPIRoute {
       txid: opts.txid,
       explorerUrl: buildExplorerUrl(opts.txid, c.env.STACKS_NETWORK),
       ...(opts.settlement && { settlement: opts.settlement }),
+      ...(opts.sponsoredTx && { sponsoredTx: opts.sponsoredTx }),
+      ...(opts.receiptId && { receiptId: opts.receiptId }),
     };
     return c.json(response);
   }

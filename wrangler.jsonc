@@ -38,7 +38,7 @@
       "name": "x402-sponsor-relay-staging",
       "workers_dev": false,
       "routes": [{ "pattern": "x402-relay.aibtc.dev", "custom_domain": true }],
-      "observability": { "enabled": true },
+      "observability": { "enabled": false },
       "vars": {
         "STACKS_NETWORK": "testnet",
         "FACILITATOR_URL": "https://facilitator.stacksx402.com"
@@ -57,7 +57,7 @@
       "name": "x402-sponsor-relay-production",
       "workers_dev": false,
       "routes": [{ "pattern": "x402-relay.aibtc.com", "custom_domain": true }],
-      "observability": { "enabled": true },
+      "observability": { "enabled": false },
       "vars": {
         "STACKS_NETWORK": "mainnet",
         "FACILITATOR_URL": "https://facilitator.stacksx402.com"

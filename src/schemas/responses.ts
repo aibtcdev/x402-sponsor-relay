@@ -81,6 +81,18 @@ export const Error401Response = {
 };
 
 /**
+ * 404 Not Found - Resource not found
+ */
+export const Error404Response = {
+  description: "Resource not found",
+  content: {
+    "application/json": {
+      schema: BaseErrorSchema,
+    },
+  },
+};
+
+/**
  * 429 Too Many Requests - Rate limit or spending cap exceeded
  */
 export const Error429Response = {

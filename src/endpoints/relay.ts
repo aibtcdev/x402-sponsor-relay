@@ -1,5 +1,5 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, FacilitatorService, StatsService } from "../services";
+import { SponsorService, FacilitatorService, StatsService, ReceiptService } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest } from "../types";
 import {
@@ -112,6 +112,17 @@ export class Relay extends BaseEndpoint {
                     amount: { type: "string" as const },
                     blockHeight: { type: "number" as const },
                   },
+                },
+                sponsoredTx: {
+                  type: "string" as const,
+                  description: "Hex-encoded fully-sponsored transaction (can be used as X-PAYMENT header value)",
+                  example: "0x00000001...",
+                },
+                receiptId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Receipt token for verifying payment via GET /verify/:receiptId",
+                  example: "550e8400-e29b-41d4-a716-446655440000",
                 },
               },
             },
@@ -288,15 +299,32 @@ export class Relay extends BaseEndpoint {
         fee: sponsorResult.fee,
       });
 
+      // Store payment receipt for future verification (best-effort)
+      const receiptService = new ReceiptService(c.env.RELAY_KV, logger);
+      const receiptId = crypto.randomUUID();
+      const storedReceipt = await receiptService.storeReceipt({
+        receiptId,
+        senderAddress: validation.senderAddress,
+        sponsoredTx: sponsorResult.sponsoredTxHex,
+        fee: sponsorResult.fee,
+        txid: settleResult.txid!,
+        settlement: settleResult.settlement!,
+        settleOptions: body.settle,
+      });
+
       logger.info("Transaction sponsored and settled", {
         txid: settleResult.txid,
         sender: validation.senderAddress,
         settlement_status: settleResult.settlement?.status,
+        receiptId: storedReceipt ? receiptId : undefined,
       });
 
       return this.okWithTx(c, {
         txid: settleResult.txid!,
         settlement: settleResult.settlement,
+        sponsoredTx: sponsorResult.sponsoredTxHex,
+        // Only return receiptId if storage succeeded
+        ...(storedReceipt ? { receiptId } : {}),
       });
     } catch (e) {
       logger.error("Unexpected error", {

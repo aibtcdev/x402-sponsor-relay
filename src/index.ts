@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, Verify, Access } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
 
@@ -35,6 +35,8 @@ const openapi = fromHono(app, {
       { name: "Health", description: "Service health endpoints" },
       { name: "Relay", description: "Transaction relay endpoints (x402 facilitator)" },
       { name: "Sponsor", description: "Transaction sponsor endpoints (direct broadcast)" },
+      { name: "Verify", description: "Payment receipt verification" },
+      { name: "Access", description: "Protected resource access" },
       { name: "Dashboard", description: "Public statistics endpoints" },
     ],
     servers: [
@@ -69,6 +71,8 @@ const openapi = fromHono(app, {
 openapi.get("/health", Health as unknown as typeof Health);
 openapi.post("/relay", Relay as unknown as typeof Relay);
 openapi.post("/sponsor", Sponsor as unknown as typeof Sponsor);
+openapi.get("/verify/:receiptId", Verify as unknown as typeof Verify);
+openapi.post("/access", Access as unknown as typeof Access);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
@@ -86,6 +90,8 @@ app.get("/", (c) => {
     endpoints: {
       relay: "POST /relay - Submit sponsored transaction for settlement (x402)",
       sponsor: "POST /sponsor - Sponsor and broadcast transaction (direct, requires API key)",
+      verify: "GET /verify/:receiptId - Verify a payment receipt",
+      access: "POST /access - Access protected resource with receipt",
       health: "GET /health - Health check with network info",
       stats: "GET /stats - Relay statistics (JSON)",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
