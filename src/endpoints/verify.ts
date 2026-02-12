@@ -76,7 +76,7 @@ export class Verify extends BaseEndpoint {
     if (!receiptId) {
       return this.err(c, {
         error: "Missing receipt ID",
-        code: "MISSING_TRANSACTION", // reusing existing code
+        code: "MISSING_RECEIPT_ID",
         status: 400,
         retryable: false,
       });

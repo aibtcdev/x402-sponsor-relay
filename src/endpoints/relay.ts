@@ -299,12 +299,10 @@ export class Relay extends BaseEndpoint {
         fee: sponsorResult.fee,
       });
 
-      // Generate receipt ID for payment verification
-      const receiptId = crypto.randomUUID();
-
       // Store payment receipt for future verification (best-effort)
       const receiptService = new ReceiptService(c.env.RELAY_KV, logger);
-      await receiptService.storeReceipt({
+      const receiptId = crypto.randomUUID();
+      const storedReceipt = await receiptService.storeReceipt({
         receiptId,
         senderAddress: validation.senderAddress,
         sponsoredTx: sponsorResult.sponsoredTxHex,
@@ -318,14 +316,15 @@ export class Relay extends BaseEndpoint {
         txid: settleResult.txid,
         sender: validation.senderAddress,
         settlement_status: settleResult.settlement?.status,
-        receiptId,
+        receiptId: storedReceipt ? receiptId : undefined,
       });
 
       return this.okWithTx(c, {
         txid: settleResult.txid!,
         settlement: settleResult.settlement,
         sponsoredTx: sponsorResult.sponsoredTxHex,
-        receiptId,
+        // Only return receiptId if storage succeeded
+        ...(storedReceipt ? { receiptId } : {}),
       });
     } catch (e) {
       logger.error("Unexpected error", {

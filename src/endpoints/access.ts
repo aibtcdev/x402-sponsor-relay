@@ -147,6 +147,40 @@ export class Access extends BaseEndpoint {
 
       // If targetUrl is provided, proxy the request
       if (body.targetUrl) {
+        // Validate targetUrl to prevent SSRF - only allow HTTPS to public hosts
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(body.targetUrl);
+        } catch {
+          return this.err(c, {
+            error: "Invalid target URL",
+            code: "INVALID_RECEIPT",
+            status: 400,
+            retryable: false,
+          });
+        }
+
+        if (parsedUrl.protocol !== "https:") {
+          return this.err(c, {
+            error: "Target URL must use HTTPS",
+            code: "INVALID_RECEIPT",
+            status: 400,
+            retryable: false,
+          });
+        }
+
+        // Block internal/private hostnames
+        const hostname = parsedUrl.hostname.toLowerCase();
+        const blockedPatterns = ["localhost", "127.0.0.1", "0.0.0.0", "[::1]", ".local", ".internal"];
+        if (blockedPatterns.some((p) => hostname === p || hostname.endsWith(p))) {
+          return this.err(c, {
+            error: "Target URL must not point to internal hosts",
+            code: "INVALID_RECEIPT",
+            status: 400,
+            retryable: false,
+          });
+        }
+
         logger.info("Proxying request to downstream service", {
           receiptId: body.receiptId,
           targetUrl: body.targetUrl,
@@ -169,7 +203,22 @@ export class Access extends BaseEndpoint {
             parsedBody = proxyBody;
           }
 
-          // Mark receipt as consumed
+          // Only consume receipt on successful downstream response
+          if (!proxyResponse.ok) {
+            logger.warn("Downstream service returned error, receipt NOT consumed", {
+              receiptId: body.receiptId,
+              proxyStatus: proxyResponse.status,
+            });
+            return this.err(c, {
+              error: "Downstream service returned an error",
+              code: "PROXY_FAILED",
+              status: 502,
+              details: `Downstream returned ${proxyResponse.status} ${proxyResponse.statusText}`,
+              retryable: true,
+            });
+          }
+
+          // Mark receipt as consumed only after successful downstream response
           await receiptService.markConsumed(body.receiptId);
 
           logger.info("Access granted via proxy", {
