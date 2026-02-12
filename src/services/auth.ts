@@ -14,6 +14,26 @@ import type {
 import { TIER_LIMITS } from "../types";
 
 /**
+ * Custom error for duplicate BTC address provisioning attempts
+ */
+export class DuplicateAddressError extends Error {
+  constructor(btcAddress: string) {
+    super(`Bitcoin address "${btcAddress}" already has a provisioned API key`);
+    this.name = "DuplicateAddressError";
+  }
+}
+
+/**
+ * Custom error for missing KV configuration
+ */
+export class KVNotConfiguredError extends Error {
+  constructor() {
+    super("API_KEYS_KV not configured");
+    this.name = "KVNotConfiguredError";
+  }
+}
+
+/**
  * Rate limit check result
  */
 export type RateLimitResult =
@@ -622,15 +642,13 @@ export class AuthService {
     btcAddress: string
   ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
     if (!this.kv) {
-      throw new Error("API_KEYS_KV not configured");
+      throw new KVNotConfiguredError();
     }
 
     // Check if BTC address already has a key
     const existingKeyId = await this.kv.get(`btc:${btcAddress}`);
     if (existingKeyId) {
-      throw new Error(
-        `Bitcoin address "${btcAddress}" already has a provisioned API key`
-      );
+      throw new DuplicateAddressError(btcAddress);
     }
 
     const { apiKey, keyId, keyHash } = await this.generateKeyPair("test");

@@ -25,16 +25,12 @@ import * as bitcoinMessage from "bitcoinjs-message";
 import * as bitcoin from "bitcoinjs-lib";
 import * as bip39 from "bip39";
 import { BIP32Factory } from "bip32";
+import { ECPairFactory } from "ecpair";
 import * as ecc from "tiny-secp256k1";
 
-// Initialize BIP32 with secp256k1
+// Initialize BIP32 and ECPair with secp256k1
 const bip32 = BIP32Factory(ecc);
-
-/**
- * Standard BIP-44 path for Bitcoin mainnet: m/44'/0'/0'/0/0
- * This matches the path used by most wallets for the first receiving address
- */
-const BTC_DERIVATION_PATH = "m/44'/0'/0'/0/0";
+const ECPair = ECPairFactory(ecc);
 
 /**
  * Standard messages for BTC signature verification
@@ -103,7 +99,7 @@ function deriveBtcFromPrivateKey(privateKeyHex: string) {
   const privateKey = Buffer.from(privateKeyHex, "hex");
 
   // Create key pair
-  const keyPair = bitcoin.ECPair.fromPrivateKey(privateKey, {
+  const keyPair = ECPair.fromPrivateKey(privateKey, {
     network: bitcoin.networks.bitcoin,
   });
 
@@ -132,7 +128,7 @@ function deriveBtcFromPrivateKey(privateKeyHex: string) {
  * @returns Base64-encoded signature
  */
 function signBtcMessage(message: string, privateKey: Buffer): string {
-  const keyPair = bitcoin.ECPair.fromPrivateKey(privateKey, {
+  const keyPair = ECPair.fromPrivateKey(privateKey, {
     network: bitcoin.networks.bitcoin,
   });
 

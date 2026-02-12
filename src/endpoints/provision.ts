@@ -1,5 +1,5 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { AuthService, BtcVerifyService } from "../services";
+import { AuthService, BtcVerifyService, DuplicateAddressError, KVNotConfiguredError } from "../services";
 import type { AppContext, ApiKeyMetadata, ProvisionRequest, RelayErrorCode } from "../types";
 import {
   Error400Response,
@@ -138,6 +138,17 @@ export class Provision extends BaseEndpoint {
         });
       }
 
+      // Validate BTC address format (P2PKH, P2SH, Bech32, Bech32m)
+      const BTC_ADDRESS_REGEX = /^(1[1-9A-HJ-NP-Za-km-z]{25,34}|3[1-9A-HJ-NP-Za-km-z]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{25,90}|tb1[a-zA-HJ-NP-Z0-9]{25,90})$/;
+      if (!BTC_ADDRESS_REGEX.test(body.btcAddress)) {
+        return this.err(c, {
+          error: "Invalid Bitcoin address format",
+          code: "MISSING_BTC_ADDRESS",
+          status: 400,
+          retryable: false,
+        });
+      }
+
       // Verify BTC signature
       const btcVerifyService = new BtcVerifyService(logger);
       const verifyResult = btcVerifyService.verify(
@@ -187,10 +198,7 @@ export class Provision extends BaseEndpoint {
         apiKey = result.apiKey;
         metadata = result.metadata;
       } catch (e) {
-        const errorMessage = e instanceof Error ? e.message : "Unknown error";
-
-        // Duplicate BTC address
-        if (errorMessage.includes("already has a provisioned API key")) {
+        if (e instanceof DuplicateAddressError) {
           logger.warn("BTC address already provisioned", { btcAddress: body.btcAddress });
           return this.err(c, {
             error: "Bitcoin address already has a provisioned API key",
@@ -200,9 +208,8 @@ export class Provision extends BaseEndpoint {
           });
         }
 
-        // KV not configured
-        if (errorMessage.includes("not configured")) {
-          logger.error("API_KEYS_KV not configured", { error: errorMessage });
+        if (e instanceof KVNotConfiguredError) {
+          logger.error("API_KEYS_KV not configured");
           return this.err(c, {
             error: "Service configuration error",
             code: "INTERNAL_ERROR",
@@ -212,7 +219,7 @@ export class Provision extends BaseEndpoint {
           });
         }
 
-        // Unexpected provisioning error
+        const errorMessage = e instanceof Error ? e.message : "Unknown error";
         logger.error("Failed to provision key", { error: errorMessage, btcAddress: body.btcAddress });
         return this.err(c, {
           error: "Failed to provision API key",

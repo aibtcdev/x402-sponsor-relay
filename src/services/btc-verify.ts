@@ -8,7 +8,7 @@ export const BTC_MESSAGES = {
   /** Base message for registration and self-service paths */
   BASE: "Bitcoin will be the currency of AIs",
   /** Format for self-service path with timestamp: "Bitcoin will be the currency of AIs | {ISO-timestamp}" */
-  SELF_SERVICE_PATTERN: /^Bitcoin will be the currency of AIs \| (.+)$/,
+  SELF_SERVICE_PATTERN: /^Bitcoin will be the currency of AIs \| ([0-9T:.Z-]+)$/,
 } as const;
 
 /** Maximum age for timestamp in self-service messages (5 minutes) */

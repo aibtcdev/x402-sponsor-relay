@@ -29,7 +29,9 @@
     "bitcoinjs-lib": "^7.0.1",
     "bitcoinjs-message": "^2.2.0",
     "chanfana": "^3.0.0",
+    "ecpair": "^3.0.1",
     "hono": "^4.11.4",
+    "tiny-secp256k1": "^2.2.4",
     "x402-stacks": "github:whoabuddy/x402Stacks#feat/sponsored-transactions"
   }
 }
