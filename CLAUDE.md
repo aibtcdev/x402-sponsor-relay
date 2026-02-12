@@ -31,6 +31,10 @@ npm run test:relay -- [relay-url]
 npm run test:sponsor
 npm run test:sponsor -- [relay-url]
 
+# Test provision endpoint (requires .env with AGENT_MNEMONIC or AGENT_PRIVATE_KEY)
+npm run test:provision
+npm run test:provision -- [relay-url]
+
 # API key management
 npm run keys -- list                            # List all keys
 npm run keys -- create --app "App" --email "x@y.com"  # Create key
@@ -54,6 +58,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /openapi.json` - OpenAPI specification
 - `POST /relay` - Submit sponsored transaction for settlement (x402 facilitator)
 - `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key)
+- `POST /keys/provision` - Provision API key via Bitcoin signature (BIP-137)
 - `GET /verify/:receiptId` - Verify a payment receipt
 - `POST /access` - Access protected resource with receipt token
 - `GET /stats` - Relay statistics (JSON API)
@@ -152,6 +157,53 @@ Response (success): {
   data?: { ... },  // relay-hosted resource
   proxy?: { status, statusText, headers, body }  // proxied resource
 }
+
+// POST /keys/provision (no authentication required)
+Request: {
+  btcAddress: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+  signature: "H9L5yLFj...",  // Base64-encoded BIP-137 signature
+  message: "Bitcoin will be the currency of AIs"  // or with timestamp for self-service
+}
+
+Response (success): {
+  success: true,
+  requestId: "uuid",
+  apiKey: "x402_sk_test_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+  metadata: {
+    keyId: "a1b2c3d4",
+    appName: "btc:1A1zP1eP",
+    contactEmail: "btc+1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa@x402relay.system",
+    tier: "free",
+    createdAt: "2026-02-12T12:00:00.000Z",
+    expiresAt: "2026-03-14T12:00:00.000Z",  // 30 days
+    active: true,
+    btcAddress: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+  }
+}
+
+Response (error - duplicate BTC address): {
+  success: false,
+  requestId: "uuid",
+  error: "Bitcoin address already has a provisioned API key",
+  code: "ALREADY_PROVISIONED",
+  retryable: false
+}
+
+Response (error - invalid signature): {
+  success: false,
+  requestId: "uuid",
+  error: "Invalid signature for registration message",
+  code: "INVALID_SIGNATURE",
+  retryable: false
+}
+
+Response (error - stale timestamp): {
+  success: false,
+  requestId: "uuid",
+  error: "Timestamp must be within 5 minutes. Current age: 7 minutes",
+  code: "STALE_TIMESTAMP",
+  retryable: false
+}
 ```
 
 **Key Files:**
@@ -162,9 +214,13 @@ Response (success): {
 - `src/endpoints/relay.ts` - Relay endpoint (sponsor + settle + receipt)
 - `src/endpoints/verify.ts` - Receipt verification endpoint
 - `src/endpoints/access.ts` - Protected resource access endpoint
+- `src/endpoints/provision.ts` - API key provisioning via BTC signature
 - `src/services/receipt.ts` - ReceiptService (store/retrieve/consume receipts in KV)
+- `src/services/btc-verify.ts` - BtcVerifyService (BIP-137 signature verification)
+- `src/services/auth.ts` - AuthService (API key management and provisioning)
 - `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
 - `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
+- `scripts/test-provision.ts` - Test script for /keys/provision endpoint (BTC sig)
 - `scripts/manage-api-keys.ts` - CLI for API key management
 - `docs/` - State machine diagram and feature roadmap
 
