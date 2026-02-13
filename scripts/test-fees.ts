@@ -15,6 +15,29 @@
  *   npm run test:fees -- https://x402-relay.aibtc.dev
  */
 
+/** Fetch the /fees endpoint and return the parsed result */
+async function fetchFees(relayUrl: string): Promise<{ response: Response; result: Record<string, unknown> }> {
+  const response = await fetch(`${relayUrl}/fees`);
+  const result = (await response.json()) as Record<string, unknown>;
+  return { response, result };
+}
+
+/** Validate that a fees response has the expected shape */
+function validateFeesShape(result: Record<string, unknown>): string | null {
+  const fees = result.fees as Record<string, unknown> | undefined;
+  if (!fees || !fees.token_transfer || !fees.contract_call || !fees.smart_contract) {
+    return "Invalid response shape - missing fee categories";
+  }
+  const validSources = ["hiro", "cache", "default"];
+  if (!validSources.includes(result.source as string)) {
+    return `Invalid source value: ${result.source}`;
+  }
+  if (typeof result.cached !== "boolean") {
+    return `Invalid cached value: ${result.cached}`;
+  }
+  return null;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const relayUrl = process.env.RELAY_URL || args[0] || "http://localhost:8787";
@@ -28,14 +51,7 @@ async function main() {
   // Test 1: GET /fees should return clamped fee estimates
   console.log("Test 1: Fetch fee estimates...");
   try {
-    const response = await fetch(`${relayUrl}/fees`, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
-
-    const result = await response.json();
+    const { response, result } = await fetchFees(relayUrl);
 
     if (!response.ok) {
       console.error(`  FAIL: HTTP ${response.status}`);
@@ -47,26 +63,15 @@ async function main() {
       console.error(`  Error: ${result.error}`);
       failed++;
     } else {
-      // Validate response shape
-      const { fees, source, cached } = result;
-      if (
-        !fees ||
-        !fees.token_transfer ||
-        !fees.contract_call ||
-        !fees.smart_contract
-      ) {
-        console.error(`  FAIL: Invalid response shape`);
+      const shapeError = validateFeesShape(result);
+      if (shapeError) {
+        console.error(`  FAIL: ${shapeError}`);
         console.error(`  Response:`, result);
         failed++;
-      } else if (!["hiro", "cache", "default"].includes(source)) {
-        console.error(`  FAIL: Invalid source value: ${source}`);
-        failed++;
-      } else if (typeof cached !== "boolean") {
-        console.error(`  FAIL: Invalid cached value: ${cached}`);
-        failed++;
       } else {
+        const fees = result.fees as Record<string, Record<string, number>>;
         console.log(`  PASS`);
-        console.log(`  Source: ${source}, Cached: ${cached}`);
+        console.log(`  Source: ${result.source}, Cached: ${result.cached}`);
         console.log(`  Token Transfer (medium): ${fees.token_transfer.medium_priority} microSTX`);
         console.log(`  Contract Call (medium): ${fees.contract_call.medium_priority} microSTX`);
         console.log(`  Smart Contract (medium): ${fees.smart_contract.medium_priority} microSTX`);
@@ -81,39 +86,21 @@ async function main() {
 
   console.log("");
 
-  // Test 2: Call again to verify cache hit
+  // Test 2: Call again to verify cache behavior
   console.log("Test 2: Verify cache behavior (call again immediately)...");
   try {
-    const response = await fetch(`${relayUrl}/fees`, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-      },
-    });
+    const { response, result } = await fetchFees(relayUrl);
 
-    const result = await response.json();
-
-    if (!response.ok) {
+    if (!response.ok || !result.success) {
       console.error(`  FAIL: HTTP ${response.status}`);
       console.error(`  Error: ${result.error}`);
       failed++;
-    } else if (!result.success) {
-      console.error(`  FAIL: Response indicates failure`);
-      console.error(`  Error: ${result.error}`);
-      failed++;
     } else {
-      const { source, cached } = result;
-      // Second call should hit cache (unless first call failed to cache)
-      if (cached && source === "cache") {
-        console.log(`  PASS - Cache hit as expected`);
-        console.log(`  Source: ${source}, Cached: ${cached}`);
-        passed++;
-      } else {
-        // Not a failure - cache might not be working or KV might be disabled
-        console.log(`  PASS - Cache not hit (KV may be unavailable)`);
-        console.log(`  Source: ${source}, Cached: ${cached}`);
-        passed++;
-      }
+      // Cache hit is expected but not required (KV may be unavailable)
+      const cacheStatus = result.cached ? "Cache hit as expected" : "Cache not hit (KV may be unavailable)";
+      console.log(`  PASS - ${cacheStatus}`);
+      console.log(`  Source: ${result.source}, Cached: ${result.cached}`);
+      passed++;
     }
   } catch (e) {
     console.error(`  FAIL: Network error`);

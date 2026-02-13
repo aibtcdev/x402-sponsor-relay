@@ -2,10 +2,11 @@ import type {
   Env,
   Logger,
   FeeEstimates,
-  HiroMempoolFeesResponse,
   FeeClampConfig,
+  FeeClamp,
   FeeTransactionType,
   FeePriority,
+  FeePriorityTiers,
 } from "../types";
 
 /**
@@ -144,15 +145,12 @@ export class FeeService {
   /**
    * Fetch fee estimates from Hiro API
    */
-  private async fetchFromHiro(): Promise<HiroMempoolFeesResponse | null> {
+  private async fetchFromHiro(): Promise<FeeEstimates | null> {
     const baseUrl = this.getHiroBaseUrl();
     const url = `${baseUrl}/extended/v2/mempool/fees`;
 
     try {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      };
-
+      const headers: Record<string, string> = {};
       if (this.hiroApiKey) {
         headers["X-Hiro-API-Key"] = this.hiroApiKey;
       }
@@ -178,7 +176,7 @@ export class FeeService {
         return null;
       }
 
-      const data = (await response.json()) as HiroMempoolFeesResponse;
+      const data = (await response.json()) as FeeEstimates;
       this.logger.info("Fetched fees from Hiro API", { data });
       return data;
     } catch (e) {
@@ -190,65 +188,38 @@ export class FeeService {
   }
 
   /**
+   * Clamp a single value between floor and ceiling
+   */
+  private clamp(value: number, floor: number, ceiling: number): number {
+    return Math.min(ceiling, Math.max(floor, value));
+  }
+
+  /**
+   * Build uniform priority tiers where all levels share the same value
+   */
+  private uniformTiers(value: number): FeePriorityTiers {
+    return { low_priority: value, medium_priority: value, high_priority: value };
+  }
+
+  /**
+   * Clamp all priority tiers for a single transaction type
+   */
+  private clampTiers(tiers: FeePriorityTiers, bounds: FeeClamp): FeePriorityTiers {
+    return {
+      low_priority: this.clamp(tiers.low_priority, bounds.floor, bounds.ceiling),
+      medium_priority: this.clamp(tiers.medium_priority, bounds.floor, bounds.ceiling),
+      high_priority: this.clamp(tiers.high_priority, bounds.floor, bounds.ceiling),
+    };
+  }
+
+  /**
    * Apply clamps to raw fee estimates
    */
-  private applyClamps(raw: HiroMempoolFeesResponse, config: FeeClampConfig): FeeEstimates {
-    const clampValue = (value: number, floor: number, ceiling: number): number => {
-      return Math.min(ceiling, Math.max(floor, value));
-    };
-
+  private applyClamps(raw: FeeEstimates, config: FeeClampConfig): FeeEstimates {
     return {
-      token_transfer: {
-        low_priority: clampValue(
-          raw.token_transfer.low_priority,
-          config.token_transfer.floor,
-          config.token_transfer.ceiling
-        ),
-        medium_priority: clampValue(
-          raw.token_transfer.medium_priority,
-          config.token_transfer.floor,
-          config.token_transfer.ceiling
-        ),
-        high_priority: clampValue(
-          raw.token_transfer.high_priority,
-          config.token_transfer.floor,
-          config.token_transfer.ceiling
-        ),
-      },
-      contract_call: {
-        low_priority: clampValue(
-          raw.contract_call.low_priority,
-          config.contract_call.floor,
-          config.contract_call.ceiling
-        ),
-        medium_priority: clampValue(
-          raw.contract_call.medium_priority,
-          config.contract_call.floor,
-          config.contract_call.ceiling
-        ),
-        high_priority: clampValue(
-          raw.contract_call.high_priority,
-          config.contract_call.floor,
-          config.contract_call.ceiling
-        ),
-      },
-      smart_contract: {
-        low_priority: clampValue(
-          raw.smart_contract.low_priority,
-          config.smart_contract.floor,
-          config.smart_contract.ceiling
-        ),
-        medium_priority: clampValue(
-          raw.smart_contract.medium_priority,
-          config.smart_contract.floor,
-          config.smart_contract.ceiling
-        ),
-        high_priority: clampValue(
-          raw.smart_contract.high_priority,
-          config.smart_contract.floor,
-          config.smart_contract.ceiling
-        ),
-      },
+      token_transfer: this.clampTiers(raw.token_transfer, config.token_transfer),
+      contract_call: this.clampTiers(raw.contract_call, config.contract_call),
+      smart_contract: this.clampTiers(raw.smart_contract, config.smart_contract),
     };
   }
 
@@ -261,15 +232,8 @@ export class FeeService {
     source: "hiro" | "cache" | "default";
     cached: boolean;
   }> {
-    // Check rate limit status
-    const { limited, retryAfter } = await this.isRateLimited();
-    if (limited) {
-      this.logger.warn("Skipping Hiro fetch due to rate limit", { retryAfter });
-      // Fall through to cache or defaults
-    }
-
-    // Try cache first
-    if (this.kv && !limited) {
+    // Try cache first (always, even when rate limited)
+    if (this.kv) {
       try {
         const cachedJson = await this.kv.get(KV_KEY_ESTIMATES);
         if (cachedJson) {
@@ -285,6 +249,7 @@ export class FeeService {
     }
 
     // Fetch from Hiro if not rate limited
+    const { limited } = await this.isRateLimited();
     if (!limited) {
       const hiroData = await this.fetchFromHiro();
       if (hiroData) {
@@ -313,21 +278,9 @@ export class FeeService {
     this.logger.warn("Using default floor-based fees");
     const config = await this.getClampConfig();
     const defaults: FeeEstimates = {
-      token_transfer: {
-        low_priority: config.token_transfer.floor,
-        medium_priority: config.token_transfer.floor,
-        high_priority: config.token_transfer.floor,
-      },
-      contract_call: {
-        low_priority: config.contract_call.floor,
-        medium_priority: config.contract_call.floor,
-        high_priority: config.contract_call.floor,
-      },
-      smart_contract: {
-        low_priority: config.smart_contract.floor,
-        medium_priority: config.smart_contract.floor,
-        high_priority: config.smart_contract.floor,
-      },
+      token_transfer: this.uniformTiers(config.token_transfer.floor),
+      contract_call: this.uniformTiers(config.contract_call.floor),
+      smart_contract: this.uniformTiers(config.smart_contract.floor),
     };
 
     return { fees: defaults, source: "default", cached: false };

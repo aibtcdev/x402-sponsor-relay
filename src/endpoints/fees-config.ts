@@ -1,6 +1,6 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import { FeeService } from "../services";
-import type { AppContext, FeeClampConfig, FeeClamp } from "../types";
+import type { AppContext, FeeClampConfig, FeeTransactionType } from "../types";
 import {
   Error400Response,
   Error401Response,
@@ -134,18 +134,28 @@ export class FeesConfig extends BaseEndpoint {
     },
   };
 
+  /** Transaction types to validate in order */
+  private static readonly TX_TYPES: FeeTransactionType[] = [
+    "token_transfer",
+    "contract_call",
+    "smart_contract",
+  ];
+
   /**
-   * Validate a single clamp configuration
+   * Validate clamp configuration, returning an error message or null if valid
    */
-  private validateClamp(clamp: FeeClamp, txType: string): string | null {
-    if (typeof clamp.floor !== "number" || clamp.floor <= 0) {
-      return `${txType}.floor must be a positive number`;
-    }
-    if (typeof clamp.ceiling !== "number" || clamp.ceiling <= 0) {
-      return `${txType}.ceiling must be a positive number`;
-    }
-    if (clamp.floor >= clamp.ceiling) {
-      return `${txType}.floor must be less than ceiling`;
+  private validateConfig(config: FeeClampConfig): string | null {
+    for (const txType of FeesConfig.TX_TYPES) {
+      const clamp = config[txType];
+      if (typeof clamp.floor !== "number" || clamp.floor <= 0) {
+        return `${txType}.floor must be a positive number`;
+      }
+      if (typeof clamp.ceiling !== "number" || clamp.ceiling <= 0) {
+        return `${txType}.ceiling must be a positive number`;
+      }
+      if (clamp.floor >= clamp.ceiling) {
+        return `${txType}.floor must be less than ceiling`;
+      }
     }
     return null;
   }
@@ -173,21 +183,16 @@ export class FeesConfig extends BaseEndpoint {
         smart_contract: body.smart_contract || currentConfig.smart_contract,
       };
 
-      // Validate each clamp
-      for (const [txType, clamp] of Object.entries(updatedConfig)) {
-        const error = this.validateClamp(
-          clamp as FeeClamp,
-          txType
-        );
-        if (error) {
-          return this.err(c, {
-            error: "Invalid clamp configuration",
-            code: "INVALID_TRANSACTION",
-            status: 400,
-            details: error,
-            retryable: false,
-          });
-        }
+      // Validate merged config
+      const validationError = this.validateConfig(updatedConfig);
+      if (validationError) {
+        return this.err(c, {
+          error: "Invalid clamp configuration",
+          code: "INVALID_TRANSACTION",
+          status: 400,
+          details: validationError,
+          retryable: false,
+        });
       }
 
       // Store updated config

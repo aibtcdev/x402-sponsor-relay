@@ -340,8 +340,7 @@ export type RelayErrorCode =
   | "MISSING_BTC_ADDRESS"
   | "MISSING_SIGNATURE"
   | "INVALID_MESSAGE_FORMAT"
-  | "FEE_FETCH_FAILED"
-  | "FEE_RATE_LIMITED";
+  | "FEE_FETCH_FAILED";
 
 /**
  * Structured error response with retry guidance
@@ -668,18 +667,10 @@ export interface FeePriorityTiers {
 }
 
 /**
- * Fee estimates for all transaction types
+ * Fee estimates for all transaction types.
+ * Also matches the shape of Hiro API GET /extended/v2/mempool/fees response.
  */
 export interface FeeEstimates {
-  token_transfer: FeePriorityTiers;
-  contract_call: FeePriorityTiers;
-  smart_contract: FeePriorityTiers;
-}
-
-/**
- * Response from Hiro API GET /extended/v2/mempool/fees
- */
-export interface HiroMempoolFeesResponse {
   token_transfer: FeePriorityTiers;
   contract_call: FeePriorityTiers;
   smart_contract: FeePriorityTiers;
