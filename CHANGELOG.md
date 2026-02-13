@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.3.0...v1.4.0) (2026-02-13)
+
+
+### Features
+
+* add fee estimation endpoint with per-type clamps ([#34](https://github.com/aibtcdev/x402-sponsor-relay/issues/34)) ([86f9f52](https://github.com/aibtcdev/x402-sponsor-relay/commit/86f9f52b456360babe8dfa55a6266f395be3db73))
+
 ## [1.3.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.2.0...v1.3.0) (2026-02-12)
 
 
