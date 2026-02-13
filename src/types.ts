@@ -49,6 +49,8 @@ export interface Env {
   SPONSOR_PRIVATE_KEY?: string;
   STACKS_NETWORK: "mainnet" | "testnet";
   FACILITATOR_URL: string;
+  /** Optional Hiro API key for higher rate limits */
+  HIRO_API_KEY?: string;
   // LOGS is a service binding to worker-logs, typed loosely to avoid complex Service<> generics
   LOGS?: unknown;
   // KV namespace for dashboard stats storage
@@ -337,7 +339,9 @@ export type RelayErrorCode =
   | "STALE_TIMESTAMP"
   | "MISSING_BTC_ADDRESS"
   | "MISSING_SIGNATURE"
-  | "INVALID_MESSAGE_FORMAT";
+  | "INVALID_MESSAGE_FORMAT"
+  | "FEE_FETCH_FAILED"
+  | "FEE_RATE_LIMITED";
 
 /**
  * Structured error response with retry guidance
@@ -639,3 +643,73 @@ export type ErrorCategory =
   | "sponsoring"
   | "facilitator"
   | "internal";
+
+// =============================================================================
+// Fee Estimation Types
+// =============================================================================
+
+/**
+ * Transaction types for fee estimation
+ */
+export type FeeTransactionType = "token_transfer" | "contract_call" | "smart_contract";
+
+/**
+ * Priority levels for fee estimation
+ */
+export type FeePriority = "low_priority" | "medium_priority" | "high_priority";
+
+/**
+ * Fee tiers for a single transaction type
+ */
+export interface FeePriorityTiers {
+  low_priority: number;
+  medium_priority: number;
+  high_priority: number;
+}
+
+/**
+ * Fee estimates for all transaction types
+ */
+export interface FeeEstimates {
+  token_transfer: FeePriorityTiers;
+  contract_call: FeePriorityTiers;
+  smart_contract: FeePriorityTiers;
+}
+
+/**
+ * Response from Hiro API GET /extended/v2/mempool/fees
+ */
+export interface HiroMempoolFeesResponse {
+  token_transfer: FeePriorityTiers;
+  contract_call: FeePriorityTiers;
+  smart_contract: FeePriorityTiers;
+}
+
+/**
+ * Floor and ceiling clamps for a transaction type
+ */
+export interface FeeClamp {
+  floor: number;
+  ceiling: number;
+}
+
+/**
+ * Clamp configuration for all transaction types
+ */
+export interface FeeClampConfig {
+  token_transfer: FeeClamp;
+  contract_call: FeeClamp;
+  smart_contract: FeeClamp;
+}
+
+/**
+ * Response from GET /fees endpoint
+ */
+export interface FeesResponse {
+  /** Clamped fee estimates */
+  fees: FeeEstimates;
+  /** Source of the fee data */
+  source: "hiro" | "cache" | "default";
+  /** Whether this data came from cache */
+  cached: boolean;
+}
