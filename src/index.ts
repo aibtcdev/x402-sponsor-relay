@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, Fees } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, Fees, FeesConfig } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
 
@@ -14,11 +14,13 @@ const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 app.use("/*", cors());
 app.use("/*", loggerMiddleware);
 
-// Apply auth middleware to /sponsor endpoint before registering routes
+// Apply auth middleware to /sponsor and /fees/config endpoints before registering routes
 // authMiddleware validates API keys and sets auth context
 // requireAuthMiddleware rejects requests without valid API key (no grace period)
 app.use("/sponsor", authMiddleware);
 app.use("/sponsor", requireAuthMiddleware);
+app.use("/fees/config", authMiddleware);
+app.use("/fees/config", requireAuthMiddleware);
 
 // Initialize Chanfana for OpenAPI documentation
 const openapi = fromHono(app, {
@@ -77,6 +79,7 @@ openapi.get("/verify/:receiptId", Verify as unknown as typeof Verify);
 openapi.post("/access", Access as unknown as typeof Access);
 openapi.post("/keys/provision", Provision as unknown as typeof Provision);
 openapi.get("/fees", Fees as unknown as typeof Fees);
+openapi.post("/fees/config", FeesConfig as unknown as typeof FeesConfig);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
@@ -98,6 +101,7 @@ app.get("/", (c) => {
       access: "POST /access - Access protected resource with receipt",
       provision: "POST /keys/provision - Provision API key via Bitcoin signature",
       fees: "GET /fees - Get clamped fee estimates",
+      feesConfig: "POST /fees/config - Update fee clamps (admin, requires API key)",
       health: "GET /health - Health check with network info",
       stats: "GET /stats - Relay statistics (JSON)",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
