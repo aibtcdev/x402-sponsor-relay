@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, Fees } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
 
@@ -38,6 +38,7 @@ const openapi = fromHono(app, {
       { name: "Verify", description: "Payment receipt verification" },
       { name: "Access", description: "Protected resource access" },
       { name: "Provision", description: "API key provisioning via Bitcoin signature" },
+      { name: "Fees", description: "Fee estimation endpoints" },
       { name: "Dashboard", description: "Public statistics endpoints" },
     ],
     servers: [
@@ -75,6 +76,7 @@ openapi.post("/sponsor", Sponsor as unknown as typeof Sponsor);
 openapi.get("/verify/:receiptId", Verify as unknown as typeof Verify);
 openapi.post("/access", Access as unknown as typeof Access);
 openapi.post("/keys/provision", Provision as unknown as typeof Provision);
+openapi.get("/fees", Fees as unknown as typeof Fees);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
@@ -95,6 +97,7 @@ app.get("/", (c) => {
       verify: "GET /verify/:receiptId - Verify a payment receipt",
       access: "POST /access - Access protected resource with receipt",
       provision: "POST /keys/provision - Provision API key via Bitcoin signature",
+      fees: "GET /fees - Get clamped fee estimates",
       health: "GET /health - Health check with network info",
       stats: "GET /stats - Relay statistics (JSON)",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
