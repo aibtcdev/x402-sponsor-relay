@@ -35,6 +35,10 @@ npm run test:sponsor -- [relay-url]
 npm run test:provision
 npm run test:provision -- [relay-url]
 
+# Test fees endpoint (no auth required)
+npm run test:fees
+npm run test:fees -- [relay-url]
+
 # API key management
 npm run keys -- list                            # List all keys
 npm run keys -- create --app "App" --email "x@y.com"  # Create key
@@ -61,6 +65,8 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `POST /keys/provision` - Provision API key via Bitcoin signature (BIP-137)
 - `GET /verify/:receiptId` - Verify a payment receipt
 - `POST /access` - Access protected resource with receipt token
+- `GET /fees` - Get clamped fee estimates (no auth required)
+- `POST /fees/config` - Update fee clamps (admin, requires API key)
 - `GET /stats` - Relay statistics (JSON API)
 - `GET /dashboard` - Public dashboard (HTML)
 
@@ -215,12 +221,17 @@ Response (error - stale timestamp): {
 - `src/endpoints/verify.ts` - Receipt verification endpoint
 - `src/endpoints/access.ts` - Protected resource access endpoint
 - `src/endpoints/provision.ts` - API key provisioning via BTC signature
+- `src/endpoints/fees.ts` - Fee estimation endpoint (public, no auth)
+- `src/endpoints/fees-config.ts` - Fee clamp configuration endpoint (admin, API key auth)
 - `src/services/receipt.ts` - ReceiptService (store/retrieve/consume receipts in KV)
 - `src/services/btc-verify.ts` - BtcVerifyService (BIP-137 signature verification)
 - `src/services/auth.ts` - AuthService (API key management and provisioning)
+- `src/services/fee.ts` - FeeService (fetch/clamp/cache fee estimates from Hiro API)
+- `src/services/sponsor.ts` - SponsorService (validate/sponsor transactions with clamped fees)
 - `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
 - `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
 - `scripts/test-provision.ts` - Test script for /keys/provision endpoint (BTC sig)
+- `scripts/test-fees.ts` - Test script for /fees endpoint (no auth)
 - `scripts/manage-api-keys.ts` - CLI for API key management
 - `docs/` - State machine diagram and feature roadmap
 
@@ -238,6 +249,7 @@ Response (error - stale timestamp): {
   - `SPONSOR_MNEMONIC` - 24-word mnemonic phrase for sponsor wallet (preferred)
   - `SPONSOR_ACCOUNT_INDEX` - Account index to derive (default: 0, optional)
   - `SPONSOR_PRIVATE_KEY` - Hex private key (fallback, not recommended)
+  - `HIRO_API_KEY` - Optional API key for Hiro fee estimation endpoint (higher rate limits)
 
 ## Deployment
 

@@ -2,6 +2,7 @@ import {
   sponsorTransaction,
   deserializeTransaction,
   AuthType,
+  PayloadType,
   type StacksTransactionWire,
 } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
@@ -9,7 +10,8 @@ import {
   generateNewAccount,
   generateWallet,
 } from "@stacks/wallet-sdk";
-import type { Env, Logger } from "../types";
+import type { Env, Logger, FeeTransactionType } from "../types";
+import { FeeService } from "./fee";
 
 /**
  * Successful transaction validation result
@@ -177,6 +179,27 @@ export class SponsorService {
   }
 
   /**
+   * Map PayloadType to FeeTransactionType for fee estimation
+   */
+  private payloadToFeeType(payloadType: PayloadType): FeeTransactionType {
+    switch (payloadType) {
+      case PayloadType.TokenTransfer:
+        return "token_transfer";
+      case PayloadType.ContractCall:
+        return "contract_call";
+      case PayloadType.SmartContract:
+      case PayloadType.VersionedSmartContract:
+        return "smart_contract";
+      default:
+        // Default to contract_call for unknown payload types
+        this.logger.warn("Unknown payload type, defaulting to contract_call", {
+          payloadType,
+        });
+        return "contract_call";
+    }
+  }
+
+  /**
    * Validate and deserialize a transaction
    */
   validateTransaction(txHex: string): TransactionValidationResult {
@@ -241,11 +264,30 @@ export class SponsorService {
 
     const network = this.getNetwork();
 
+    // Determine fee from FeeService to prevent overpayment
+    let fee: number | undefined;
+    try {
+      const feeService = new FeeService(this.env, this.logger);
+      const feeType = this.payloadToFeeType(transaction.payload.payloadType);
+      fee = await feeService.getFeeForType(feeType, "medium_priority");
+      this.logger.info("Using clamped fee from FeeService", {
+        feeType,
+        fee,
+      });
+    } catch (e) {
+      // On failure, let @stacks/transactions estimate the fee (fallback)
+      this.logger.warn("Failed to get clamped fee, falling back to node estimate", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      fee = undefined;
+    }
+
     try {
       const sponsoredTx = await sponsorTransaction({
         transaction,
         sponsorPrivateKey: sponsorKey,
         network,
+        fee,
       });
 
       // v7: serialize() returns hex string directly
@@ -253,7 +295,7 @@ export class SponsorService {
 
       // Extract fee from the sponsor's spending condition
       // For sponsored transactions, the fee is set by the sponsor
-      let fee = "0";
+      let actualFee = "0";
       if (
         sponsoredTx.auth.authType === AuthType.Sponsored &&
         "sponsorSpendingCondition" in sponsoredTx.auth
@@ -267,16 +309,16 @@ export class SponsorService {
             { rawFee: sponsorFeeStr }
           );
         } else {
-          fee = sponsorFeeStr;
+          actualFee = sponsorFeeStr;
         }
       }
 
-      this.logger.info("Transaction sponsored", { fee });
+      this.logger.info("Transaction sponsored", { fee: actualFee });
 
       return {
         success: true,
         sponsoredTxHex,
-        fee,
+        fee: actualFee,
       };
     } catch (e) {
       this.logger.error("Failed to sponsor transaction", {

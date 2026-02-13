@@ -29,3 +29,5 @@ export type {
   BtcVerifyResult,
   BtcVerifyErrorCode,
 } from "./btc-verify";
+
+export { FeeService } from "./fee";
