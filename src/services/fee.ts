@@ -72,6 +72,24 @@ export class FeeService {
       }
 
       const config = JSON.parse(configJson) as FeeClampConfig;
+
+      // Validate required keys and types before trusting KV data
+      const txTypes: FeeTransactionType[] = ["token_transfer", "contract_call", "smart_contract"];
+      for (const txType of txTypes) {
+        const clamp = config[txType];
+        if (
+          !clamp ||
+          typeof clamp.floor !== "number" ||
+          typeof clamp.ceiling !== "number" ||
+          clamp.floor <= 0 ||
+          clamp.ceiling <= 0 ||
+          clamp.floor >= clamp.ceiling
+        ) {
+          this.logger.warn("Invalid clamp config in KV, using defaults", { txType, clamp });
+          return DEFAULT_CLAMPS;
+        }
+      }
+
       this.logger.debug("Loaded clamp config from KV", { config });
       return config;
     } catch (e) {
@@ -91,6 +109,17 @@ export class FeeService {
     }
 
     await this.kv.put(KV_KEY_CONFIG, JSON.stringify(config));
+
+    // Invalidate cached fee estimates so new clamps take effect immediately
+    try {
+      await this.kv.delete(KV_KEY_ESTIMATES);
+      this.logger.debug("Invalidated cached fee estimates after config update");
+    } catch (e) {
+      this.logger.warn("Failed to invalidate cached fee estimates", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+
     this.logger.info("Updated clamp config in KV", { config });
   }
 
@@ -156,7 +185,10 @@ export class FeeService {
       }
 
       this.logger.debug("Fetching fees from Hiro API", { url });
-      const response = await fetch(url, { headers });
+      const response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(5000),
+      });
 
       if (response.status === 429) {
         const retryAfter = response.headers.get("Retry-After");
@@ -177,7 +209,7 @@ export class FeeService {
       }
 
       const data = (await response.json()) as FeeEstimates;
-      this.logger.info("Fetched fees from Hiro API", { data });
+      this.logger.debug("Fetched fees from Hiro API", { data });
       return data;
     } catch (e) {
       this.logger.error("Error fetching fees from Hiro API", {

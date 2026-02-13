@@ -154,7 +154,7 @@ export class FeesConfig extends BaseEndpoint {
         return `${txType}.ceiling must be a positive number`;
       }
       if (clamp.floor >= clamp.ceiling) {
-        return `${txType}.floor must be less than ceiling`;
+        return `${txType}.floor must be less than ${txType}.ceiling`;
       }
     }
     return null;
@@ -170,17 +170,32 @@ export class FeesConfig extends BaseEndpoint {
       logger.info("Admin updating fee config", { keyId: auth.metadata?.keyId });
 
       // Parse request body
-      const body = (await c.req.json()) as Partial<FeeClampConfig>;
+      const body = (await c.req.json()) as Record<string, unknown>;
+
+      // Reject unknown top-level keys
+      const allowedKeys = new Set<string>(FeesConfig.TX_TYPES);
+      for (const key of Object.keys(body)) {
+        if (!allowedKeys.has(key)) {
+          return this.err(c, {
+            error: "Invalid clamp configuration",
+            code: "INVALID_FEE_CONFIG",
+            status: 400,
+            details: `Unknown transaction type: ${key}`,
+            retryable: false,
+          });
+        }
+      }
 
       // Get current config
       const feeService = new FeeService(c.env, logger);
       const currentConfig = await feeService.getClampConfig();
 
-      // Merge with provided updates (partial update)
+      // Merge with provided updates (per-field merging within each tx type)
+      const typedBody = body as Partial<FeeClampConfig>;
       const updatedConfig: FeeClampConfig = {
-        token_transfer: body.token_transfer || currentConfig.token_transfer,
-        contract_call: body.contract_call || currentConfig.contract_call,
-        smart_contract: body.smart_contract || currentConfig.smart_contract,
+        token_transfer: { ...currentConfig.token_transfer, ...typedBody.token_transfer },
+        contract_call: { ...currentConfig.contract_call, ...typedBody.contract_call },
+        smart_contract: { ...currentConfig.smart_contract, ...typedBody.smart_contract },
       };
 
       // Validate merged config
@@ -188,7 +203,7 @@ export class FeesConfig extends BaseEndpoint {
       if (validationError) {
         return this.err(c, {
           error: "Invalid clamp configuration",
-          code: "INVALID_TRANSACTION",
+          code: "INVALID_FEE_CONFIG",
           status: 400,
           details: validationError,
           retryable: false,

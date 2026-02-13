@@ -340,7 +340,8 @@ export type RelayErrorCode =
   | "MISSING_BTC_ADDRESS"
   | "MISSING_SIGNATURE"
   | "INVALID_MESSAGE_FORMAT"
-  | "FEE_FETCH_FAILED";
+  | "FEE_FETCH_FAILED"
+  | "INVALID_FEE_CONFIG";
 
 /**
  * Structured error response with retry guidance
