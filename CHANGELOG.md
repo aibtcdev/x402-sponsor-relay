@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.4.0...v1.4.1) (2026-02-14)
+
+
+### Bug Fixes
+
+* **version:** sync version.ts with package.json (1.4.0) ([#36](https://github.com/aibtcdev/x402-sponsor-relay/issues/36)) ([de2edf7](https://github.com/aibtcdev/x402-sponsor-relay/commit/de2edf72b0ae13c8549b52a6e2ece2c97589645b))
+
 ## [1.4.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.3.0...v1.4.0) (2026-02-13)
 
 
