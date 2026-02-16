@@ -31,9 +31,17 @@ npm run test:relay -- [relay-url]
 npm run test:sponsor
 npm run test:sponsor -- [relay-url]
 
-# Test provision endpoint (requires .env with AGENT_MNEMONIC or AGENT_PRIVATE_KEY)
+# Test provision endpoint - Bitcoin signature (requires .env with AGENT_MNEMONIC or AGENT_PRIVATE_KEY)
 npm run test:provision
 npm run test:provision -- [relay-url]
+
+# Test provision endpoint - Stacks signature (requires .env with AGENT_MNEMONIC or AGENT_PRIVATE_KEY)
+npm run test:provision-stx
+npm run test:provision-stx -- [relay-url]
+
+# Test SIP-018 structured data auth (requires .env with AGENT_MNEMONIC and TEST_API_KEY)
+npm run test:sip018-auth
+npm run test:sip018-auth -- [relay-url]
 
 # Test fees endpoint (no auth required)
 npm run test:fees
@@ -60,9 +68,10 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /health` - Health check with network info
 - `GET /docs` - Swagger UI API documentation
 - `GET /openapi.json` - OpenAPI specification
-- `POST /relay` - Submit sponsored transaction for settlement (x402 facilitator)
-- `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key)
+- `POST /relay` - Submit sponsored transaction for settlement (x402 facilitator, optional SIP-018 auth)
+- `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key, optional SIP-018 auth)
 - `POST /keys/provision` - Provision API key via Bitcoin signature (BIP-137)
+- `POST /keys/provision-stx` - Provision API key via Stacks signature
 - `GET /verify/:receiptId` - Verify a payment receipt
 - `POST /access` - Access protected resource with receipt token
 - `GET /fees` - Get clamped fee estimates (no auth required)
@@ -82,6 +91,14 @@ Request: {
     expectedSender?: "SP...",
     resource?: "/api/endpoint",
     method?: "GET"
+  },
+  auth?: {
+    signature: "0x1234...",  // RSV signature of SIP-018 structured data
+    message: {
+      action: "relay",
+      nonce: "1708099200000",  // Unix timestamp ms for replay protection
+      expiry: "1708185600000"  // Expiry timestamp (unix ms)
+    }
   }
 }
 
@@ -112,7 +129,15 @@ Response (error): {
 
 // POST /sponsor (requires API key)
 Request: {
-  transaction: "hex-encoded-sponsored-tx"
+  transaction: "hex-encoded-sponsored-tx",
+  auth?: {
+    signature: "0x1234...",  // RSV signature of SIP-018 structured data
+    message: {
+      action: "sponsor",
+      nonce: "1708099200000",  // Unix timestamp ms for replay protection
+      expiry: "1708185600000"  // Expiry timestamp (unix ms)
+    }
+  }
 }
 
 Response (success): {
@@ -210,27 +235,115 @@ Response (error - stale timestamp): {
   code: "STALE_TIMESTAMP",
   retryable: false
 }
+
+// POST /keys/provision-stx (no authentication required)
+Request: {
+  stxAddress: "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7",
+  signature: "0x1234567890abcdef...",  // Hex-encoded RSV signature
+  message: "Bitcoin will be the currency of AIs"  // or with timestamp for self-service
+}
+
+Response (success): {
+  success: true,
+  requestId: "uuid",
+  apiKey: "x402_sk_test_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+  metadata: {
+    keyId: "a1b2c3d4",
+    appName: "stx:SP2J6ZY4",
+    contactEmail: "stx+SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7@x402relay.system",
+    tier: "free",
+    createdAt: "2026-02-16T12:00:00.000Z",
+    expiresAt: "2026-03-18T12:00:00.000Z",  // 30 days
+    active: true,
+    stxAddress: "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7"
+  }
+}
+
+Response (error - duplicate STX address): {
+  success: false,
+  requestId: "uuid",
+  error: "Stacks address already has a provisioned API key",
+  code: "ALREADY_PROVISIONED",
+  retryable: false
+}
+
+Response (error - invalid signature): {
+  success: false,
+  requestId: "uuid",
+  error: "Invalid signature for message",
+  code: "INVALID_STX_SIGNATURE",
+  retryable: false
+}
+
+Response (error - stale timestamp): {
+  success: false,
+  requestId: "uuid",
+  error: "Timestamp must be within 5 minutes. Current age: 7 minutes",
+  code: "EXPIRED_AUTH",
+  retryable: false
+}
 ```
+
+**SIP-018 Authentication:**
+
+The relay supports optional SIP-018 structured data signature verification for enhanced security on `/relay` and `/sponsor` endpoints. This provides:
+- Domain-bound signatures (specific to x402-sponsor-relay)
+- Replay protection via nonce (unix timestamp ms)
+- Time-bound authorization via expiry timestamp
+- Backward compatibility (auth field is optional)
+
+Domain constants:
+- Mainnet: `name="x402-sponsor-relay"`, `version="1"`, `chainId=1`
+- Testnet: `name="x402-sponsor-relay"`, `version="1"`, `chainId=2147483648`
+
+Message schema (ClarityValue tuple):
+```clarity
+{
+  action: (string-ascii 10),     ;; "relay" or "sponsor"
+  nonce: uint,                    ;; Unix timestamp ms for replay protection
+  expiry: uint                    ;; Expiry timestamp (unix ms), must be in future
+}
+```
+
+The signature is created by:
+1. Encoding the domain and message as SIP-018 structured data
+2. Hashing the encoded bytes with SHA-256
+3. Signing the hash with the sender's Stacks private key (RSV format)
+4. Including the signature and message in the `auth` field
+
+If the auth field is provided, the relay verifies:
+- Signature is valid for the recovered Stacks address
+- Action matches the endpoint ("relay" or "sponsor")
+- Nonce is within the last 5 minutes (replay protection)
+- Expiry is in the future (not expired)
+- Domain matches the relay's network
+
+If verification fails, the request is rejected with HTTP 401. If the auth field is omitted, the request proceeds without SIP-018 verification (backward compatible).
 
 **Key Files:**
 - `src/index.ts` - Hono app entry point with Chanfana OpenAPI setup
 - `src/version.ts` - Single source of truth for VERSION constant
-- `src/types.ts` - Centralized type definitions
+- `src/types.ts` - Centralized type definitions (includes SIP-018 domain constants)
 - `src/endpoints/BaseEndpoint.ts` - Base class with ok/okWithTx/err helpers
-- `src/endpoints/relay.ts` - Relay endpoint (sponsor + settle + receipt)
+- `src/endpoints/relay.ts` - Relay endpoint (sponsor + settle + receipt, optional SIP-018 auth)
+- `src/endpoints/sponsor.ts` - Sponsor endpoint (direct broadcast, API key + optional SIP-018 auth)
 - `src/endpoints/verify.ts` - Receipt verification endpoint
 - `src/endpoints/access.ts` - Protected resource access endpoint
-- `src/endpoints/provision.ts` - API key provisioning via BTC signature
+- `src/endpoints/provision.ts` - API key provisioning via BTC signature (BIP-137)
+- `src/endpoints/provision-stx.ts` - API key provisioning via Stacks signature
 - `src/endpoints/fees.ts` - Fee estimation endpoint (public, no auth)
 - `src/endpoints/fees-config.ts` - Fee clamp configuration endpoint (admin, API key auth)
 - `src/services/receipt.ts` - ReceiptService (store/retrieve/consume receipts in KV)
 - `src/services/btc-verify.ts` - BtcVerifyService (BIP-137 signature verification)
+- `src/services/stx-verify.ts` - StxVerifyService (plain message + SIP-018 signature verification)
 - `src/services/auth.ts` - AuthService (API key management and provisioning)
 - `src/services/fee.ts` - FeeService (fetch/clamp/cache fee estimates from Hiro API)
 - `src/services/sponsor.ts` - SponsorService (validate/sponsor transactions with clamped fees)
 - `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
 - `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
 - `scripts/test-provision.ts` - Test script for /keys/provision endpoint (BTC sig)
+- `scripts/test-provision-stx.ts` - Test script for /keys/provision-stx endpoint (STX sig)
+- `scripts/test-sip018-auth.ts` - Test script for SIP-018 auth on /relay and /sponsor
 - `scripts/test-fees.ts` - Test script for /fees endpoint (no auth)
 - `scripts/manage-api-keys.ts` - CLI for API key management
 - `docs/` - State machine diagram and feature roadmap
