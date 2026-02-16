@@ -209,6 +209,46 @@ export interface SettleOptions {
   method?: string;
 }
 
+// =============================================================================
+// SIP-018 Auth Types
+// =============================================================================
+
+/**
+ * SIP-018 structured data signature for optional authentication
+ */
+export interface Sip018Auth {
+  /** RSV signature of the structured data */
+  signature: string;
+  /** Structured data message that was signed */
+  message: {
+    /** Action being performed ("relay" or "sponsor") */
+    action: string;
+    /** Nonce (unix timestamp ms) for replay protection */
+    nonce: string;
+    /** Expiry timestamp (unix ms) for time-bound authorization */
+    expiry: string;
+  };
+}
+
+/**
+ * SIP-018 domain constants for x402-sponsor-relay
+ * Domain binds signatures to this specific application
+ */
+export const SIP018_DOMAIN = {
+  /** Mainnet domain: chain-id u1 */
+  mainnet: {
+    name: "x402-sponsor-relay",
+    version: "1",
+    chainId: 1,
+  },
+  /** Testnet domain: chain-id u2147483648 */
+  testnet: {
+    name: "x402-sponsor-relay",
+    version: "1",
+    chainId: 2147483648,
+  },
+} as const;
+
 /**
  * Request body for /relay endpoint
  */
@@ -217,6 +257,8 @@ export interface RelayRequest {
   transaction: string;
   /** Settlement options for x402 payment verification */
   settle: SettleOptions;
+  /** Optional SIP-018 authentication */
+  auth?: Sip018Auth;
 }
 
 /**
@@ -346,7 +388,9 @@ export type RelayErrorCode =
   | "INVALID_FEE_CONFIG"
   | "INVALID_STX_SIGNATURE"
   | "EXPIRED_AUTH"
-  | "MISSING_STX_ADDRESS";
+  | "MISSING_STX_ADDRESS"
+  | "INVALID_AUTH_SIGNATURE"
+  | "AUTH_EXPIRED";
 
 /**
  * Structured error response with retry guidance
@@ -392,6 +436,8 @@ export interface RelaySuccessResponse extends BaseSuccessResponse {
 export interface SponsorRequest {
   /** Hex-encoded signed sponsored transaction */
   transaction: string;
+  /** Optional SIP-018 authentication */
+  auth?: Sip018Auth;
 }
 
 /**
