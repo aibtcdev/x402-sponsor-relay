@@ -114,6 +114,8 @@ export interface ApiKeyMetadata {
   active: boolean;
   /** Bitcoin address used to provision this key (optional, only for BTC-provisioned keys) */
   btcAddress?: string;
+  /** Stacks address used to provision this key (optional, only for STX-provisioned keys) */
+  stxAddress?: string;
 }
 
 /**
@@ -426,6 +428,18 @@ export interface ProvisionSuccessResponse extends BaseSuccessResponse {
   apiKey: string;
   /** Key metadata */
   metadata: ApiKeyMetadata;
+}
+
+/**
+ * Request body for POST /keys/provision-stx endpoint
+ */
+export interface ProvisionStxRequest {
+  /** Stacks address used to sign the message */
+  stxAddress: string;
+  /** RSV signature of the message */
+  signature: string;
+  /** Message that was signed (for verification) */
+  message: string;
 }
 
 // =============================================================================
