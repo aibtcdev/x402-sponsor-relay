@@ -1,9 +1,10 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, FacilitatorService, StatsService, ReceiptService } from "../services";
+import { SponsorService, FacilitatorService, StatsService, ReceiptService, StxVerifyService } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest } from "../types";
 import {
   Error400Response,
+  Error401Response,
   Error429Response,
   Error500Response,
   Error502Response,
@@ -65,6 +66,38 @@ export class Relay extends BaseEndpoint {
                     method: {
                       type: "string" as const,
                       description: "HTTP method being used (optional)",
+                    },
+                  },
+                },
+                auth: {
+                  type: "object" as const,
+                  description: "Optional SIP-018 structured data signature for authentication",
+                  properties: {
+                    signature: {
+                      type: "string" as const,
+                      description: "RSV signature of the structured data",
+                      example: "0x1234...",
+                    },
+                    message: {
+                      type: "object" as const,
+                      required: ["action", "nonce", "expiry"],
+                      properties: {
+                        action: {
+                          type: "string" as const,
+                          description: "Action being performed (should be 'relay')",
+                          example: "relay",
+                        },
+                        nonce: {
+                          type: "string" as const,
+                          description: "Unix timestamp ms for replay protection",
+                          example: "1708099200000",
+                        },
+                        expiry: {
+                          type: "string" as const,
+                          description: "Expiry timestamp (unix ms) for time-bound authorization",
+                          example: "1708185600000",
+                        },
+                      },
                     },
                   },
                 },
@@ -130,6 +163,7 @@ export class Relay extends BaseEndpoint {
         },
       },
       "400": Error400Response,
+      "401": { ...Error401Response, description: "Authentication failed (invalid or expired SIP-018 signature)" },
       "429": { ...Error429Response, description: "Rate limit exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Facilitator error" },
@@ -167,6 +201,21 @@ export class Relay extends BaseEndpoint {
           status: 400,
           retryable: false,
         });
+      }
+
+      // Optional: Verify SIP-018 auth if provided
+      if (body.auth) {
+        const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
+        const authError = stxVerifyService.verifySip018Auth(body.auth, "relay");
+        if (authError) {
+          await statsService.recordError("validation");
+          return this.err(c, {
+            error: authError.error,
+            code: authError.code,
+            status: 401,
+            retryable: false,
+          });
+        }
       }
 
       // Initialize services

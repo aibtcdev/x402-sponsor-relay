@@ -14,11 +14,15 @@ import type {
 import { TIER_LIMITS } from "../types";
 
 /**
- * Custom error for duplicate BTC address provisioning attempts
+ * Custom error for duplicate address provisioning attempts (BTC or STX)
  */
 export class DuplicateAddressError extends Error {
-  constructor(btcAddress: string) {
-    super(`Bitcoin address "${btcAddress}" already has a provisioned API key`);
+  constructor(
+    public readonly addressType: "btc" | "stx",
+    public readonly address: string
+  ) {
+    const label = addressType === "btc" ? "Bitcoin" : "Stacks";
+    super(`${label} address "${address}" already has a provisioned API key`);
     this.name = "DuplicateAddressError";
   }
 }
@@ -636,19 +640,44 @@ export class AuthService {
    * Provision a new free-tier API key for a Bitcoin address
    * Used by POST /keys/provision after BTC signature verification
    *
-   * @throws Error if BTC address already has a key or if KV not configured
+   * @throws DuplicateAddressError if BTC address already has a key
+   * @throws KVNotConfiguredError if KV not configured
    */
   async provisionKey(
     btcAddress: string
+  ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
+    return this.provisionKeyByAddress("btc", btcAddress);
+  }
+
+  /**
+   * Provision a new free-tier API key for a Stacks address
+   * Used by POST /keys/provision-stx after STX signature verification
+   *
+   * @throws DuplicateAddressError if STX address already has a key
+   * @throws KVNotConfiguredError if KV not configured
+   */
+  async provisionKeyByStx(
+    stxAddress: string
+  ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
+    return this.provisionKeyByAddress("stx", stxAddress);
+  }
+
+  /**
+   * Shared provisioning logic for both BTC and STX addresses
+   */
+  private async provisionKeyByAddress(
+    type: "btc" | "stx",
+    address: string
   ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
     if (!this.kv) {
       throw new KVNotConfiguredError();
     }
 
-    // Check if BTC address already has a key
-    const existingKeyId = await this.kv.get(`btc:${btcAddress}`);
+    // Check if address already has a key
+    const indexKey = `${type}:${address}`;
+    const existingKeyId = await this.kv.get(indexKey);
     if (existingKeyId) {
-      throw new DuplicateAddressError(btcAddress);
+      throw new DuplicateAddressError(type, address);
     }
 
     const { apiKey, keyId, keyHash } = await this.generateKeyPair("test");
@@ -656,21 +685,21 @@ export class AuthService {
 
     const metadata: ApiKeyMetadata = {
       keyId,
-      appName: `btc:${btcAddress.slice(0, 8)}`,
-      contactEmail: `btc+${btcAddress}@x402relay.system`,
+      appName: `${type}:${address.slice(0, 8)}`,
+      contactEmail: `${type}+${address}@x402relay.system`,
       tier: "free",
       createdAt,
       expiresAt,
       active: true,
-      btcAddress,
+      ...(type === "btc" ? { btcAddress: address } : { stxAddress: address }),
     };
 
     await this.storeKeyMetadata(keyHash, metadata, [
-      { key: `btc:${btcAddress}`, value: keyId },
+      { key: indexKey, value: keyId },
     ]);
 
-    this.logger.info("API key provisioned via BTC signature", {
-      btcAddress,
+    this.logger.info(`API key provisioned via ${type.toUpperCase()} signature`, {
+      [type === "btc" ? "btcAddress" : "stxAddress"]: address,
       keyId,
       tier: "free",
     });

@@ -114,6 +114,8 @@ export interface ApiKeyMetadata {
   active: boolean;
   /** Bitcoin address used to provision this key (optional, only for BTC-provisioned keys) */
   btcAddress?: string;
+  /** Stacks address used to provision this key (optional, only for STX-provisioned keys) */
+  stxAddress?: string;
 }
 
 /**
@@ -207,6 +209,46 @@ export interface SettleOptions {
   method?: string;
 }
 
+// =============================================================================
+// SIP-018 Auth Types
+// =============================================================================
+
+/**
+ * SIP-018 structured data signature for optional authentication
+ */
+export interface Sip018Auth {
+  /** RSV signature of the structured data */
+  signature: string;
+  /** Structured data message that was signed */
+  message: {
+    /** Action being performed ("relay" or "sponsor") */
+    action: string;
+    /** Nonce (unix timestamp ms) for replay protection */
+    nonce: string;
+    /** Expiry timestamp (unix ms) for time-bound authorization */
+    expiry: string;
+  };
+}
+
+/**
+ * SIP-018 domain constants for x402-sponsor-relay
+ * Domain binds signatures to this specific application
+ */
+export const SIP018_DOMAIN = {
+  /** Mainnet domain: chain-id u1 */
+  mainnet: {
+    name: "x402-sponsor-relay",
+    version: "1",
+    chainId: 1,
+  },
+  /** Testnet domain: chain-id u2147483648 */
+  testnet: {
+    name: "x402-sponsor-relay",
+    version: "1",
+    chainId: 2147483648,
+  },
+} as const;
+
 /**
  * Request body for /relay endpoint
  */
@@ -215,6 +257,8 @@ export interface RelayRequest {
   transaction: string;
   /** Settlement options for x402 payment verification */
   settle: SettleOptions;
+  /** Optional SIP-018 authentication */
+  auth?: Sip018Auth;
 }
 
 /**
@@ -341,7 +385,11 @@ export type RelayErrorCode =
   | "MISSING_SIGNATURE"
   | "INVALID_MESSAGE_FORMAT"
   | "FEE_FETCH_FAILED"
-  | "INVALID_FEE_CONFIG";
+  | "INVALID_FEE_CONFIG"
+  | "INVALID_STX_SIGNATURE"
+  | "MISSING_STX_ADDRESS"
+  | "INVALID_AUTH_SIGNATURE"
+  | "AUTH_EXPIRED";
 
 /**
  * Structured error response with retry guidance
@@ -387,6 +435,8 @@ export interface RelaySuccessResponse extends BaseSuccessResponse {
 export interface SponsorRequest {
   /** Hex-encoded signed sponsored transaction */
   transaction: string;
+  /** Optional SIP-018 authentication */
+  auth?: Sip018Auth;
 }
 
 /**
@@ -423,6 +473,18 @@ export interface ProvisionSuccessResponse extends BaseSuccessResponse {
   apiKey: string;
   /** Key metadata */
   metadata: ApiKeyMetadata;
+}
+
+/**
+ * Request body for POST /keys/provision-stx endpoint
+ */
+export interface ProvisionStxRequest {
+  /** Stacks address used to sign the message */
+  stxAddress: string;
+  /** RSV signature of the message */
+  signature: string;
+  /** Message that was signed (for verification) */
+  message: string;
 }
 
 // =============================================================================

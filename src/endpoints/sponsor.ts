@@ -1,7 +1,7 @@
 import { broadcastTransaction, deserializeTransaction } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, StatsService, AuthService } from "../services";
+import { SponsorService, StatsService, AuthService, StxVerifyService } from "../services";
 import type { AppContext, SponsorRequest } from "../types";
 import { buildExplorerUrl } from "../utils";
 import {
@@ -40,6 +40,38 @@ export class Sponsor extends BaseEndpoint {
                   type: "string" as const,
                   description: "Hex-encoded signed sponsored transaction",
                   example: "0x00000001...",
+                },
+                auth: {
+                  type: "object" as const,
+                  description: "Optional SIP-018 structured data signature for authentication",
+                  properties: {
+                    signature: {
+                      type: "string" as const,
+                      description: "RSV signature of the structured data",
+                      example: "0x1234...",
+                    },
+                    message: {
+                      type: "object" as const,
+                      required: ["action", "nonce", "expiry"],
+                      properties: {
+                        action: {
+                          type: "string" as const,
+                          description: "Action being performed (should be 'sponsor')",
+                          example: "sponsor",
+                        },
+                        nonce: {
+                          type: "string" as const,
+                          description: "Unix timestamp ms for replay protection",
+                          example: "1708099200000",
+                        },
+                        expiry: {
+                          type: "string" as const,
+                          description: "Expiry timestamp (unix ms) for time-bound authorization",
+                          example: "1708185600000",
+                        },
+                      },
+                    },
+                  },
                 },
               },
             },
@@ -113,6 +145,21 @@ export class Sponsor extends BaseEndpoint {
           status: 400,
           retryable: false,
         });
+      }
+
+      // Optional: Verify SIP-018 auth if provided
+      if (body.auth) {
+        const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
+        const authError = stxVerifyService.verifySip018Auth(body.auth, "sponsor");
+        if (authError) {
+          await statsService.recordError("validation");
+          return this.err(c, {
+            error: authError.error,
+            code: authError.code,
+            status: 401,
+            retryable: false,
+          });
+        }
       }
 
       // Initialize sponsor service
