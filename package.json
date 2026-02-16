@@ -23,6 +23,8 @@
     "wrangler": "^4.58.0"
   },
   "dependencies": {
+    "@stacks/common": "^7.3.1",
+    "@stacks/encryption": "^7.3.1",
     "@stacks/transactions": "^7.3.1",
     "@stacks/wallet-sdk": "^7.2.0",
     "bip32": "^5.0.0",

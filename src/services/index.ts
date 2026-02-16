@@ -30,4 +30,10 @@ export type {
   BtcVerifyErrorCode,
 } from "./btc-verify";
 
+export { StxVerifyService, STX_MESSAGES } from "./stx-verify";
+export type {
+  StxVerifyResult,
+  StxVerifyErrorCode,
+} from "./stx-verify";
+
 export { FeeService } from "./fee";

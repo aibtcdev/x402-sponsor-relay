@@ -341,7 +341,10 @@ export type RelayErrorCode =
   | "MISSING_SIGNATURE"
   | "INVALID_MESSAGE_FORMAT"
   | "FEE_FETCH_FAILED"
-  | "INVALID_FEE_CONFIG";
+  | "INVALID_FEE_CONFIG"
+  | "INVALID_STX_SIGNATURE"
+  | "EXPIRED_AUTH"
+  | "MISSING_STX_ADDRESS";
 
 /**
  * Structured error response with retry guidance
