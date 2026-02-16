@@ -24,6 +24,16 @@ export class DuplicateAddressError extends Error {
 }
 
 /**
+ * Custom error for duplicate STX address provisioning attempts
+ */
+export class DuplicateStxAddressError extends Error {
+  constructor(stxAddress: string) {
+    super(`Stacks address "${stxAddress}" already has a provisioned API key`);
+    this.name = "DuplicateStxAddressError";
+  }
+}
+
+/**
  * Custom error for missing KV configuration
  */
 export class KVNotConfiguredError extends Error {
@@ -671,6 +681,51 @@ export class AuthService {
 
     this.logger.info("API key provisioned via BTC signature", {
       btcAddress,
+      keyId,
+      tier: "free",
+    });
+    return { apiKey, metadata };
+  }
+
+  /**
+   * Provision a new free-tier API key for a Stacks address
+   * Used by POST /keys/provision-stx after STX signature verification
+   *
+   * @throws Error if STX address already has a key or if KV not configured
+   */
+  async provisionKeyByStx(
+    stxAddress: string
+  ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
+    if (!this.kv) {
+      throw new KVNotConfiguredError();
+    }
+
+    // Check if STX address already has a key
+    const existingKeyId = await this.kv.get(`stx:${stxAddress}`);
+    if (existingKeyId) {
+      throw new DuplicateStxAddressError(stxAddress);
+    }
+
+    const { apiKey, keyId, keyHash } = await this.generateKeyPair("test");
+    const { createdAt, expiresAt } = AuthService.createKeyDates();
+
+    const metadata: ApiKeyMetadata = {
+      keyId,
+      appName: `stx:${stxAddress.slice(0, 8)}`,
+      contactEmail: `stx+${stxAddress}@x402relay.system`,
+      tier: "free",
+      createdAt,
+      expiresAt,
+      active: true,
+      stxAddress,
+    };
+
+    await this.storeKeyMetadata(keyHash, metadata, [
+      { key: `stx:${stxAddress}`, value: keyId },
+    ]);
+
+    this.logger.info("API key provisioned via STX signature", {
+      stxAddress,
       keyId,
       tier: "free",
     });
