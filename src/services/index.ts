@@ -16,7 +16,7 @@ export type {
 
 export { StatsService } from "./stats";
 
-export { AuthService, DuplicateAddressError, DuplicateStxAddressError, KVNotConfiguredError } from "./auth";
+export { AuthService, DuplicateAddressError, KVNotConfiguredError } from "./auth";
 export type { RateLimitResult, SpendingCapResult, UsageData } from "./auth";
 
 export { HealthMonitor } from "./health-monitor";
@@ -34,6 +34,7 @@ export { StxVerifyService, STX_MESSAGES } from "./stx-verify";
 export type {
   StxVerifyResult,
   StxVerifyErrorCode,
+  Sip018AuthError,
 } from "./stx-verify";
 
 export { FeeService } from "./fee";

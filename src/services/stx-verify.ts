@@ -2,6 +2,9 @@ import {
   publicKeyFromSignatureRsv,
   getAddressFromPublicKey,
   encodeStructuredDataBytes,
+  tupleCV,
+  uintCV,
+  stringAsciiCV,
   type ClarityValue,
 } from "@stacks/transactions";
 import {
@@ -10,7 +13,8 @@ import {
 } from "@stacks/encryption";
 import { bytesToHex } from "@stacks/common";
 import { sha256 } from "@noble/hashes/sha256";
-import type { Logger } from "../types";
+import type { Logger, Sip018Auth } from "../types";
+import { SIP018_DOMAIN } from "../types";
 
 /**
  * Standard messages for Stacks signature verification
@@ -40,7 +44,7 @@ export type StxVerifyResult =
  */
 export type StxVerifyErrorCode =
   | "INVALID_SIGNATURE"
-  | "EXPIRED_AUTH"
+  | "STALE_TIMESTAMP"
   | "INVALID_MESSAGE_FORMAT"
   | "VERIFICATION_ERROR";
 
@@ -243,7 +247,7 @@ export class StxVerifyService {
       return {
         valid: false,
         error: `Timestamp must be within 5 minutes. Current age: ${ageMinutes} minutes`,
-        code: "EXPIRED_AUTH",
+        code: "STALE_TIMESTAMP",
       };
     }
 
@@ -252,9 +256,86 @@ export class StxVerifyService {
       return {
         valid: false,
         error: "Timestamp cannot be more than 1 minute in the future",
-        code: "EXPIRED_AUTH",
+        code: "STALE_TIMESTAMP",
       };
     }
+
+    return null;
+  }
+
+  /**
+   * Verify a SIP-018 auth payload from a request body.
+   * Validates structure, expiry, nonce, builds domain/message tuples, and verifies signature.
+   * Used by /relay and /sponsor endpoints for optional SIP-018 authentication.
+   *
+   * Returns null if auth is valid, or an error object if validation fails.
+   */
+  verifySip018Auth(auth: Sip018Auth): Sip018AuthError | null {
+    // Validate auth structure
+    if (!auth.signature || !auth.message?.action || !auth.message?.nonce || !auth.message?.expiry) {
+      return {
+        error: "Invalid auth structure: signature, message.action, message.nonce, and message.expiry are required",
+        code: "INVALID_AUTH_SIGNATURE",
+      };
+    }
+
+    // Check expiry
+    const expiry = parseInt(auth.message.expiry, 10);
+    if (isNaN(expiry) || expiry < Date.now()) {
+      return {
+        error: "Auth signature has expired",
+        code: "AUTH_EXPIRED",
+      };
+    }
+
+    // Parse nonce
+    const nonce = parseInt(auth.message.nonce, 10);
+    if (isNaN(nonce)) {
+      return {
+        error: "Invalid nonce: must be a valid unix timestamp",
+        code: "INVALID_AUTH_SIGNATURE",
+      };
+    }
+
+    // Build SIP-018 domain tuple based on network
+    const domain = this.network === "mainnet"
+      ? SIP018_DOMAIN.mainnet
+      : SIP018_DOMAIN.testnet;
+    const domainTuple = tupleCV({
+      name: stringAsciiCV(domain.name),
+      version: stringAsciiCV(domain.version),
+      "chain-id": uintCV(domain.chainId),
+    });
+
+    // Build message tuple from auth payload
+    const messageTuple = tupleCV({
+      action: stringAsciiCV(auth.message.action),
+      nonce: uintCV(nonce),
+      expiry: uintCV(expiry),
+    });
+
+    // Verify SIP-018 signature
+    const verifyResult = this.verifySip018({
+      signature: auth.signature,
+      domain: domainTuple,
+      message: messageTuple,
+    });
+
+    if (!verifyResult.valid) {
+      this.logger.warn("SIP-018 auth verification failed", { error: verifyResult.error });
+      return {
+        error: verifyResult.error,
+        code: "INVALID_AUTH_SIGNATURE",
+      };
+    }
+
+    // Log verified signer for audit trail
+    this.logger.info("SIP-018 auth verified", {
+      signer: verifyResult.stxAddress,
+      action: auth.message.action,
+      nonce: auth.message.nonce,
+      expiry: auth.message.expiry,
+    });
 
     return null;
   }
@@ -266,4 +347,13 @@ export class StxVerifyService {
   static generateSelfServiceMessage(): string {
     return `${STX_MESSAGES.BASE} | ${new Date().toISOString()}`;
   }
+}
+
+/**
+ * Error from SIP-018 auth verification.
+ * Returned by verifySip018Auth when validation fails.
+ */
+export interface Sip018AuthError {
+  error: string;
+  code: "INVALID_AUTH_SIGNATURE" | "AUTH_EXPIRED";
 }

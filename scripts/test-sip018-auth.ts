@@ -28,7 +28,6 @@ import {
   uintCV,
   stringAsciiCV,
   encodeStructuredDataBytes,
-  publicKeyFromSignatureRsv,
 } from "@stacks/transactions";
 import {
   generateNewAccount,

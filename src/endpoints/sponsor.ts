@@ -1,9 +1,8 @@
-import { broadcastTransaction, deserializeTransaction, tupleCV, uintCV, stringAsciiCV } from "@stacks/transactions";
+import { broadcastTransaction, deserializeTransaction } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { BaseEndpoint } from "./BaseEndpoint";
 import { SponsorService, StatsService, AuthService, StxVerifyService } from "../services";
 import type { AppContext, SponsorRequest } from "../types";
-import { SIP018_DOMAIN } from "../types";
 import { buildExplorerUrl } from "../utils";
 import {
   Error400Response,
@@ -150,82 +149,17 @@ export class Sponsor extends BaseEndpoint {
 
       // Optional: Verify SIP-018 auth if provided
       if (body.auth) {
-        // Validate auth structure
-        if (!body.auth.signature || !body.auth.message?.action || !body.auth.message?.nonce || !body.auth.message?.expiry) {
-          await statsService.recordError("validation");
-          return this.err(c, {
-            error: "Invalid auth structure: signature, message.action, message.nonce, and message.expiry are required",
-            code: "INVALID_AUTH_SIGNATURE",
-            status: 401,
-            retryable: false,
-          });
-        }
-
-        // Check expiry
-        const expiry = parseInt(body.auth.message.expiry, 10);
-        if (isNaN(expiry) || expiry < Date.now()) {
-          await statsService.recordError("validation");
-          return this.err(c, {
-            error: "Auth signature has expired",
-            code: "AUTH_EXPIRED",
-            status: 401,
-            retryable: false,
-          });
-        }
-
-        // Build SIP-018 domain tuple based on network
-        const domain = c.env.STACKS_NETWORK === "mainnet"
-          ? SIP018_DOMAIN.mainnet
-          : SIP018_DOMAIN.testnet;
-        const domainTuple = tupleCV({
-          name: stringAsciiCV(domain.name),
-          version: stringAsciiCV(domain.version),
-          "chain-id": uintCV(domain.chainId),
-        });
-
-        // Build message tuple from auth payload
-        const nonce = parseInt(body.auth.message.nonce, 10);
-        if (isNaN(nonce)) {
-          await statsService.recordError("validation");
-          return this.err(c, {
-            error: "Invalid nonce: must be a valid unix timestamp",
-            code: "INVALID_AUTH_SIGNATURE",
-            status: 401,
-            retryable: false,
-          });
-        }
-        const messageTuple = tupleCV({
-          action: stringAsciiCV(body.auth.message.action),
-          nonce: uintCV(nonce),
-          expiry: uintCV(expiry),
-        });
-
-        // Verify SIP-018 signature
         const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
-        const verifyResult = stxVerifyService.verifySip018({
-          signature: body.auth.signature,
-          domain: domainTuple,
-          message: messageTuple,
-        });
-
-        if (!verifyResult.valid) {
+        const authError = stxVerifyService.verifySip018Auth(body.auth);
+        if (authError) {
           await statsService.recordError("validation");
-          logger.warn("SIP-018 auth verification failed", { error: verifyResult.error });
           return this.err(c, {
-            error: verifyResult.error,
-            code: "INVALID_AUTH_SIGNATURE",
+            error: authError.error,
+            code: authError.code,
             status: 401,
             retryable: false,
           });
         }
-
-        // Log verified signer for audit trail
-        logger.info("SIP-018 auth verified", {
-          signer: verifyResult.stxAddress,
-          action: body.auth.message.action,
-          nonce: body.auth.message.nonce,
-          expiry: body.auth.message.expiry,
-        });
       }
 
       // Initialize sponsor service

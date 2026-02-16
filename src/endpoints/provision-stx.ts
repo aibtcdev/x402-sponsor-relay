@@ -1,5 +1,5 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { AuthService, DuplicateStxAddressError, KVNotConfiguredError, StxVerifyService } from "../services";
+import { AuthService, DuplicateAddressError, KVNotConfiguredError, StxVerifyService } from "../services";
 import type { AppContext, ApiKeyMetadata, ProvisionStxRequest, RelayErrorCode } from "../types";
 import {
   Error400Response,
@@ -150,8 +150,7 @@ export class ProvisionStx extends BaseEndpoint {
       }
 
       // Verify STX signature
-      const network = c.env.STACKS_NETWORK;
-      const stxVerifyService = new StxVerifyService(logger, network);
+      const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
       const verifyResult = stxVerifyService.verifyProvisionMessage(
         body.signature,
         body.message
@@ -164,7 +163,6 @@ export class ProvisionStx extends BaseEndpoint {
           error: verifyResult.error,
         });
 
-        // Map VERIFICATION_ERROR (internal) to INTERNAL_ERROR; others pass through directly
         if (verifyResult.code === "VERIFICATION_ERROR") {
           return this.err(c, {
             error: verifyResult.error,
@@ -174,17 +172,27 @@ export class ProvisionStx extends BaseEndpoint {
           });
         }
 
-        // Map StxVerifyErrorCode to RelayErrorCode
-        let errorCode: RelayErrorCode;
-        if (verifyResult.code === "INVALID_SIGNATURE") {
-          errorCode = "INVALID_STX_SIGNATURE";
-        } else {
-          errorCode = verifyResult.code satisfies RelayErrorCode;
-        }
+        const errorCode: RelayErrorCode = verifyResult.code === "INVALID_SIGNATURE"
+          ? "INVALID_STX_SIGNATURE"
+          : verifyResult.code;
 
         return this.err(c, {
           error: verifyResult.error,
           code: errorCode,
+          status: 400,
+          retryable: false,
+        });
+      }
+
+      // Verify the recovered address matches the claimed address
+      if (verifyResult.stxAddress !== body.stxAddress) {
+        logger.warn("STX address mismatch", {
+          claimed: body.stxAddress,
+          recovered: verifyResult.stxAddress,
+        });
+        return this.err(c, {
+          error: `Signature was signed by ${verifyResult.stxAddress}, not ${body.stxAddress}`,
+          code: "INVALID_STX_SIGNATURE",
           status: 400,
           retryable: false,
         });
@@ -206,7 +214,7 @@ export class ProvisionStx extends BaseEndpoint {
         apiKey = result.apiKey;
         metadata = result.metadata;
       } catch (e) {
-        if (e instanceof DuplicateStxAddressError) {
+        if (e instanceof DuplicateAddressError) {
           logger.warn("STX address already provisioned", { stxAddress: body.stxAddress });
           return this.err(c, {
             error: "Stacks address already has a provisioned API key",
