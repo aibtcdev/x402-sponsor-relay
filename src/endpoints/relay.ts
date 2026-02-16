@@ -206,7 +206,7 @@ export class Relay extends BaseEndpoint {
       // Optional: Verify SIP-018 auth if provided
       if (body.auth) {
         const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
-        const authError = stxVerifyService.verifySip018Auth(body.auth);
+        const authError = stxVerifyService.verifySip018Auth(body.auth, "relay");
         if (authError) {
           await statsService.recordError("validation");
           return this.err(c, {

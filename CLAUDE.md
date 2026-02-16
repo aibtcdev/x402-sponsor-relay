@@ -279,7 +279,7 @@ Response (error - stale timestamp): {
   success: false,
   requestId: "uuid",
   error: "Timestamp must be within 5 minutes. Current age: 7 minutes",
-  code: "EXPIRED_AUTH",
+  code: "STALE_TIMESTAMP",
   retryable: false
 }
 ```
@@ -313,8 +313,8 @@ The signature is created by:
 
 If the auth field is provided, the relay verifies:
 - Signature is valid for the recovered Stacks address
-- Action matches the endpoint ("relay" or "sponsor")
-- Nonce is within the last 5 minutes (replay protection)
+- Action matches the endpoint ("relay" or "sponsor") — prevents cross-endpoint replay
+- Nonce is a valid integer (used as unique identifier in the signed tuple)
 - Expiry is in the future (not expired)
 - Domain matches the relay's network
 

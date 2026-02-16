@@ -270,11 +270,19 @@ export class StxVerifyService {
    *
    * Returns null if auth is valid, or an error object if validation fails.
    */
-  verifySip018Auth(auth: Sip018Auth): Sip018AuthError | null {
+  verifySip018Auth(auth: Sip018Auth, expectedAction: "relay" | "sponsor"): Sip018AuthError | null {
     // Validate auth structure
     if (!auth.signature || !auth.message?.action || !auth.message?.nonce || !auth.message?.expiry) {
       return {
         error: "Invalid auth structure: signature, message.action, message.nonce, and message.expiry are required",
+        code: "INVALID_AUTH_SIGNATURE",
+      };
+    }
+
+    // Validate action matches the endpoint
+    if (auth.message.action !== expectedAction) {
+      return {
+        error: `Invalid auth action: expected "${expectedAction}", got "${auth.message.action}"`,
         code: "INVALID_AUTH_SIGNATURE",
       };
     }
