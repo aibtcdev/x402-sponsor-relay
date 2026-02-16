@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.4.1...v1.5.0) (2026-02-16)
+
+
+### Features
+
+* add SIP-018 signature verification for agent authentication ([#38](https://github.com/aibtcdev/x402-sponsor-relay/issues/38)) ([e3aaf44](https://github.com/aibtcdev/x402-sponsor-relay/commit/e3aaf44334d29af1676637fdba5671ad5ed56e11))
+
 ## [1.4.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.4.0...v1.4.1) (2026-02-14)
 
 
