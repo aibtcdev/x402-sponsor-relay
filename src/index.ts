@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, Fees, FeesConfig } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { VERSION } from "./version";
 
@@ -78,6 +78,7 @@ openapi.post("/sponsor", Sponsor as unknown as typeof Sponsor);
 openapi.get("/verify/:receiptId", Verify as unknown as typeof Verify);
 openapi.post("/access", Access as unknown as typeof Access);
 openapi.post("/keys/provision", Provision as unknown as typeof Provision);
+openapi.post("/keys/provision-stx", ProvisionStx as unknown as typeof ProvisionStx);
 openapi.get("/fees", Fees as unknown as typeof Fees);
 openapi.post("/fees/config", FeesConfig as unknown as typeof FeesConfig);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
@@ -100,6 +101,7 @@ app.get("/", (c) => {
       verify: "GET /verify/:receiptId - Verify a payment receipt",
       access: "POST /access - Access protected resource with receipt",
       provision: "POST /keys/provision - Provision API key via Bitcoin signature",
+      provisionStx: "POST /keys/provision-stx - Provision API key via Stacks signature",
       fees: "GET /fees - Get clamped fee estimates",
       feesConfig: "POST /fees/config - Update fee clamps (admin, requires API key)",
       health: "GET /health - Health check with network info",
