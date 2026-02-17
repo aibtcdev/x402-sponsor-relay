@@ -9,8 +9,8 @@ import type { Env, AppVariables } from "../types";
  * Routes:
  *   GET /llms.txt              — Quick-start guide
  *   GET /llms-full.txt         — Full reference documentation
- *   GET /docs                  — Topic index (JSON)
- *   GET /docs/:topic           — Topic sub-docs (plaintext)
+ *   GET /topics                — Topic index (JSON)
+ *   GET /topics/:topic         — Topic sub-docs (plaintext)
  *   GET /.well-known/agent.json — A2A agent card (JSON)
  */
 const discovery = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -134,7 +134,7 @@ Success response:
 - GET  /dashboard           — Public dashboard (HTML)
 
 Full reference: https://x402-relay.aibtc.com/llms-full.txt
-Topic docs:     https://x402-relay.aibtc.com/docs
+Topic docs:     https://x402-relay.aibtc.com/topics
 `;
 
   return new Response(content, {
@@ -163,10 +163,10 @@ Quick-start guide: https://x402-relay.aibtc.com/llms.txt
 ## Topic Sub-Docs
 
 For focused deep-dives:
-- https://x402-relay.aibtc.com/docs/sponsored-transactions
-- https://x402-relay.aibtc.com/docs/api-keys
-- https://x402-relay.aibtc.com/docs/authentication
-- https://x402-relay.aibtc.com/docs/errors
+- https://x402-relay.aibtc.com/topics/sponsored-transactions
+- https://x402-relay.aibtc.com/topics/api-keys
+- https://x402-relay.aibtc.com/topics/authentication
+- https://x402-relay.aibtc.com/topics/errors
 
 ---
 
@@ -535,7 +535,7 @@ When included, the auth field provides:
 - Time-bound authorization via expiry
 
 For complete SIP-018 details:
-https://x402-relay.aibtc.com/docs/authentication
+https://x402-relay.aibtc.com/topics/authentication
 
 ---
 
@@ -550,7 +550,7 @@ Receipts track accessCount. A receipt can be used multiple times unless consumed
 by a one-time-use access grant.
 
 For complete receipt and access flow:
-https://x402-relay.aibtc.com/docs/sponsored-transactions
+https://x402-relay.aibtc.com/topics/sponsored-transactions
 
 ---
 
@@ -569,7 +569,7 @@ All errors follow this format:
 }
 
 For the complete error code reference:
-https://x402-relay.aibtc.com/docs/errors
+https://x402-relay.aibtc.com/topics/errors
 
 ---
 
@@ -604,34 +604,33 @@ When rate-limited, the response includes:
 });
 
 // ---------------------------------------------------------------------------
-// /docs — Topic index (JSON)
+// /topics — Topic index (JSON)
 // ---------------------------------------------------------------------------
-discovery.get("/docs", (c) => {
-  // Chanfana Swagger UI is at /api-docs to keep /docs free for AX discovery.
+discovery.get("/topics", (c) => {
   const topics = [
     {
       topic: "sponsored-transactions",
       description:
         "Full relay flow: agent builds sponsored tx, relay sponsors it, facilitator settles, receipt issued. Includes receipt verification and access gating.",
-      url: "https://x402-relay.aibtc.com/docs/sponsored-transactions",
+      url: "https://x402-relay.aibtc.com/topics/sponsored-transactions",
     },
     {
       topic: "api-keys",
       description:
         "API key provisioning via BTC signature (BIP-137) or STX signature (RSV hex). Key tiers, expiry, and management.",
-      url: "https://x402-relay.aibtc.com/docs/api-keys",
+      url: "https://x402-relay.aibtc.com/topics/api-keys",
     },
     {
       topic: "authentication",
       description:
         "SIP-018 structured data authentication for /relay and /sponsor. Domain constants, message schema, signature creation.",
-      url: "https://x402-relay.aibtc.com/docs/authentication",
+      url: "https://x402-relay.aibtc.com/topics/authentication",
     },
     {
       topic: "errors",
       description:
         "Complete error code reference with descriptions, HTTP status codes, and retry behavior.",
-      url: "https://x402-relay.aibtc.com/docs/errors",
+      url: "https://x402-relay.aibtc.com/topics/errors",
     },
   ];
 
@@ -651,9 +650,9 @@ discovery.get("/docs", (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// /docs/:topic — Topic sub-docs (plaintext)
+// /topics/:topic — Topic sub-docs (plaintext)
 // ---------------------------------------------------------------------------
-discovery.get("/docs/:topic", (c) => {
+discovery.get("/topics/:topic", (c) => {
   const topic = c.req.param("topic");
 
   const topicDocs: Record<string, string> = {
@@ -722,7 +721,7 @@ Success (200):
   "receiptId": "uuid"          // save this for later verification
 }
 
-Error (4xx/5xx): See https://x402-relay.aibtc.com/docs/errors
+Error (4xx/5xx): See https://x402-relay.aibtc.com/topics/errors
 
 ### Step 4: Verify the Receipt
 
@@ -1185,11 +1184,11 @@ discovery.get("/.well-known/agent.json", (c) => {
       fullReference: "https://x402-relay.aibtc.com/llms-full.txt",
       openApiSpec: "https://x402-relay.aibtc.com/openapi.json",
       topicDocs: {
-        index: "https://x402-relay.aibtc.com/docs",
-        sponsoredTransactions: "https://x402-relay.aibtc.com/docs/sponsored-transactions",
-        apiKeys: "https://x402-relay.aibtc.com/docs/api-keys",
-        authentication: "https://x402-relay.aibtc.com/docs/authentication",
-        errors: "https://x402-relay.aibtc.com/docs/errors",
+        index: "https://x402-relay.aibtc.com/topics",
+        sponsoredTransactions: "https://x402-relay.aibtc.com/topics/sponsored-transactions",
+        apiKeys: "https://x402-relay.aibtc.com/topics/api-keys",
+        authentication: "https://x402-relay.aibtc.com/topics/authentication",
+        errors: "https://x402-relay.aibtc.com/topics/errors",
       },
       relatedPlatform: "https://aibtc.com/llms.txt",
     },
