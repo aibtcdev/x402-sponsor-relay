@@ -1,6 +1,7 @@
 import {
   sponsorTransaction,
   deserializeTransaction,
+  getAddressFromPrivateKey,
   AuthType,
   PayloadType,
   type StacksTransactionWire,
@@ -71,6 +72,10 @@ let cachedAccountIndex: number | null = null;
 // Validation constants
 const MAX_ACCOUNT_INDEX = 1000;
 const VALID_MNEMONIC_LENGTHS = [12, 24];
+
+// Nonce fetch retry configuration
+const NONCE_FETCH_MAX_ATTEMPTS = 3;
+const NONCE_FETCH_BASE_DELAY_MS = 500;
 
 /**
  * Service for validating and sponsoring Stacks transactions
@@ -200,6 +205,83 @@ export class SponsorService {
   }
 
   /**
+   * Fetch the sponsor account nonce from Hiro API with retry-with-backoff.
+   * Retries on 429 (rate limit) and network errors up to NONCE_FETCH_MAX_ATTEMPTS.
+   * Uses HIRO_API_KEY if configured for higher rate limits.
+   * Returns the nonce as a bigint, or null if all attempts fail.
+   */
+  private async fetchNonceWithRetry(sponsorAddress: string): Promise<bigint | null> {
+    const baseUrl = this.env.STACKS_NETWORK === "mainnet"
+      ? "https://api.hiro.so"
+      : "https://api.testnet.hiro.so";
+    const url = `${baseUrl}/v2/accounts/${sponsorAddress}?proof=0`;
+
+    const headers: Record<string, string> = {};
+    if (this.env.HIRO_API_KEY) {
+      headers["x-hiro-api-key"] = this.env.HIRO_API_KEY;
+    }
+
+    for (let attempt = 1; attempt <= NONCE_FETCH_MAX_ATTEMPTS; attempt++) {
+      try {
+        const response = await fetch(url, {
+          headers,
+          signal: AbortSignal.timeout(5000),
+        });
+
+        if (response.status === 429) {
+          const retryAfter = response.headers.get("Retry-After");
+          const delayMs = retryAfter
+            ? parseInt(retryAfter, 10) * 1000
+            : NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+          this.logger.warn("Hiro API rate limited on nonce fetch, retrying", {
+            attempt,
+            delayMs,
+          });
+          if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
+          continue;
+        }
+
+        if (!response.ok) {
+          this.logger.warn("Hiro API error on nonce fetch", {
+            attempt,
+            status: response.status,
+          });
+          if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
+            const delayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          }
+          continue;
+        }
+
+        const data = (await response.json()) as { nonce?: number };
+        if (typeof data?.nonce !== "number") {
+          this.logger.warn("Hiro API nonce response missing nonce field", { attempt });
+          return null;
+        }
+
+        this.logger.debug("Fetched sponsor nonce", { nonce: data.nonce, attempt });
+        return BigInt(data.nonce);
+      } catch (e) {
+        this.logger.warn("Error fetching nonce from Hiro API", {
+          attempt,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
+          const delayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+
+    this.logger.error("Failed to fetch sponsor nonce after all retries", {
+      attempts: NONCE_FETCH_MAX_ATTEMPTS,
+    });
+    return null;
+  }
+
+  /**
    * Validate and deserialize a transaction
    */
   validateTransaction(txHex: string): TransactionValidationResult {
@@ -282,12 +364,33 @@ export class SponsorService {
       fee = undefined;
     }
 
+    // Pre-fetch the sponsor nonce with retry-with-backoff to avoid hitting Hiro
+    // API rate limits from the internal fetchNonce() call inside sponsorTransaction().
+    // Passing sponsorNonce explicitly skips the internal nonce fetch entirely.
+    let sponsorNonce: bigint | undefined;
+    try {
+      const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
+      const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
+      if (fetchedNonce !== null) {
+        sponsorNonce = fetchedNonce;
+        this.logger.debug("Using pre-fetched sponsor nonce", { sponsorNonce: sponsorNonce.toString() });
+      } else {
+        // Fall back to letting @stacks/transactions fetch the nonce internally
+        this.logger.warn("Nonce pre-fetch failed, falling back to internal nonce fetch");
+      }
+    } catch (e) {
+      this.logger.warn("Error during nonce pre-fetch, falling back to internal nonce fetch", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+
     try {
       const sponsoredTx = await sponsorTransaction({
         transaction,
         sponsorPrivateKey: sponsorKey,
         network,
         fee,
+        ...(sponsorNonce !== undefined ? { sponsorNonce } : {}),
       });
 
       // v7: serialize() returns hex string directly
