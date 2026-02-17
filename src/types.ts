@@ -361,7 +361,6 @@ export type RelayErrorCode =
   | "SPONSOR_CONFIG_ERROR"
   | "SPONSOR_FAILED"
   | "BROADCAST_FAILED"
-  | "SETTLEMENT_FAILED"
   | "SETTLEMENT_VERIFICATION_FAILED"
   | "SETTLEMENT_BROADCAST_FAILED"
   | "NOT_FOUND"
@@ -767,15 +766,13 @@ export interface FeesResponse {
   cached: boolean;
 }
 
-// =============================================================================
 // Native Settlement Types
-// =============================================================================
 
 /**
  * Extracted payment verification data from a transaction
  */
 export interface SettlementVerification {
-  /** Sender address extracted from the transaction */
+  /** Sender hash160 hex extracted from the transaction (for traceability) */
   sender: string;
   /** Recipient address extracted from the transaction */
   recipient: string;
@@ -783,6 +780,8 @@ export interface SettlementVerification {
   amount: string;
   /** Token type detected from the transaction */
   tokenType: TokenType;
+  /** The deserialized transaction (avoids re-deserialization for broadcast) */
+  transaction: import("@stacks/transactions").StacksTransactionWire;
 }
 
 /**

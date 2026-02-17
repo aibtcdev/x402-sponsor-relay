@@ -320,7 +320,7 @@ export class Relay extends BaseEndpoint {
 
       // Step C — Broadcast and poll for confirmation (up to 60s)
       const broadcastResult = await settlementService.broadcastAndConfirm(
-        sponsorResult.sponsoredTxHex
+        verifyResult.data.transaction
       );
       if ("error" in broadcastResult) {
         await statsService.recordError("internal");

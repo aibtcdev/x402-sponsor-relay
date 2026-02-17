@@ -5,6 +5,7 @@ import {
   ClarityType,
   addressToString,
   type ClarityValue,
+  type StacksTransactionWire,
   type AddressWire,
   type LengthPrefixedStringWire,
 } from "@stacks/transactions";
@@ -19,50 +20,28 @@ import type {
   BroadcastAndConfirmResult,
 } from "../types";
 
-// =============================================================================
 // Known SIP-010 token contract addresses
-// =============================================================================
-
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
 const SBTC_CONTRACT_TESTNET = "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4";
 const SBTC_CONTRACT_NAME = "sbtc-token";
 const SIP010_TRANSFER_FUNCTION = "transfer";
 
-// =============================================================================
 // Polling configuration
-// =============================================================================
-
-/** Maximum time to poll for transaction confirmation (ms) */
 const MAX_POLL_TIME_MS = 60_000;
-/** Initial delay before first poll (ms) */
 const INITIAL_POLL_DELAY_MS = 2_000;
-/** Exponential backoff multiplier */
 const POLL_BACKOFF_FACTOR = 1.5;
-/** Maximum delay between polls (ms) */
 const MAX_POLL_DELAY_MS = 8_000;
 
-// =============================================================================
-// KV configuration
-// =============================================================================
-
-/** TTL for dedup entries in KV (seconds) */
-const DEDUP_TTL_SECONDS = 300; // 5 minutes
-/** KV key prefix for dedup entries */
+// KV dedup configuration
+const DEDUP_TTL_SECONDS = 300;
 const DEDUP_KEY_PREFIX = "dedup:";
 
-// =============================================================================
-// Hiro API response types
-// =============================================================================
-
+/** Shape of Hiro GET /extended/v1/tx/{txid} response (subset) */
 interface HiroTxResponse {
   tx_status?: string;
   block_height?: number;
   tx_id?: string;
 }
-
-// =============================================================================
-// SettlementService
-// =============================================================================
 
 /**
  * Native settlement service that replaces the external facilitator.
@@ -112,15 +91,21 @@ export class SettlementService {
   }
 
   /**
-   * Compute SHA-256 hash of the transaction hex string.
-   * Used as the dedup key in KV storage.
+   * Strip 0x prefix and deserialize a transaction hex string
+   */
+  private deserializeTx(txHex: string): StacksTransactionWire {
+    const cleanHex = txHex.startsWith("0x") ? txHex.slice(2) : txHex;
+    return deserializeTransaction(cleanHex);
+  }
+
+  /**
+   * Compute SHA-256 hash of the transaction hex string for dedup keys
    */
   private async computeTxHash(txHex: string): Promise<string> {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(txHex);
+    const data = new TextEncoder().encode(txHex);
     const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+    const bytes = new Uint8Array(hashBuffer);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
   }
 
   /**
@@ -142,8 +127,7 @@ export class SettlementService {
   }
 
   /**
-   * Validate settle options — same logic as FacilitatorService.validateSettleOptions.
-   * Moved here so SettlementService is self-contained.
+   * Validate settle options (expectedRecipient, minAmount, tokenType)
    */
   validateSettleOptions(settle: SettleOptions):
     | { valid: true }
@@ -189,21 +173,16 @@ export class SettlementService {
    * Validates:
    * - recipient matches settle.expectedRecipient (case-insensitive)
    * - amount >= settle.minAmount
-   * - sender matches settle.expectedSender if provided (case-insensitive)
+   *
+   * On success, returns the deserialized transaction for reuse by broadcastAndConfirm.
    */
   verifyPaymentParams(
     sponsoredTxHex: string,
     settle: SettleOptions
   ): SettlementVerifyResult {
-    // Strip 0x prefix if present (same pattern as SponsorService)
-    const cleanHex = sponsoredTxHex.startsWith("0x")
-      ? sponsoredTxHex.slice(2)
-      : sponsoredTxHex;
-
-    // Deserialize the transaction
-    let transaction;
+    let transaction: StacksTransactionWire;
     try {
-      transaction = deserializeTransaction(cleanHex);
+      transaction = this.deserializeTx(sponsoredTxHex);
     } catch (e) {
       this.logger.warn("Failed to deserialize transaction for payment verification", {
         error: e instanceof Error ? e.message : String(e),
@@ -215,17 +194,9 @@ export class SettlementService {
       };
     }
 
-    // Extract sender from the spending condition signer field
-    // Same pattern as SponsorService.validateTransaction
-    const senderHex = Buffer.from(
-      transaction.auth.spendingCondition.signer
-    ).toString("hex");
-    // The signer is a hash160 of the public key, not the address directly.
-    // For verification purposes we use it as an opaque identifier.
-    // The actual sender address comparison uses settle.expectedSender which
-    // should be the human-readable Stacks address (SP.../ST...).
-    // We'll extract the actual sender address from the auth condition below.
-    const sender = senderHex;
+    // The signer field is a hash160 hex string (40 chars) — not a human-readable
+    // Stacks address. Included in the result for traceability only.
+    const sender = transaction.auth.spendingCondition.signer;
 
     let recipient: string;
     let amount: string;
@@ -311,7 +282,7 @@ export class SettlementService {
           details: `Expected uint, got ${amountCV.type}`,
         };
       }
-      amount = (amountCV.value as bigint).toString();
+      amount = String(amountCV.value);
 
       // args[2] = to/recipient (principal)
       const recipientCV = args[2];
@@ -373,21 +344,9 @@ export class SettlementService {
       };
     }
 
-    // Validate sender if expectedSender is specified
-    // Note: sender from auth.spendingCondition.signer is a hex hash160 of the
-    // signing key — it is NOT the full Stacks address. For sender validation,
-    // we rely on the transaction signature being valid (validated upstream by
-    // SponsorService.validateTransaction). We document this limitation.
-    if (settle.expectedSender) {
-      // The signer field is a hash160 (20 bytes) — not directly comparable to
-      // a Stacks address SP.../ST... without c32check decoding. We skip
-      // direct comparison here; sender validation via signature is enforced
-      // upstream. Log for visibility.
-      this.logger.debug("expectedSender provided; sender validation via transaction signature", {
-        expectedSender: settle.expectedSender,
-        signerHex: sender,
-      });
-    }
+    // Note: expectedSender validation is handled upstream by SponsorService
+    // via transaction signature verification. The signer hash160 cannot be
+    // directly compared to a Stacks address without c32check decoding.
 
     this.logger.debug("Payment verification succeeded", {
       recipient,
@@ -402,12 +361,13 @@ export class SettlementService {
         recipient,
         amount,
         tokenType,
+        transaction,
       },
     };
   }
 
   /**
-   * Broadcast the transaction to the Stacks node and poll for confirmation.
+   * Broadcast a pre-deserialized transaction and poll for confirmation.
    *
    * Polls Hiro API GET /extended/v1/tx/{txid} with exponential backoff:
    * - Initial delay: 2s, backoff factor: 1.5x, max delay: 8s, max time: 60s
@@ -418,23 +378,8 @@ export class SettlementService {
    * - { error, details } on broadcast failure or transaction abort/drop
    */
   async broadcastAndConfirm(
-    sponsoredTxHex: string
+    transaction: StacksTransactionWire
   ): Promise<BroadcastAndConfirmResult> {
-    const cleanHex = sponsoredTxHex.startsWith("0x")
-      ? sponsoredTxHex.slice(2)
-      : sponsoredTxHex;
-
-    // Deserialize for broadcastTransaction
-    let transaction;
-    try {
-      transaction = deserializeTransaction(cleanHex);
-    } catch (e) {
-      return {
-        error: "Failed to deserialize transaction for broadcast",
-        details: e instanceof Error ? e.message : String(e),
-      };
-    }
-
     // Broadcast to Stacks node
     let txid: string;
     try {
