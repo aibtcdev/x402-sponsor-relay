@@ -38,3 +38,5 @@ export type {
 } from "./stx-verify";
 
 export { FeeService } from "./fee";
+
+export { SettlementService } from "./settlement";
