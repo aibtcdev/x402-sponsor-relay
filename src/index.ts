@@ -5,6 +5,7 @@ import type { Env, AppVariables } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
 import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig } from "./endpoints";
 import { dashboard } from "./dashboard";
+import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
 
 // Create Hono app with type safety
@@ -23,8 +24,9 @@ app.use("/fees/config", authMiddleware);
 app.use("/fees/config", requireAuthMiddleware);
 
 // Initialize Chanfana for OpenAPI documentation
+// NOTE: docs_url changed to /api-docs so /docs is free for AX discovery JSON index
 const openapi = fromHono(app, {
-  docs_url: "/docs",
+  docs_url: "/api-docs",
   openapi_url: "/openapi.json",
   schema: {
     info: {
@@ -86,6 +88,10 @@ openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 // Mount dashboard routes (HTML pages, not OpenAPI)
 app.route("/dashboard", dashboard);
 
+// Mount AX discovery routes (plaintext/JSON for AI agents)
+// Registers: /llms.txt, /llms-full.txt, /docs, /docs/:topic, /.well-known/agent.json
+app.route("/", discovery);
+
 // Root endpoint - service info
 app.get("/", (c) => {
   return c.json({
@@ -93,7 +99,9 @@ app.get("/", (c) => {
     version: VERSION,
     description:
       "Gasless transactions for AI agents on the Stacks blockchain",
-    docs: "/docs",
+    docs: "/api-docs",
+    openapi: "/openapi.json",
+    agentDiscovery: "/llms.txt",
     dashboard: "/dashboard",
     endpoints: {
       relay: "POST /relay - Submit sponsored transaction for settlement (x402)",
