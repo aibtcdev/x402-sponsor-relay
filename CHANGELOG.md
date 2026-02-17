@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.5.0...v1.6.0) (2026-02-17)
+
+
+### Features
+
+* **discovery:** add AX discovery chain for AI agent onboarding ([#42](https://github.com/aibtcdev/x402-sponsor-relay/issues/42)) ([d1185af](https://github.com/aibtcdev/x402-sponsor-relay/commit/d1185afc49028e57e393dcd98e3eb912440fe5a2))
+
+
+### Bug Fixes
+
+* resolve Hiro API rate limiting cascading failures ([#41](https://github.com/aibtcdev/x402-sponsor-relay/issues/41)) ([251ffc8](https://github.com/aibtcdev/x402-sponsor-relay/commit/251ffc84f3454696d65fab0285257248d7c0de48))
+
 ## [1.5.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.4.1...v1.5.0) (2026-02-16)
 
 
