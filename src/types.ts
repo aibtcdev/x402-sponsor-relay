@@ -191,6 +191,180 @@ export interface AuthContext {
  */
 export type FacilitatorTokenType = "STX" | "SBTC" | "USDCX";
 
+// =============================================================================
+// x402 V2 Types (Coinbase x402 V2 spec compatible)
+// =============================================================================
+
+/**
+ * CAIP-2 network identifiers for Stacks
+ */
+export const CAIP2_NETWORKS = {
+  mainnet: "stacks:1",
+  testnet: "stacks:2147483648",
+} as const;
+
+/**
+ * Payment requirements for x402 V2 spec (defines acceptable payment method)
+ */
+export interface X402PaymentRequirementsV2 {
+  /** Payment scheme (e.g., "exact") */
+  scheme: string;
+  /** CAIP-2 network identifier (e.g., "stacks:1" for mainnet) */
+  network: string;
+  /** Amount in smallest unit as string */
+  amount: string;
+  /** Asset identifier: "STX", "sBTC", or CAIP-19 contract address */
+  asset: string;
+  /** Recipient Stacks address */
+  payTo: string;
+  /** Maximum timeout in seconds for settlement */
+  maxTimeoutSeconds: number;
+  /** Optional extra fields for scheme-specific data */
+  extra?: Record<string, unknown>;
+}
+
+/**
+ * Resource info describing the protected resource (x402 V2)
+ */
+export interface X402ResourceInfo {
+  /** URL of the protected resource */
+  url: string;
+  /** Human-readable description of the resource */
+  description?: string;
+  /** MIME type of the resource */
+  mimeType?: string;
+}
+
+/**
+ * Stacks scheme-specific payment payload (x402 V2)
+ * Contains the signed sponsored transaction hex
+ */
+export interface X402PayloadV2 {
+  /** Hex-encoded signed sponsored transaction */
+  transaction: string;
+}
+
+/**
+ * Client's payment authorization (x402 V2 paymentPayload)
+ */
+export interface X402PaymentPayloadV2 {
+  /** x402 protocol version (must be 2) */
+  x402Version: number;
+  /** Optional resource info */
+  resource?: X402ResourceInfo;
+  /** The payment requirements that were accepted */
+  accepted: X402PaymentRequirementsV2;
+  /** Scheme-specific payload containing the transaction */
+  payload: X402PayloadV2;
+  /** Optional protocol extensions */
+  extensions?: Record<string, unknown>;
+}
+
+/**
+ * Request body for POST /settle (x402 V2)
+ * Also accepts x402Version at top level for library compatibility
+ */
+export interface X402SettleRequestV2 {
+  /** x402 protocol version (optional at top level, library compat) */
+  x402Version?: number;
+  /** Client's payment authorization */
+  paymentPayload: X402PaymentPayloadV2;
+  /** Server's payment requirements to validate against */
+  paymentRequirements: X402PaymentRequirementsV2;
+}
+
+/**
+ * Response from POST /settle (x402 V2 SettlementResponse)
+ */
+export interface X402SettlementResponseV2 {
+  /** Whether settlement succeeded */
+  success: boolean;
+  /** Error reason code if settlement failed (x402 V2 error code) */
+  errorReason?: string;
+  /** Payer Stacks address (present on success or partial failure) */
+  payer?: string;
+  /** Transaction ID on the network */
+  transaction: string;
+  /** CAIP-2 network identifier */
+  network: string;
+  /** Optional protocol extensions */
+  extensions?: Record<string, unknown>;
+}
+
+/**
+ * Request body for POST /verify (x402 V2)
+ * Same structure as settle request
+ */
+export interface X402VerifyRequestV2 {
+  /** x402 protocol version (optional at top level, library compat) */
+  x402Version?: number;
+  /** Client's payment authorization */
+  paymentPayload: X402PaymentPayloadV2;
+  /** Server's payment requirements to validate against */
+  paymentRequirements: X402PaymentRequirementsV2;
+}
+
+/**
+ * Response from POST /verify (x402 V2)
+ */
+export interface X402VerifyResponseV2 {
+  /** Whether the payment is valid */
+  isValid: boolean;
+  /** Reason for invalidity if isValid is false */
+  invalidReason?: string;
+  /** Payer Stacks address (if determinable) */
+  payer?: string;
+}
+
+/**
+ * A supported payment kind (for GET /supported response)
+ */
+export interface X402SupportedKind {
+  /** x402 protocol version */
+  x402Version: number;
+  /** Payment scheme supported (e.g., "exact") */
+  scheme: string;
+  /** CAIP-2 network identifier */
+  network: string;
+  /** Optional extra fields for scheme-specific data */
+  extra?: Record<string, unknown>;
+}
+
+/**
+ * Response from GET /supported (x402 V2)
+ */
+export interface X402SupportedResponseV2 {
+  /** List of supported payment kinds */
+  kinds: X402SupportedKind[];
+  /** Supported protocol extensions */
+  extensions: string[];
+  /** Map of network to supported signer addresses */
+  signers: Record<string, string[]>;
+}
+
+/**
+ * x402 V2 error codes per spec
+ */
+export const X402_V2_ERROR_CODES = {
+  INSUFFICIENT_FUNDS: "insufficient_funds",
+  INVALID_NETWORK: "invalid_network",
+  INVALID_PAYLOAD: "invalid_payload",
+  INVALID_PAYMENT_REQUIREMENTS: "invalid_payment_requirements",
+  INVALID_SCHEME: "invalid_scheme",
+  UNSUPPORTED_SCHEME: "unsupported_scheme",
+  INVALID_X402_VERSION: "invalid_x402_version",
+  INVALID_TRANSACTION_STATE: "invalid_transaction_state",
+  UNEXPECTED_VERIFY_ERROR: "unexpected_verify_error",
+  UNEXPECTED_SETTLE_ERROR: "unexpected_settle_error",
+  RECIPIENT_MISMATCH: "recipient_mismatch",
+  AMOUNT_INSUFFICIENT: "amount_insufficient",
+  SENDER_MISMATCH: "sender_mismatch",
+  TRANSACTION_NOT_FOUND: "transaction_not_found",
+  TRANSACTION_PENDING: "transaction_pending",
+  TRANSACTION_FAILED: "transaction_failed",
+  BROADCAST_FAILED: "broadcast_failed",
+} as const;
+
 /**
  * Settlement options for x402 payment verification
  */

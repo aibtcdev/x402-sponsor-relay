@@ -4,6 +4,9 @@ import {
   PayloadType,
   ClarityType,
   addressToString,
+  addressFromVersionHash,
+  addressHashModeToVersion,
+  AddressHashMode,
   type ClarityValue,
   type StacksTransactionWire,
   type AddressWire,
@@ -162,6 +165,40 @@ export class SettlementService {
     }
 
     return { valid: true };
+  }
+
+  /**
+   * Convert the hash160 signer from a transaction's spending condition to
+   * a human-readable Stacks address string.
+   *
+   * The `signer` field in SpendingConditionWire is a 40-char hex hash160
+   * (not a human-readable address). This method uses the hashMode to derive
+   * the correct AddressVersion and then c32check-encodes it.
+   */
+  senderToAddress(transaction: StacksTransactionWire, network: "mainnet" | "testnet"): string {
+    const { hashMode, signer } = transaction.auth.spendingCondition;
+    const stacksNetwork = network === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+    const version = addressHashModeToVersion(hashMode as AddressHashMode, stacksNetwork);
+    const addrWire = addressFromVersionHash(version, signer);
+    return addressToString(addrWire);
+  }
+
+  /**
+   * Map an x402 V2 asset identifier to the relay's internal TokenType.
+   *
+   * Handles:
+   * - "STX" → "STX"
+   * - "SBTC" or "sBTC" (case-insensitive) → "sBTC"
+   * - CAIP-19 format containing known sBTC contract addresses → "sBTC"
+   * - Unknown → null (caller should return unsupported_scheme error)
+   */
+  mapAssetToTokenType(asset: string): TokenType | null {
+    if (asset === "STX") return "STX";
+    const upper = asset.toUpperCase();
+    if (upper === "SBTC") return "sBTC";
+    // CAIP-19 format: eip155:1/erc20:0x... or stacks:1/ft:SP...::sbtc-token
+    if (asset.includes(SBTC_CONTRACT_MAINNET) || asset.includes(SBTC_CONTRACT_TESTNET)) return "sBTC";
+    return null;
   }
 
   /**
