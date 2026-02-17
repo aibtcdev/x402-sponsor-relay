@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Env, AppVariables } from "../types";
+import { VERSION } from "../version";
 
 /**
  * Agent Discovery (AX) routes for x402-sponsor-relay.
@@ -30,7 +31,7 @@ Base URL (production): https://x402-relay.aibtc.com
 Base URL (staging/testnet): https://x402-relay.aibtc.dev
 
 OpenAPI spec: https://x402-relay.aibtc.com/openapi.json
-Swagger UI:   https://x402-relay.aibtc.com/docs
+Swagger UI:   https://x402-relay.aibtc.com/api-docs
 Agent card:   https://x402-relay.aibtc.com/.well-known/agent.json
 
 For the full aibtc agent platform, see https://aibtc.com/llms.txt
@@ -510,11 +511,9 @@ Returns service health, Stacks network connectivity, and sponsor wallet info.
 {
   "success": true,
   "requestId": "uuid",
-  "status": "healthy",
+  "status": "ok",
   "version": "1.4.0",
-  "network": "mainnet",
-  "sponsorAddress": "SP...",
-  "facilitatorUrl": "https://facilitator.stacksx402.com"
+  "network": "mainnet"
 }
 
 ---
@@ -1176,7 +1175,7 @@ discovery.get("/.well-known/agent.json", (c) => {
       organization: "AIBTC Working Group",
       url: "https://aibtc.com",
     },
-    version: "1.0.0",
+    version: VERSION,
     documentationUrl: "https://x402-relay.aibtc.com/llms.txt",
     openApiUrl: "https://x402-relay.aibtc.com/openapi.json",
     documentation: {
