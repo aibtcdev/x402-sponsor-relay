@@ -164,9 +164,11 @@ export class FeeService {
       return;
     }
 
-    const until = new Date(Date.now() + retryAfterSeconds * 1000);
+    // Cloudflare KV requires a minimum TTL of 60 seconds; clamp up to avoid PUT errors
+    const kvTtl = Math.max(retryAfterSeconds, 60);
+    const until = new Date(Date.now() + kvTtl * 1000);
     await this.kv.put(KV_KEY_RATE_LIMITED, until.toISOString(), {
-      expirationTtl: retryAfterSeconds,
+      expirationTtl: kvTtl,
     });
     this.logger.warn("Recorded rate limit from Hiro API", { retryAfterSeconds });
   }
