@@ -66,7 +66,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 **Endpoints:**
 - `GET /` - Service info
 - `GET /health` - Health check with network info
-- `GET /docs` - Swagger UI API documentation
+- `GET /docs` - Swagger UI API documentation (Chanfana)
 - `GET /openapi.json` - OpenAPI specification
 - `POST /relay` - Submit sponsored transaction for settlement (x402 facilitator, optional SIP-018 auth)
 - `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key, optional SIP-018 auth)
@@ -78,6 +78,17 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `POST /fees/config` - Update fee clamps (admin, requires API key)
 - `GET /stats` - Relay statistics (JSON API)
 - `GET /dashboard` - Public dashboard (HTML)
+
+**Agent Discovery (AX) — `src/routes/discovery.ts`:**
+- `GET /llms.txt` - Quick-start guide: what the relay does, key provisioning, /relay and /sponsor examples
+- `GET /llms-full.txt` - Full reference: all endpoints with schemas, SIP-018 auth, receipt system, error codes
+- `GET /topics` - Topic index: JSON array of available topic docs with descriptions and URLs
+- `GET /topics/:topic` - Topic sub-docs (plaintext). Available topics:
+  - `sponsored-transactions` — Full relay flow, step-by-step with transaction diagram
+  - `api-keys` — Key provisioning via BTC/STX sig, tiers, expiry, renewal
+  - `authentication` — SIP-018 structured data auth, domain constants, message schema
+  - `errors` — All error codes with HTTP status, retry behavior, and descriptions
+- `GET /.well-known/agent.json` - A2A agent card: skills, capabilities, auth methods, network config
 
 **Request/Response:**
 ```typescript
@@ -321,7 +332,8 @@ If the auth field is provided, the relay verifies:
 If verification fails, the request is rejected with HTTP 401. If the auth field is omitted, the request proceeds without SIP-018 verification (backward compatible).
 
 **Key Files:**
-- `src/index.ts` - Hono app entry point with Chanfana OpenAPI setup
+- `src/index.ts` - Hono app entry point with Chanfana OpenAPI setup (Swagger at /docs)
+- `src/routes/discovery.ts` - AX discovery routes (/llms.txt, /llms-full.txt, /topics, /topics/:topic, /.well-known/agent.json)
 - `src/version.ts` - Single source of truth for VERSION constant
 - `src/types.ts` - Centralized type definitions (includes SIP-018 domain constants)
 - `src/endpoints/BaseEndpoint.ts` - Base class with ok/okWithTx/err helpers

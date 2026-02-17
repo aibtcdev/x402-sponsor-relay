@@ -5,6 +5,7 @@ import type { Env, AppVariables } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
 import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig } from "./endpoints";
 import { dashboard } from "./dashboard";
+import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
 
 // Create Hono app with type safety
@@ -86,6 +87,10 @@ openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 // Mount dashboard routes (HTML pages, not OpenAPI)
 app.route("/dashboard", dashboard);
 
+// Mount AX discovery routes (plaintext/JSON for AI agents)
+// Registers: /llms.txt, /llms-full.txt, /topics, /topics/:topic, /.well-known/agent.json
+app.route("/", discovery);
+
 // Root endpoint - service info
 app.get("/", (c) => {
   return c.json({
@@ -94,6 +99,8 @@ app.get("/", (c) => {
     description:
       "Gasless transactions for AI agents on the Stacks blockchain",
     docs: "/docs",
+    openapi: "/openapi.json",
+    agentDiscovery: "/llms.txt",
     dashboard: "/dashboard",
     endpoints: {
       relay: "POST /relay - Submit sponsored transaction for settlement (x402)",
