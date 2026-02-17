@@ -242,6 +242,7 @@ Content-Type: application/json
 - 500 SPONSOR_CONFIG_ERROR — relay misconfigured, not retryable
 - 500 SPONSOR_FAILED — sponsoring failed, retryable: true
 - 502 SETTLEMENT_BROADCAST_FAILED — Stacks node rejected broadcast, retryAfter: 5
+- 422 SETTLEMENT_FAILED — tx broadcast OK but aborted/dropped on-chain, not retryable
 
 ---
 
@@ -772,8 +773,8 @@ Agent                 Relay                         Stacks
   |                     | validate tx                  |
   |                     | check rate limit             |
   |                     | check dedup (KV)             |
-  |                     | verify payment params        |
   |                     | sponsor (add fee sig)        |
+  |                     | verify payment params        |
   |                     | broadcast                    |
   |                     |----------------------------> |
   |                     |<---------------------------- |
@@ -1073,6 +1074,7 @@ All errors return JSON with this shape:
 | SPONSOR_CONFIG_ERROR           | 500  | false     | relay not configured (missing mnemonic) |
 | SPONSOR_FAILED                 | 500  | true      | sponsoring the tx failed |
 | SETTLEMENT_BROADCAST_FAILED    | 502  | true      | Stacks node rejected broadcast, retryAfter: 5 |
+| SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but aborted/dropped on-chain |
 
 ## API Key Errors (POST /sponsor, POST /fees/config)
 

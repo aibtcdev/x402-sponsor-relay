@@ -139,7 +139,7 @@ export class Relay extends BaseEndpoint {
                       type: "string" as const,
                       enum: ["pending", "confirmed", "failed"],
                     },
-                    sender: { type: "string" as const },
+                    sender: { type: "string" as const, description: "Sender hash160 hex (40-char raw hash, not a human-readable Stacks address)" },
                     recipient: { type: "string" as const },
                     amount: { type: "string" as const },
                     blockHeight: { type: "number" as const },
@@ -283,6 +283,7 @@ export class Relay extends BaseEndpoint {
             amount: dedupResult.amount,
             ...(dedupResult.blockHeight ? { blockHeight: dedupResult.blockHeight } : {}),
           },
+          ...(dedupResult.sponsoredTx ? { sponsoredTx: dedupResult.sponsoredTx } : {}),
           ...(dedupResult.receiptId ? { receiptId: dedupResult.receiptId } : {}),
         });
       }
@@ -335,13 +336,15 @@ export class Relay extends BaseEndpoint {
           amount: body.settle.minAmount,
           fee: sponsorResult.fee,
         });
+        // Distinguish retryable broadcast failures from non-retryable on-chain failures
+        const code = broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED";
         return this.err(c, {
           error: broadcastResult.error,
-          code: "SETTLEMENT_BROADCAST_FAILED",
-          status: 502,
+          code,
+          status: broadcastResult.retryable ? 502 : 422,
           details: broadcastResult.details,
-          retryable: true,
-          retryAfter: 5,
+          retryable: broadcastResult.retryable,
+          ...(broadcastResult.retryable ? { retryAfter: 5 } : {}),
         });
       }
 
@@ -386,6 +389,7 @@ export class Relay extends BaseEndpoint {
         sender: verifyResult.data.sender,
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
+        sponsoredTx: sponsorResult.sponsoredTxHex,
         ...(broadcastResult.status === "confirmed"
           ? { blockHeight: broadcastResult.blockHeight }
           : {}),

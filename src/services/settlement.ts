@@ -417,6 +417,7 @@ export class SettlementService {
         return {
           error: "Broadcast failed",
           details: result.error || result.reason || "No txid in broadcast response",
+          retryable: true,
         };
       }
 
@@ -429,6 +430,7 @@ export class SettlementService {
       return {
         error: "Broadcast failed",
         details: e instanceof Error ? e.message : "Unknown broadcast error",
+        retryable: true,
       };
     }
 
@@ -438,7 +440,7 @@ export class SettlementService {
     const pollUrl = `${hiroBaseUrl}/extended/v1/tx/${txid}`;
 
     const startTime = Date.now();
-    let delay = INITIAL_POLL_DELAY_MS;
+    let delay = 0; // First poll is immediate after broadcast
 
     while (true) {
       // Check for timeout before sleeping
@@ -451,8 +453,10 @@ export class SettlementService {
         return { txid, status: "pending" };
       }
 
-      // Wait before polling
-      await new Promise((resolve) => setTimeout(resolve, delay));
+      // Wait before polling (immediate on first iteration)
+      if (delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
 
       // Poll Hiro API
       try {
@@ -494,6 +498,7 @@ export class SettlementService {
             return {
               error: "Transaction failed on-chain",
               details: `tx_status: ${txStatus}`,
+              retryable: false,
             };
           }
 
@@ -526,8 +531,8 @@ export class SettlementService {
         });
       }
 
-      // Increase delay with exponential backoff, capped at MAX_POLL_DELAY_MS
-      delay = Math.min(delay * POLL_BACKOFF_FACTOR, MAX_POLL_DELAY_MS);
+      // Set delay: first iteration starts the backoff series, then exponential growth
+      delay = delay === 0 ? INITIAL_POLL_DELAY_MS : Math.min(delay * POLL_BACKOFF_FACTOR, MAX_POLL_DELAY_MS);
     }
   }
 

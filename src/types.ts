@@ -295,7 +295,7 @@ export interface FacilitatorSettleResponse {
  */
 export interface SettlementResult {
   success: boolean;
-  status: string;
+  status: "pending" | "confirmed" | "failed";
   sender?: string;
   recipient?: string;
   amount?: string;
@@ -363,6 +363,7 @@ export type RelayErrorCode =
   | "BROADCAST_FAILED"
   | "SETTLEMENT_VERIFICATION_FAILED"
   | "SETTLEMENT_BROADCAST_FAILED"
+  | "SETTLEMENT_FAILED"
   | "NOT_FOUND"
   | "INTERNAL_ERROR"
   | "MISSING_API_KEY"
@@ -814,6 +815,8 @@ export interface DedupResult {
   amount: string;
   /** Block height if confirmed */
   blockHeight?: number;
+  /** Hex-encoded fully-sponsored transaction for consistent dedup responses */
+  sponsoredTx?: string;
 }
 
 /**
@@ -822,4 +825,4 @@ export interface DedupResult {
 export type BroadcastAndConfirmResult =
   | { txid: string; status: "confirmed"; blockHeight: number }
   | { txid: string; status: "pending" }
-  | { error: string; details: string };
+  | { error: string; details: string; retryable: boolean };
