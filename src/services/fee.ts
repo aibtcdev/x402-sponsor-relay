@@ -211,6 +211,22 @@ export class FeeService {
       }
 
       const data = (await response.json()) as FeeEstimates;
+
+      // Guard against malformed responses — if expected fields are missing,
+      // accessing .low_priority on undefined would throw at runtime
+      if (
+        !data?.token_transfer?.low_priority ||
+        !data?.contract_call?.low_priority ||
+        !data?.smart_contract?.low_priority
+      ) {
+        this.logger.warn("Hiro API fee response missing expected fields", {
+          hasTokenTransfer: !!data?.token_transfer,
+          hasContractCall: !!data?.contract_call,
+          hasSmartContract: !!data?.smart_contract,
+        });
+        return null;
+      }
+
       this.logger.debug("Fetched fees from Hiro API", { data });
       return data;
     } catch (e) {
