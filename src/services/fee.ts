@@ -164,9 +164,13 @@ export class FeeService {
       return;
     }
 
-    const until = new Date(Date.now() + retryAfterSeconds * 1000);
+    // Normalize: if retryAfterSeconds is NaN (e.g. unparseable Retry-After header),
+    // fall back to 60. Cloudflare KV requires a minimum TTL of 60 seconds.
+    const safeRetryAfter = Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : 60;
+    const kvTtl = Math.max(safeRetryAfter, 60);
+    const until = new Date(Date.now() + kvTtl * 1000);
     await this.kv.put(KV_KEY_RATE_LIMITED, until.toISOString(), {
-      expirationTtl: retryAfterSeconds,
+      expirationTtl: kvTtl,
     });
     this.logger.warn("Recorded rate limit from Hiro API", { retryAfterSeconds });
   }
@@ -209,6 +213,38 @@ export class FeeService {
       }
 
       const data = (await response.json()) as FeeEstimates;
+
+      // Guard against malformed responses — validate all expected fields exist
+      // and are finite numbers. Avoids truthiness checks so that 0 is allowed.
+      const isValidNumber = (value: unknown): value is number =>
+        typeof value === "number" && Number.isFinite(value);
+
+      const tokenTransfer = data?.token_transfer;
+      const contractCall = data?.contract_call;
+      const smartContract = data?.smart_contract;
+
+      if (
+        !tokenTransfer ||
+        !contractCall ||
+        !smartContract ||
+        !isValidNumber(tokenTransfer.low_priority) ||
+        !isValidNumber(tokenTransfer.medium_priority) ||
+        !isValidNumber(tokenTransfer.high_priority) ||
+        !isValidNumber(contractCall.low_priority) ||
+        !isValidNumber(contractCall.medium_priority) ||
+        !isValidNumber(contractCall.high_priority) ||
+        !isValidNumber(smartContract.low_priority) ||
+        !isValidNumber(smartContract.medium_priority) ||
+        !isValidNumber(smartContract.high_priority)
+      ) {
+        this.logger.warn("Hiro API fee response missing or invalid fields", {
+          hasTokenTransfer: !!tokenTransfer,
+          hasContractCall: !!contractCall,
+          hasSmartContract: !!smartContract,
+        });
+        return null;
+      }
+
       this.logger.debug("Fetched fees from Hiro API", { data });
       return data;
     } catch (e) {
