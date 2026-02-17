@@ -772,9 +772,13 @@ export interface FeesResponse {
  * Extracted payment verification data from a transaction
  */
 export interface SettlementVerification {
-  /** Sender hash160 hex extracted from the transaction (for traceability) */
+  /**
+   * Sender hash160 as a 40-character hex string extracted from the transaction
+   * (for traceability). This is a raw hash160 value, NOT a human-readable
+   * Stacks address, and its format differs from `recipient`.
+   */
   sender: string;
-  /** Recipient address extracted from the transaction */
+  /** Recipient address extracted from the transaction (human-readable form) */
   recipient: string;
   /** Amount in smallest unit (microSTX, sats, etc.) as string */
   amount: string;
@@ -801,7 +805,15 @@ export interface DedupResult {
   /** Receipt ID if one was created */
   receiptId?: string;
   /** Transaction status at time of dedup record */
-  status: "confirmed" | "pending" | "failed";
+  status: "confirmed" | "pending";
+  /** Sender hash160 hex (for consistent response shape on dedup hits) */
+  sender: string;
+  /** Recipient address */
+  recipient: string;
+  /** Amount in smallest unit */
+  amount: string;
+  /** Block height if confirmed */
+  blockHeight?: number;
 }
 
 /**

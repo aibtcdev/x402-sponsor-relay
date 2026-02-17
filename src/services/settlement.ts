@@ -99,10 +99,12 @@ export class SettlementService {
   }
 
   /**
-   * Compute SHA-256 hash of the transaction hex string for dedup keys
+   * Compute SHA-256 hash of the normalized transaction hex for dedup keys.
+   * Strips 0x prefix before hashing so the same tx always produces the same key.
    */
   private async computeTxHash(txHex: string): Promise<string> {
-    const data = new TextEncoder().encode(txHex);
+    const normalized = txHex.startsWith("0x") ? txHex.slice(2) : txHex;
+    const data = new TextEncoder().encode(normalized);
     const hashBuffer = await crypto.subtle.digest("SHA-256", data);
     const bytes = new Uint8Array(hashBuffer);
     return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -258,8 +260,12 @@ export class SettlementService {
         }
         tokenType = "sBTC";
       } else {
-        // Treat any other SIP-010 transfer as USDCx (contract TBD)
-        tokenType = "USDCx";
+        // Reject unknown SIP-010 contracts — only known tokens are supported
+        return {
+          valid: false,
+          error: "Unsupported token contract",
+          details: `Unsupported SIP-010 token contract: ${contractAddressStr}.${contractNameStr}`,
+        };
       }
 
       // SIP-010 transfer args: [amount (uint), from (principal), to (principal), memo (optional)]
@@ -421,12 +427,8 @@ export class SettlementService {
     let delay = INITIAL_POLL_DELAY_MS;
 
     while (true) {
-      // Wait before polling
-      await new Promise((resolve) => setTimeout(resolve, delay));
-
+      // Check for timeout before sleeping
       const elapsed = Date.now() - startTime;
-
-      // Check for timeout
       if (elapsed >= MAX_POLL_TIME_MS) {
         this.logger.info("Transaction confirmation timeout, returning pending", {
           txid,
@@ -434,6 +436,9 @@ export class SettlementService {
         });
         return { txid, status: "pending" };
       }
+
+      // Wait before polling
+      await new Promise((resolve) => setTimeout(resolve, delay));
 
       // Poll Hiro API
       try {

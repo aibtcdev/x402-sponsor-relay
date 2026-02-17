@@ -296,6 +296,10 @@ export class Relay extends BaseEndpoint {
           settlement: {
             success: true,
             status: dedupResult.status,
+            sender: dedupResult.sender,
+            recipient: dedupResult.recipient,
+            amount: dedupResult.amount,
+            ...(dedupResult.blockHeight ? { blockHeight: dedupResult.blockHeight } : {}),
           },
           sponsoredTx: sponsorResult.sponsoredTxHex,
           ...(dedupResult.receiptId ? { receiptId: dedupResult.receiptId } : {}),
@@ -380,6 +384,12 @@ export class Relay extends BaseEndpoint {
         txid: broadcastResult.txid,
         receiptId: storedReceipt ? receiptId : undefined,
         status: broadcastResult.status,
+        sender: verifyResult.data.sender,
+        recipient: verifyResult.data.recipient,
+        amount: verifyResult.data.amount,
+        ...(broadcastResult.status === "confirmed"
+          ? { blockHeight: broadcastResult.blockHeight }
+          : {}),
       });
 
       // Step G — Log and return
