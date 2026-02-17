@@ -293,16 +293,9 @@ export interface X402SettlementResponseV2 {
 
 /**
  * Request body for POST /verify (x402 V2)
- * Same structure as settle request
+ * Same wire format as settle request per the x402 V2 spec
  */
-export interface X402VerifyRequestV2 {
-  /** x402 protocol version (optional at top level, library compat) */
-  x402Version?: number;
-  /** Client's payment authorization */
-  paymentPayload: X402PaymentPayloadV2;
-  /** Server's payment requirements to validate against */
-  paymentRequirements: X402PaymentRequirementsV2;
-}
+export type X402VerifyRequestV2 = X402SettleRequestV2;
 
 /**
  * Response from POST /verify (x402 V2)

@@ -1,11 +1,11 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SettlementService } from "../services";
-import type {
-  AppContext,
-  X402SettleRequestV2,
-  X402SettlementResponseV2,
-  SettleOptions,
-} from "../types";
+import {
+  validateV2Request,
+  mapVerifyErrorToV2Code,
+  V2_REQUEST_BODY_SCHEMA,
+  V2_ERROR_RESPONSE_SCHEMA,
+} from "./v2-helpers";
+import type { AppContext, X402SettlementResponseV2 } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
 /**
@@ -13,7 +13,7 @@ import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
  * POST /settle (spec section 7.2)
  *
  * Verifies payment parameters locally and broadcasts the transaction.
- * Does NOT sponsor — expects a pre-sponsored transaction in paymentPayload.
+ * Does NOT sponsor -- expects a pre-sponsored transaction in paymentPayload.
  * Returns x402 V2 spec-compliant settlement response.
  */
 export class Settle extends BaseEndpoint {
@@ -26,49 +26,7 @@ export class Settle extends BaseEndpoint {
       body: {
         content: {
           "application/json": {
-            schema: {
-              type: "object" as const,
-              required: ["paymentPayload", "paymentRequirements"],
-              properties: {
-                x402Version: {
-                  type: "number" as const,
-                  description: "x402 protocol version (optional at top level, library compat)",
-                  example: 2,
-                },
-                paymentPayload: {
-                  type: "object" as const,
-                  description: "Client payment authorization",
-                  required: ["payload"],
-                  properties: {
-                    x402Version: { type: "number" as const },
-                    payload: {
-                      type: "object" as const,
-                      required: ["transaction"],
-                      properties: {
-                        transaction: {
-                          type: "string" as const,
-                          description: "Hex-encoded signed sponsored transaction",
-                          example: "0x00000001...",
-                        },
-                      },
-                    },
-                  },
-                },
-                paymentRequirements: {
-                  type: "object" as const,
-                  description: "Server payment requirements to validate against",
-                  required: ["network", "payTo", "amount", "asset"],
-                  properties: {
-                    scheme: { type: "string" as const, example: "exact" },
-                    network: { type: "string" as const, description: "CAIP-2 network identifier", example: "stacks:2147483648" },
-                    amount: { type: "string" as const, description: "Required amount in smallest unit", example: "1000000" },
-                    asset: { type: "string" as const, description: "Asset identifier (STX, sBTC, or CAIP-19 contract address)", example: "STX" },
-                    payTo: { type: "string" as const, description: "Recipient Stacks address", example: "SP3FBR2AGK5H9QBDH3EEN6DF8EK8JY7RX8QJ5SVTE" },
-                    maxTimeoutSeconds: { type: "number" as const, example: 60 },
-                  },
-                },
-              },
-            },
+            schema: V2_REQUEST_BODY_SCHEMA,
           },
         },
       },
@@ -112,16 +70,7 @@ export class Settle extends BaseEndpoint {
         description: "Invalid request — missing or malformed required fields",
         content: {
           "application/json": {
-            schema: {
-              type: "object" as const,
-              required: ["success", "errorReason", "transaction", "network"],
-              properties: {
-                success: { type: "boolean" as const, example: false },
-                errorReason: { type: "string" as const, example: "invalid_payload" },
-                transaction: { type: "string" as const, example: "" },
-                network: { type: "string" as const, example: "stacks:2147483648" },
-              },
-            },
+            schema: V2_ERROR_RESPONSE_SCHEMA,
           },
         },
       },
@@ -130,13 +79,10 @@ export class Settle extends BaseEndpoint {
         content: {
           "application/json": {
             schema: {
-              type: "object" as const,
-              required: ["success", "errorReason", "transaction", "network"],
+              ...V2_ERROR_RESPONSE_SCHEMA,
               properties: {
-                success: { type: "boolean" as const, example: false },
+                ...V2_ERROR_RESPONSE_SCHEMA.properties,
                 errorReason: { type: "string" as const, example: "unexpected_settle_error" },
-                transaction: { type: "string" as const, example: "" },
-                network: { type: "string" as const, example: "stacks:2147483648" },
               },
             },
           },
@@ -169,53 +115,20 @@ export class Settle extends BaseEndpoint {
 
     try {
       // Parse request body
-      let body: X402SettleRequestV2;
+      let body: unknown;
       try {
-        body = (await c.req.json()) as X402SettleRequestV2;
+        body = await c.req.json();
       } catch {
         return v2Error(X402_V2_ERROR_CODES.INVALID_PAYLOAD, 400);
       }
 
-      // Validate required top-level fields
-      if (!body.paymentPayload || !body.paymentRequirements) {
-        return v2Error(X402_V2_ERROR_CODES.INVALID_PAYLOAD, 400);
+      // Validate V2 request structure (shared with /verify)
+      const validation = validateV2Request(body, c.env, logger);
+      if (!validation.valid) {
+        return v2Error(validation.error.errorReason, validation.error.status);
       }
 
-      // Validate paymentRequirements has required fields
-      const req = body.paymentRequirements;
-      if (!req.network || !req.payTo || !req.amount) {
-        return v2Error(X402_V2_ERROR_CODES.INVALID_PAYMENT_REQUIREMENTS, 400);
-      }
-
-      // Validate network matches relay's configured network
-      if (req.network !== network) {
-        logger.warn("Network mismatch", {
-          expected: network,
-          received: req.network,
-        });
-        return v2Error(X402_V2_ERROR_CODES.INVALID_NETWORK, 400);
-      }
-
-      // Map asset to internal token type
-      const settlementService = new SettlementService(c.env, logger);
-      const tokenType = settlementService.mapAssetToTokenType(req.asset || "STX");
-      if (tokenType === null) {
-        logger.warn("Unsupported asset", { asset: req.asset });
-        return v2Error(X402_V2_ERROR_CODES.UNSUPPORTED_SCHEME, 400);
-      }
-
-      // Build internal settle options from paymentRequirements
-      const settleOptions: SettleOptions = {
-        expectedRecipient: req.payTo,
-        minAmount: req.amount,
-        tokenType,
-      };
-
-      // Extract transaction hex from payload
-      const txHex = body.paymentPayload?.payload?.transaction;
-      if (!txHex) {
-        return v2Error(X402_V2_ERROR_CODES.INVALID_PAYLOAD, 400);
-      }
+      const { settleOptions, txHex, settlementService } = validation.data;
 
       // Check dedup — return cached result if available
       const dedupResult = await settlementService.checkDedup(txHex);
@@ -233,22 +146,11 @@ export class Settle extends BaseEndpoint {
         return c.json(response, 200);
       }
 
-      // Verify payment parameters locally (no broadcast)
+      // Verify payment parameters locally
       const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
       if (!verifyResult.valid) {
         logger.warn("Payment verification failed", { error: verifyResult.error });
-
-        // Map internal error to V2 error reason
-        let errorReason: string = X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE;
-        if (verifyResult.error === "Recipient mismatch") {
-          errorReason = X402_V2_ERROR_CODES.RECIPIENT_MISMATCH;
-        } else if (verifyResult.error === "Insufficient payment amount") {
-          errorReason = X402_V2_ERROR_CODES.AMOUNT_INSUFFICIENT;
-        } else if (verifyResult.error === "Token type mismatch") {
-          errorReason = X402_V2_ERROR_CODES.SENDER_MISMATCH;
-        }
-
-        return v2Error(errorReason, 200);
+        return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
       }
 
       // Broadcast and poll for confirmation
