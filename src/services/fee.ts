@@ -164,8 +164,10 @@ export class FeeService {
       return;
     }
 
-    // Cloudflare KV requires a minimum TTL of 60 seconds; clamp up to avoid PUT errors
-    const kvTtl = Math.max(retryAfterSeconds, 60);
+    // Normalize: if retryAfterSeconds is NaN (e.g. unparseable Retry-After header),
+    // fall back to 60. Cloudflare KV requires a minimum TTL of 60 seconds.
+    const safeRetryAfter = Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : 60;
+    const kvTtl = Math.max(safeRetryAfter, 60);
     const until = new Date(Date.now() + kvTtl * 1000);
     await this.kv.put(KV_KEY_RATE_LIMITED, until.toISOString(), {
       expirationTtl: kvTtl,
@@ -212,17 +214,33 @@ export class FeeService {
 
       const data = (await response.json()) as FeeEstimates;
 
-      // Guard against malformed responses — if expected fields are missing,
-      // accessing .low_priority on undefined would throw at runtime
+      // Guard against malformed responses — validate all expected fields exist
+      // and are finite numbers. Avoids truthiness checks so that 0 is allowed.
+      const isValidNumber = (value: unknown): value is number =>
+        typeof value === "number" && Number.isFinite(value);
+
+      const tokenTransfer = data?.token_transfer;
+      const contractCall = data?.contract_call;
+      const smartContract = data?.smart_contract;
+
       if (
-        !data?.token_transfer?.low_priority ||
-        !data?.contract_call?.low_priority ||
-        !data?.smart_contract?.low_priority
+        !tokenTransfer ||
+        !contractCall ||
+        !smartContract ||
+        !isValidNumber(tokenTransfer.low_priority) ||
+        !isValidNumber(tokenTransfer.medium_priority) ||
+        !isValidNumber(tokenTransfer.high_priority) ||
+        !isValidNumber(contractCall.low_priority) ||
+        !isValidNumber(contractCall.medium_priority) ||
+        !isValidNumber(contractCall.high_priority) ||
+        !isValidNumber(smartContract.low_priority) ||
+        !isValidNumber(smartContract.medium_priority) ||
+        !isValidNumber(smartContract.high_priority)
       ) {
-        this.logger.warn("Hiro API fee response missing expected fields", {
-          hasTokenTransfer: !!data?.token_transfer,
-          hasContractCall: !!data?.contract_call,
-          hasSmartContract: !!data?.smart_contract,
+        this.logger.warn("Hiro API fee response missing or invalid fields", {
+          hasTokenTransfer: !!tokenTransfer,
+          hasContractCall: !!contractCall,
+          hasSmartContract: !!smartContract,
         });
         return null;
       }

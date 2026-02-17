@@ -76,6 +76,8 @@ const VALID_MNEMONIC_LENGTHS = [12, 24];
 // Nonce fetch retry configuration
 const NONCE_FETCH_MAX_ATTEMPTS = 3;
 const NONCE_FETCH_BASE_DELAY_MS = 500;
+/** Cap retry delay at 5s to stay well within Worker request time limits */
+const NONCE_FETCH_MAX_DELAY_MS = 5000;
 
 /**
  * Service for validating and sponsoring Stacks transactions
@@ -230,9 +232,19 @@ export class SponsorService {
 
         if (response.status === 429) {
           const retryAfter = response.headers.get("Retry-After");
-          const delayMs = retryAfter
-            ? parseInt(retryAfter, 10) * 1000
-            : NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+          const baseDelayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+          let delayMs = baseDelayMs;
+
+          if (retryAfter !== null) {
+            const parsedSeconds = parseInt(retryAfter, 10);
+            const retryAfterDelayMs = parsedSeconds * 1000;
+            if (Number.isFinite(retryAfterDelayMs) && retryAfterDelayMs > 0) {
+              delayMs = retryAfterDelayMs;
+            }
+          }
+
+          // Cap delay to prevent exceeding Worker request time limits
+          delayMs = Math.min(delayMs, NONCE_FETCH_MAX_DELAY_MS);
           this.logger.warn("Hiro API rate limited on nonce fetch, retrying", {
             attempt,
             delayMs,
