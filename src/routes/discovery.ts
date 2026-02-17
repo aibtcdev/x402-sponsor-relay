@@ -31,7 +31,7 @@ Base URL (production): https://x402-relay.aibtc.com
 Base URL (staging/testnet): https://x402-relay.aibtc.dev
 
 OpenAPI spec: https://x402-relay.aibtc.com/openapi.json
-Swagger UI:   https://x402-relay.aibtc.com/api-docs
+Swagger UI:   https://x402-relay.aibtc.com/docs
 Agent card:   https://x402-relay.aibtc.com/.well-known/agent.json
 
 For the full aibtc agent platform, see https://aibtc.com/llms.txt
