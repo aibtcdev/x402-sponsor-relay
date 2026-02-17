@@ -365,6 +365,8 @@ export type RelayErrorCode =
   | "FACILITATOR_ERROR"
   | "FACILITATOR_INVALID_RESPONSE"
   | "SETTLEMENT_FAILED"
+  | "SETTLEMENT_VERIFICATION_FAILED"
+  | "SETTLEMENT_BROADCAST_FAILED"
   | "NOT_FOUND"
   | "INTERNAL_ERROR"
   | "MISSING_API_KEY"
@@ -767,3 +769,49 @@ export interface FeesResponse {
   /** Whether this data came from cache */
   cached: boolean;
 }
+
+// =============================================================================
+// Native Settlement Types
+// =============================================================================
+
+/**
+ * Extracted payment verification data from a transaction
+ */
+export interface SettlementVerification {
+  /** Sender address extracted from the transaction */
+  sender: string;
+  /** Recipient address extracted from the transaction */
+  recipient: string;
+  /** Amount in smallest unit (microSTX, sats, etc.) as string */
+  amount: string;
+  /** Token type detected from the transaction */
+  tokenType: TokenType;
+}
+
+/**
+ * Result of native payment parameter verification
+ */
+export type SettlementVerifyResult =
+  | { valid: true; data: SettlementVerification }
+  | { valid: false; error: string; details: string };
+
+/**
+ * Cached deduplication result stored in KV
+ * Prevents double-broadcast and double-receipt-creation
+ */
+export interface DedupResult {
+  /** Blockchain transaction ID */
+  txid: string;
+  /** Receipt ID if one was created */
+  receiptId?: string;
+  /** Transaction status at time of dedup record */
+  status: "confirmed" | "pending" | "failed";
+}
+
+/**
+ * Result from broadcasting a transaction and polling for confirmation
+ */
+export type BroadcastAndConfirmResult =
+  | { txid: string; status: "confirmed"; blockHeight: number }
+  | { txid: string; status: "pending" }
+  | { error: string; details: string };
