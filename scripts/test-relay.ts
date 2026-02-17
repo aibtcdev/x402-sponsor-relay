@@ -166,14 +166,30 @@ async function main() {
       console.log(`Explorer: https://explorer.hiro.so/txid/${result.txid}?chain=testnet`);
       if (result.settlement) {
         console.log("\n=== SETTLEMENT ===");
-        console.log(`Status: ${result.settlement.status}`);
         console.log(`Success: ${result.settlement.success}`);
-        console.log(`Sender: ${result.settlement.sender}`);
-        console.log(`Recipient: ${result.settlement.recipient}`);
-        console.log(`Amount: ${result.settlement.amount}`);
-        if (result.settlement.blockHeight) {
-          console.log(`Block Height: ${result.settlement.blockHeight}`);
+        if (result.settlement.status === "confirmed") {
+          console.log(`Status: CONFIRMED at block ${result.settlement.blockHeight}`);
+        } else {
+          console.log(`Status: PENDING (broadcast succeeded, confirmation polling timed out)`);
+          console.log(`  → Transaction is in the mempool. Poll GET /verify/:receiptId for updates.`);
         }
+        if (result.settlement.sender) {
+          console.log(`Sender: ${result.settlement.sender}`);
+        }
+        if (result.settlement.recipient) {
+          console.log(`Recipient: ${result.settlement.recipient}`);
+        }
+        if (result.settlement.amount) {
+          console.log(`Amount: ${result.settlement.amount} microSTX`);
+        }
+      }
+      if (result.receiptId) {
+        console.log("\n=== RECEIPT ===");
+        console.log(`Receipt ID: ${result.receiptId}`);
+        console.log(`Verify: GET ${relayUrl}/verify/${result.receiptId}`);
+        console.log(`  → Idempotent: submitting the same tx again returns this cached result (5-min window)`);
+      } else {
+        console.log("\n(No receiptId returned — KV storage may be unavailable)");
       }
     } else {
       console.error("\n=== ERROR ===");
