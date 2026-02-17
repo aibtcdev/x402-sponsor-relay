@@ -266,26 +266,8 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Sponsor the transaction
-      const sponsorResult = await sponsorService.sponsorTransaction(
-        validation.transaction
-      );
-      if (sponsorResult.success === false) {
-        await statsService.recordError("sponsoring");
-        const code = sponsorResult.error === "Service not configured"
-          ? "SPONSOR_CONFIG_ERROR"
-          : "SPONSOR_FAILED";
-        return this.err(c, {
-          error: sponsorResult.error,
-          code,
-          status: 500,
-          details: sponsorResult.details,
-          retryable: code === "SPONSOR_FAILED", // Config errors are not retryable
-        });
-      }
-
-      // Step A — Dedup check: return cached result for idempotent retries
-      const dedupResult = await settlementService.checkDedup(sponsorResult.sponsoredTxHex);
+      // Step A — Dedup check on original tx (stable across retries with different sponsor nonces)
+      const dedupResult = await settlementService.checkDedup(body.transaction);
       if (dedupResult) {
         logger.info("Dedup hit, returning cached result", {
           txid: dedupResult.txid,
@@ -301,12 +283,29 @@ export class Relay extends BaseEndpoint {
             amount: dedupResult.amount,
             ...(dedupResult.blockHeight ? { blockHeight: dedupResult.blockHeight } : {}),
           },
-          sponsoredTx: sponsorResult.sponsoredTxHex,
           ...(dedupResult.receiptId ? { receiptId: dedupResult.receiptId } : {}),
         });
       }
 
-      // Step B — Verify payment parameters locally
+      // Step B — Sponsor the transaction
+      const sponsorResult = await sponsorService.sponsorTransaction(
+        validation.transaction
+      );
+      if (sponsorResult.success === false) {
+        await statsService.recordError("sponsoring");
+        const code = sponsorResult.error === "Service not configured"
+          ? "SPONSOR_CONFIG_ERROR"
+          : "SPONSOR_FAILED";
+        return this.err(c, {
+          error: sponsorResult.error,
+          code,
+          status: 500,
+          details: sponsorResult.details,
+          retryable: code === "SPONSOR_FAILED",
+        });
+      }
+
+      // Step C — Verify payment parameters locally
       const verifyResult = settlementService.verifyPaymentParams(
         sponsorResult.sponsoredTxHex,
         body.settle
@@ -322,7 +321,7 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Step C — Broadcast and poll for confirmation (up to 60s)
+      // Step D — Broadcast and poll for confirmation (up to 60s)
       const broadcastResult = await settlementService.broadcastAndConfirm(
         verifyResult.data.transaction
       );
@@ -346,7 +345,7 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Step D — Record successful transaction stats
+      // Step E — Record successful transaction stats
       const tokenType = body.settle.tokenType || "STX";
       await statsService.recordTransaction({
         success: true,
@@ -355,7 +354,7 @@ export class Relay extends BaseEndpoint {
         fee: sponsorResult.fee,
       });
 
-      // Step E — Build settlement result and store payment receipt
+      // Step F — Build settlement result and store payment receipt
       const settlement: SettlementResult = {
         success: true,
         status: broadcastResult.status,
@@ -379,8 +378,8 @@ export class Relay extends BaseEndpoint {
         settleOptions: body.settle,
       });
 
-      // Step F — Record dedup entry to handle idempotent retries
-      await settlementService.recordDedup(sponsorResult.sponsoredTxHex, {
+      // Step G — Record dedup entry keyed on original tx for idempotent retries
+      await settlementService.recordDedup(body.transaction, {
         txid: broadcastResult.txid,
         receiptId: storedReceipt ? receiptId : undefined,
         status: broadcastResult.status,
@@ -392,7 +391,7 @@ export class Relay extends BaseEndpoint {
           : {}),
       });
 
-      // Step G — Log and return
+      // Step H — Log and return
       logger.info("Transaction sponsored and settled", {
         txid: broadcastResult.txid,
         sender: validation.senderAddress,

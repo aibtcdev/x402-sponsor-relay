@@ -151,13 +151,13 @@ export class SettlementService {
       };
     }
 
-    // Token type must be one of the supported values
+    // Token type must be one of the currently supported values
     const tokenType = settle.tokenType || "STX";
-    if (tokenType !== "STX" && tokenType !== "sBTC" && tokenType !== "USDCx") {
+    if (tokenType !== "STX" && tokenType !== "sBTC") {
       return {
         valid: false,
         error: "Invalid token type",
-        details: `Unsupported token type: ${tokenType}. Valid types: STX, sBTC, USDCx`,
+        details: `Unsupported token type: ${tokenType}. Valid types: STX, sBTC`,
       };
     }
 
@@ -309,6 +309,20 @@ export class SettlementService {
       };
     }
 
+    // Validate token type matches what the caller claimed
+    const expectedTokenType = settle.tokenType || "STX";
+    if (tokenType !== expectedTokenType) {
+      this.logger.warn("Token type mismatch", {
+        expected: expectedTokenType,
+        actual: tokenType,
+      });
+      return {
+        valid: false,
+        error: "Token type mismatch",
+        details: `Transaction uses ${tokenType}, but settle.tokenType is ${expectedTokenType}`,
+      };
+    }
+
     // Validate recipient matches expected (case-insensitive Stacks address comparison)
     if (
       recipient.toLowerCase() !== settle.expectedRecipient.toLowerCase()
@@ -452,16 +466,24 @@ export class SettlementService {
           const txStatus = data.tx_status;
 
           if (txStatus === "success") {
-            this.logger.info("Transaction confirmed", {
-              txid,
-              blockHeight: data.block_height,
-              elapsedMs: elapsed,
-            });
-            return {
-              txid,
-              status: "confirmed",
-              blockHeight: data.block_height ?? 0,
-            };
+            if (typeof data.block_height !== "number") {
+              // Success without block height — keep polling until it's available
+              this.logger.warn("Transaction success reported without block height, continuing to poll", {
+                txid,
+                elapsedMs: elapsed,
+              });
+            } else {
+              this.logger.info("Transaction confirmed", {
+                txid,
+                blockHeight: data.block_height,
+                elapsedMs: elapsed,
+              });
+              return {
+                txid,
+                status: "confirmed",
+                blockHeight: data.block_height,
+              };
+            }
           }
 
           if (txStatus?.startsWith("abort_") || txStatus?.startsWith("dropped_")) {
