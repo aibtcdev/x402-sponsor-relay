@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.7.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.6.0...v1.7.0) (2026-02-17)
+
+
+### Features
+
+* native settlement replaces external facilitator ([994462b](https://github.com/aibtcdev/x402-sponsor-relay/commit/994462b53bd1f45abb59a0a4e1ea4247642b9271))
+
 ## [1.6.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.5.0...v1.6.0) (2026-02-17)
 
 
