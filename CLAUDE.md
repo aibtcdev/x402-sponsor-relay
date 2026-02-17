@@ -416,7 +416,7 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 | Flow | Agent calls relay directly |
 | Abuse prevention | Rate limits (10 req/min per sender) |
 | Payment tokens | STX, sBTC, USDCx |
-| Facilitator | facilitator.stacksx402.com (existing) |
+| Settlement | Native (local verify + direct broadcast, no external facilitator) |
 
 ## Related Projects
 
@@ -455,9 +455,9 @@ Agent                    Relay                              Stacks
   │                        │ 3. Validate settle options       │
   │                        │ 4. Validate tx                   │
   │                        │ 5. Check dedup (KV)              │
-  │                        │ 6. Verify payment params         │
+  │                        │ 6. Sponsor (add fee sig)         │
+  │                        │ 7. Verify payment params         │
   │                        │    (recipient/amount/token)      │
-  │                        │ 7. Sponsor (add fee sig)         │
   │                        │ 8. Broadcast                     │
   │                        │─────────────────────────────────▶│
   │                        │◀─────────────────────────────────│
@@ -487,6 +487,7 @@ Agent                    Relay                              Stacks
 **Settlement states:**
 - `confirmed`: tx confirmed on-chain within 60s — includes `blockHeight`
 - `pending`: broadcast succeeded but confirmation timed out — safe state, poll `/verify/:receiptId`
+- `failed`: tx broadcast OK but aborted/dropped on-chain — returns `SETTLEMENT_FAILED` (422, not retryable)
 
 **Idempotency:** Submitting the same sponsored tx hex within 5 minutes returns the cached result from KV (dedup). Safe for agents to retry on network failure.
 
