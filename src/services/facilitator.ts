@@ -333,7 +333,7 @@ export class FacilitatorService {
         txid: settleResponse.tx_id,
         settlement: {
           success: settleResponse.success,
-          status: settleResponse.status || "unknown",
+          status: settleResponse.status || "failed",
           sender: settleResponse.sender_address,
           recipient: settleResponse.recipient_address,
           amount: settleResponse.amount?.toString(),

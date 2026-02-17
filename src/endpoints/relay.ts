@@ -1,14 +1,13 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, FacilitatorService, StatsService, ReceiptService, StxVerifyService } from "../services";
+import { SponsorService, SettlementService, StatsService, ReceiptService, StxVerifyService } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
-import type { AppContext, RelayRequest } from "../types";
+import type { AppContext, RelayRequest, SettlementResult } from "../types";
 import {
   Error400Response,
   Error401Response,
   Error429Response,
   Error500Response,
   Error502Response,
-  Error504Response,
 } from "../schemas";
 
 /**
@@ -20,7 +19,7 @@ export class Relay extends BaseEndpoint {
     tags: ["Relay"],
     summary: "Submit sponsored transaction for settlement",
     description:
-      "Accepts a pre-signed sponsored transaction, sponsors it with the relay's key, and calls the x402 facilitator for settlement verification.",
+      "Accepts a pre-signed sponsored transaction, sponsors it with the relay's key, verifies payment locally, and broadcasts directly to the Stacks network.",
     request: {
       body: {
         content: {
@@ -140,7 +139,7 @@ export class Relay extends BaseEndpoint {
                       type: "string" as const,
                       enum: ["pending", "confirmed", "failed"],
                     },
-                    sender: { type: "string" as const },
+                    sender: { type: "string" as const, description: "Sender hash160 hex (40-char raw hash, not a human-readable Stacks address)" },
                     recipient: { type: "string" as const },
                     amount: { type: "string" as const },
                     blockHeight: { type: "number" as const },
@@ -166,8 +165,7 @@ export class Relay extends BaseEndpoint {
       "401": { ...Error401Response, description: "Authentication failed (invalid or expired SIP-018 signature)" },
       "429": { ...Error429Response, description: "Rate limit exceeded" },
       "500": Error500Response,
-      "502": { ...Error502Response, description: "Facilitator error" },
-      "504": Error504Response,
+      "502": { ...Error502Response, description: "Broadcast or network error" },
     },
   };
 
@@ -220,10 +218,10 @@ export class Relay extends BaseEndpoint {
 
       // Initialize services
       const sponsorService = new SponsorService(c.env, logger);
-      const facilitatorService = new FacilitatorService(c.env, logger);
+      const settlementService = new SettlementService(c.env, logger);
 
       // Validate settle options
-      const settleValidation = facilitatorService.validateSettleOptions(
+      const settleValidation = settlementService.validateSettleOptions(
         body.settle
       );
       if (settleValidation.valid === false) {
@@ -268,7 +266,29 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Sponsor the transaction
+      // Step A — Dedup check on original tx (stable across retries with different sponsor nonces)
+      const dedupResult = await settlementService.checkDedup(body.transaction);
+      if (dedupResult) {
+        logger.info("Dedup hit, returning cached result", {
+          txid: dedupResult.txid,
+          status: dedupResult.status,
+        });
+        return this.okWithTx(c, {
+          txid: dedupResult.txid,
+          settlement: {
+            success: true,
+            status: dedupResult.status,
+            sender: dedupResult.sender,
+            recipient: dedupResult.recipient,
+            amount: dedupResult.amount,
+            ...(dedupResult.blockHeight ? { blockHeight: dedupResult.blockHeight } : {}),
+          },
+          ...(dedupResult.sponsoredTx ? { sponsoredTx: dedupResult.sponsoredTx } : {}),
+          ...(dedupResult.receiptId ? { receiptId: dedupResult.receiptId } : {}),
+        });
+      }
+
+      // Step B — Sponsor the transaction
       const sponsorResult = await sponsorService.sponsorTransaction(
         validation.transaction
       );
@@ -282,64 +302,53 @@ export class Relay extends BaseEndpoint {
           code,
           status: 500,
           details: sponsorResult.details,
-          retryable: code === "SPONSOR_FAILED", // Config errors are not retryable
+          retryable: code === "SPONSOR_FAILED",
         });
       }
 
-      // Call facilitator to settle
-      const settleResult = await facilitatorService.settle(
+      // Step C — Verify payment parameters locally
+      const verifyResult = settlementService.verifyPaymentParams(
         sponsorResult.sponsoredTxHex,
         body.settle
       );
-
-      if (settleResult.success === false) {
-        await statsService.recordError("facilitator");
-
-        // Record fee even for failed settlements - sponsor already paid
-        const tokenType = body.settle.tokenType || "STX";
-        await statsService.recordTransaction({
-          success: false,
-          tokenType,
-          amount: body.settle.minAmount,
-          fee: sponsorResult.fee,
-        });
-
-        // Determine error code and retry guidance based on HTTP status
-        let code: "FACILITATOR_TIMEOUT" | "FACILITATOR_ERROR" | "FACILITATOR_INVALID_RESPONSE" | "SETTLEMENT_FAILED";
-        let retryable = false;
-        let retryAfter: number | undefined;
-
-        if (settleResult.httpStatus === 504) {
-          code = "FACILITATOR_TIMEOUT";
-          retryable = true;
-          retryAfter = 5; // Wait 5 seconds before retrying timeout
-        } else if (settleResult.httpStatus === 502) {
-          code = "FACILITATOR_ERROR";
-          retryable = true;
-          retryAfter = 5; // Wait 5 seconds before retrying gateway error
-        } else if (settleResult.error === "Settlement response invalid") {
-          code = "FACILITATOR_INVALID_RESPONSE";
-          retryable = true;
-          retryAfter = 10;
-        } else {
-          code = "SETTLEMENT_FAILED";
-          retryable = false; // Settlement validation failures are not retryable
-        }
-
-        // SETTLEMENT_FAILED is a 400 (bad request), others use httpStatus
-        const status = code === "SETTLEMENT_FAILED" ? 400 : (settleResult.httpStatus || 500);
-
+      if (!verifyResult.valid) {
+        await statsService.recordError("validation");
         return this.err(c, {
-          error: settleResult.error,
-          code,
-          status,
-          details: settleResult.details,
-          retryable,
-          retryAfter,
+          error: verifyResult.error,
+          code: "SETTLEMENT_VERIFICATION_FAILED",
+          status: 400,
+          details: verifyResult.details,
+          retryable: false,
         });
       }
 
-      // Record successful transaction with fee
+      // Step D — Broadcast and poll for confirmation (up to 60s)
+      const broadcastResult = await settlementService.broadcastAndConfirm(
+        verifyResult.data.transaction
+      );
+      if ("error" in broadcastResult) {
+        await statsService.recordError("internal");
+        // Record fee even for failed broadcasts — sponsor already paid
+        const tokenTypeFailed = body.settle.tokenType || "STX";
+        await statsService.recordTransaction({
+          success: false,
+          tokenType: tokenTypeFailed,
+          amount: body.settle.minAmount,
+          fee: sponsorResult.fee,
+        });
+        // Distinguish retryable broadcast failures from non-retryable on-chain failures
+        const code = broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED";
+        return this.err(c, {
+          error: broadcastResult.error,
+          code,
+          status: broadcastResult.retryable ? 502 : 422,
+          details: broadcastResult.details,
+          retryable: broadcastResult.retryable,
+          ...(broadcastResult.retryable ? { retryAfter: 5 } : {}),
+        });
+      }
+
+      // Step E — Record successful transaction stats
       const tokenType = body.settle.tokenType || "STX";
       await statsService.recordTransaction({
         success: true,
@@ -348,7 +357,18 @@ export class Relay extends BaseEndpoint {
         fee: sponsorResult.fee,
       });
 
-      // Store payment receipt for future verification (best-effort)
+      // Step F — Build settlement result and store payment receipt
+      const settlement: SettlementResult = {
+        success: true,
+        status: broadcastResult.status,
+        sender: verifyResult.data.sender,
+        recipient: verifyResult.data.recipient,
+        amount: verifyResult.data.amount,
+        ...(broadcastResult.status === "confirmed"
+          ? { blockHeight: broadcastResult.blockHeight }
+          : {}),
+      };
+
       const receiptService = new ReceiptService(c.env.RELAY_KV, logger);
       const receiptId = crypto.randomUUID();
       const storedReceipt = await receiptService.storeReceipt({
@@ -356,21 +376,36 @@ export class Relay extends BaseEndpoint {
         senderAddress: validation.senderAddress,
         sponsoredTx: sponsorResult.sponsoredTxHex,
         fee: sponsorResult.fee,
-        txid: settleResult.txid!,
-        settlement: settleResult.settlement!,
+        txid: broadcastResult.txid,
+        settlement,
         settleOptions: body.settle,
       });
 
+      // Step G — Record dedup entry keyed on original tx for idempotent retries
+      await settlementService.recordDedup(body.transaction, {
+        txid: broadcastResult.txid,
+        receiptId: storedReceipt ? receiptId : undefined,
+        status: broadcastResult.status,
+        sender: verifyResult.data.sender,
+        recipient: verifyResult.data.recipient,
+        amount: verifyResult.data.amount,
+        sponsoredTx: sponsorResult.sponsoredTxHex,
+        ...(broadcastResult.status === "confirmed"
+          ? { blockHeight: broadcastResult.blockHeight }
+          : {}),
+      });
+
+      // Step H — Log and return
       logger.info("Transaction sponsored and settled", {
-        txid: settleResult.txid,
+        txid: broadcastResult.txid,
         sender: validation.senderAddress,
-        settlement_status: settleResult.settlement?.status,
+        settlement_status: broadcastResult.status,
         receiptId: storedReceipt ? receiptId : undefined,
       });
 
       return this.okWithTx(c, {
-        txid: settleResult.txid!,
-        settlement: settleResult.settlement,
+        txid: broadcastResult.txid,
+        settlement,
         sponsoredTx: sponsorResult.sponsoredTxHex,
         // Only return receiptId if storage succeeded
         ...(storedReceipt ? { receiptId } : {}),

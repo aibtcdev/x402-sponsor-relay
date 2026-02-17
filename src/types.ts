@@ -295,7 +295,7 @@ export interface FacilitatorSettleResponse {
  */
 export interface SettlementResult {
   success: boolean;
-  status: string;
+  status: "pending" | "confirmed" | "failed";
   sender?: string;
   recipient?: string;
   amount?: string;
@@ -361,9 +361,8 @@ export type RelayErrorCode =
   | "SPONSOR_CONFIG_ERROR"
   | "SPONSOR_FAILED"
   | "BROADCAST_FAILED"
-  | "FACILITATOR_TIMEOUT"
-  | "FACILITATOR_ERROR"
-  | "FACILITATOR_INVALID_RESPONSE"
+  | "SETTLEMENT_VERIFICATION_FAILED"
+  | "SETTLEMENT_BROADCAST_FAILED"
   | "SETTLEMENT_FAILED"
   | "NOT_FOUND"
   | "INTERNAL_ERROR"
@@ -767,3 +766,63 @@ export interface FeesResponse {
   /** Whether this data came from cache */
   cached: boolean;
 }
+
+// Native Settlement Types
+
+/**
+ * Extracted payment verification data from a transaction
+ */
+export interface SettlementVerification {
+  /**
+   * Sender hash160 as a 40-character hex string extracted from the transaction
+   * (for traceability). This is a raw hash160 value, NOT a human-readable
+   * Stacks address, and its format differs from `recipient`.
+   */
+  sender: string;
+  /** Recipient address extracted from the transaction (human-readable form) */
+  recipient: string;
+  /** Amount in smallest unit (microSTX, sats, etc.) as string */
+  amount: string;
+  /** Token type detected from the transaction */
+  tokenType: TokenType;
+  /** The deserialized transaction (avoids re-deserialization for broadcast) */
+  transaction: import("@stacks/transactions").StacksTransactionWire;
+}
+
+/**
+ * Result of native payment parameter verification
+ */
+export type SettlementVerifyResult =
+  | { valid: true; data: SettlementVerification }
+  | { valid: false; error: string; details: string };
+
+/**
+ * Cached deduplication result stored in KV
+ * Prevents double-broadcast and double-receipt-creation
+ */
+export interface DedupResult {
+  /** Blockchain transaction ID */
+  txid: string;
+  /** Receipt ID if one was created */
+  receiptId?: string;
+  /** Transaction status at time of dedup record */
+  status: "confirmed" | "pending";
+  /** Sender hash160 hex (for consistent response shape on dedup hits) */
+  sender: string;
+  /** Recipient address */
+  recipient: string;
+  /** Amount in smallest unit */
+  amount: string;
+  /** Block height if confirmed */
+  blockHeight?: number;
+  /** Hex-encoded fully-sponsored transaction for consistent dedup responses */
+  sponsoredTx?: string;
+}
+
+/**
+ * Result from broadcasting a transaction and polling for confirmation
+ */
+export type BroadcastAndConfirmResult =
+  | { txid: string; status: "confirmed"; blockHeight: number }
+  | { txid: string; status: "pending" }
+  | { error: string; details: string; retryable: boolean };

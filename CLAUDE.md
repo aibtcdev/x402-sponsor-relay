@@ -4,9 +4,9 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-x402 Stacks Sponsor Relay - A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, and calls the x402 facilitator for settlement verification.
+x402 Stacks Sponsor Relay - A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, verifies payment parameters locally, and broadcasts directly to the Stacks network. Supports confirmed (immediate) and pending (60s timeout) settlement states with idempotent retry via KV dedup.
 
-**Status**: Core relay with facilitator integration, payment receipts, and protected resource access. Deployed to testnet staging.
+**Status**: Native settlement (no external facilitator), payment receipts, protected resource access, and idempotent retry. Deployed to testnet staging.
 
 ## Commands
 
@@ -68,7 +68,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /health` - Health check with network info
 - `GET /docs` - Swagger UI API documentation (Chanfana)
 - `GET /openapi.json` - OpenAPI specification
-- `POST /relay` - Submit sponsored transaction for settlement (x402 facilitator, optional SIP-018 auth)
+- `POST /relay` - Submit sponsored transaction for native settlement (verify locally + broadcast + poll, optional SIP-018 auth)
 - `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key, optional SIP-018 auth)
 - `POST /keys/provision` - Provision API key via Bitcoin signature (BIP-137)
 - `POST /keys/provision-stx` - Provision API key via Stacks signature
@@ -132,7 +132,7 @@ Response (success): {
 
 Response (error): {
   error: "...",
-  code: "FACILITATOR_TIMEOUT" | "RATE_LIMIT_EXCEEDED" | ...,
+  code: "SETTLEMENT_BROADCAST_FAILED" | "SETTLEMENT_VERIFICATION_FAILED" | "RATE_LIMIT_EXCEEDED" | ...,
   details: "...",
   retryable: true | false,
   retryAfter?: 5  // seconds, also sent as Retry-After header
@@ -416,7 +416,7 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 | Flow | Agent calls relay directly |
 | Abuse prevention | Rate limits (10 req/min per sender) |
 | Payment tokens | STX, sBTC, USDCx |
-| Facilitator | facilitator.stacksx402.com (existing) |
+| Settlement | Native (local verify + direct broadcast, no external facilitator) |
 
 ## Related Projects
 
@@ -443,40 +443,53 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 ## Sponsored Transaction Flow
 
 ```
-Agent                    Relay                    Facilitator              Stacks
-  │                        │                           │                     │
-  │ 1. Build tx with       │                           │                     │
-  │    sponsored: true     │                           │                     │
-  │                        │                           │                     │
-  │ 2. POST /relay         │                           │                     │
-  │    { transaction,      │                           │                     │
-  │      settle: {...} }   │                           │                     │
-  │───────────────────────▶│                           │                     │
-  │                        │ 3. Validate & sponsor    │                     │
-  │                        │                           │                     │
-  │                        │ 4. POST /api/v1/settle   │                     │
-  │                        │───────────────────────────▶│                     │
-  │                        │                           │ 5. Broadcast        │
-  │                        │                           │────────────────────▶│
-  │                        │                           │◀────────────────────│
-  │                        │◀───────────────────────────│ 6. Settlement      │
-  │◀───────────────────────│ 7. Return { txid,        │                     │
-  │                        │    settlement,           │                     │
-  │                        │    sponsoredTx,          │                     │
-  │                        │    receiptId }           │                     │
-  │                        │                           │                     │
-  │ 8. GET /verify/:id     │                           │                     │
-  │───────────────────────▶│ 9. Check KV receipt      │                     │
-  │◀───────────────────────│ 10. Return receipt       │                     │
-  │                        │     status               │                     │
-  │                        │                           │                     │
-  │ 11. POST /access       │                           │                     │
-  │     { receiptId }      │                           │                     │
-  │───────────────────────▶│ 12. Validate receipt     │                     │
-  │                        │ 13. Grant access /       │                     │
-  │                        │     proxy request         │                     │
-  │◀───────────────────────│ 14. Return data          │                     │
+Agent                    Relay                              Stacks
+  │                        │                                  │
+  │ 1. Build tx with       │                                  │
+  │    sponsored: true     │                                  │
+  │                        │                                  │
+  │ 2. POST /relay         │                                  │
+  │    { transaction,      │                                  │
+  │      settle: {...} }   │                                  │
+  │───────────────────────▶│                                  │
+  │                        │ 3. Validate settle options       │
+  │                        │ 4. Validate tx                   │
+  │                        │ 5. Check dedup (KV)              │
+  │                        │ 6. Sponsor (add fee sig)         │
+  │                        │ 7. Verify payment params         │
+  │                        │    (recipient/amount/token)      │
+  │                        │ 8. Broadcast                     │
+  │                        │─────────────────────────────────▶│
+  │                        │◀─────────────────────────────────│
+  │                        │ 9. Poll confirm (≤60s)           │
+  │                        │10. Store receipt (KV)            │
+  │                        │11. Record dedup (KV)             │
+  │◀───────────────────────│ 12. Return {                     │
+  │                        │     txid,                        │
+  │                        │     settlement: {                │
+  │                        │       status: confirmed|pending, │
+  │                        │       blockHeight? },            │
+  │                        │     sponsoredTx,                 │
+  │                        │     receiptId }                  │
+  │                        │                                  │
+  │ 13. GET /verify/:id    │                                  │
+  │───────────────────────▶│ 14. Check KV receipt            │
+  │◀───────────────────────│ 15. Return receipt status       │
+  │                        │                                  │
+  │ 16. POST /access       │                                  │
+  │     { receiptId }      │                                  │
+  │───────────────────────▶│ 17. Validate receipt            │
+  │                        │ 18. Grant access /              │
+  │                        │     proxy request                │
+  │◀───────────────────────│ 19. Return data                 │
 ```
+
+**Settlement states:**
+- `confirmed`: tx confirmed on-chain within 60s — includes `blockHeight`
+- `pending`: broadcast succeeded but confirmation timed out — safe state, poll `/verify/:receiptId`
+- `failed`: tx broadcast OK but aborted/dropped on-chain — returns `SETTLEMENT_FAILED` (422, not retryable)
+
+**Idempotency:** Submitting the same sponsored tx hex within 5 minutes returns the cached result from KV (dedup). Safe for agents to retry on network failure.
 
 ## Future Enhancements
 
