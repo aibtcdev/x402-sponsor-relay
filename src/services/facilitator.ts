@@ -8,10 +8,15 @@ import type {
   FacilitatorSettleResponse,
   SettlementResult,
 } from "../types";
+import { hexToBytes } from "@stacks/common";
+import { txidFromBytes } from "@stacks/transactions";
 import { HealthMonitor } from "./health-monitor";
 
 const FACILITATOR_TIMEOUT_MS = 30000; // 30 seconds
 const HEALTH_CHECK_TIMEOUT_MS = 5000; // 5 seconds for health checks
+const HIRO_TIMEOUT_MS = 5000; // 5 seconds for tx lookups
+const RBF_RECOVERY_ATTEMPTS = 3;
+const RBF_RECOVERY_DELAY_MS = 2000;
 
 /**
  * Map token types to facilitator format
@@ -69,6 +74,22 @@ export type SettleValidationResult =
   | SettleValidationSuccess
   | SettleValidationFailure;
 
+type ParsedTransferEvent = {
+  tokenKind: "STX" | "FT";
+  assetId?: string;
+  amount: string;
+  sender?: string;
+  recipient?: string;
+};
+
+type HiroTxResponse = {
+  tx_id?: string;
+  tx_status?: string;
+  sender_address?: string;
+  block_height?: number;
+  events?: unknown[];
+};
+
 /**
  * Service for interacting with the x402 facilitator
  */
@@ -81,6 +102,225 @@ export class FacilitatorService {
     this.env = env;
     this.logger = logger;
     this.healthMonitor = new HealthMonitor(env.RELAY_KV, logger);
+  }
+
+  private isDroppedReplaceByFee(details: string): boolean {
+    return /dropped_replace_by_fee/i.test(details);
+  }
+
+  private with0x(txid: string): string {
+    return txid.startsWith("0x") ? txid : `0x${txid}`;
+  }
+
+  private computeTxidFromSponsoredTx(sponsoredTxHex: string): string | null {
+    try {
+      const raw = sponsoredTxHex.startsWith("0x")
+        ? sponsoredTxHex.slice(2)
+        : sponsoredTxHex;
+      return this.with0x(txidFromBytes(hexToBytes(raw)));
+    } catch (e) {
+      this.logger.warn("Failed to compute txid from sponsored tx", {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+      return null;
+    }
+  }
+
+  private hiroBaseUrl(): string {
+    return this.env.STACKS_NETWORK === "mainnet"
+      ? "https://api.hiro.so"
+      : "https://api.testnet.hiro.so";
+  }
+
+  private hiroHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {};
+    if (this.env.HIRO_API_KEY) {
+      headers["x-hiro-api-key"] = this.env.HIRO_API_KEY;
+    }
+    return headers;
+  }
+
+  private parseTransferEvent(event: unknown): ParsedTransferEvent | null {
+    if (typeof event !== "object" || event === null) return null;
+    const e = event as {
+      event_type?: string;
+      asset?: { amount?: string | number; sender?: string; recipient?: string; asset_id?: string };
+      stx_transfer_event?: { amount?: string | number; sender?: string; recipient?: string };
+      ft_transfer_event?: {
+        amount?: string | number;
+        sender?: string;
+        recipient?: string;
+        asset_identifier?: string;
+      };
+    };
+
+    if (e.event_type === "stx_asset" || e.event_type === "stx_transfer_event") {
+      const amount = e.asset?.amount ?? e.stx_transfer_event?.amount;
+      const sender = e.asset?.sender ?? e.stx_transfer_event?.sender;
+      const recipient = e.asset?.recipient ?? e.stx_transfer_event?.recipient;
+      if (amount === undefined || amount === null) return null;
+      return {
+        tokenKind: "STX",
+        amount: String(amount),
+        sender,
+        recipient,
+      };
+    }
+
+    if (
+      e.event_type === "fungible_token_asset" ||
+      e.event_type === "ft_transfer_event"
+    ) {
+      const amount = e.asset?.amount ?? e.ft_transfer_event?.amount;
+      const sender = e.asset?.sender ?? e.ft_transfer_event?.sender;
+      const recipient = e.asset?.recipient ?? e.ft_transfer_event?.recipient;
+      const assetId = e.asset?.asset_id ?? e.ft_transfer_event?.asset_identifier;
+      if (amount === undefined || amount === null) return null;
+      return {
+        tokenKind: "FT",
+        assetId,
+        amount: String(amount),
+        sender,
+        recipient,
+      };
+    }
+
+    return null;
+  }
+
+  private tokenMatches(tokenType: TokenType, event: ParsedTransferEvent): boolean {
+    if (tokenType === "STX") {
+      return event.tokenKind === "STX";
+    }
+    if (event.tokenKind !== "FT") {
+      return false;
+    }
+    const asset = (event.assetId || "").toLowerCase();
+    if (tokenType === "sBTC") {
+      return asset.includes("sbtc");
+    }
+    if (tokenType === "USDCx") {
+      return asset.includes("usdc");
+    }
+    return false;
+  }
+
+  private buildRecoveredSettlement(
+    tx: HiroTxResponse,
+    settle: SettleOptions
+  ): SettlementResult | null {
+    const minAmount = BigInt(settle.minAmount);
+    const tokenType = settle.tokenType || "STX";
+
+    if (settle.expectedSender && tx.sender_address && settle.expectedSender !== tx.sender_address) {
+      return null;
+    }
+
+    const events = Array.isArray(tx.events) ? tx.events : [];
+    for (const rawEvent of events) {
+      const parsed = this.parseTransferEvent(rawEvent);
+      if (!parsed) continue;
+      if (!this.tokenMatches(tokenType, parsed)) continue;
+      if (!parsed.recipient || parsed.recipient !== settle.expectedRecipient) continue;
+      if (settle.expectedSender && parsed.sender && parsed.sender !== settle.expectedSender) continue;
+
+      try {
+        const amount = BigInt(parsed.amount);
+        if (amount < minAmount) continue;
+      } catch {
+        continue;
+      }
+
+      return {
+        success: true,
+        status: "confirmed",
+        sender: parsed.sender || tx.sender_address || settle.expectedSender,
+        recipient: parsed.recipient,
+        amount: parsed.amount,
+        blockHeight: tx.block_height,
+      };
+    }
+
+    return null;
+  }
+
+  private async recoverDroppedRbfSettlement(
+    sponsoredTxHex: string,
+    settle: SettleOptions,
+    facilitatorTxid?: string
+  ): Promise<FacilitatorSuccess | null> {
+    const txid = facilitatorTxid
+      ? this.with0x(facilitatorTxid)
+      : this.computeTxidFromSponsoredTx(sponsoredTxHex);
+    if (!txid) return null;
+
+    const url = `${this.hiroBaseUrl()}/extended/v1/tx/${txid}`;
+    const headers = this.hiroHeaders();
+
+    for (let attempt = 1; attempt <= RBF_RECOVERY_ATTEMPTS; attempt++) {
+      try {
+        const response = await fetch(url, {
+          headers,
+          signal: AbortSignal.timeout(HIRO_TIMEOUT_MS),
+        });
+
+        if (!response.ok) {
+          this.logger.warn("Hiro tx lookup failed during RBF recovery", {
+            txid,
+            status: response.status,
+            attempt,
+          });
+        } else {
+          const tx = (await response.json()) as HiroTxResponse;
+          const status = tx.tx_status || "unknown";
+
+          if (status === "success") {
+            const recovered = this.buildRecoveredSettlement(tx, settle);
+            if (recovered) {
+              this.logger.info("Recovered settlement after dropped_replace_by_fee", {
+                txid,
+                attempt,
+              });
+              return {
+                success: true,
+                txid: this.with0x(tx.tx_id || txid),
+                settlement: recovered,
+              };
+            }
+            this.logger.warn("Tx confirmed but could not validate transfer details", {
+              txid,
+              expectedRecipient: settle.expectedRecipient,
+              minAmount: settle.minAmount,
+            });
+            return null;
+          }
+
+          if (
+            status !== "pending" &&
+            status !== "dropped_replace_by_fee" &&
+            status !== "unknown"
+          ) {
+            this.logger.warn("RBF recovery aborted on terminal tx status", {
+              txid,
+              status,
+            });
+            return null;
+          }
+        }
+      } catch (e) {
+        this.logger.warn("Hiro tx lookup error during RBF recovery", {
+          txid,
+          attempt,
+          error: e instanceof Error ? e.message : "Unknown error",
+        });
+      }
+
+      if (attempt < RBF_RECOVERY_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, RBF_RECOVERY_DELAY_MS));
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -288,14 +528,27 @@ export class FacilitatorService {
           error: settleResponse.error,
         });
 
+        const details =
+          settleResponse.validation_errors?.join(", ") ||
+          settleResponse.error ||
+          "Unknown error";
+
+        if (this.isDroppedReplaceByFee(details)) {
+          const recovered = await this.recoverDroppedRbfSettlement(
+            sponsoredTxHex,
+            settle,
+            settleResponse.tx_id
+          );
+          if (recovered) {
+            return recovered;
+          }
+        }
+
         return {
           success: false,
           error: "Settlement failed",
-          details:
-            settleResponse.validation_errors?.join(", ") ||
-            settleResponse.error ||
-            "Unknown error",
-          httpStatus: 400,
+          details,
+          httpStatus: response.status,
         };
       }
 
