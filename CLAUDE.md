@@ -6,7 +6,10 @@ This file provides guidance to Claude Code when working with this repository.
 
 x402 Stacks Sponsor Relay - A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, verifies payment parameters locally, and broadcasts directly to the Stacks network. Supports confirmed (immediate) and pending (60s timeout) settlement states with idempotent retry via KV dedup.
 
-**Status**: Native settlement (no external facilitator), payment receipts, protected resource access, and idempotent retry. Deployed to testnet staging.
+Also implements the x402 V2 facilitator API (spec sections 7.1–7.3) for compatibility with standard x402 client libraries: POST /settle, POST /verify, GET /supported.
+Spec reference: https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
+
+**Status**: Native settlement, x402 V2 facilitator API, payment receipts, protected resource access, and idempotent retry. Deployed to testnet staging.
 
 ## Commands
 
@@ -47,6 +50,10 @@ npm run test:sip018-auth -- [relay-url]
 npm run test:fees
 npm run test:fees -- [relay-url]
 
+# Test x402 V2 facilitator endpoints (/settle, /verify, /supported)
+npm run test:settle
+npm run test:settle -- [relay-url]
+
 # API key management
 npm run keys -- list                            # List all keys
 npm run keys -- create --app "App" --email "x@y.com"  # Create key
@@ -62,6 +69,9 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - @stacks/transactions for Stacks transaction handling
 - x402-stacks (fork) for building sponsored transactions
 - worker-logs service binding for centralized logging
+- x402 V2 spec-compliant facilitator (POST /settle, POST /verify, GET /supported)
+  Spec: https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
+  CAIP-2 networks: "stacks:1" (mainnet), "stacks:2147483648" (testnet)
 
 **Endpoints:**
 - `GET /` - Service info
@@ -78,6 +88,9 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `POST /fees/config` - Update fee clamps (admin, requires API key)
 - `GET /stats` - Relay statistics (JSON API)
 - `GET /dashboard` - Public dashboard (HTML)
+- `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast, no sponsoring)
+- `POST /verify` - x402 V2 facilitator verify (local validation only, no broadcast)
+- `GET /supported` - x402 V2 supported payment kinds (static config)
 
 **Agent Discovery (AX) — `src/routes/discovery.ts`:**
 - `GET /llms.txt` - Quick-start guide: what the relay does, key provisioning, /relay and /sponsor examples
@@ -88,6 +101,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
   - `api-keys` — Key provisioning via BTC/STX sig, tiers, expiry, renewal
   - `authentication` — SIP-018 structured data auth, domain constants, message schema
   - `errors` — All error codes with HTTP status, retry behavior, and descriptions
+  - `x402-v2-facilitator` — V2 spec compliance, /settle//verify//supported, CAIP-2 identifiers, CAIP-19 asset format
 - `GET /.well-known/agent.json` - A2A agent card: skills, capabilities, auth methods, network config
 
 **Request/Response:**
@@ -293,6 +307,66 @@ Response (error - stale timestamp): {
   code: "STALE_TIMESTAMP",
   retryable: false
 }
+
+// POST /settle (x402 V2 facilitator — verify + broadcast, no sponsoring)
+// CAIP-2 networks: "stacks:1" (mainnet), "stacks:2147483648" (testnet)
+// Assets: "STX", "sBTC", or CAIP-19 contract address
+Request: {
+  x402Version?: 2,  // optional, for library compat
+  paymentPayload: {
+    x402Version: 2,
+    payload: {
+      transaction: "hex-encoded-signed-sponsored-tx"  // pre-sponsored tx
+    },
+    accepted?: { ... }  // paymentRequirements the client accepted
+  },
+  paymentRequirements: {
+    scheme: "exact",
+    network: "stacks:2147483648",  // CAIP-2 identifier
+    amount: "1000000",             // minimum in smallest unit
+    asset: "STX",                  // "STX" | "sBTC" | CAIP-19 address
+    payTo: "SP...",                // recipient Stacks address
+    maxTimeoutSeconds: 60
+  }
+}
+
+Response (success, HTTP 200): {
+  success: true,
+  payer: "SP...",          // agent's Stacks address
+  transaction: "0x...",   // txid on the network
+  network: "stacks:2147483648"
+}
+
+Response (failure, HTTP 200 per spec): {
+  success: false,
+  errorReason: "recipient_mismatch",  // V2 error code
+  transaction: "",                    // empty on pre-broadcast failure
+  network: "stacks:2147483648"
+}
+
+// POST /verify (x402 V2 facilitator — local validation only, no broadcast)
+// Same request shape as POST /settle
+Request: {
+  paymentPayload: { x402Version: 2, payload: { transaction: "0x..." } },
+  paymentRequirements: { network: "stacks:2147483648", amount: "1000000", asset: "STX", payTo: "SP..." }
+}
+
+Response (valid, HTTP 200): {
+  isValid: true,
+  payer: "SP..."  // agent address if derivable
+}
+
+Response (invalid, HTTP 200): {
+  isValid: false,
+  invalidReason: "recipient_mismatch"  // V2 error code
+}
+
+// GET /supported (x402 V2 facilitator — static config)
+Response: {
+  kinds: [{ x402Version: 2, scheme: "exact", network: "stacks:2147483648" }],
+  extensions: [],
+  signers: { "stacks:*": [] }  // empty = any signer accepted
+}
 ```
 
 **SIP-018 Authentication:**
@@ -339,7 +413,10 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
 - `src/endpoints/BaseEndpoint.ts` - Base class with ok/okWithTx/err helpers
 - `src/endpoints/relay.ts` - Relay endpoint (sponsor + settle + receipt, optional SIP-018 auth)
 - `src/endpoints/sponsor.ts` - Sponsor endpoint (direct broadcast, API key + optional SIP-018 auth)
-- `src/endpoints/verify.ts` - Receipt verification endpoint
+- `src/endpoints/settle.ts` - x402 V2 settle endpoint (verify + broadcast, spec section 7.2)
+- `src/endpoints/verify-v2.ts` - x402 V2 verify endpoint (local validation only, spec section 7.1)
+- `src/endpoints/supported.ts` - x402 V2 supported payment kinds (spec section 7.3)
+- `src/endpoints/verify-receipt.ts` - Receipt verification endpoint (GET /verify/:receiptId)
 - `src/endpoints/access.ts` - Protected resource access endpoint
 - `src/endpoints/provision.ts` - API key provisioning via BTC signature (BIP-137)
 - `src/endpoints/provision-stx.ts` - API key provisioning via Stacks signature
@@ -353,6 +430,7 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
 - `src/services/sponsor.ts` - SponsorService (validate/sponsor transactions with clamped fees)
 - `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
 - `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
+- `scripts/test-settle.ts` - Test script for x402 V2 facilitator endpoints (/settle, /verify, /supported)
 - `scripts/test-provision.ts` - Test script for /keys/provision endpoint (BTC sig)
 - `scripts/test-provision-stx.ts` - Test script for /keys/provision-stx endpoint (STX sig)
 - `scripts/test-sip018-auth.ts` - Test script for SIP-018 auth on /relay and /sponsor
