@@ -5,6 +5,7 @@ import {
   V2_REQUEST_BODY_SCHEMA,
   V2_ERROR_RESPONSE_SCHEMA,
 } from "./v2-helpers";
+import { StatsService } from "../services";
 import type { AppContext, X402SettlementResponseV2 } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
@@ -95,6 +96,9 @@ export class Settle extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("x402 V2 settle request received");
 
+    // Initialize stats service for metrics recording
+    const statsService = new StatsService(c.env.RELAY_KV, logger);
+
     const network = CAIP2_NETWORKS[c.env.STACKS_NETWORK];
 
     // Helper to return V2-shaped error responses
@@ -125,6 +129,7 @@ export class Settle extends BaseEndpoint {
       // Validate V2 request structure (shared with /verify)
       const validation = validateV2Request(body, c.env, logger);
       if (!validation.valid) {
+        await statsService.recordError("validation");
         return v2Error(validation.error.errorReason, validation.error.status);
       }
 
@@ -150,6 +155,7 @@ export class Settle extends BaseEndpoint {
       const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
       if (!verifyResult.valid) {
         logger.warn("Payment verification failed", { error: verifyResult.error });
+        await statsService.recordError("validation");
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
       }
 
@@ -162,6 +168,11 @@ export class Settle extends BaseEndpoint {
         logger.warn("Broadcast/confirm failed", {
           error: broadcastResult.error,
           retryable: broadcastResult.retryable,
+        });
+        await statsService.recordTransaction({
+          success: false,
+          tokenType: settleOptions.tokenType ?? "STX",
+          amount: settleOptions.minAmount,
         });
         const errorReason = broadcastResult.retryable
           ? X402_V2_ERROR_CODES.BROADCAST_FAILED
@@ -187,6 +198,14 @@ export class Settle extends BaseEndpoint {
           : {}),
       });
 
+      // Record successful transaction stats
+      await statsService.recordTransaction({
+        success: true,
+        tokenType: settleOptions.tokenType ?? "STX",
+        amount: settleOptions.minAmount,
+        // No fee: /settle does not sponsor, it only broadcasts pre-sponsored txs
+      });
+
       logger.info("x402 V2 settle succeeded", {
         txid: broadcastResult.txid,
         payer,
@@ -204,6 +223,7 @@ export class Settle extends BaseEndpoint {
       logger.error("Unexpected settle error", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
+      await statsService.recordError("internal");
       return v2Error(X402_V2_ERROR_CODES.UNEXPECTED_SETTLE_ERROR, 500);
     }
   }
