@@ -166,7 +166,6 @@ export const dashboardCss = `
   .h-8 { height: 2rem; }
   .h-10 { height: 2.5rem; }
   .h-16 { height: 4rem; }
-  .h-64 { height: 16rem; }
   .h-96 { height: 24rem; }
   .h-full { height: 100%; }
   .min-h-screen { min-height: 100vh; }
@@ -181,7 +180,6 @@ export const dashboardCss = `
   .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
   .text-xl { font-size: 1.25rem; line-height: 1.75rem; }
   .text-2xl { font-size: 1.5rem; line-height: 2rem; }
-  .text-4xl { font-size: 2.25rem; line-height: 2.5rem; }
   .font-medium { font-weight: 500; }
   .font-semibold { font-weight: 600; }
   .font-bold { font-weight: 700; }
@@ -245,7 +243,6 @@ export const dashboardCss = `
     .md\\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   }
   @media (min-width: 1024px) {
-    .lg\\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .lg\\:px-8 { padding-left: 2rem; padding-right: 2rem; }
   }
 
@@ -267,18 +264,6 @@ export const dashboardCss = `
   .trend-up { color: ${colors.trend.up}; }
   .trend-down { color: ${colors.trend.down}; }
   .trend-stable { color: ${colors.trend.stable}; }
-
-  /* ── Brand animations ──────────────────────────────────────── */
-  @keyframes float {
-    0%, 100% { transform: translateY(0); }
-    50% { transform: translateY(-4px); }
-  }
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .animate-float { animation: float 3s ease-in-out infinite; }
-  .animate-fade-up { animation: fadeUp 0.4s ease-out; }
 
   /* ── Brand card styles ─────────────────────────────────────── */
   .brand-card {
