@@ -148,6 +148,9 @@ ${footer(now + " UTC")}
   // Server-rendered 24h chart config (used by Alpine init)
   var _chartConfig = ${transactionChartConfig(data.hourlyData)};
 
+  // Module-scoped reference for auto-refresh interval
+  var _txChartInstance = null;
+
   // Alpine.js component for the transaction volume chart with period toggle
   function txChartApp() {
     return {
@@ -160,6 +163,7 @@ ${footer(now + " UTC")}
         if (canvas && typeof Chart !== 'undefined') {
           this.chartInstance = new Chart(canvas, _chartConfig);
         }
+        _txChartInstance = this;
       },
 
       setPeriod: function(p) {
@@ -188,17 +192,18 @@ ${footer(now + " UTC")}
     };
   }
 
-  // Auto-refresh every 60 seconds (pre-validate network before reload)
-  document.addEventListener('DOMContentLoaded', function() {
-    setTimeout(function() {
-      var autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
-      if (autoRefresh) {
-        fetch(location.pathname + '/api/stats', { method: 'HEAD' })
-          .then(function(r) { if (r.ok) location.reload(); })
-          .catch(function() { /* network error — skip reload */ });
-      }
-    }, 60000);
-  });
+  // Auto-refresh chart every 60 seconds via AJAX (no page reload)
+  setInterval(function() {
+    var autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
+    if (!autoRefresh || !_txChartInstance || !_txChartInstance.chartInstance) return;
+    var period = _txChartInstance.period || '24h';
+    fetch('/dashboard/api/stats?period=' + period)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.hourlyData) _txChartInstance.rebuildChart(data.hourlyData);
+      })
+      .catch(function() {});
+  }, 60000);
 </script>
 `;
 
