@@ -89,12 +89,33 @@ ${header(network)}
     })}
   </div>
 
-  <!-- Transaction Volume Chart (full-width) -->
-  <div class="mb-6">
+  <!-- Transaction Volume Chart (full-width, with 24h/7d toggle) -->
+  <div class="mb-6" x-data="txChartApp()">
     <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">Transaction Volume</h3>
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-semibold text-white">Transaction Volume</h3>
+        <div class="flex items-center gap-1 bg-gray-800 rounded-lg p-1" x-show="${showTxChart ? 'true' : 'false'}">
+          <button
+            @click="setPeriod('24h')"
+            :class="period === '24h' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'"
+            class="px-3 py-1 rounded text-sm font-medium transition-colors min-h-[32px]">
+            24h
+          </button>
+          <button
+            @click="setPeriod('7d')"
+            :class="period === '7d' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'"
+            class="px-3 py-1 rounded text-sm font-medium transition-colors min-h-[32px]">
+            7d
+          </button>
+        </div>
+      </div>
       ${showTxChart
-        ? `<div class="h-96"><canvas id="transactionChart"></canvas></div>`
+        ? `<div class="h-96 relative">
+        <div x-show="loading" class="absolute inset-0 flex items-center justify-center bg-gray-900 bg-opacity-50 rounded z-10">
+          <span class="text-gray-400 text-sm">Loading...</span>
+        </div>
+        <canvas id="transactionChart"></canvas>
+      </div>`
         : chartEmptyState("No transaction data yet")}
     </div>
   </div>
@@ -121,17 +142,93 @@ ${header(network)}
 ${footer(now + " UTC")}
 
 <script>
-  // Initialize charts when DOM is ready
-  document.addEventListener('DOMContentLoaded', function() {
-    // Transaction volume chart (only if canvas exists and data is non-zero)
-    const txCtx = document.getElementById('transactionChart');
-    if (txCtx) {
-      new Chart(txCtx, ${transactionChartConfig(data.hourlyData)});
-    }
+  // Server-rendered 24h chart config (used by Alpine init)
+  var _chartConfig = ${transactionChartConfig(data.hourlyData)};
 
-    // Auto-refresh every 60 seconds (pre-validate network before reload)
-    setTimeout(() => {
-      const autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
+  // Alpine.js component for the transaction volume chart with period toggle
+  function txChartApp() {
+    return {
+      period: '24h',
+      loading: false,
+      chartInstance: null,
+
+      init: function() {
+        var canvas = document.getElementById('transactionChart');
+        if (canvas && typeof Chart !== 'undefined') {
+          this.chartInstance = new Chart(canvas, _chartConfig);
+        }
+      },
+
+      setPeriod: function(p) {
+        if (this.period === p || this.loading) return;
+        this.period = p;
+        this.loading = true;
+
+        var self = this;
+        fetch('/dashboard/api/stats?period=' + p)
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            var hourlyData = data.hourlyData || [];
+            self.rebuildChart(hourlyData);
+          })
+          .catch(function() { /* silently ignore fetch errors */ })
+          .finally(function() { self.loading = false; });
+      },
+
+      rebuildChart: function(hourlyData) {
+        var canvas = document.getElementById('transactionChart');
+        if (!canvas || typeof Chart === 'undefined') return;
+
+        if (this.chartInstance) {
+          this.chartInstance.destroy();
+          this.chartInstance = null;
+        }
+
+        var labels = hourlyData.map(function(d) { return d.hour; });
+        var transactions = hourlyData.map(function(d) { return d.transactions; });
+        var success = hourlyData.map(function(d) { return d.success; });
+
+        this.chartInstance = new Chart(canvas, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [
+              {
+                label: 'Total',
+                data: transactions,
+                borderColor: '#F97316',
+                backgroundColor: '#F9731620',
+                fill: true,
+                tension: 0.3
+              },
+              {
+                label: 'Success',
+                data: success,
+                borderColor: '#10B981',
+                backgroundColor: '#10B98120',
+                fill: true,
+                tension: 0.3
+              }
+            ]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'top', labels: { color: '#9CA3AF' } } },
+            scales: {
+              x: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' } },
+              y: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' }, beginAtZero: true }
+            }
+          }
+        });
+      }
+    };
+  }
+
+  // Auto-refresh every 60 seconds (pre-validate network before reload)
+  document.addEventListener('DOMContentLoaded', function() {
+    setTimeout(function() {
+      var autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
       if (autoRefresh) {
         fetch(location.pathname + '/api/stats', { method: 'HEAD' })
           .then(function(r) { if (r.ok) location.reload(); })
