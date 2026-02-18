@@ -252,8 +252,8 @@ export interface X402PaymentPayloadV2 {
   x402Version: number;
   /** Optional resource info */
   resource?: X402ResourceInfo;
-  /** The payment requirements that were accepted */
-  accepted: X402PaymentRequirementsV2;
+  /** The payment requirements that were accepted (optional — not validated by relay) */
+  accepted?: X402PaymentRequirementsV2;
   /** Scheme-specific payload containing the transaction */
   payload: X402PayloadV2;
   /** Optional protocol extensions */

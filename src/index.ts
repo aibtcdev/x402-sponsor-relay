@@ -85,6 +85,8 @@ openapi.get("/fees", Fees as unknown as typeof Fees);
 openapi.post("/fees/config", FeesConfig as unknown as typeof FeesConfig);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 openapi.post("/settle", Settle as unknown as typeof Settle);
+// Note: POST /verify (V2 facilitator) and GET /verify/:receiptId (receipt check)
+// share the /verify path but use different HTTP methods — no route collision.
 openapi.post("/verify", VerifyV2 as unknown as typeof VerifyV2);
 openapi.get("/supported", Supported as unknown as typeof Supported);
 

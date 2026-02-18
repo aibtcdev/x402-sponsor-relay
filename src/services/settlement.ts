@@ -27,6 +27,8 @@ import type {
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
 const SBTC_CONTRACT_TESTNET = "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4";
 const SBTC_CONTRACT_NAME = "sbtc-token";
+const USDCX_CONTRACT_MAINNET = "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9";
+const USDCX_CONTRACT_NAME = "token-aeusdc";
 const SIP010_TRANSFER_FUNCTION = "transfer";
 
 // Polling configuration
@@ -189,19 +191,23 @@ export class SettlementService {
    * Handles:
    * - "STX" → "STX"
    * - "SBTC" or "sBTC" (case-insensitive) → "sBTC"
-   * - CAIP-19 Stacks FT identifiers whose contract address is sBTC → "sBTC"
+   * - "USDCX" or "USDCx" (case-insensitive) → "USDCx"
+   * - CAIP-19 Stacks FT identifiers whose contract address is known → mapped token
    * - Unknown → null (caller should return unsupported_scheme error)
    */
   mapAssetToTokenType(asset: string): TokenType | null {
     if (asset === "STX") return "STX";
     const upper = asset.toUpperCase();
     if (upper === "SBTC") return "sBTC";
+    if (upper === "USDCX") return "USDCx";
 
     // Try to parse a Stacks FT CAIP-19 identifier and extract the contract address.
-    // Only treat it as sBTC if the *contract address* matches the known sBTC contracts.
     const contractAddr = this.extractStacksFtContractAddress(asset);
     if (contractAddr === SBTC_CONTRACT_MAINNET || contractAddr === SBTC_CONTRACT_TESTNET) {
       return "sBTC";
+    }
+    if (contractAddr === USDCX_CONTRACT_MAINNET) {
+      return "USDCx";
     }
 
     return null;
@@ -320,6 +326,15 @@ export class SettlementService {
           };
         }
         tokenType = "sBTC";
+      } else if (contractAddressStr === USDCX_CONTRACT_MAINNET) {
+        if (contractNameStr !== USDCX_CONTRACT_NAME) {
+          return {
+            valid: false,
+            error: "Unsupported contract",
+            details: `Expected contract name '${USDCX_CONTRACT_NAME}', got '${contractNameStr}'`,
+          };
+        }
+        tokenType = "USDCx";
       } else {
         // Reject unknown SIP-010 contracts — only known tokens are supported
         return {

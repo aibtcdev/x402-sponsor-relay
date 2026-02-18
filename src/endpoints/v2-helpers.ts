@@ -208,7 +208,7 @@ export function mapVerifyErrorToV2Code(errorMessage: string): string {
     case "Insufficient payment amount":
       return X402_V2_ERROR_CODES.AMOUNT_INSUFFICIENT;
     case "Token type mismatch":
-      return X402_V2_ERROR_CODES.SENDER_MISMATCH;
+      return X402_V2_ERROR_CODES.UNSUPPORTED_SCHEME;
     default:
       return X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE;
   }

@@ -16,10 +16,23 @@ import { VERSION } from "../version";
  */
 const discovery = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
+/**
+ * Derive base URL from the incoming request origin so discovery docs
+ * reflect the correct environment (staging vs production).
+ */
+function getBaseUrl(c: { req: { url: string } }): string {
+  const url = new URL(c.req.url);
+  return url.origin;
+}
+
+// Placeholder used in template strings, replaced with actual base URL at runtime
+const BASE_URL_PLACEHOLDER = "https://x402-relay.aibtc.com";
+
 // ---------------------------------------------------------------------------
 // /llms.txt — Quick-start guide
 // ---------------------------------------------------------------------------
 discovery.get("/llms.txt", (c) => {
+  const baseUrl = getBaseUrl(c);
   const content = `# x402 Stacks Sponsor Relay
 
 > A Cloudflare Worker enabling gasless transactions for AI agents on the
@@ -157,7 +170,7 @@ Full reference: https://x402-relay.aibtc.com/llms-full.txt
 Topic docs:     https://x402-relay.aibtc.com/topics
 `;
 
-  return new Response(content, {
+  return new Response(content.replaceAll(BASE_URL_PLACEHOLDER, baseUrl), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "public, max-age=300, s-maxage=3600",
@@ -169,6 +182,7 @@ Topic docs:     https://x402-relay.aibtc.com/topics
 // /llms-full.txt — Full reference documentation
 // ---------------------------------------------------------------------------
 discovery.get("/llms-full.txt", (c) => {
+  const baseUrl = getBaseUrl(c);
   const content = `# x402 Stacks Sponsor Relay — Full Reference
 
 Base URL (production): https://x402-relay.aibtc.com
@@ -790,7 +804,7 @@ When rate-limited, the response includes:
 - GitHub:           https://github.com/aibtcdev/x402-sponsor-relay
 `;
 
-  return new Response(content, {
+  return new Response(content.replaceAll(BASE_URL_PLACEHOLDER, baseUrl), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "public, max-age=300, s-maxage=3600",
@@ -802,36 +816,37 @@ When rate-limited, the response includes:
 // /topics — Topic index (JSON)
 // ---------------------------------------------------------------------------
 discovery.get("/topics", (c) => {
+  const baseUrl = getBaseUrl(c);
   const topics = [
     {
       topic: "sponsored-transactions",
       description:
         "Full relay flow: agent builds sponsored tx, relay verifies payment params locally, sponsors it, broadcasts natively, receipt issued. Includes pending vs confirmed states, idempotency behavior, receipt verification, and access gating.",
-      url: "https://x402-relay.aibtc.com/topics/sponsored-transactions",
+      url: `${baseUrl}/topics/sponsored-transactions`,
     },
     {
       topic: "api-keys",
       description:
         "API key provisioning via BTC signature (BIP-137) or STX signature (RSV hex). Key tiers, expiry, and management.",
-      url: "https://x402-relay.aibtc.com/topics/api-keys",
+      url: `${baseUrl}/topics/api-keys`,
     },
     {
       topic: "authentication",
       description:
         "SIP-018 structured data authentication for /relay and /sponsor. Domain constants, message schema, signature creation.",
-      url: "https://x402-relay.aibtc.com/topics/authentication",
+      url: `${baseUrl}/topics/authentication`,
     },
     {
       topic: "errors",
       description:
         "Complete error code reference with descriptions, HTTP status codes, and retry behavior.",
-      url: "https://x402-relay.aibtc.com/topics/errors",
+      url: `${baseUrl}/topics/errors`,
     },
     {
       topic: "x402-v2-facilitator",
       description:
         "x402 V2 spec compliance: relay as a facilitator. POST /settle (verify + broadcast), POST /verify (local validation), GET /supported (static config). CAIP-2 network identifiers, CAIP-19 asset format, V2 error codes, and usage examples.",
-      url: "https://x402-relay.aibtc.com/topics/x402-v2-facilitator",
+      url: `${baseUrl}/topics/x402-v2-facilitator`,
     },
   ];
 
@@ -841,10 +856,10 @@ discovery.get("/topics", (c) => {
       "Deep-dive reference docs for specific relay topics. Each doc is self-contained and covers unique workflow content.",
     topics,
     related: {
-      quickStart: "https://x402-relay.aibtc.com/llms.txt",
-      fullReference: "https://x402-relay.aibtc.com/llms-full.txt",
-      openApiSpec: "https://x402-relay.aibtc.com/openapi.json",
-      agentCard: "https://x402-relay.aibtc.com/.well-known/agent.json",
+      quickStart: `${baseUrl}/llms.txt`,
+      fullReference: `${baseUrl}/llms-full.txt`,
+      openApiSpec: `${baseUrl}/openapi.json`,
+      agentCard: `${baseUrl}/.well-known/agent.json`,
       aibtcPlatform: "https://aibtc.com/llms.txt",
     },
   });
@@ -854,6 +869,7 @@ discovery.get("/topics", (c) => {
 // /topics/:topic — Topic sub-docs (plaintext)
 // ---------------------------------------------------------------------------
 discovery.get("/topics/:topic", (c) => {
+  const baseUrl = getBaseUrl(c);
   const topic = c.req.param("topic");
 
   const topicDocs: Record<string, string> = {
@@ -1579,7 +1595,7 @@ GET https://x402-relay.aibtc.com/supported
     );
   }
 
-  return new Response(content, {
+  return new Response(content.replaceAll(BASE_URL_PLACEHOLDER, baseUrl), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "public, max-age=300, s-maxage=3600",
@@ -1591,6 +1607,7 @@ GET https://x402-relay.aibtc.com/supported
 // /.well-known/agent.json — A2A Agent Card
 // ---------------------------------------------------------------------------
 discovery.get("/.well-known/agent.json", (c) => {
+  const baseUrl = getBaseUrl(c);
   const agentCard = {
     name: "x402 Stacks Sponsor Relay",
     description:
@@ -1598,25 +1615,25 @@ discovery.get("/.well-known/agent.json", (c) => {
       "Accepts pre-signed sponsored transactions, covers the network fee, verifies payment parameters locally, and broadcasts directly to the Stacks network. " +
       "Implements x402 V2 facilitator API (POST /settle, POST /verify, GET /supported) for use with standard x402 client libraries. " +
       "Supports STX, sBTC, and USDCx tokens. API keys provisioned for free via BTC or STX signature.",
-    url: "https://x402-relay.aibtc.com",
+    url: baseUrl,
     provider: {
       organization: "AIBTC Working Group",
       url: "https://aibtc.com",
     },
     version: VERSION,
-    documentationUrl: "https://x402-relay.aibtc.com/llms.txt",
-    openApiUrl: "https://x402-relay.aibtc.com/openapi.json",
+    documentationUrl: `${baseUrl}/llms.txt`,
+    openApiUrl: `${baseUrl}/openapi.json`,
     documentation: {
-      quickStart: "https://x402-relay.aibtc.com/llms.txt",
-      fullReference: "https://x402-relay.aibtc.com/llms-full.txt",
-      openApiSpec: "https://x402-relay.aibtc.com/openapi.json",
+      quickStart: `${baseUrl}/llms.txt`,
+      fullReference: `${baseUrl}/llms-full.txt`,
+      openApiSpec: `${baseUrl}/openapi.json`,
       topicDocs: {
-        index: "https://x402-relay.aibtc.com/topics",
-        sponsoredTransactions: "https://x402-relay.aibtc.com/topics/sponsored-transactions",
-        apiKeys: "https://x402-relay.aibtc.com/topics/api-keys",
-        authentication: "https://x402-relay.aibtc.com/topics/authentication",
-        errors: "https://x402-relay.aibtc.com/topics/errors",
-        x402V2Facilitator: "https://x402-relay.aibtc.com/topics/x402-v2-facilitator",
+        index: `${baseUrl}/topics`,
+        sponsoredTransactions: `${baseUrl}/topics/sponsored-transactions`,
+        apiKeys: `${baseUrl}/topics/api-keys`,
+        authentication: `${baseUrl}/topics/authentication`,
+        errors: `${baseUrl}/topics/errors`,
+        x402V2Facilitator: `${baseUrl}/topics/x402-v2-facilitator`,
       },
       relatedPlatform: "https://aibtc.com/llms.txt",
     },
