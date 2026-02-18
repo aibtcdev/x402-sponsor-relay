@@ -342,33 +342,26 @@ export function formatNumber(n: number): string {
 }
 
 /**
- * Format a token amount for display
+ * Format a token amount for display in micro-units
+ *
+ * Returns the raw integer value with locale-aware thousands separators
+ * and the appropriate micro-unit suffix:
+ *   STX   → "56,500 μSTX"
+ *   sBTC  → "12,300 sats"
+ *   USDCx → "1,000,000 μUSDCx"
  */
 export function formatTokenAmount(amount: string, token: string): string {
   const value = BigInt(amount);
-  let divisor: bigint;
-  let decimals: number;
+  const formatted = value.toLocaleString("en-US");
 
   switch (token) {
     case "STX":
-      divisor = BigInt(1_000_000); // 6 decimals
-      decimals = 6;
-      break;
+      return `${formatted} μSTX`;
     case "sBTC":
-      divisor = BigInt(100_000_000); // 8 decimals
-      decimals = 8;
-      break;
+      return `${formatted} sats`;
     case "USDCx":
-      divisor = BigInt(1_000_000); // 6 decimals
-      decimals = 6;
-      break;
+      return `${formatted} μUSDCx`;
     default:
       return amount;
   }
-
-  const whole = value / divisor;
-  const fraction = value % divisor;
-  const fractionStr = fraction.toString().padStart(decimals, "0").slice(0, 2);
-
-  return `${whole.toLocaleString("en-US")}.${fractionStr}`;
 }
