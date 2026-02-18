@@ -310,21 +310,26 @@ export class StatsService {
     }
 
     try {
-      const stats: DailyStats[] = [];
       const now = Date.now();
 
+      // Build date keys for all requested days
+      const dateKeys: string[] = [];
       for (let i = 0; i < days; i++) {
-        const date = new Date(now - i * DAY_MS)
-          .toISOString()
-          .split("T")[0];
-        const data = await this.kv.get<DailyStats>(
-          `stats:daily:${date}`,
-          "json"
+        dateKeys.push(
+          new Date(now - i * DAY_MS).toISOString().split("T")[0]
         );
-        stats.push(data || createEmptyDailyStats(date));
       }
 
-      return stats.reverse(); // Oldest first
+      // Fetch all days in parallel
+      const results = await Promise.all(
+        dateKeys.map((date) =>
+          this.kv!.get<DailyStats>(`stats:daily:${date}`, "json")
+        )
+      );
+
+      return dateKeys
+        .map((date, i) => results[i] || createEmptyDailyStats(date))
+        .reverse(); // Oldest first
     } catch (e) {
       this.logger.error("Failed to get daily stats", {
         error: e instanceof Error ? e.message : "Unknown error",
@@ -344,25 +349,34 @@ export class StatsService {
     }
 
     try {
-      const stats: Array<{ hour: string; transactions: number; success: number; fees?: string }> = [];
       const now = Date.now();
 
+      // Build keys for all 24 hours
+      const hourEntries: Array<{ key: string; hourLabel: string }> = [];
       for (let i = 23; i >= 0; i--) {
         const hourDate = new Date(now - i * HOUR_MS);
         const date = hourDate.toISOString().split("T")[0];
         const hour = hourDate.getUTCHours().toString().padStart(2, "0");
-        const key = `stats:hourly:${date}:${hour}`;
-
-        const data = await this.kv.get<HourlyStats>(key, "json");
-        stats.push({
-          hour: `${hour}:00`,
-          transactions: data?.transactions || 0,
-          success: data?.success || 0,
-          fees: data?.fees,
+        hourEntries.push({
+          key: `stats:hourly:${date}:${hour}`,
+          hourLabel: `${hour}:00`,
         });
       }
 
-      return stats;
+      // Fetch all 24 hours in parallel
+      const results = await Promise.all(
+        hourEntries.map((entry) => this.kv!.get<HourlyStats>(entry.key, "json"))
+      );
+
+      return hourEntries.map((entry, i) => {
+        const data = results[i];
+        return {
+          hour: entry.hourLabel,
+          transactions: data?.transactions || 0,
+          success: data?.success || 0,
+          fees: data?.fees,
+        };
+      });
     } catch (e) {
       this.logger.error("Failed to get hourly stats", {
         error: e instanceof Error ? e.message : "Unknown error",

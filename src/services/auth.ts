@@ -831,6 +831,9 @@ export class AuthService {
     const maxIterations = 10; // Limit KV list operations
 
     try {
+      // Phase 1: collect key names from KV list (no reads yet)
+      const usageKeyNames: string[] = [];
+
       do {
         const result = await this.kv.list({
           prefix: usagePrefix,
@@ -839,17 +842,8 @@ export class AuthService {
         });
 
         for (const key of result.keys) {
-          // Only process today's usage records
           if (key.name.endsWith(todaySuffix)) {
-            const usage = await this.kv.get<ApiKeyUsage>(key.name, "json");
-            if (usage) {
-              // Extract keyId from key name: usage:daily:<keyId>:<date>
-              // Use slice to handle keyIds that might contain colons
-              const keyId = key.name.slice(usagePrefix.length, -todaySuffix.length);
-              if (keyId) {
-                usageEntries.push({ keyId, usage });
-              }
-            }
+            usageKeyNames.push(key.name);
           }
         }
 
@@ -860,8 +854,23 @@ export class AuthService {
       if (iterationCount >= maxIterations) {
         this.logger.warn("Aggregate stats: reached iteration limit", {
           maxIterations,
-          entriesFound: usageEntries.length,
+          entriesFound: usageKeyNames.length,
         });
+      }
+
+      // Phase 2: batch-read all usage entries in parallel
+      const usageResults = await Promise.all(
+        usageKeyNames.map((name) => this.kv!.get<ApiKeyUsage>(name, "json"))
+      );
+
+      for (let i = 0; i < usageKeyNames.length; i++) {
+        const usage = usageResults[i];
+        if (usage) {
+          const keyId = usageKeyNames[i].slice(usagePrefix.length, -todaySuffix.length);
+          if (keyId) {
+            usageEntries.push({ keyId, usage });
+          }
+        }
       }
     } catch (error) {
       this.logger.error("Failed to fetch aggregate key stats", {
@@ -874,11 +883,12 @@ export class AuthService {
     let totalActiveKeys = 0;
 
     try {
+      // Phase 1: collect key names from KV list
+      const metadataKeyNames: string[] = [];
       let keyCursor: string | undefined = undefined;
-      let shouldContinue = true;
       let keyIterations = 0;
 
-      while (shouldContinue && keyIterations < maxIterations) {
+      do {
         const listOptions: { prefix: string; limit: number; cursor?: string } = {
           prefix: "key:",
           limit: 100,
@@ -890,21 +900,26 @@ export class AuthService {
         const keyListResult = await this.kv.list(listOptions);
 
         for (const key of keyListResult.keys) {
-          const metadata = await this.kv.get<ApiKeyMetadata>(key.name, "json");
-          if (metadata?.active) {
-            const expiresAt = new Date(metadata.expiresAt);
-            if (expiresAt > new Date()) {
-              totalActiveKeys++;
-            }
-          }
+          metadataKeyNames.push(key.name);
         }
 
-        if (keyListResult.list_complete) {
-          shouldContinue = false;
-        } else {
-          keyCursor = keyListResult.cursor;
-        }
+        keyCursor = keyListResult.list_complete ? undefined : keyListResult.cursor;
         keyIterations++;
+      } while (keyCursor && keyIterations < maxIterations);
+
+      // Phase 2: batch-read all metadata entries in parallel
+      const metadataResults = await Promise.all(
+        metadataKeyNames.map((name) => this.kv!.get<ApiKeyMetadata>(name, "json"))
+      );
+
+      const now = new Date();
+      for (const metadata of metadataResults) {
+        if (metadata?.active) {
+          const expiresAt = new Date(metadata.expiresAt);
+          if (expiresAt > now) {
+            totalActiveKeys++;
+          }
+        }
       }
     } catch (error) {
       this.logger.error("Failed to count active keys", {
