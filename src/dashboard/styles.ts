@@ -93,6 +93,9 @@ export const dashboardCss = `
   .inline-block { display: inline-block; }
   .grid { display: grid; }
   .relative { position: relative; }
+  .absolute { position: absolute; }
+  .inset-0 { top: 0; right: 0; bottom: 0; left: 0; }
+  .z-10 { z-index: 10; }
   .overflow-hidden { overflow: hidden; }
   .overflow-x-auto { overflow-x: auto; }
   .items-center { align-items: center; }
@@ -107,12 +110,14 @@ export const dashboardCss = `
   .grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
   /* ── Spacing ───────────────────────────────────────────────── */
+  .gap-1 { gap: 0.25rem; }
   .gap-3 { gap: 0.75rem; }
   .gap-4 { gap: 1rem; }
   .gap-y-2 { row-gap: 0.5rem; }
   .space-x-2 > :not(:first-child) { margin-left: 0.5rem; }
   .space-x-3 > :not(:first-child) { margin-left: 0.75rem; }
   .space-x-4 > :not(:first-child) { margin-left: 1rem; }
+  .p-1 { padding: 0.25rem; }
   .p-2 { padding: 0.5rem; }
   .p-4 { padding: 1rem; }
   .p-6 { padding: 1.5rem; }
@@ -121,6 +126,7 @@ export const dashboardCss = `
   .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
   .px-4 { padding-left: 1rem; padding-right: 1rem; }
   .px-8 { padding-left: 2rem; padding-right: 2rem; }
+  .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
   .py-0\\.5 { padding-top: 0.125rem; padding-bottom: 0.125rem; }
   .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
   .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
@@ -161,8 +167,10 @@ export const dashboardCss = `
   .h-10 { height: 2.5rem; }
   .h-16 { height: 4rem; }
   .h-64 { height: 16rem; }
+  .h-96 { height: 24rem; }
   .h-full { height: 100%; }
   .min-h-screen { min-height: 100vh; }
+  .min-h-\\[32px\\] { min-height: 32px; }
   .min-h-\\[44px\\] { min-height: 44px; }
   .min-w-\\[44px\\] { min-width: 44px; }
   .max-w-7xl { max-width: 80rem; }
@@ -190,9 +198,14 @@ export const dashboardCss = `
   .text-gray-600 { color: #4b5563; }
   .text-purple-400 { color: #c084fc; }
   .text-orange-400 { color: #fb923c; }
+  .text-green-300 { color: #86efac; }
   .text-yellow-300 { color: #fde047; }
+  .text-yellow-400 { color: #facc15; }
   .bg-white { background-color: #ffffff; }
   .bg-gray-600 { background-color: #4b5563; }
+  .bg-gray-800 { background-color: #1f2937; }
+  .bg-gray-900 { background-color: #111827; }
+  .bg-gray-900.bg-opacity-50 { background-color: rgba(17, 24, 39, 0.5); }
   .bg-green-600 { background-color: #16a34a; }
   .bg-green-900 { background-color: #14532d; }
   .bg-yellow-900 { background-color: #713f12; }
@@ -203,6 +216,7 @@ export const dashboardCss = `
   .border-yellow-700 { border-color: #a16207; }
 
   /* ── Rounded ───────────────────────────────────────────────── */
+  .rounded { border-radius: 0.25rem; }
   .rounded-sm { border-radius: 0.125rem; }
   .rounded-lg { border-radius: 0.5rem; }
   .rounded-full { border-radius: 9999px; }
