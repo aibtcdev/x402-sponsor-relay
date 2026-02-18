@@ -14,16 +14,22 @@ export interface HealthStatus {
 }
 
 /**
- * Service for monitoring facilitator health
+ * Service for monitoring health checks.
+ * Accepts an optional key prefix to namespace KV entries (default: "facilitator").
  */
 export class HealthMonitor {
+  private keyPrefix: string;
+
   constructor(
     private kv: KVNamespace | undefined,
-    private logger: Logger
-  ) {}
+    private logger: Logger,
+    keyPrefix = "facilitator"
+  ) {
+    this.keyPrefix = keyPrefix;
+  }
 
   /**
-   * Record a health check result from a facilitator call
+   * Record a health check result
    */
   async recordCheck(
     check: Omit<FacilitatorHealthCheck, "timestamp">
@@ -41,13 +47,13 @@ export class HealthMonitor {
 
       // Update latest check
       await this.kv.put(
-        "facilitator:health:latest",
+        `${this.keyPrefix}:health:latest`,
         JSON.stringify(healthCheck)
       );
 
       // Update history (ring buffer)
       const history = await this.kv.get<FacilitatorHealthCheck[]>(
-        "facilitator:health:history",
+        `${this.keyPrefix}:health:history`,
         "json"
       );
       const checks = history || [];
@@ -58,7 +64,7 @@ export class HealthMonitor {
       }
 
       await this.kv.put(
-        "facilitator:health:history",
+        `${this.keyPrefix}:health:history`,
         JSON.stringify(checks)
       );
     } catch (e) {
@@ -69,7 +75,7 @@ export class HealthMonitor {
   }
 
   /**
-   * Get current facilitator health status
+   * Get current health status
    */
   async getStatus(): Promise<HealthStatus> {
     const emptyStatus: HealthStatus = {
@@ -87,11 +93,11 @@ export class HealthMonitor {
     try {
       const [latest, history] = await Promise.all([
         this.kv.get<FacilitatorHealthCheck>(
-          "facilitator:health:latest",
+          `${this.keyPrefix}:health:latest`,
           "json"
         ),
         this.kv.get<FacilitatorHealthCheck[]>(
-          "facilitator:health:history",
+          `${this.keyPrefix}:health:history`,
           "json"
         ),
       ]);

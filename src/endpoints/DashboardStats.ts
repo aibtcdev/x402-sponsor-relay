@@ -1,8 +1,7 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import {
   StatsService,
-  HealthMonitor,
-  FacilitatorService,
+  SettlementHealthService,
   AuthService,
 } from "../services";
 import type { AppContext, DashboardOverview } from "../types";
@@ -17,7 +16,7 @@ export class DashboardStats extends BaseEndpoint {
     tags: ["Dashboard"],
     summary: "Get relay statistics",
     description:
-      "Returns aggregated statistics about relay transactions, token breakdown, and facilitator health. This is a public endpoint.",
+      "Returns aggregated statistics about relay transactions, token breakdown, and settlement health. This is a public endpoint.",
     responses: {
       "200": {
         description: "Statistics retrieved successfully",
@@ -163,16 +162,15 @@ export class DashboardStats extends BaseEndpoint {
 
     try {
       const statsService = new StatsService(c.env.RELAY_KV, logger);
-      const healthMonitor = new HealthMonitor(c.env.RELAY_KV, logger);
-      const facilitatorService = new FacilitatorService(c.env, logger);
+      const settlementHealthService = new SettlementHealthService(c.env, logger);
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
 
-      // Trigger a fresh health check (non-blocking - we'll still return cached data if this fails)
-      // Run health check and API key stats in parallel with data fetching
+      // Run settlement health check and API key stats in parallel with data fetching
+      // Health check pings Hiro API and verifies sponsor wallet is configured
       const [overview, health, apiKeyStats] = await Promise.all([
         statsService.getOverview(),
-        // First do a fresh health check, then get the updated status
-        facilitatorService.checkHealth().then(() => healthMonitor.getStatus()),
+        // Fresh self-check (wallet configured + Hiro reachable), then read updated KV status
+        settlementHealthService.checkHealth().then(() => settlementHealthService.getStatus()),
         // Get API key aggregate stats (returns empty stats if KV not configured)
         authService.getAggregateKeyStats(),
       ]);

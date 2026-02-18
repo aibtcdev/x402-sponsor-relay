@@ -40,3 +40,5 @@ export type {
 export { FeeService } from "./fee";
 
 export { SettlementService } from "./settlement";
+
+export { SettlementHealthService } from "./settlement-health";
