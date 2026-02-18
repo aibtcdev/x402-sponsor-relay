@@ -70,22 +70,22 @@ dashboard.get("/api/stats", async (c) => {
   const period = c.req.query("period") === "7d" ? "7d" : "24h";
 
   try {
+    // 7d only needs chart data — skip getOverview() (26 reads) and getStatus() (2 reads)
+    if (period === "7d") {
+      const dailyChartData = await statsService.getDailyChartData(7);
+      return c.json(
+        { hourlyData: dailyChartData, period: "7d" as const },
+        200,
+        { "Cache-Control": "public, max-age=60" }
+      );
+    }
+
     const [overview, health] = await Promise.all([
       statsService.getOverview(),
       healthService.getStatus(),
     ]);
 
     const dashboardData = buildDashboardData(overview, health);
-
-    // For 7d period, replace hourlyData with daily-granularity entries
-    if (period === "7d") {
-      const dailyChartData = await statsService.getDailyChartData(7);
-      return c.json(
-        { ...dashboardData, period: "7d" as const, hourlyData: dailyChartData },
-        200,
-        { "Cache-Control": "public, max-age=60" }
-      );
-    }
 
     return c.json(dashboardData, 200, {
       "Cache-Control": "public, max-age=15",
