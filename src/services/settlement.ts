@@ -458,9 +458,33 @@ export class SettlementService {
 
       // Serialize transaction to bytes (serialize() returns hex in @stacks/transactions v7)
       const txHex = transaction.serialize();
-      const txBytes = new Uint8Array(
-        txHex.match(/.{1,2}/g)!.map((b) => parseInt(b, 16))
-      );
+      if (
+        typeof txHex !== "string" ||
+        txHex.length === 0 ||
+        txHex.length % 2 !== 0 ||
+        !/^[0-9a-fA-F]+$/.test(txHex)
+      ) {
+        this.logger.error("Failed to serialize transaction to valid hex", {
+          txHexSample: String(txHex).slice(0, 64),
+        });
+        return {
+          error: "Broadcast failed",
+          details: "Serialized transaction is not a valid hex string",
+          retryable: false,
+        };
+      }
+      const bytePairs = txHex.match(/.{2}/g);
+      if (!bytePairs) {
+        this.logger.error("Hex serialization produced no byte pairs", {
+          txHexSample: txHex.slice(0, 64),
+        });
+        return {
+          error: "Broadcast failed",
+          details: "Serialized transaction hex could not be converted to bytes",
+          retryable: false,
+        };
+      }
+      const txBytes = new Uint8Array(bytePairs.map((b) => parseInt(b, 16)));
 
       const broadcastHeaders: Record<string, string> = {
         "Content-Type": "application/octet-stream",
