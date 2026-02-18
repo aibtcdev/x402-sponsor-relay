@@ -186,7 +186,7 @@ export class StatsService {
         USDCx: { count: 0, volume: "0", percentage: 0 },
       },
       fees: emptyFees,
-      facilitator: {
+      settlement: {
         status: "unknown",
         avgLatencyMs: 0,
         uptime24h: 0,
@@ -285,7 +285,7 @@ export class StatsService {
           trend: feeTrend,
           previousTotal: previousFees.total,
         },
-        facilitator: {
+        settlement: {
           status: "unknown", // Will be populated by health monitor
           avgLatencyMs: 0,
           uptime24h: 0,

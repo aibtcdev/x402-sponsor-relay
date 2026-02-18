@@ -29,7 +29,7 @@ dashboard.get("/", async (c) => {
     // Merge health data into overview
     const dashboardData: DashboardOverview = {
       ...overview,
-      facilitator: {
+      settlement: {
         status: health.status,
         avgLatencyMs: health.avgLatencyMs,
         uptime24h: health.uptime24h,
@@ -70,7 +70,7 @@ dashboard.get("/api/stats", async (c) => {
 
     const dashboardData: DashboardOverview = {
       ...overview,
-      facilitator: {
+      settlement: {
         status: health.status,
         avgLatencyMs: health.avgLatencyMs,
         uptime24h: health.uptime24h,

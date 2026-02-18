@@ -78,7 +78,7 @@ export class DashboardStats extends BaseEndpoint {
                     },
                   },
                 },
-                facilitator: {
+                settlement: {
                   type: "object" as const,
                   properties: {
                     status: {
@@ -177,7 +177,7 @@ export class DashboardStats extends BaseEndpoint {
 
       const dashboardData: DashboardOverview = {
         ...overview,
-        facilitator: {
+        settlement: {
           status: health.status,
           avgLatencyMs: health.avgLatencyMs,
           uptime24h: health.uptime24h,

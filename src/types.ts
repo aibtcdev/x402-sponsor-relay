@@ -820,7 +820,7 @@ export interface DashboardOverview {
     /** Total fees paid previous day */
     previousTotal: string;
   };
-  facilitator: {
+  settlement: {
     status: "healthy" | "degraded" | "down" | "unknown";
     avgLatencyMs: number;
     uptime24h: number;
