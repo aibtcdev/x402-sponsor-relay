@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.8.1...v1.8.2) (2026-02-18)
+
+
+### Bug Fixes
+
+* **dashboard:** resolve all code review findings ([#60](https://github.com/aibtcdev/x402-sponsor-relay/issues/60)) ([aef5f9c](https://github.com/aibtcdev/x402-sponsor-relay/commit/aef5f9cf9cb7e60c6f8aaf6dea7c7a9f293d1f06))
+
 ## [1.8.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.8.0...v1.8.1) (2026-02-18)
 
 
