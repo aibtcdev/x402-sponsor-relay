@@ -1,6 +1,5 @@
 import {
   deserializeTransaction,
-  broadcastTransaction,
   PayloadType,
   ClarityType,
   addressToString,
@@ -65,15 +64,6 @@ export class SettlementService {
   constructor(env: Env, logger: Logger) {
     this.env = env;
     this.logger = logger;
-  }
-
-  /**
-   * Get the Stacks network instance based on environment configuration
-   */
-  private getNetwork() {
-    return this.env.STACKS_NETWORK === "mainnet"
-      ? STACKS_MAINNET
-      : STACKS_TESTNET;
   }
 
   /**
@@ -457,29 +447,88 @@ export class SettlementService {
   async broadcastAndConfirm(
     transaction: StacksTransactionWire
   ): Promise<BroadcastAndConfirmResult> {
-    // Broadcast to Stacks node
+    // Broadcast to Stacks node via direct fetch to /v2/transactions.
+    // Using direct fetch instead of broadcastTransaction() from @stacks/transactions
+    // to avoid unhandled throws on non-JSON node responses and gain structured
+    // Ok/Err handling regardless of the node's response content type.
     let txid: string;
     try {
-      const network = this.getNetwork();
-      const result = (await broadcastTransaction({
-        transaction,
-        network,
-      })) as { txid?: string; error?: string; reason?: string };
+      const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
+      const broadcastUrl = `${hiroBaseUrl}/v2/transactions`;
 
-      if (result.error || !result.txid) {
+      // Serialize transaction to bytes (serialize() returns hex in @stacks/transactions v7)
+      const txHex = transaction.serialize();
+      const txBytes = new Uint8Array(
+        txHex.match(/.{1,2}/g)!.map((b) => parseInt(b, 16))
+      );
+
+      const broadcastHeaders: Record<string, string> = {
+        "Content-Type": "application/octet-stream",
+        ...getHiroHeaders(this.env.HIRO_API_KEY),
+      };
+
+      const broadcastResponse = await fetch(broadcastUrl, {
+        method: "POST",
+        headers: broadcastHeaders,
+        body: txBytes,
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      const responseText = await broadcastResponse.text();
+
+      if (broadcastResponse.ok) {
+        // Success: body is a JSON-quoted txid string, e.g. "\"0x1234...\""
+        let parsedTxid: string;
+        try {
+          parsedTxid = JSON.parse(responseText) as string;
+        } catch {
+          // Some nodes return the txid without JSON quoting
+          parsedTxid = responseText.trim().replace(/^"|"$/g, "");
+        }
+
+        if (!parsedTxid || typeof parsedTxid !== "string") {
+          this.logger.error("Broadcast returned OK but unparseable txid", {
+            responseText: responseText.slice(0, 200),
+          });
+          return {
+            error: "Broadcast failed",
+            details: "Node returned OK but txid could not be parsed",
+            retryable: true,
+          };
+        }
+
+        txid = parsedTxid;
+        this.logger.info("Transaction broadcast successful", { txid });
+      } else {
+        // Error: try to parse JSON error body; fall back to raw text
+        let errorMessage = `HTTP ${broadcastResponse.status}`;
+        let errorDetails = responseText.slice(0, 500);
+
+        try {
+          const errorJson = JSON.parse(responseText) as {
+            error?: string;
+            reason?: string;
+            message?: string;
+          };
+          if (errorJson.error || errorJson.reason || errorJson.message) {
+            errorMessage = errorJson.error ?? errorJson.message ?? errorMessage;
+            errorDetails = errorJson.reason ?? errorDetails;
+          }
+        } catch {
+          // Body is not JSON — use raw text as details
+        }
+
         this.logger.error("Broadcast failed", {
-          error: result.error,
-          reason: result.reason,
+          status: broadcastResponse.status,
+          error: errorMessage,
+          details: errorDetails,
         });
         return {
           error: "Broadcast failed",
-          details: result.error || result.reason || "No txid in broadcast response",
+          details: `${errorMessage}: ${errorDetails}`,
           retryable: true,
         };
       }
-
-      txid = result.txid;
-      this.logger.info("Transaction broadcast successful", { txid });
     } catch (e) {
       this.logger.error("Broadcast threw exception", {
         error: e instanceof Error ? e.message : String(e),
