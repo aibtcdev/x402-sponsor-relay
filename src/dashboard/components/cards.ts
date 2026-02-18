@@ -18,7 +18,7 @@ export function statsCard(
   const color = options?.colorClass || "text-white";
 
   return `
-<div class="stat-card brand-card p-4">
+<div class="brand-card p-4">
   <div class="flex items-center justify-between">
     <p class="text-sm text-gray-400">${escapeHtml(label)}</p>
     ${options?.icon || ""}
@@ -41,7 +41,7 @@ export function tokenCard(
   const formattedVolume = formatTokenAmount(volume, token);
 
   return `
-<div class="stat-card brand-card p-4">
+<div class="brand-card p-4">
   <div class="flex items-center space-x-2">
     <div class="w-3 h-3 rounded-full" style="background-color: ${tokenColor}"></div>
     <span class="font-medium" style="color: ${tokenColor}">${token}</span>
@@ -149,7 +149,7 @@ export function successRateCard(success: number, total: number): string {
   const color = rate >= 95 ? colors.status.healthy : rate >= 80 ? colors.status.degraded : colors.status.down;
 
   return `
-<div class="stat-card brand-card p-4">
+<div class="brand-card p-4">
   <p class="text-sm text-gray-400">Success Rate</p>
   <p class="text-2xl font-bold mt-2" style="color: ${color}">${rate}%</p>
   <div class="mt-2 h-2 rounded-full overflow-hidden" style="background-color: ${colors.bg.border}">

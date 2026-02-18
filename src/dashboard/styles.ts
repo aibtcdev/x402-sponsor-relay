@@ -303,15 +303,6 @@ export const dashboardCss = `
     border-radius: 0.5rem;
   }
 
-  /* Legacy compat: stat-card maps to brand-card */
-  .stat-card {
-    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
-  }
-  .stat-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 20px rgba(255, 79, 3, 0.08);
-    border-color: rgba(255, 79, 3, 0.3);
-  }
 `;
 
 /**
