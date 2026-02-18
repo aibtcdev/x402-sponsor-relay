@@ -731,7 +731,7 @@ Returns service health, Stacks network connectivity, and sponsor wallet info.
 ## GET /stats — Relay Statistics
 
 Returns aggregate relay statistics for the last 24h and 7 days.
-Includes transaction counts, token breakdown, fee stats, and facilitator health.
+Includes transaction counts, token breakdown, fee stats, and settlement health.
 
 ---
 

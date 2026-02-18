@@ -88,7 +88,7 @@ dashboard.get("/api/stats", async (c) => {
 });
 
 /**
- * GET /dashboard/api/health - Facilitator health JSON
+ * GET /dashboard/api/health - Settlement health JSON
  */
 dashboard.get("/api/health", async (c) => {
   const logger = c.get("logger");
