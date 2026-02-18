@@ -10,7 +10,7 @@ import {
   formatTrend,
   transactionChartConfig,
 } from "../components/charts";
-import { colors, formatNumber, formatTokenAmount, escapeHtml } from "../styles";
+import { formatNumber, formatTokenAmount, escapeHtml } from "../styles";
 
 /** Bar chart SVG icon (reused in empty states) */
 function barChartSvg(sizeClass: string, extraClass = ""): string {
@@ -147,9 +147,6 @@ ${header(network)}
 ${footer(utcTimestamp())}
 
 <script>
-  // Brand colors for chart datasets (single source of truth from styles.ts)
-  var _brandColors = { total: '${colors.brand.orange}', success: '${colors.status.healthy}' };
-
   // Server-rendered 24h chart config (used by Alpine init)
   var _chartConfig = ${transactionChartConfig(data.hourlyData)};
 

@@ -17,7 +17,7 @@ export function htmlDocument(content: string, title: string, options?: { include
   <title>${escapeHtml(title)}</title>
   <link rel="icon" type="image/png" sizes="32x32" href="https://aibtc.com/favicon-32x32.png">
   <link rel="preconnect" href="https://aibtc.com" crossorigin>
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>${chartJsTag}
+  ${chartJsTag}<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
   <style>
     ${dashboardCss}
     [x-cloak] { display: none !important; }
