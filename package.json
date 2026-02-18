@@ -1,6 +1,6 @@
 {
   "name": "x402-sponsor-relay",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "private": true,
   "scripts": {
     "dev": "npm run wrangler -- dev",
