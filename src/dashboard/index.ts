@@ -1,7 +1,8 @@
 import { Hono } from "hono";
-import type { Env, AppVariables, DashboardOverview } from "../types";
-import { StatsService, HealthMonitor } from "../services";
+import type { Env, AppVariables } from "../types";
+import { StatsService, SettlementHealthService } from "../services";
 import { overviewPage, emptyStatePage } from "./pages/overview";
+import { buildDashboardData } from "./helpers";
 
 /**
  * Dashboard router - public stats display
@@ -17,29 +18,17 @@ export const dashboard = new Hono<{
 dashboard.get("/", async (c) => {
   const logger = c.get("logger");
   const statsService = new StatsService(c.env.RELAY_KV, logger);
-  const healthMonitor = new HealthMonitor(c.env.RELAY_KV, logger);
+  const healthService = new SettlementHealthService(c.env, logger);
 
   try {
-    // Get stats and health data in parallel
     const [overview, health] = await Promise.all([
       statsService.getOverview(),
-      healthMonitor.getStatus(),
+      healthService.getStatus(),
     ]);
 
-    // Merge health data into overview
-    const dashboardData: DashboardOverview = {
-      ...overview,
-      settlement: {
-        status: health.status,
-        avgLatencyMs: health.avgLatencyMs,
-        uptime24h: health.uptime24h,
-        lastCheck: health.lastCheck?.timestamp || null,
-      },
-    };
-
+    const dashboardData = buildDashboardData(overview, health);
     const network = c.env.STACKS_NETWORK;
 
-    // Check if we have any data
     const hasData =
       dashboardData.transactions.total > 0 || health.recentChecks.length > 0;
 
@@ -47,9 +36,11 @@ dashboard.get("/", async (c) => {
       return c.html(emptyStatePage(network));
     }
 
-    return c.html(overviewPage(dashboardData, network));
+    return c.html(overviewPage(dashboardData, network), 200, {
+      "Cache-Control": "public, max-age=30",
+    });
   } catch (e) {
-    logger?.error("Failed to render dashboard", {
+    logger.error("Failed to render dashboard", {
       error: e instanceof Error ? e.message : "Unknown error",
     });
     return c.html(emptyStatePage(c.env.STACKS_NETWORK));
@@ -62,27 +53,21 @@ dashboard.get("/", async (c) => {
 dashboard.get("/api/stats", async (c) => {
   const logger = c.get("logger");
   const statsService = new StatsService(c.env.RELAY_KV, logger);
-  const healthMonitor = new HealthMonitor(c.env.RELAY_KV, logger);
+  const healthService = new SettlementHealthService(c.env, logger);
 
   try {
     const [overview, health] = await Promise.all([
       statsService.getOverview(),
-      healthMonitor.getStatus(),
+      healthService.getStatus(),
     ]);
 
-    const dashboardData: DashboardOverview = {
-      ...overview,
-      settlement: {
-        status: health.status,
-        avgLatencyMs: health.avgLatencyMs,
-        uptime24h: health.uptime24h,
-        lastCheck: health.lastCheck?.timestamp || null,
-      },
-    };
+    const dashboardData = buildDashboardData(overview, health);
 
-    return c.json(dashboardData);
+    return c.json(dashboardData, 200, {
+      "Cache-Control": "public, max-age=15",
+    });
   } catch (e) {
-    logger?.error("Failed to get stats", {
+    logger.error("Failed to get stats", {
       error: e instanceof Error ? e.message : "Unknown error",
     });
     return c.json({ error: "Failed to retrieve stats" }, 500);
@@ -94,13 +79,15 @@ dashboard.get("/api/stats", async (c) => {
  */
 dashboard.get("/api/health", async (c) => {
   const logger = c.get("logger");
-  const healthMonitor = new HealthMonitor(c.env.RELAY_KV, logger);
+  const healthService = new SettlementHealthService(c.env, logger);
 
   try {
-    const health = await healthMonitor.getStatus();
-    return c.json(health);
+    const health = await healthService.getStatus();
+    return c.json(health, 200, {
+      "Cache-Control": "public, max-age=15",
+    });
   } catch (e) {
-    logger?.error("Failed to get health", {
+    logger.error("Failed to get health", {
       error: e instanceof Error ? e.message : "Unknown error",
     });
     return c.json({ error: "Failed to retrieve health status" }, 500);

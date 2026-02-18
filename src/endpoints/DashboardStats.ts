@@ -4,8 +4,9 @@ import {
   SettlementHealthService,
   AuthService,
 } from "../services";
-import type { AppContext, DashboardOverview } from "../types";
+import type { AppContext } from "../types";
 import { Error500Response } from "../schemas";
+import { buildDashboardData } from "../dashboard/helpers";
 
 /**
  * Dashboard stats endpoint - returns stats as JSON
@@ -162,35 +163,21 @@ export class DashboardStats extends BaseEndpoint {
 
     try {
       const statsService = new StatsService(c.env.RELAY_KV, logger);
-      const settlementHealthService = new SettlementHealthService(c.env, logger);
+      const healthService = new SettlementHealthService(c.env, logger);
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
 
-      // Run settlement health check and API key stats in parallel with data fetching
-      // Health check pings Hiro API and verifies sponsor wallet is configured
+      // Read cached health status from KV (no live Hiro call)
       const [overview, health, apiKeyStats] = await Promise.all([
         statsService.getOverview(),
-        // Fresh self-check (wallet configured + Hiro reachable), then read updated KV status
-        settlementHealthService.checkHealth().then(() => settlementHealthService.getStatus()),
-        // Get API key aggregate stats (returns empty stats if KV not configured)
+        healthService.getStatus(),
         authService.getAggregateKeyStats(),
       ]);
 
-      const dashboardData: DashboardOverview = {
-        ...overview,
-        settlement: {
-          status: health.status,
-          avgLatencyMs: health.avgLatencyMs,
-          uptime24h: health.uptime24h,
-          lastCheck: health.lastCheck?.timestamp || null,
-        },
-        // Only include apiKeys if there are active keys or usage data
-        apiKeys:
-          apiKeyStats.totalActiveKeys > 0 || apiKeyStats.topKeys.length > 0
-            ? apiKeyStats
-            : undefined,
-      };
+      const dashboardData = buildDashboardData(overview, health, apiKeyStats);
 
-      return this.ok(c, dashboardData);
+      return this.ok(c, dashboardData, {
+        "Cache-Control": "public, max-age=15",
+      });
     } catch (e) {
       logger.error("Failed to get stats", {
         error: e instanceof Error ? e.message : "Unknown error",
