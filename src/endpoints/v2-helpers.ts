@@ -135,7 +135,7 @@ export function validateV2Request(
 
   // Validate paymentRequirements has required fields
   const req = parsed.paymentRequirements;
-  if (!req.network || !req.payTo || !req.amount) {
+  if (!req.network || !req.payTo || !req.amount || !req.asset) {
     return {
       valid: false,
       error: {
@@ -159,7 +159,7 @@ export function validateV2Request(
 
   // Map asset to internal token type
   const settlementService = new SettlementService(env, logger);
-  const tokenType = settlementService.mapAssetToTokenType(req.asset || "STX");
+  const tokenType = settlementService.mapAssetToTokenType(req.asset);
   if (tokenType === null) {
     logger.warn("Unsupported asset", { asset: req.asset });
     return {

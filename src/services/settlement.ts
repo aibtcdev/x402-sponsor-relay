@@ -189,16 +189,40 @@ export class SettlementService {
    * Handles:
    * - "STX" → "STX"
    * - "SBTC" or "sBTC" (case-insensitive) → "sBTC"
-   * - CAIP-19 format containing known sBTC contract addresses → "sBTC"
+   * - CAIP-19 Stacks FT identifiers whose contract address is sBTC → "sBTC"
    * - Unknown → null (caller should return unsupported_scheme error)
    */
   mapAssetToTokenType(asset: string): TokenType | null {
     if (asset === "STX") return "STX";
     const upper = asset.toUpperCase();
     if (upper === "SBTC") return "sBTC";
-    // CAIP-19 format: eip155:1/erc20:0x... or stacks:1/ft:SP...::sbtc-token
-    if (asset.includes(SBTC_CONTRACT_MAINNET) || asset.includes(SBTC_CONTRACT_TESTNET)) return "sBTC";
+
+    // Try to parse a Stacks FT CAIP-19 identifier and extract the contract address.
+    // Only treat it as sBTC if the *contract address* matches the known sBTC contracts.
+    const contractAddr = this.extractStacksFtContractAddress(asset);
+    if (contractAddr === SBTC_CONTRACT_MAINNET || contractAddr === SBTC_CONTRACT_TESTNET) {
+      return "sBTC";
+    }
+
     return null;
+  }
+
+  /**
+   * Extract the Stacks FT contract principal from a CAIP-19 asset identifier.
+   *
+   * Expected format: stacks:<chainId>/sip010:<contractAddr>.<contractName>.<tokenName>
+   * Returns the uppercase contract address, or null if not a valid Stacks FT CAIP-19.
+   */
+  private extractStacksFtContractAddress(asset: string): string | null {
+    if (!asset.toLowerCase().startsWith("stacks:")) return null;
+    const parts = asset.split("/");
+    if (parts.length < 2) return null;
+    const assetSpec = parts[1]; // e.g., "sip010:SP1234.my-token.my-token"
+    if (!assetSpec.toLowerCase().startsWith("sip010:")) return null;
+    const afterType = assetSpec.substring(7); // strip "sip010:"
+    if (!afterType) return null;
+    const [contractPrincipal] = afterType.split(".");
+    return contractPrincipal ? contractPrincipal.toUpperCase() : null;
   }
 
   /**

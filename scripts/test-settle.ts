@@ -156,8 +156,8 @@ async function main() {
   const recipient = process.env.TEST_RECIPIENT || AIBTC_TESTNET;
   console.log(`Recipient address: ${recipient}`);
 
-  // Build a sponsored STX transfer
-  console.log("\nBuilding sponsored transaction...");
+  // Build a standard (non-sponsored) STX transfer — /settle does NOT sponsor
+  console.log("\nBuilding standard transaction...");
   const transaction = await makeSTXTokenTransfer({
     recipient,
     amount: 1000n, // 0.001 STX in microSTX
@@ -165,8 +165,8 @@ async function main() {
     network: "testnet",
     memo: "test-settle",
     anchorMode: AnchorMode.Any,
-    sponsored: true,
-    fee: 0n, // Sponsor will pay
+    sponsored: false,
+    fee: 1000n, // Sender pays their own fee
   });
 
   // Serialize to hex (v7: serialize() returns hex string directly)
