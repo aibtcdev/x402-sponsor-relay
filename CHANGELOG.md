@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.7.0...v1.8.0) (2026-02-18)
+
+
+### Features
+
+* add x402 V2 facilitator API (settle, verify, supported) ([#50](https://github.com/aibtcdev/x402-sponsor-relay/issues/50)) ([991e698](https://github.com/aibtcdev/x402-sponsor-relay/commit/991e6989edec35e6187b9cc0348c0a8e3a99c9cb))
+
 ## [1.7.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.6.0...v1.7.0) (2026-02-17)
 
 
