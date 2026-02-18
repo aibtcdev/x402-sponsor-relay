@@ -152,18 +152,22 @@ ${footer(now + " UTC")}
       new Chart(tokenCtx, ${tokenPieChartConfig(data.tokens)});
     }
 
-    // Auto-refresh every 60 seconds
+    // Auto-refresh every 60 seconds (pre-validate network before reload)
     setTimeout(() => {
       const autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
       if (autoRefresh) {
-        location.reload();
+        fetch(location.pathname + '/api/stats', { method: 'HEAD' })
+          .then(function(r) { if (r.ok) location.reload(); })
+          .catch(function() { /* network error — skip reload */ });
       }
     }, 60000);
   });
 </script>
 `;
 
-  return htmlDocument(content, "x402 Sponsor Relay - Dashboard");
+  return htmlDocument(content, "x402 Sponsor Relay - Dashboard", {
+    includeChartJs: showTxChart || showTokenChart,
+  });
 }
 
 /**

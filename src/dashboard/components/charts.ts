@@ -1,46 +1,6 @@
 import { colors } from "../styles";
 
 /**
- * Generate SVG sparkline from data points
- */
-export function sparkline(
-  data: number[],
-  color: string,
-  width = 100,
-  height = 30
-): string {
-  if (data.length === 0) {
-    return `<svg width="${width}" height="${height}" class="opacity-50">
-      <text x="50%" y="50%" text-anchor="middle" fill="#6B7280" font-size="10">No data</text>
-    </svg>`;
-  }
-
-  const max = Math.max(...data, 1);
-  const min = Math.min(...data, 0);
-  const range = max - min || 1;
-
-  const points = data
-    .map((value, i) => {
-      const x = (i / (data.length - 1 || 1)) * width;
-      const y = height - ((value - min) / range) * height;
-      return `${x},${y}`;
-    })
-    .join(" ");
-
-  return `
-<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-  <polyline
-    points="${points}"
-    fill="none"
-    stroke="${color}"
-    stroke-width="2"
-    stroke-linecap="round"
-    stroke-linejoin="round"
-  />
-</svg>`;
-}
-
-/**
  * Format trend indicator with arrow and percentage
  */
 export function formatTrend(

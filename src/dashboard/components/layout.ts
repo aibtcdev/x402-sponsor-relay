@@ -4,7 +4,11 @@ import { VERSION } from "../../version";
 /**
  * Generate full HTML document wrapper
  */
-export function htmlDocument(content: string, title: string): string {
+export function htmlDocument(content: string, title: string, options?: { includeChartJs?: boolean }): string {
+  const chartJsTag = options?.includeChartJs
+    ? `\n  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>`
+    : "";
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -12,10 +16,8 @@ export function htmlDocument(content: string, title: string): string {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)}</title>
   <link rel="icon" type="image/png" sizes="32x32" href="https://aibtc.com/favicon-32x32.png">
-  <link rel="dns-prefetch" href="https://aibtc.com">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="preconnect" href="https://aibtc.com" crossorigin>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>${chartJsTag}
   <style>
     ${dashboardCss}
     [x-cloak] { display: none !important; }
