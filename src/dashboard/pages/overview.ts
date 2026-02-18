@@ -179,51 +179,11 @@ ${footer(now + " UTC")}
       },
 
       rebuildChart: function(hourlyData) {
-        var canvas = document.getElementById('transactionChart');
-        if (!canvas || typeof Chart === 'undefined') return;
-
-        if (this.chartInstance) {
-          this.chartInstance.destroy();
-          this.chartInstance = null;
-        }
-
-        var labels = hourlyData.map(function(d) { return d.hour; });
-        var transactions = hourlyData.map(function(d) { return d.transactions; });
-        var success = hourlyData.map(function(d) { return d.success; });
-
-        this.chartInstance = new Chart(canvas, {
-          type: 'line',
-          data: {
-            labels: labels,
-            datasets: [
-              {
-                label: 'Total',
-                data: transactions,
-                borderColor: _brandColors.total,
-                backgroundColor: _brandColors.total + '20',
-                fill: true,
-                tension: 0.3
-              },
-              {
-                label: 'Success',
-                data: success,
-                borderColor: _brandColors.success,
-                backgroundColor: _brandColors.success + '20',
-                fill: true,
-                tension: 0.3
-              }
-            ]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { position: 'top', labels: { color: '#9CA3AF' } } },
-            scales: {
-              x: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' } },
-              y: { grid: { color: '#374151' }, ticks: { color: '#9CA3AF' }, beginAtZero: true }
-            }
-          }
-        });
+        if (!this.chartInstance) return;
+        this.chartInstance.data.labels = hourlyData.map(function(d) { return d.hour; });
+        this.chartInstance.data.datasets[0].data = hourlyData.map(function(d) { return d.transactions; });
+        this.chartInstance.data.datasets[1].data = hourlyData.map(function(d) { return d.success; });
+        this.chartInstance.update();
       }
     };
   }
