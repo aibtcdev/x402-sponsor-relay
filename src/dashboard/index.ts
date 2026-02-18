@@ -60,11 +60,14 @@ dashboard.get("/", async (c) => {
 
 /**
  * GET /dashboard/api/stats - Stats JSON for AJAX refresh
+ * Accepts optional ?period=7d query param for 7-day daily view (default: 24h hourly)
  */
 dashboard.get("/api/stats", async (c) => {
   const logger = c.get("logger");
   const statsService = new StatsService(c.env.RELAY_KV, logger);
   const healthService = new SettlementHealthService(c.env, logger);
+
+  const period = c.req.query("period") === "7d" ? "7d" : "24h";
 
   try {
     const [overview, health] = await Promise.all([
@@ -73,6 +76,16 @@ dashboard.get("/api/stats", async (c) => {
     ]);
 
     const dashboardData = buildDashboardData(overview, health);
+
+    // For 7d period, replace hourlyData with daily-granularity entries
+    if (period === "7d") {
+      const dailyChartData = await statsService.getDailyChartData(7);
+      return c.json(
+        { ...dashboardData, period: "7d" as const, hourlyData: dailyChartData },
+        200,
+        { "Cache-Control": "public, max-age=60" }
+      );
+    }
 
     return c.json(dashboardData, 200, {
       "Cache-Control": "public, max-age=15",

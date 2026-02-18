@@ -296,6 +296,29 @@ export class StatsService {
   }
 
   /**
+   * Get daily stats aggregated as chart-compatible hourly-format entries.
+   * Returns one entry per day with a short date label (e.g. "Feb 12").
+   */
+  async getDailyChartData(
+    days: number
+  ): Promise<Array<{ hour: string; transactions: number; success: number }>> {
+    const daily = await this.getDailyStats(days);
+    return daily.map((d) => {
+      // Format YYYY-MM-DD as "Mon DD" (e.g. "Feb 12")
+      const [year, month, day] = d.date.split("-").map(Number);
+      const label = new Date(Date.UTC(year, month - 1, day)).toLocaleDateString(
+        "en-US",
+        { month: "short", day: "numeric", timeZone: "UTC" }
+      );
+      return {
+        hour: label,
+        transactions: d.transactions.total,
+        success: d.transactions.success,
+      };
+    });
+  }
+
+  /**
    * Get daily stats for a date range
    */
   async getDailyStats(days: number): Promise<DailyStats[]> {
