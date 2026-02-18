@@ -5,7 +5,6 @@ import {
   tokenCard,
   healthCard,
   successRateCard,
-  apiKeysSection,
 } from "../components/cards";
 import {
   formatTrend,
@@ -129,9 +128,6 @@ ${header(network)}
       ${tokenCard("USDCx", data.tokens.USDCx.count, data.tokens.USDCx.percentage, data.tokens.USDCx.volume)}
     </div>
   </div>
-
-  <!-- API Key Usage Section -->
-  ${data.apiKeys ? apiKeysSection(data.apiKeys) : ""}
 
   <!-- Stacks API Section -->
   <div class="mb-6">
