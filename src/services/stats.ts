@@ -63,7 +63,7 @@ function createEmptyHourlyStats(hour: string): HourlyStats {
 /**
  * Calculate trend based on current vs previous values
  */
-function calculateTrend(
+export function calculateTrend(
   current: number,
   previous: number
 ): "up" | "down" | "stable" {

@@ -6,7 +6,7 @@ export type {
   SponsorResult,
 } from "./sponsor";
 
-export { StatsService } from "./stats";
+export { StatsService, calculateTrend } from "./stats";
 
 export { AuthService, DuplicateAddressError, KVNotConfiguredError } from "./auth";
 export type { RateLimitResult, SpendingCapResult, UsageData } from "./auth";
