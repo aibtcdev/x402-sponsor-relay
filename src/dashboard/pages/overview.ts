@@ -126,19 +126,19 @@ ${header(network)}
     <div class="brand-section p-6">
       <div class="flex items-center justify-between mb-4">
         <h3 class="text-lg font-semibold text-white">Transaction Volume</h3>
-        <div class="flex items-center gap-1 bg-gray-800 rounded-lg p-1" x-show="${showTxChart ? 'true' : 'false'}">
-          <button
+        <div class="flex items-center gap-3 text-sm" x-show="${showTxChart ? 'true' : 'false'}">
+          <span
             @click="setPeriod('24h')"
-            :class="period === '24h' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'"
-            class="px-3 py-1 rounded text-sm font-medium transition-colors min-h-[32px]">
+            :class="period === '24h' ? 'text-white' : 'text-gray-500 hover:text-gray-300 cursor-pointer'"
+            class="font-medium transition-colors select-none">
             24h
-          </button>
-          <button
+          </span>
+          <span
             @click="setPeriod('7d')"
-            :class="period === '7d' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'"
-            class="px-3 py-1 rounded text-sm font-medium transition-colors min-h-[32px]">
+            :class="period === '7d' ? 'text-white' : 'text-gray-500 hover:text-gray-300 cursor-pointer'"
+            class="font-medium transition-colors select-none">
             7d
-          </button>
+          </span>
         </div>
       </div>
       ${showTxChart
@@ -209,11 +209,17 @@ ${footer(utcTimestamp())}
       },
 
       rebuildChart: function(hourlyData) {
-        if (!this.chartInstance) return;
-        this.chartInstance.data.labels = hourlyData.map(function(d) { return d.hour; });
-        this.chartInstance.data.datasets[0].data = hourlyData.map(function(d) { return d.transactions; });
-        this.chartInstance.data.datasets[1].data = hourlyData.map(function(d) { return d.success; });
-        this.chartInstance.update();
+        // Destroy and recreate the chart to handle label count changes (24 → 7)
+        if (this.chartInstance) {
+          this.chartInstance.destroy();
+        }
+        var canvas = document.getElementById('transactionChart');
+        if (!canvas || typeof Chart === 'undefined') return;
+        var config = JSON.parse(JSON.stringify(_chartConfig));
+        config.data.labels = hourlyData.map(function(d) { return d.hour; });
+        config.data.datasets[0].data = hourlyData.map(function(d) { return d.transactions; });
+        config.data.datasets[1].data = hourlyData.map(function(d) { return d.success; });
+        this.chartInstance = new Chart(canvas, config);
       }
     };
   }
