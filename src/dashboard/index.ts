@@ -31,7 +31,7 @@ dashboard.get("/", async (c) => {
       c.executionCtx.waitUntil(
         healthService.checkHealth().catch((e) => {
           logger.warn("Background health check failed", {
-            error: e instanceof Error ? e.message : String(e),
+            error: e instanceof Error ? e.message : "Unknown error",
           });
         })
       );
