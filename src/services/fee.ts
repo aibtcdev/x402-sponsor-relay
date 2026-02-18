@@ -206,39 +206,49 @@ export class FeeService {
 
       const data = (await response.json()) as FeeEstimates;
 
-      // Guard against malformed responses — validate all expected fields exist
+      // Guard against malformed responses — validate required fields exist
       // and are finite numbers. Avoids truthiness checks so that 0 is allowed.
+      // Note: smart_contract is optional — Hiro may omit it when there is
+      // insufficient mempool data for that tier. We synthesize it from
+      // contract_call values in that case.
       const isValidNumber = (value: unknown): value is number =>
         typeof value === "number" && Number.isFinite(value);
+
+      const isValidTiers = (t: unknown): t is FeePriorityTiers =>
+        t != null &&
+        isValidNumber((t as FeePriorityTiers).low_priority) &&
+        isValidNumber((t as FeePriorityTiers).medium_priority) &&
+        isValidNumber((t as FeePriorityTiers).high_priority);
 
       const tokenTransfer = data?.token_transfer;
       const contractCall = data?.contract_call;
       const smartContract = data?.smart_contract;
 
-      if (
-        !tokenTransfer ||
-        !contractCall ||
-        !smartContract ||
-        !isValidNumber(tokenTransfer.low_priority) ||
-        !isValidNumber(tokenTransfer.medium_priority) ||
-        !isValidNumber(tokenTransfer.high_priority) ||
-        !isValidNumber(contractCall.low_priority) ||
-        !isValidNumber(contractCall.medium_priority) ||
-        !isValidNumber(contractCall.high_priority) ||
-        !isValidNumber(smartContract.low_priority) ||
-        !isValidNumber(smartContract.medium_priority) ||
-        !isValidNumber(smartContract.high_priority)
-      ) {
-        this.logger.warn("Hiro API fee response missing or invalid fields", {
+      if (!isValidTiers(tokenTransfer) || !isValidTiers(contractCall)) {
+        this.logger.warn("Hiro API fee response missing or invalid required fields", {
           hasTokenTransfer: !!tokenTransfer,
           hasContractCall: !!contractCall,
-          hasSmartContract: !!smartContract,
         });
         return null;
       }
 
-      this.logger.debug("Fetched fees from Hiro API", { data });
-      return data;
+      // Use smart_contract if present and valid; otherwise synthesize from contract_call
+      const resolvedSmartContract: FeePriorityTiers = isValidTiers(smartContract)
+        ? smartContract
+        : contractCall;
+
+      if (!isValidTiers(smartContract)) {
+        this.logger.info("Hiro API did not return smart_contract tier; synthesizing from contract_call");
+      }
+
+      const resolved: FeeEstimates = {
+        token_transfer: tokenTransfer,
+        contract_call: contractCall,
+        smart_contract: resolvedSmartContract,
+      };
+
+      this.logger.debug("Fetched fees from Hiro API", { data: resolved });
+      return resolved;
     } catch (e) {
       this.logger.error("Error fetching fees from Hiro API", {
         error: e instanceof Error ? e.message : String(e),
@@ -273,13 +283,16 @@ export class FeeService {
   }
 
   /**
-   * Apply clamps to raw fee estimates
+   * Apply clamps to raw fee estimates.
+   * smart_contract is optional in FeeEstimates; fall back to contract_call tiers
+   * if absent so the output always includes a smart_contract entry.
    */
   private applyClamps(raw: FeeEstimates, config: FeeClampConfig): FeeEstimates {
+    const smartContractTiers = raw.smart_contract ?? raw.contract_call;
     return {
       token_transfer: this.clampTiers(raw.token_transfer, config.token_transfer),
       contract_call: this.clampTiers(raw.contract_call, config.contract_call),
-      smart_contract: this.clampTiers(raw.smart_contract, config.smart_contract),
+      smart_contract: this.clampTiers(smartContractTiers, config.smart_contract),
     };
   }
 
@@ -347,14 +360,17 @@ export class FeeService {
   }
 
   /**
-   * Get fee for a specific transaction type and priority
-   * Convenience method for sponsor service
+   * Get fee for a specific transaction type and priority.
+   * Falls back to contract_call fee if the requested type is not present
+   * (e.g., smart_contract may be absent from stale cache entries).
+   * Convenience method for sponsor service.
    */
   async getFeeForType(
     txType: FeeTransactionType,
     priority: FeePriority = "medium_priority"
   ): Promise<number> {
     const { fees } = await this.getEstimates();
-    return fees[txType][priority];
+    const tiers = fees[txType] ?? fees.contract_call;
+    return tiers[priority];
   }
 }
