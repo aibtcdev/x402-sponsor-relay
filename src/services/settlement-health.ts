@@ -1,6 +1,7 @@
 import type { Env, Logger } from "../types";
 import { HealthMonitor } from "./health-monitor";
 import type { HealthStatus } from "./health-monitor";
+import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 
 const HIRO_CHECK_TIMEOUT_MS = 5000;
 
@@ -21,26 +22,6 @@ export class SettlementHealthService {
     private logger: Logger
   ) {
     this.healthMonitor = new HealthMonitor(env.RELAY_KV, logger, "settlement");
-  }
-
-  /**
-   * Get the Hiro API base URL based on environment configuration
-   */
-  private getHiroBaseUrl(): string {
-    return this.env.STACKS_NETWORK === "mainnet"
-      ? "https://api.hiro.so"
-      : "https://api.testnet.hiro.so";
-  }
-
-  /**
-   * Build headers for Hiro API requests, including optional API key
-   */
-  private getHiroHeaders(): Record<string, string> {
-    const headers: Record<string, string> = {};
-    if (this.env.HIRO_API_KEY) {
-      headers["x-hiro-api-key"] = this.env.HIRO_API_KEY;
-    }
-    return headers;
   }
 
   /**
@@ -77,12 +58,12 @@ export class SettlementHealthService {
     }
 
     // Check 2: Hiro API reachable
-    const hiroUrl = `${this.getHiroBaseUrl()}/extended/v1/info`;
+    const hiroUrl = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/info`;
 
     try {
       const response = await fetch(hiroUrl, {
         method: "GET",
-        headers: this.getHiroHeaders(),
+        headers: getHiroHeaders(this.env.HIRO_API_KEY),
         signal: AbortSignal.timeout(HIRO_CHECK_TIMEOUT_MS),
       });
 
