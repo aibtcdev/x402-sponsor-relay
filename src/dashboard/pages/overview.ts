@@ -12,6 +12,24 @@ import {
 } from "../components/charts";
 import { colors, formatNumber, formatTokenAmount, escapeHtml } from "../styles";
 
+/** Bar chart SVG icon (reused in empty states) */
+function barChartSvg(sizeClass: string, extraClass = ""): string {
+  const cls = `${sizeClass} text-gray-600 mx-auto${extraClass ? ` ${extraClass}` : ""}`;
+  return `<svg class="${cls}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+    </svg>`;
+}
+
+/** Formatted UTC timestamp for footer display */
+function utcTimestamp(): string {
+  return new Date().toLocaleString("en-US", {
+    timeZone: "UTC",
+    dateStyle: "medium",
+    timeStyle: "short",
+  }) + " UTC";
+}
+
 /**
  * Check whether hourly data has any non-zero transaction counts
  */
@@ -28,10 +46,7 @@ function chartEmptyState(message: string): string {
   return `
 <div class="h-96 flex items-center justify-center">
   <div class="text-center">
-    <svg class="w-10 h-10 text-gray-600 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
-    </svg>
+    ${barChartSvg("w-10 h-10")}
     <p class="text-gray-400 mt-2">${escapeHtml(message)}</p>
     <p class="text-sm text-gray-500 mt-1">Charts will appear once transactions are processed</p>
   </div>
@@ -44,12 +59,6 @@ function chartEmptyState(message: string): string {
  * @param network - Optional network context ("testnet" | "mainnet")
  */
 export function overviewPage(data: DashboardOverview, network?: string): string {
-  const now = new Date().toLocaleString("en-US", {
-    timeZone: "UTC",
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
-
   const trend = formatTrend(
     data.transactions.total,
     data.transactions.previousTotal
@@ -135,7 +144,7 @@ ${header(network)}
   </div>
 </main>
 
-${footer(now + " UTC")}
+${footer(utcTimestamp())}
 
 <script>
   // Brand colors for chart datasets (single source of truth from styles.ts)
@@ -218,10 +227,7 @@ ${header(network)}
 
 <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-8">
   <div class="brand-section p-12 text-center">
-    <svg class="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-    </svg>
+    ${barChartSvg("w-16 h-16", "mb-4")}
     <h2 class="text-xl font-semibold text-white mb-2">No Data Yet</h2>
     <p class="text-gray-400 mb-6">
       The relay hasn't processed any transactions yet. Stats will appear here once transactions are submitted.
@@ -235,7 +241,7 @@ ${header(network)}
   </div>
 </main>
 
-${footer(new Date().toLocaleString("en-US", { timeZone: "UTC", dateStyle: "medium", timeStyle: "short" }) + " UTC")}
+${footer(utcTimestamp())}
 `;
 
   return htmlDocument(content, "x402 Sponsor Relay - Dashboard");
