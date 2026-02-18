@@ -136,7 +136,7 @@ ${header(network)}
   <!-- API Key Usage Section -->
   ${data.apiKeys ? apiKeysSection(data.apiKeys) : ""}
 
-  <!-- Settlement Health Section -->
+  <!-- Stacks API Section -->
   <div class="mb-6">
     ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
   </div>

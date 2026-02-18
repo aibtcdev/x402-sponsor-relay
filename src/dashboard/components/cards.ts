@@ -112,7 +112,7 @@ export function healthCard(
 
   return `
 <div class="brand-card p-6">
-  <h3 class="text-lg font-semibold text-white mb-4">Settlement Health</h3>
+  <h3 class="text-lg font-semibold text-white mb-4">Stacks API</h3>
 
   <div class="flex items-center space-x-3 mb-4">
     <div class="p-2 rounded-full" style="background-color: ${config.color}20; color: ${config.color}">
