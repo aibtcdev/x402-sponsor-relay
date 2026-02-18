@@ -11,7 +11,7 @@ import {
   formatTrend,
   transactionChartConfig,
 } from "../components/charts";
-import { formatNumber, formatTokenAmount, escapeHtml } from "../styles";
+import { colors, formatNumber, formatTokenAmount, escapeHtml } from "../styles";
 
 /**
  * Check whether hourly data has any non-zero transaction counts
@@ -142,6 +142,9 @@ ${header(network)}
 ${footer(now + " UTC")}
 
 <script>
+  // Brand colors for chart datasets (single source of truth from styles.ts)
+  var _brandColors = { total: '${colors.brand.orange}', success: '${colors.status.healthy}' };
+
   // Server-rendered 24h chart config (used by Alpine init)
   var _chartConfig = ${transactionChartConfig(data.hourlyData)};
 
@@ -196,16 +199,16 @@ ${footer(now + " UTC")}
               {
                 label: 'Total',
                 data: transactions,
-                borderColor: '#F97316',
-                backgroundColor: '#F9731620',
+                borderColor: _brandColors.total,
+                backgroundColor: _brandColors.total + '20',
                 fill: true,
                 tension: 0.3
               },
               {
                 label: 'Success',
                 data: success,
-                borderColor: '#10B981',
-                backgroundColor: '#10B98120',
+                borderColor: _brandColors.success,
+                backgroundColor: _brandColors.success + '20',
                 fill: true,
                 tension: 0.3
               }
