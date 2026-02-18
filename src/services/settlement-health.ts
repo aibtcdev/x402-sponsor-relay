@@ -10,7 +10,7 @@ const HIRO_CHECK_TIMEOUT_MS = 5000;
  *
  * Performs a self-check:
  *   1. Sponsor wallet is configured (SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY set)
- *   2. Hiro API is reachable (GET /extended/v1/info returns HTTP 200)
+ *   2. Hiro API is reachable (GET /extended returns HTTP 200)
  *
  * Health results are stored in KV under the "settlement" key prefix.
  */
@@ -58,7 +58,7 @@ export class SettlementHealthService {
     }
 
     // Check 2: Hiro API reachable
-    const hiroUrl = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/info`;
+    const hiroUrl = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended`;
 
     try {
       const response = await fetch(hiroUrl, {
