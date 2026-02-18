@@ -37,20 +37,22 @@ dashboard.get("/", async (c) => {
       },
     };
 
+    const network = c.env.STACKS_NETWORK;
+
     // Check if we have any data
     const hasData =
       dashboardData.transactions.total > 0 || health.recentChecks.length > 0;
 
     if (!hasData) {
-      return c.html(emptyStatePage());
+      return c.html(emptyStatePage(network));
     }
 
-    return c.html(overviewPage(dashboardData));
+    return c.html(overviewPage(dashboardData, network));
   } catch (e) {
     logger?.error("Failed to render dashboard", {
       error: e instanceof Error ? e.message : "Unknown error",
     });
-    return c.html(emptyStatePage());
+    return c.html(emptyStatePage(c.env.STACKS_NETWORK));
   }
 });
 
