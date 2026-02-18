@@ -1,0 +1,122 @@
+import { BaseEndpoint } from "./BaseEndpoint";
+import {
+  validateV2Request,
+  mapVerifyErrorToV2Code,
+  V2_REQUEST_BODY_SCHEMA,
+} from "./v2-helpers";
+import type { AppContext, X402VerifyResponseV2 } from "../types";
+import { X402_V2_ERROR_CODES } from "../types";
+
+/**
+ * V2 Verify endpoint - x402 V2 facilitator verify
+ * POST /verify (spec section 7.1)
+ *
+ * Validates the payment locally without broadcasting to the network.
+ * Returns HTTP 200 for all results (valid or invalid).
+ */
+export class VerifyV2 extends BaseEndpoint {
+  schema = {
+    tags: ["x402 V2"],
+    summary: "Verify an x402 V2 payment (local validation only)",
+    description:
+      "x402 V2 facilitator verify endpoint (spec section 7.1). Validates payment parameters by deserializing the transaction locally — does NOT broadcast. Returns HTTP 200 for all results; check isValid field.",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: V2_REQUEST_BODY_SCHEMA,
+          },
+        },
+      },
+    },
+    responses: {
+      "200": {
+        description: "Verification result (valid or invalid — check isValid field)",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object" as const,
+              required: ["isValid"],
+              properties: {
+                isValid: { type: "boolean" as const },
+                invalidReason: {
+                  type: "string" as const,
+                  description: "Reason for invalidity if isValid is false",
+                  example: "recipient_mismatch",
+                },
+                payer: {
+                  type: "string" as const,
+                  description: "Payer Stacks address (if determinable from transaction)",
+                  example: "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7",
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+
+  async handle(c: AppContext) {
+    const logger = this.getLogger(c);
+    logger.info("x402 V2 verify request received");
+
+    // Helper to return a V2 verify failure response
+    const v2Invalid = (invalidReason: string): Response => {
+      const response: X402VerifyResponseV2 = { isValid: false, invalidReason };
+      return c.json(response, 200);
+    };
+
+    try {
+      // Parse request body
+      let body: unknown;
+      try {
+        body = await c.req.json();
+      } catch {
+        return v2Invalid(X402_V2_ERROR_CODES.INVALID_PAYLOAD);
+      }
+
+      // Validate V2 request structure (shared with /settle)
+      const validation = validateV2Request(body, c.env, logger);
+      if (!validation.valid) {
+        return v2Invalid(validation.error.errorReason);
+      }
+
+      const { settleOptions, txHex, settlementService } = validation.data;
+
+      // Verify payment parameters locally (no broadcast)
+      const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
+
+      if (!verifyResult.valid) {
+        logger.info("Payment verification failed", { error: verifyResult.error });
+        return v2Invalid(mapVerifyErrorToV2Code(verifyResult.error));
+      }
+
+      // Attempt to convert signer to human-readable address for the payer field
+      let payer: string | undefined;
+      try {
+        payer = settlementService.senderToAddress(
+          verifyResult.data.transaction,
+          c.env.STACKS_NETWORK
+        );
+      } catch (e) {
+        logger.warn("Could not convert signer to address", {
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+
+      logger.info("x402 V2 verify succeeded", { payer });
+
+      const response: X402VerifyResponseV2 = {
+        isValid: true,
+        ...(payer ? { payer } : {}),
+      };
+      return c.json(response, 200);
+    } catch (e) {
+      logger.error("Unexpected verify error", {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+      return v2Invalid(X402_V2_ERROR_CODES.UNEXPECTED_VERIFY_ERROR);
+    }
+  }
+}

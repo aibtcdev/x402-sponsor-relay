@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, Settle, VerifyV2, Supported } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -43,6 +43,7 @@ const openapi = fromHono(app, {
       { name: "Provision", description: "API key provisioning via Bitcoin signature" },
       { name: "Fees", description: "Fee estimation endpoints" },
       { name: "Dashboard", description: "Public statistics endpoints" },
+      { name: "x402 V2", description: "x402 V2 facilitator API (spec-compliant)" },
     ],
     servers: [
       {
@@ -83,6 +84,11 @@ openapi.post("/keys/provision-stx", ProvisionStx as unknown as typeof ProvisionS
 openapi.get("/fees", Fees as unknown as typeof Fees);
 openapi.post("/fees/config", FeesConfig as unknown as typeof FeesConfig);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
+openapi.post("/settle", Settle as unknown as typeof Settle);
+// Note: POST /verify (V2 facilitator) and GET /verify/:receiptId (receipt check)
+// share the /verify path but use different HTTP methods — no route collision.
+openapi.post("/verify", VerifyV2 as unknown as typeof VerifyV2);
+openapi.get("/supported", Supported as unknown as typeof Supported);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
 app.route("/dashboard", dashboard);
@@ -103,7 +109,7 @@ app.get("/", (c) => {
     agentDiscovery: "/llms.txt",
     dashboard: "/dashboard",
     endpoints: {
-      relay: "POST /relay - Submit sponsored transaction for settlement (x402)",
+      relay: "POST /relay - Submit sponsored transaction for native settlement",
       sponsor: "POST /sponsor - Sponsor and broadcast transaction (direct, requires API key)",
       verify: "GET /verify/:receiptId - Verify a payment receipt",
       access: "POST /access - Access protected resource with receipt",
@@ -114,13 +120,15 @@ app.get("/", (c) => {
       health: "GET /health - Health check with network info",
       stats: "GET /stats - Relay statistics (JSON)",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
+      settle: "POST /settle - x402 V2 facilitator settle",
+      verifyV2: "POST /verify - x402 V2 facilitator verify",
+      supported: "GET /supported - x402 V2 supported payment kinds",
     },
     payment: {
       tokens: ["STX", "sBTC", "USDCx"],
-      flow: "Agent signs sponsored tx -> Relay sponsors -> Facilitator settles",
+      flow: "Agent signs sponsored tx -> POST /relay sponsors + settles natively",
     },
     related: {
-      facilitator: "https://facilitator.stacksx402.com",
       github: "https://github.com/aibtcdev/x402-sponsor-relay",
     },
   });

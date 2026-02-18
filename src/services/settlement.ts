@@ -4,6 +4,9 @@ import {
   PayloadType,
   ClarityType,
   addressToString,
+  addressFromVersionHash,
+  addressHashModeToVersion,
+  AddressHashMode,
   type ClarityValue,
   type StacksTransactionWire,
   type AddressWire,
@@ -24,6 +27,8 @@ import type {
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
 const SBTC_CONTRACT_TESTNET = "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4";
 const SBTC_CONTRACT_NAME = "sbtc-token";
+const USDCX_CONTRACT_MAINNET = "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9";
+const USDCX_CONTRACT_NAME = "token-aeusdc";
 const SIP010_TRANSFER_FUNCTION = "transfer";
 
 // Polling configuration
@@ -165,6 +170,68 @@ export class SettlementService {
   }
 
   /**
+   * Convert the hash160 signer from a transaction's spending condition to
+   * a human-readable Stacks address string.
+   *
+   * The `signer` field in SpendingConditionWire is a 40-char hex hash160
+   * (not a human-readable address). This method uses the hashMode to derive
+   * the correct AddressVersion and then c32check-encodes it.
+   */
+  senderToAddress(transaction: StacksTransactionWire, network: "mainnet" | "testnet"): string {
+    const { hashMode, signer } = transaction.auth.spendingCondition;
+    const stacksNetwork = network === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+    const version = addressHashModeToVersion(hashMode as AddressHashMode, stacksNetwork);
+    const addrWire = addressFromVersionHash(version, signer);
+    return addressToString(addrWire);
+  }
+
+  /**
+   * Map an x402 V2 asset identifier to the relay's internal TokenType.
+   *
+   * Handles:
+   * - "STX" → "STX"
+   * - "SBTC" or "sBTC" (case-insensitive) → "sBTC"
+   * - "USDCX" or "USDCx" (case-insensitive) → "USDCx"
+   * - CAIP-19 Stacks FT identifiers whose contract address is known → mapped token
+   * - Unknown → null (caller should return unsupported_scheme error)
+   */
+  mapAssetToTokenType(asset: string): TokenType | null {
+    if (asset === "STX") return "STX";
+    const upper = asset.toUpperCase();
+    if (upper === "SBTC") return "sBTC";
+    if (upper === "USDCX") return "USDCx";
+
+    // Try to parse a Stacks FT CAIP-19 identifier and extract the contract address.
+    const contractAddr = this.extractStacksFtContractAddress(asset);
+    if (contractAddr === SBTC_CONTRACT_MAINNET || contractAddr === SBTC_CONTRACT_TESTNET) {
+      return "sBTC";
+    }
+    if (contractAddr === USDCX_CONTRACT_MAINNET) {
+      return "USDCx";
+    }
+
+    return null;
+  }
+
+  /**
+   * Extract the Stacks FT contract principal from a CAIP-19 asset identifier.
+   *
+   * Expected format: stacks:<chainId>/sip010:<contractAddr>.<contractName>.<tokenName>
+   * Returns the uppercase contract address, or null if not a valid Stacks FT CAIP-19.
+   */
+  private extractStacksFtContractAddress(asset: string): string | null {
+    if (!asset.toLowerCase().startsWith("stacks:")) return null;
+    const parts = asset.split("/");
+    if (parts.length < 2) return null;
+    const assetSpec = parts[1]; // e.g., "sip010:SP1234.my-token.my-token"
+    if (!assetSpec.toLowerCase().startsWith("sip010:")) return null;
+    const afterType = assetSpec.substring(7); // strip "sip010:"
+    if (!afterType) return null;
+    const [contractPrincipal] = afterType.split(".");
+    return contractPrincipal ? contractPrincipal.toUpperCase() : null;
+  }
+
+  /**
    * Verify payment parameters by deserializing the sponsored transaction
    * and extracting sender, recipient, amount, and token type.
    *
@@ -259,6 +326,15 @@ export class SettlementService {
           };
         }
         tokenType = "sBTC";
+      } else if (contractAddressStr === USDCX_CONTRACT_MAINNET) {
+        if (contractNameStr !== USDCX_CONTRACT_NAME) {
+          return {
+            valid: false,
+            error: "Unsupported contract",
+            details: `Expected contract name '${USDCX_CONTRACT_NAME}', got '${contractNameStr}'`,
+          };
+        }
+        tokenType = "USDCx";
       } else {
         // Reject unknown SIP-010 contracts — only known tokens are supported
         return {

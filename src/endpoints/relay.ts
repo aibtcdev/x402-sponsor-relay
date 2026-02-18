@@ -139,7 +139,7 @@ export class Relay extends BaseEndpoint {
                       type: "string" as const,
                       enum: ["pending", "confirmed", "failed"],
                     },
-                    sender: { type: "string" as const, description: "Sender hash160 hex (40-char raw hash, not a human-readable Stacks address)" },
+                    sender: { type: "string" as const, description: "Sender Stacks address (c32check-encoded, human-readable)" },
                     recipient: { type: "string" as const },
                     amount: { type: "string" as const },
                     blockHeight: { type: "number" as const },
@@ -358,10 +358,15 @@ export class Relay extends BaseEndpoint {
       });
 
       // Step F — Build settlement result and store payment receipt
+      // Convert signer hash160 to human-readable Stacks address
+      const senderAddress = settlementService.senderToAddress(
+        verifyResult.data.transaction,
+        c.env.STACKS_NETWORK
+      );
       const settlement: SettlementResult = {
         success: true,
         status: broadcastResult.status,
-        sender: verifyResult.data.sender,
+        sender: senderAddress,
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
         ...(broadcastResult.status === "confirmed"
@@ -386,7 +391,7 @@ export class Relay extends BaseEndpoint {
         txid: broadcastResult.txid,
         receiptId: storedReceipt ? receiptId : undefined,
         status: broadcastResult.status,
-        sender: verifyResult.data.sender,
+        sender: senderAddress,
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
         sponsoredTx: sponsorResult.sponsoredTxHex,
@@ -398,7 +403,7 @@ export class Relay extends BaseEndpoint {
       // Step H — Log and return
       logger.info("Transaction sponsored and settled", {
         txid: broadcastResult.txid,
-        sender: validation.senderAddress,
+        sender: senderAddress,
         settlement_status: broadcastResult.status,
         receiptId: storedReceipt ? receiptId : undefined,
       });

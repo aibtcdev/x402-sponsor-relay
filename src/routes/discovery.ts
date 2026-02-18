@@ -16,10 +16,23 @@ import { VERSION } from "../version";
  */
 const discovery = new Hono<{ Bindings: Env; Variables: AppVariables }>();
 
+/**
+ * Derive base URL from the incoming request origin so discovery docs
+ * reflect the correct environment (staging vs production).
+ */
+function getBaseUrl(c: { req: { url: string } }): string {
+  const url = new URL(c.req.url);
+  return url.origin;
+}
+
+// Placeholder used in template strings, replaced with actual base URL at runtime
+const BASE_URL_PLACEHOLDER = "https://x402-relay.aibtc.com";
+
 // ---------------------------------------------------------------------------
 // /llms.txt — Quick-start guide
 // ---------------------------------------------------------------------------
 discovery.get("/llms.txt", (c) => {
+  const baseUrl = getBaseUrl(c);
   const content = `# x402 Stacks Sponsor Relay
 
 > A Cloudflare Worker enabling gasless transactions for AI agents on the
@@ -124,6 +137,25 @@ Success response:
   "fee": "1000"                    // microSTX sponsored by the relay
 }
 
+## x402 V2 Facilitator API
+
+This relay is a spec-compliant x402 V2 facilitator (spec section 7):
+https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
+
+POST https://x402-relay.aibtc.com/settle
+POST https://x402-relay.aibtc.com/verify
+GET  https://x402-relay.aibtc.com/supported
+
+The /settle endpoint verifies payment parameters locally and broadcasts the
+pre-sponsored transaction to the Stacks network. The /verify endpoint performs
+local validation only (no broadcast). The /supported endpoint returns the
+static configuration of supported payment kinds.
+
+CAIP-2 network identifiers: "stacks:1" (mainnet), "stacks:2147483648" (testnet)
+Supported assets: "STX", "sBTC", or CAIP-19 contract address (e.g., ".token-name")
+
+Full V2 facilitator docs: https://x402-relay.aibtc.com/topics/x402-v2-facilitator
+
 ## Other Endpoints
 
 - GET  /health              — Health check with network info
@@ -138,7 +170,7 @@ Full reference: https://x402-relay.aibtc.com/llms-full.txt
 Topic docs:     https://x402-relay.aibtc.com/topics
 `;
 
-  return new Response(content, {
+  return new Response(content.replaceAll(BASE_URL_PLACEHOLDER, baseUrl), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "public, max-age=300, s-maxage=3600",
@@ -150,6 +182,7 @@ Topic docs:     https://x402-relay.aibtc.com/topics
 // /llms-full.txt — Full reference documentation
 // ---------------------------------------------------------------------------
 discovery.get("/llms-full.txt", (c) => {
+  const baseUrl = getBaseUrl(c);
   const content = `# x402 Stacks Sponsor Relay — Full Reference
 
 Base URL (production): https://x402-relay.aibtc.com
@@ -168,6 +201,7 @@ For focused deep-dives:
 - https://x402-relay.aibtc.com/topics/api-keys
 - https://x402-relay.aibtc.com/topics/authentication
 - https://x402-relay.aibtc.com/topics/errors
+- https://x402-relay.aibtc.com/topics/x402-v2-facilitator
 
 ---
 
@@ -507,6 +541,177 @@ All fields are optional — only provided types are updated.
 
 ---
 
+## POST /settle — x402 V2 Facilitator Settle (Spec Section 7.2)
+
+Spec-compliant x402 V2 facilitator settle endpoint. Verifies payment parameters
+locally and broadcasts the pre-sponsored transaction to the Stacks network.
+
+IMPORTANT: This endpoint does NOT sponsor. The transaction in the payload must
+already be fully signed (sponsored: true). The relay verifies that the transaction
+satisfies the paymentRequirements and broadcasts it.
+
+Returns HTTP 200 for all settlement results (success or failure).
+Returns HTTP 400 only for malformed request schema.
+
+Idempotent: submitting the same tx hex returns the cached result (5-min KV dedup).
+
+Spec reference: https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
+
+### CAIP-2 Network Identifiers
+
+- Mainnet: "stacks:1"
+- Testnet: "stacks:2147483648"
+
+### Asset Identifiers (CAIP-19)
+
+- "STX" — native STX token (microSTX)
+- "sBTC" — wrapped Bitcoin (satoshis)
+- CAIP-19 contract: e.g., "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9.token-aeusdc::token-aeusdc"
+
+### Request
+
+POST /settle
+Content-Type: application/json
+
+{
+  "x402Version": 2,                          // optional, library compat
+  "paymentPayload": {
+    "x402Version": 2,                        // required
+    "payload": {
+      "transaction": "0x00000001..."         // hex-encoded signed sponsored tx
+    },
+    "accepted": {                            // payment requirements that were accepted
+      "scheme": "exact",
+      "network": "stacks:2147483648",        // CAIP-2 network
+      "amount": "1000000",
+      "asset": "STX",
+      "payTo": "SP...",
+      "maxTimeoutSeconds": 60
+    }
+  },
+  "paymentRequirements": {
+    "scheme": "exact",
+    "network": "stacks:2147483648",          // must match relay's network
+    "amount": "1000000",                     // minimum amount in smallest unit
+    "asset": "STX",                          // asset identifier
+    "payTo": "SP...",                        // recipient Stacks address
+    "maxTimeoutSeconds": 60
+  }
+}
+
+### Success Response (200)
+
+{
+  "success": true,
+  "payer": "SP...",                          // agent's Stacks address
+  "transaction": "0x...",                   // transaction ID on the network
+  "network": "stacks:2147483648"            // CAIP-2 network identifier
+}
+
+### Failure Response (200) — settlement failed but request was valid
+
+{
+  "success": false,
+  "errorReason": "recipient_mismatch",      // V2 error code
+  "transaction": "",                        // empty on pre-broadcast failure
+  "network": "stacks:2147483648"
+}
+
+### Error Response (400) — malformed request
+
+{
+  "success": false,
+  "errorReason": "invalid_payload",
+  "transaction": "",
+  "network": "stacks:2147483648"
+}
+
+### V2 Error Codes
+
+- invalid_payload — missing required fields in request
+- invalid_payment_requirements — paymentRequirements missing network/payTo/amount
+- invalid_network — network does not match relay's configured network
+- unsupported_scheme — asset identifier not recognized
+- invalid_transaction_state — tx deserialization or verification failed
+- recipient_mismatch — tx recipient does not match payTo
+- amount_insufficient — tx amount is below the required minimum
+- sender_mismatch — tx token type does not match asset
+- broadcast_failed — Stacks node rejected broadcast (retryable)
+- transaction_failed — tx broadcast OK but aborted/dropped on-chain
+- unexpected_settle_error — unexpected internal error
+
+---
+
+## POST /verify — x402 V2 Facilitator Verify (Spec Section 7.1)
+
+Validates payment parameters by deserializing the transaction locally.
+Does NOT broadcast to the network.
+
+Returns HTTP 200 for all results (valid or invalid). Check the isValid field.
+
+Same request shape as POST /settle.
+
+### Request
+
+POST /verify
+Content-Type: application/json
+
+{
+  "paymentPayload": {
+    "x402Version": 2,
+    "payload": {
+      "transaction": "0x00000001..."         // hex-encoded signed sponsored tx
+    }
+  },
+  "paymentRequirements": {
+    "scheme": "exact",
+    "network": "stacks:2147483648",
+    "amount": "1000000",
+    "asset": "STX",
+    "payTo": "SP...",
+    "maxTimeoutSeconds": 60
+  }
+}
+
+### Success Response (200)
+
+{
+  "isValid": true,
+  "payer": "SP..."                           // agent's Stacks address (if determinable)
+}
+
+### Failure Response (200) — validation failed
+
+{
+  "isValid": false,
+  "invalidReason": "recipient_mismatch"      // V2 error code (same set as /settle)
+}
+
+---
+
+## GET /supported — x402 V2 Supported Payment Kinds (Spec Section 7.3)
+
+Returns the static configuration of payment kinds supported by this relay.
+No authentication required.
+
+### Response (200)
+
+{
+  "kinds": [
+    {
+      "x402Version": 2,
+      "scheme": "exact",
+      "network": "stacks:2147483648"         // or "stacks:1" on mainnet
+    }
+  ],
+  "extensions": [],                          // no protocol extensions
+  "signers": {
+    "stacks:*": []                           // empty = any signer accepted
+  }
+}
+
+---
+
 ## GET /health — Health Check
 
 Returns service health, Stacks network connectivity, and sponsor wallet info.
@@ -599,7 +804,7 @@ When rate-limited, the response includes:
 - GitHub:           https://github.com/aibtcdev/x402-sponsor-relay
 `;
 
-  return new Response(content, {
+  return new Response(content.replaceAll(BASE_URL_PLACEHOLDER, baseUrl), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "public, max-age=300, s-maxage=3600",
@@ -611,30 +816,37 @@ When rate-limited, the response includes:
 // /topics — Topic index (JSON)
 // ---------------------------------------------------------------------------
 discovery.get("/topics", (c) => {
+  const baseUrl = getBaseUrl(c);
   const topics = [
     {
       topic: "sponsored-transactions",
       description:
         "Full relay flow: agent builds sponsored tx, relay verifies payment params locally, sponsors it, broadcasts natively, receipt issued. Includes pending vs confirmed states, idempotency behavior, receipt verification, and access gating.",
-      url: "https://x402-relay.aibtc.com/topics/sponsored-transactions",
+      url: `${baseUrl}/topics/sponsored-transactions`,
     },
     {
       topic: "api-keys",
       description:
         "API key provisioning via BTC signature (BIP-137) or STX signature (RSV hex). Key tiers, expiry, and management.",
-      url: "https://x402-relay.aibtc.com/topics/api-keys",
+      url: `${baseUrl}/topics/api-keys`,
     },
     {
       topic: "authentication",
       description:
         "SIP-018 structured data authentication for /relay and /sponsor. Domain constants, message schema, signature creation.",
-      url: "https://x402-relay.aibtc.com/topics/authentication",
+      url: `${baseUrl}/topics/authentication`,
     },
     {
       topic: "errors",
       description:
         "Complete error code reference with descriptions, HTTP status codes, and retry behavior.",
-      url: "https://x402-relay.aibtc.com/topics/errors",
+      url: `${baseUrl}/topics/errors`,
+    },
+    {
+      topic: "x402-v2-facilitator",
+      description:
+        "x402 V2 spec compliance: relay as a facilitator. POST /settle (verify + broadcast), POST /verify (local validation), GET /supported (static config). CAIP-2 network identifiers, CAIP-19 asset format, V2 error codes, and usage examples.",
+      url: `${baseUrl}/topics/x402-v2-facilitator`,
     },
   ];
 
@@ -644,10 +856,10 @@ discovery.get("/topics", (c) => {
       "Deep-dive reference docs for specific relay topics. Each doc is self-contained and covers unique workflow content.",
     topics,
     related: {
-      quickStart: "https://x402-relay.aibtc.com/llms.txt",
-      fullReference: "https://x402-relay.aibtc.com/llms-full.txt",
-      openApiSpec: "https://x402-relay.aibtc.com/openapi.json",
-      agentCard: "https://x402-relay.aibtc.com/.well-known/agent.json",
+      quickStart: `${baseUrl}/llms.txt`,
+      fullReference: `${baseUrl}/llms-full.txt`,
+      openApiSpec: `${baseUrl}/openapi.json`,
+      agentCard: `${baseUrl}/.well-known/agent.json`,
       aibtcPlatform: "https://aibtc.com/llms.txt",
     },
   });
@@ -657,6 +869,7 @@ discovery.get("/topics", (c) => {
 // /topics/:topic — Topic sub-docs (plaintext)
 // ---------------------------------------------------------------------------
 discovery.get("/topics/:topic", (c) => {
+  const baseUrl = getBaseUrl(c);
   const topic = c.req.param("topic");
 
   const topicDocs: Record<string, string> = {
@@ -1150,6 +1363,222 @@ Do retry (after retryAfter):
 Note: POST /relay is idempotent for the same sponsored tx hex (5-min dedup window).
 If you receive a network error after submitting, retrying with the same tx is safe.
 `,
+
+    "x402-v2-facilitator": `# x402 V2 Facilitator — Full Reference
+
+Service: https://x402-relay.aibtc.com
+Spec: https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
+Full reference: https://x402-relay.aibtc.com/llms-full.txt
+
+## Overview
+
+The x402 Stacks Sponsor Relay implements the x402 V2 facilitator API, making it
+compatible with any x402 V2-compliant client library (including the official
+coinbase/x402 client). The facilitator API handles payment verification and
+settlement for the x402 payment protocol.
+
+Three endpoints implement the V2 spec:
+
+1. POST /verify   — Validate payment locally (spec section 7.1), no broadcast
+2. POST /settle   — Verify + broadcast (spec section 7.2), idempotent
+3. GET  /supported — Static config of supported kinds (spec section 7.3)
+
+Facilitator base URLs:
+  Production (mainnet): https://x402-relay.aibtc.com
+  Staging (testnet):    https://x402-relay.aibtc.dev
+
+## CAIP-2 Network Identifiers
+
+The relay uses CAIP-2 format for network identification:
+
+  Mainnet: "stacks:1"
+  Testnet: "stacks:2147483648"
+
+The network field in all V2 requests must match the relay's configured network.
+Mismatch returns errorReason: "invalid_network" / invalidReason: "invalid_network".
+
+## Asset Identifiers
+
+Assets are identified by type:
+
+  "STX"   — native STX token (amounts in microSTX)
+  "sBTC"  — wrapped Bitcoin (amounts in satoshis)
+  CAIP-19 contract address — e.g., full principal for USDCx or other SIP-010 tokens
+
+If the asset is unrecognized, the relay returns errorReason: "unsupported_scheme".
+
+## POST /verify — Local Validation (Spec Section 7.1)
+
+Validates that the transaction in paymentPayload satisfies paymentRequirements
+by deserializing it locally. Does NOT broadcast to the network.
+
+Always returns HTTP 200. Check isValid field.
+
+### Request
+
+POST https://x402-relay.aibtc.com/verify
+Content-Type: application/json
+
+{
+  "paymentPayload": {
+    "x402Version": 2,
+    "payload": {
+      "transaction": "<hex-encoded sponsored tx>"
+    }
+  },
+  "paymentRequirements": {
+    "scheme": "exact",
+    "network": "stacks:2147483648",          // testnet CAIP-2 identifier
+    "amount": "1000000",                     // minimum in smallest unit (microSTX)
+    "asset": "STX",
+    "payTo": "SP...",                        // recipient Stacks address
+    "maxTimeoutSeconds": 60
+  }
+}
+
+### Success Response
+
+{
+  "isValid": true,
+  "payer": "SP..."                           // agent address (if derivable)
+}
+
+### Failure Response
+
+{
+  "isValid": false,
+  "invalidReason": "recipient_mismatch"
+}
+
+### V2 invalidReason Values
+
+  invalid_payload               — missing required request fields
+  invalid_payment_requirements  — paymentRequirements missing network/payTo/amount
+  invalid_network               — network does not match relay's chain
+  unsupported_scheme            — asset not recognized
+  invalid_transaction_state     — tx cannot be deserialized or verified
+  recipient_mismatch            — tx recipient != paymentRequirements.payTo
+  amount_insufficient           — tx amount < paymentRequirements.amount
+  sender_mismatch               — tx token type != asset
+  unexpected_verify_error       — internal error
+
+## POST /settle — Verify + Broadcast (Spec Section 7.2)
+
+Verifies payment parameters and broadcasts the transaction to the Stacks network.
+Does NOT sponsor — expects a pre-sponsored transaction.
+
+Always returns HTTP 200 for settlement results (success or failure per spec).
+Returns HTTP 400 only for malformed request schema.
+
+Idempotent: submitting the same tx hex within 5 minutes returns cached result.
+
+### Request
+
+POST https://x402-relay.aibtc.com/settle
+Content-Type: application/json
+
+{
+  "x402Version": 2,                          // optional, for library compat
+  "paymentPayload": {
+    "x402Version": 2,
+    "payload": {
+      "transaction": "<hex-encoded sponsored tx>"
+    },
+    "accepted": {                            // requirements the client accepted
+      "scheme": "exact",
+      "network": "stacks:2147483648",
+      "amount": "1000000",
+      "asset": "STX",
+      "payTo": "SP...",
+      "maxTimeoutSeconds": 60
+    }
+  },
+  "paymentRequirements": {
+    "scheme": "exact",
+    "network": "stacks:2147483648",
+    "amount": "1000000",
+    "asset": "STX",
+    "payTo": "SP...",
+    "maxTimeoutSeconds": 60
+  }
+}
+
+### Success Response (200)
+
+{
+  "success": true,
+  "payer": "SP...",                          // agent's Stacks address
+  "transaction": "0x...",                   // txid on the network
+  "network": "stacks:2147483648"
+}
+
+### Failure Response (200) — valid request, settlement failed
+
+{
+  "success": false,
+  "errorReason": "recipient_mismatch",
+  "transaction": "",                        // empty if not broadcast
+  "network": "stacks:2147483648"
+}
+
+### V2 errorReason Values
+
+Same set as invalidReason (above), plus:
+  broadcast_failed    — node rejected broadcast (may be retryable)
+  transaction_failed  — tx broadcast but aborted/dropped on-chain
+  unexpected_settle_error — internal error
+
+## GET /supported — Supported Payment Kinds (Spec Section 7.3)
+
+Returns the static configuration of what this facilitator supports.
+No authentication required.
+
+### Request
+
+GET https://x402-relay.aibtc.com/supported
+
+### Response (200)
+
+{
+  "kinds": [
+    {
+      "x402Version": 2,
+      "scheme": "exact",
+      "network": "stacks:2147483648"         // "stacks:1" on mainnet
+    }
+  ],
+  "extensions": [],
+  "signers": {
+    "stacks:*": []                           // empty = any signer accepted
+  }
+}
+
+## Full V2 Flow Example
+
+1. Client requests a resource — server responds with 402 Payment Required
+   and paymentRequirements (network, amount, asset, payTo).
+
+2. Client calls GET /supported to confirm relay supports the requirements.
+
+3. Client builds a sponsored Stacks transaction (sponsored: true) paying the
+   required amount to payTo, and signs it.
+
+4. (Optional) Client calls POST /verify to validate before spending resources.
+
+5. Client calls POST /settle with the signed tx and paymentRequirements.
+   Relay verifies, broadcasts, and returns { success: true, transaction: "0x..." }.
+
+6. Client presents the transaction ID to the resource server as proof of payment.
+
+## Notes
+
+- The /settle endpoint polls for confirmation up to 60 seconds. If confirmation
+  times out, the transaction is still broadcast and success: true is returned.
+  Poll the Stacks node directly for final confirmation status.
+- Use POST /relay (the native relay endpoint) if you also need fee sponsorship.
+  POST /settle is for clients that already have a fully-sponsored transaction.
+- See GET /fees for current fee estimates before building your transaction.
+`,
   };
 
   const content = topicDocs[topic];
@@ -1159,14 +1588,14 @@ If you receive a network error after submitting, retrying with the same tx is sa
       {
         error: "Topic not found",
         code: "NOT_FOUND",
-        details: `Unknown topic: ${topic}. Available topics: sponsored-transactions, api-keys, authentication, errors`,
+        details: `Unknown topic: ${topic}. Available topics: sponsored-transactions, api-keys, authentication, errors, x402-v2-facilitator`,
         retryable: false,
       },
       404
     );
   }
 
-  return new Response(content, {
+  return new Response(content.replaceAll(BASE_URL_PLACEHOLDER, baseUrl), {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": "public, max-age=300, s-maxage=3600",
@@ -1178,30 +1607,33 @@ If you receive a network error after submitting, retrying with the same tx is sa
 // /.well-known/agent.json — A2A Agent Card
 // ---------------------------------------------------------------------------
 discovery.get("/.well-known/agent.json", (c) => {
+  const baseUrl = getBaseUrl(c);
   const agentCard = {
     name: "x402 Stacks Sponsor Relay",
     description:
-      "Gasless transaction relay for AI agents on the Stacks blockchain. " +
+      "Gasless transaction relay and x402 V2 spec-compliant facilitator for AI agents on the Stacks blockchain. " +
       "Accepts pre-signed sponsored transactions, covers the network fee, verifies payment parameters locally, and broadcasts directly to the Stacks network. " +
+      "Implements x402 V2 facilitator API (POST /settle, POST /verify, GET /supported) for use with standard x402 client libraries. " +
       "Supports STX, sBTC, and USDCx tokens. API keys provisioned for free via BTC or STX signature.",
-    url: "https://x402-relay.aibtc.com",
+    url: baseUrl,
     provider: {
       organization: "AIBTC Working Group",
       url: "https://aibtc.com",
     },
     version: VERSION,
-    documentationUrl: "https://x402-relay.aibtc.com/llms.txt",
-    openApiUrl: "https://x402-relay.aibtc.com/openapi.json",
+    documentationUrl: `${baseUrl}/llms.txt`,
+    openApiUrl: `${baseUrl}/openapi.json`,
     documentation: {
-      quickStart: "https://x402-relay.aibtc.com/llms.txt",
-      fullReference: "https://x402-relay.aibtc.com/llms-full.txt",
-      openApiSpec: "https://x402-relay.aibtc.com/openapi.json",
+      quickStart: `${baseUrl}/llms.txt`,
+      fullReference: `${baseUrl}/llms-full.txt`,
+      openApiSpec: `${baseUrl}/openapi.json`,
       topicDocs: {
-        index: "https://x402-relay.aibtc.com/topics",
-        sponsoredTransactions: "https://x402-relay.aibtc.com/topics/sponsored-transactions",
-        apiKeys: "https://x402-relay.aibtc.com/topics/api-keys",
-        authentication: "https://x402-relay.aibtc.com/topics/authentication",
-        errors: "https://x402-relay.aibtc.com/topics/errors",
+        index: `${baseUrl}/topics`,
+        sponsoredTransactions: `${baseUrl}/topics/sponsored-transactions`,
+        apiKeys: `${baseUrl}/topics/api-keys`,
+        authentication: `${baseUrl}/topics/authentication`,
+        errors: `${baseUrl}/topics/errors`,
+        x402V2Facilitator: `${baseUrl}/topics/x402-v2-facilitator`,
       },
       relatedPlatform: "https://aibtc.com/llms.txt",
     },
@@ -1209,6 +1641,9 @@ discovery.get("/.well-known/agent.json", (c) => {
       streaming: false,
       pushNotifications: false,
       stateTransitionHistory: false,
+      facilitator: true,
+      facilitatorSpec: "x402-v2",
+      facilitatorSpecUrl: "https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md",
     },
     authentication: {
       schemes: ["bearer"],
@@ -1350,6 +1785,28 @@ discovery.get("/.well-known/agent.json", (c) => {
         examples: [
           "Is the relay healthy?",
           "Check relay status before submitting a transaction",
+        ],
+        inputModes: ["application/json"],
+        outputModes: ["application/json"],
+      },
+      {
+        id: "x402-v2-facilitator",
+        name: "x402 V2 Facilitator",
+        description:
+          "Spec-compliant x402 V2 facilitator (coinbase/x402 spec section 7). " +
+          "POST /settle — verifies payment params locally and broadcasts the pre-sponsored transaction; returns { success, transaction, network, payer }. " +
+          "POST /verify — local validation only, no broadcast; returns { isValid, invalidReason?, payer? }. " +
+          "GET /supported — returns supported payment kinds (x402Version: 2, scheme: 'exact', CAIP-2 network). " +
+          "CAIP-2 networks: 'stacks:1' (mainnet), 'stacks:2147483648' (testnet). " +
+          "Assets: 'STX', 'sBTC', or CAIP-19 contract address. " +
+          "Always returns HTTP 200 for settle/verify; HTTP 400 for malformed schema. " +
+          "Idempotent: same tx hex returns cached result within 5 minutes.",
+        tags: ["x402", "facilitator", "settlement", "stacks", "caip2"],
+        examples: [
+          "Settle an x402 V2 payment on Stacks",
+          "Verify an x402 payment before broadcasting",
+          "Check supported payment kinds for this facilitator",
+          "Use this relay as an x402 V2 facilitator in my client",
         ],
         inputModes: ["application/json"],
         outputModes: ["application/json"],
