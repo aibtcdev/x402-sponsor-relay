@@ -509,7 +509,6 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 **x402 Stacks Ecosystem:**
 - `~/dev/whoabuddy/stx402/` - x402 implementation (stx402.com)
 - `~/dev/tony1908/x402Stacks/` - x402-stacks npm package (PR #8 adds sponsored tx)
-- Facilitator: facilitator.stacksx402.com
 
 **aibtcdev Resources:**
 - `../erc-8004-stacks/` - Agent identity contracts (future integration)

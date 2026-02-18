@@ -863,11 +863,14 @@ export interface FeePriorityTiers {
 /**
  * Fee estimates for all transaction types.
  * Also matches the shape of Hiro API GET /extended/v2/mempool/fees response.
+ * Note: smart_contract is optional because the Hiro API may omit it when
+ * there is insufficient mempool data for that tier. Callers that need
+ * smart_contract fees should fall back to contract_call values.
  */
 export interface FeeEstimates {
   token_transfer: FeePriorityTiers;
   contract_call: FeePriorityTiers;
-  smart_contract: FeePriorityTiers;
+  smart_contract?: FeePriorityTiers;
 }
 
 /**

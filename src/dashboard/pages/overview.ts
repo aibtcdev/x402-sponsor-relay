@@ -10,7 +10,7 @@ import {
   formatTrend,
   transactionChartConfig,
 } from "../components/charts";
-import { formatNumber, formatTokenAmount, escapeHtml } from "../styles";
+import { colors, escapeHtml } from "../styles";
 
 /** Bar chart SVG icon (reused in empty states) */
 function barChartSvg(sizeClass: string, extraClass = ""): string {
@@ -54,6 +54,33 @@ function chartEmptyState(message: string): string {
 }
 
 /**
+ * Settlement status badge card — shows status as a small pill badge
+ * rather than a large bold headline, to avoid alarming "Down" text.
+ */
+function settlementCard(
+  status: "healthy" | "degraded" | "down" | "unknown",
+  uptime24h: number
+): string {
+  const badgeColor = colors.status[status];
+  const label = status.charAt(0).toUpperCase() + status.slice(1);
+
+  return `
+<div class="brand-card p-4">
+  <div class="flex items-center justify-between">
+    <p class="text-sm text-gray-400">Settlement</p>
+    <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
+  </div>
+  <div class="mt-2">
+    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium"
+          style="background-color: ${badgeColor}20; color: ${badgeColor}; border: 1px solid ${badgeColor}40">
+      ${escapeHtml(label)}
+    </span>
+  </div>
+  <p class="text-xs text-gray-500 mt-2">Uptime 24h: ${uptime24h}%</p>
+</div>`;
+}
+
+/**
  * Generate the main dashboard overview page
  * @param data - Dashboard overview data
  * @param network - Optional network context ("testnet" | "mainnet")
@@ -86,10 +113,7 @@ ${header(network)}
 
     ${successRateCard(data.transactions.success, data.transactions.total)}
 
-    ${statsCard("Settlement", settlement.status.charAt(0).toUpperCase() + settlement.status.slice(1), {
-      colorClass: `status-${settlement.status}`,
-      icon: `<svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>`,
-    })}
+    ${settlementCard(settlement.status, settlement.uptime24h)}
 
     ${statsCard("Hiro Latency", `${settlement.avgLatencyMs}ms`, {
       colorClass: settlement.avgLatencyMs > 2000 ? "text-yellow-400" : "text-white",
@@ -102,19 +126,19 @@ ${header(network)}
     <div class="brand-section p-6">
       <div class="flex items-center justify-between mb-4">
         <h3 class="text-lg font-semibold text-white">Transaction Volume</h3>
-        <div class="flex items-center gap-1 bg-gray-800 rounded-lg p-1" x-show="${showTxChart ? 'true' : 'false'}">
-          <button
+        <div class="flex items-center gap-3 text-sm" x-show="${showTxChart ? 'true' : 'false'}">
+          <span
             @click="setPeriod('24h')"
-            :class="period === '24h' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'"
-            class="px-3 py-1 rounded text-sm font-medium transition-colors min-h-[32px]">
+            :class="period === '24h' ? 'text-white' : 'text-gray-500 hover:text-gray-300 cursor-pointer'"
+            class="font-medium transition-colors select-none">
             24h
-          </button>
-          <button
+          </span>
+          <span
             @click="setPeriod('7d')"
-            :class="period === '7d' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'"
-            class="px-3 py-1 rounded text-sm font-medium transition-colors min-h-[32px]">
+            :class="period === '7d' ? 'text-white' : 'text-gray-500 hover:text-gray-300 cursor-pointer'"
+            class="font-medium transition-colors select-none">
             7d
-          </button>
+          </span>
         </div>
       </div>
       ${showTxChart
@@ -185,11 +209,17 @@ ${footer(utcTimestamp())}
       },
 
       rebuildChart: function(hourlyData) {
-        if (!this.chartInstance) return;
-        this.chartInstance.data.labels = hourlyData.map(function(d) { return d.hour; });
-        this.chartInstance.data.datasets[0].data = hourlyData.map(function(d) { return d.transactions; });
-        this.chartInstance.data.datasets[1].data = hourlyData.map(function(d) { return d.success; });
-        this.chartInstance.update();
+        // Destroy and recreate the chart to handle label count changes (24 → 7)
+        if (this.chartInstance) {
+          this.chartInstance.destroy();
+        }
+        var canvas = document.getElementById('transactionChart');
+        if (!canvas || typeof Chart === 'undefined') return;
+        var config = JSON.parse(JSON.stringify(_chartConfig));
+        config.data.labels = hourlyData.map(function(d) { return d.hour; });
+        config.data.datasets[0].data = hourlyData.map(function(d) { return d.transactions; });
+        config.data.datasets[1].data = hourlyData.map(function(d) { return d.success; });
+        this.chartInstance = new Chart(canvas, config);
       }
     };
   }

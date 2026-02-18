@@ -19,11 +19,11 @@ All error responses now include structured retry guidance:
 ```typescript
 // Error response with retry guidance
 {
-  error: "Facilitator timeout",
-  code: "FACILITATOR_TIMEOUT",
+  error: "Broadcast failed: connection reset",
+  code: "SETTLEMENT_BROADCAST_FAILED",
   retryable: true,
   retryAfter: 5, // seconds - also sent as Retry-After header
-  details: "Request timed out after 30s, safe to retry"
+  details: "Failed to broadcast transaction, safe to retry"
 }
 ```
 
@@ -39,9 +39,7 @@ All error responses now include structured retry guidance:
 | `RATE_LIMIT_EXCEEDED` | 429 | Yes | 60s |
 | `SPONSOR_CONFIG_ERROR` | 500 | No | - |
 | `SPONSOR_FAILED` | 500 | Yes | - |
-| `FACILITATOR_TIMEOUT` | 504 | Yes | 5s |
-| `FACILITATOR_ERROR` | 502 | Yes | 5s |
-| `FACILITATOR_INVALID_RESPONSE` | 502 | Yes | 10s |
+| `SETTLEMENT_BROADCAST_FAILED` | 502 | Yes | 5s |
 | `SETTLEMENT_FAILED` | 400 | No | - |
 | `INTERNAL_ERROR` | 500 | Yes | 5s |
 

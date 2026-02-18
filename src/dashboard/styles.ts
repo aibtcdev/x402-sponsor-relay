@@ -332,26 +332,40 @@ export function formatNumber(n: number): string {
 }
 
 /**
- * Format a token amount for display in micro-units
+ * Format a token amount for display in human-readable units.
  *
- * Returns the raw integer value with locale-aware thousands separators
- * and the appropriate micro-unit suffix:
- *   STX   → "56,500 μSTX"
- *   sBTC  → "12,300 sats"
- *   USDCx → "1,000,000 μUSDCx"
+ * Converts raw micro-unit integer strings to decimal notation:
+ *   STX   (6 decimals):  "1000000"   → "1.000000 STX"
+ *   sBTC  (8 decimals):  "100000000" → "1.00000000 sBTC"
+ *   USDCx (6 decimals):  "1000000"   → "1.000000 USDCx"
+ *
+ * Uses BigInt arithmetic to avoid floating-point precision loss.
  */
 export function formatTokenAmount(amount: string, token: string): string {
-  const value = BigInt(amount);
-  const formatted = value.toLocaleString("en-US");
-
+  // Determine divisor and decimal places per token
+  let decimals: number;
   switch (token) {
     case "STX":
-      return `${formatted} μSTX`;
+      decimals = 6;
+      break;
     case "sBTC":
-      return `${formatted} sats`;
+      decimals = 8;
+      break;
     case "USDCx":
-      return `${formatted} μUSDCx`;
+      decimals = 6;
+      break;
     default:
       return amount;
   }
+
+  const divisor = BigInt(10) ** BigInt(decimals);
+  const value = BigInt(amount || "0");
+  const whole = value / divisor;
+  const frac = value % divisor;
+
+  // Pad fractional part to the required number of decimal places
+  const fracStr = frac.toString().padStart(decimals, "0");
+  const wholeFormatted = whole.toLocaleString("en-US");
+
+  return `${wholeFormatted}.${fracStr} ${token}`;
 }

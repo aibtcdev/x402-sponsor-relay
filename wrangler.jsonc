@@ -23,6 +23,10 @@
   "vars": {
     "STACKS_NETWORK": "testnet"
   },
+  // Cron trigger: run health check every 5 minutes
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
 
   /**
    * Environments
@@ -49,7 +53,11 @@
       "kv_namespaces": [
         { "binding": "RELAY_KV", "id": "3851254fa8f9494189689ce5a726b773" },
         { "binding": "API_KEYS_KV", "id": "20be33ef450a4c31a128dd80a1ff3bd9" }
-      ]
+      ],
+      // Cron trigger: run health check every 5 minutes
+      "triggers": {
+        "crons": ["*/5 * * * *"]
+      }
     },
     "production": {
       "name": "x402-sponsor-relay-production",
@@ -67,7 +75,11 @@
       "kv_namespaces": [
         { "binding": "RELAY_KV", "id": "56f3b1596357434291161238d40cbd81" },
         { "binding": "API_KEYS_KV", "id": "307c3134a46e4d5a94e2d0b7f1d97cbf" }
-      ]
+      ],
+      // Cron trigger: run health check every 5 minutes
+      "triggers": {
+        "crons": ["*/5 * * * *"]
+      }
     }
   }
 }

@@ -1,12 +1,13 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
-import type { Env, AppVariables } from "./types";
+import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
 import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, Settle, VerifyV2, Supported } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
+import { SettlementHealthService } from "./services";
 
 // Create Hono app with type safety
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -173,4 +174,31 @@ app.notFound((c) => {
   );
 });
 
-export default app;
+/** Minimal no-op logger for use outside of HTTP request context (e.g., cron) */
+function createNoOpLogger(): Logger {
+  return {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+    debug: () => {},
+  };
+}
+
+export default {
+  fetch: app.fetch.bind(app),
+
+  /**
+   * Scheduled handler — runs on the cron trigger defined in wrangler.jsonc.
+   * Executes a settlement health check every 5 minutes to populate KV history
+   * so that the dashboard uptime24h metric is accurate.
+   */
+  async scheduled(
+    _event: ScheduledEvent,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<void> {
+    const logger = createNoOpLogger();
+    const healthService = new SettlementHealthService(env, logger);
+    ctx.waitUntil(healthService.checkHealth());
+  },
+};
