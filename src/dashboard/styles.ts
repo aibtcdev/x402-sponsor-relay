@@ -93,6 +93,9 @@ export const dashboardCss = `
   .inline-block { display: inline-block; }
   .grid { display: grid; }
   .relative { position: relative; }
+  .absolute { position: absolute; }
+  .inset-0 { top: 0; right: 0; bottom: 0; left: 0; }
+  .z-10 { z-index: 10; }
   .overflow-hidden { overflow: hidden; }
   .overflow-x-auto { overflow-x: auto; }
   .items-center { align-items: center; }
@@ -107,12 +110,14 @@ export const dashboardCss = `
   .grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
   /* ── Spacing ───────────────────────────────────────────────── */
+  .gap-1 { gap: 0.25rem; }
   .gap-3 { gap: 0.75rem; }
   .gap-4 { gap: 1rem; }
   .gap-y-2 { row-gap: 0.5rem; }
   .space-x-2 > :not(:first-child) { margin-left: 0.5rem; }
   .space-x-3 > :not(:first-child) { margin-left: 0.75rem; }
   .space-x-4 > :not(:first-child) { margin-left: 1rem; }
+  .p-1 { padding: 0.25rem; }
   .p-2 { padding: 0.5rem; }
   .p-4 { padding: 1rem; }
   .p-6 { padding: 1.5rem; }
@@ -121,6 +126,7 @@ export const dashboardCss = `
   .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
   .px-4 { padding-left: 1rem; padding-right: 1rem; }
   .px-8 { padding-left: 2rem; padding-right: 2rem; }
+  .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
   .py-0\\.5 { padding-top: 0.125rem; padding-bottom: 0.125rem; }
   .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
   .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
@@ -160,9 +166,10 @@ export const dashboardCss = `
   .h-8 { height: 2rem; }
   .h-10 { height: 2.5rem; }
   .h-16 { height: 4rem; }
-  .h-64 { height: 16rem; }
+  .h-96 { height: 24rem; }
   .h-full { height: 100%; }
   .min-h-screen { min-height: 100vh; }
+  .min-h-\\[32px\\] { min-height: 32px; }
   .min-h-\\[44px\\] { min-height: 44px; }
   .min-w-\\[44px\\] { min-width: 44px; }
   .max-w-7xl { max-width: 80rem; }
@@ -173,7 +180,6 @@ export const dashboardCss = `
   .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
   .text-xl { font-size: 1.25rem; line-height: 1.75rem; }
   .text-2xl { font-size: 1.5rem; line-height: 2rem; }
-  .text-4xl { font-size: 2.25rem; line-height: 2.5rem; }
   .font-medium { font-weight: 500; }
   .font-semibold { font-weight: 600; }
   .font-bold { font-weight: 700; }
@@ -190,9 +196,14 @@ export const dashboardCss = `
   .text-gray-600 { color: #4b5563; }
   .text-purple-400 { color: #c084fc; }
   .text-orange-400 { color: #fb923c; }
+  .text-green-300 { color: #86efac; }
   .text-yellow-300 { color: #fde047; }
+  .text-yellow-400 { color: #facc15; }
   .bg-white { background-color: #ffffff; }
   .bg-gray-600 { background-color: #4b5563; }
+  .bg-gray-800 { background-color: #1f2937; }
+  .bg-gray-900 { background-color: #111827; }
+  .bg-gray-900.bg-opacity-50 { background-color: rgba(17, 24, 39, 0.5); }
   .bg-green-600 { background-color: #16a34a; }
   .bg-green-900 { background-color: #14532d; }
   .bg-yellow-900 { background-color: #713f12; }
@@ -203,6 +214,7 @@ export const dashboardCss = `
   .border-yellow-700 { border-color: #a16207; }
 
   /* ── Rounded ───────────────────────────────────────────────── */
+  .rounded { border-radius: 0.25rem; }
   .rounded-sm { border-radius: 0.125rem; }
   .rounded-lg { border-radius: 0.5rem; }
   .rounded-full { border-radius: 9999px; }
@@ -231,7 +243,6 @@ export const dashboardCss = `
     .md\\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   }
   @media (min-width: 1024px) {
-    .lg\\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .lg\\:px-8 { padding-left: 2rem; padding-right: 2rem; }
   }
 
@@ -253,18 +264,6 @@ export const dashboardCss = `
   .trend-up { color: ${colors.trend.up}; }
   .trend-down { color: ${colors.trend.down}; }
   .trend-stable { color: ${colors.trend.stable}; }
-
-  /* ── Brand animations ──────────────────────────────────────── */
-  @keyframes float {
-    0%, 100% { transform: translateY(0); }
-    50% { transform: translateY(-4px); }
-  }
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .animate-float { animation: float 3s ease-in-out infinite; }
-  .animate-fade-up { animation: fadeUp 0.4s ease-out; }
 
   /* ── Brand card styles ─────────────────────────────────────── */
   .brand-card {
@@ -304,15 +303,6 @@ export const dashboardCss = `
     border-radius: 0.5rem;
   }
 
-  /* Legacy compat: stat-card maps to brand-card */
-  .stat-card {
-    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
-  }
-  .stat-card:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 4px 20px rgba(255, 79, 3, 0.08);
-    border-color: rgba(255, 79, 3, 0.3);
-  }
 `;
 
 /**
@@ -342,33 +332,26 @@ export function formatNumber(n: number): string {
 }
 
 /**
- * Format a token amount for display
+ * Format a token amount for display in micro-units
+ *
+ * Returns the raw integer value with locale-aware thousands separators
+ * and the appropriate micro-unit suffix:
+ *   STX   → "56,500 μSTX"
+ *   sBTC  → "12,300 sats"
+ *   USDCx → "1,000,000 μUSDCx"
  */
 export function formatTokenAmount(amount: string, token: string): string {
   const value = BigInt(amount);
-  let divisor: bigint;
-  let decimals: number;
+  const formatted = value.toLocaleString("en-US");
 
   switch (token) {
     case "STX":
-      divisor = BigInt(1_000_000); // 6 decimals
-      decimals = 6;
-      break;
+      return `${formatted} μSTX`;
     case "sBTC":
-      divisor = BigInt(100_000_000); // 8 decimals
-      decimals = 8;
-      break;
+      return `${formatted} sats`;
     case "USDCx":
-      divisor = BigInt(1_000_000); // 6 decimals
-      decimals = 6;
-      break;
+      return `${formatted} μUSDCx`;
     default:
       return amount;
   }
-
-  const whole = value / divisor;
-  const fraction = value % divisor;
-  const fractionStr = fraction.toString().padStart(decimals, "0").slice(0, 2);
-
-  return `${whole.toLocaleString("en-US")}.${fractionStr}`;
 }

@@ -18,7 +18,7 @@ export function statsCard(
   const color = options?.colorClass || "text-white";
 
   return `
-<div class="stat-card brand-card p-4">
+<div class="brand-card p-4">
   <div class="flex items-center justify-between">
     <p class="text-sm text-gray-400">${escapeHtml(label)}</p>
     ${options?.icon || ""}
@@ -41,7 +41,7 @@ export function tokenCard(
   const formattedVolume = formatTokenAmount(volume, token);
 
   return `
-<div class="stat-card brand-card p-4">
+<div class="brand-card p-4">
   <div class="flex items-center space-x-2">
     <div class="w-3 h-3 rounded-full" style="background-color: ${tokenColor}"></div>
     <span class="font-medium" style="color: ${tokenColor}">${token}</span>
@@ -52,7 +52,7 @@ export function tokenCard(
   </div>
   <div class="mt-2 pt-2" style="border-top: 1px solid ${colors.bg.border}">
     <p class="text-sm text-gray-400">Volume</p>
-    <p class="text-lg font-medium text-white">${formattedVolume} ${token}</p>
+    <p class="text-lg font-medium text-white">${formattedVolume}</p>
   </div>
 </div>`;
 }
@@ -112,7 +112,7 @@ export function healthCard(
 
   return `
 <div class="brand-card p-6">
-  <h3 class="text-lg font-semibold text-white mb-4">Settlement Health</h3>
+  <h3 class="text-lg font-semibold text-white mb-4">Stacks API</h3>
 
   <div class="flex items-center space-x-3 mb-4">
     <div class="p-2 rounded-full" style="background-color: ${config.color}20; color: ${config.color}">
@@ -149,7 +149,7 @@ export function successRateCard(success: number, total: number): string {
   const color = rate >= 95 ? colors.status.healthy : rate >= 80 ? colors.status.degraded : colors.status.down;
 
   return `
-<div class="stat-card brand-card p-4">
+<div class="brand-card p-4">
   <p class="text-sm text-gray-400">Success Rate</p>
   <p class="text-2xl font-bold mt-2" style="color: ${color}">${rate}%</p>
   <div class="mt-2 h-2 rounded-full overflow-hidden" style="background-color: ${colors.bg.border}">
@@ -202,7 +202,7 @@ export function apiKeySummaryCards(stats: AggregateKeyStats): string {
     icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>`,
   })}
 
-  ${statsCard("Fees Sponsored Today", `${formattedFees} STX`, {
+  ${statsCard("Fees Sponsored Today", formattedFees, {
     icon: `<svg class="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`,
   })}
 </div>`;
@@ -241,7 +241,6 @@ export function topKeysTable(stats: AggregateKeyStats): string {
       </td>
       <td class="py-3 px-4 text-right">
         <span class="text-white font-medium">${formattedFees}</span>
-        <span class="text-gray-500 text-sm ml-1">STX</span>
       </td>
       <td class="py-3 px-4 text-right">
         ${getStatusBadge(key.status)}

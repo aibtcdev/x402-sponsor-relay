@@ -5,14 +5,30 @@ import {
   tokenCard,
   healthCard,
   successRateCard,
-  apiKeysSection,
 } from "../components/cards";
 import {
   formatTrend,
   transactionChartConfig,
-  tokenPieChartConfig,
 } from "../components/charts";
 import { formatNumber, formatTokenAmount, escapeHtml } from "../styles";
+
+/** Bar chart SVG icon (reused in empty states) */
+function barChartSvg(sizeClass: string, extraClass = ""): string {
+  const cls = `${sizeClass} text-gray-600 mx-auto${extraClass ? ` ${extraClass}` : ""}`;
+  return `<svg class="${cls}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+    </svg>`;
+}
+
+/** Formatted UTC timestamp for footer display */
+function utcTimestamp(): string {
+  return new Date().toLocaleString("en-US", {
+    timeZone: "UTC",
+    dateStyle: "medium",
+    timeStyle: "short",
+  }) + " UTC";
+}
 
 /**
  * Check whether hourly data has any non-zero transaction counts
@@ -24,29 +40,13 @@ function hasTransactionChartData(
 }
 
 /**
- * Check whether token data has any non-zero counts
- */
-function hasTokenChartData(tokens: {
-  STX: { count: number };
-  sBTC: { count: number };
-  USDCx: { count: number };
-}): boolean {
-  return (
-    tokens.STX.count > 0 || tokens.sBTC.count > 0 || tokens.USDCx.count > 0
-  );
-}
-
-/**
  * Empty-state div for charts with no data
  */
 function chartEmptyState(message: string): string {
   return `
-<div class="h-64 flex items-center justify-center">
+<div class="h-96 flex items-center justify-center">
   <div class="text-center">
-    <svg class="w-10 h-10 text-gray-600 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
-    </svg>
+    ${barChartSvg("w-10 h-10")}
     <p class="text-gray-400 mt-2">${escapeHtml(message)}</p>
     <p class="text-sm text-gray-500 mt-1">Charts will appear once transactions are processed</p>
   </div>
@@ -59,12 +59,6 @@ function chartEmptyState(message: string): string {
  * @param network - Optional network context ("testnet" | "mainnet")
  */
 export function overviewPage(data: DashboardOverview, network?: string): string {
-  const now = new Date().toLocaleString("en-US", {
-    timeZone: "UTC",
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
-
   const trend = formatTrend(
     data.transactions.total,
     data.transactions.previousTotal
@@ -78,7 +72,6 @@ export function overviewPage(data: DashboardOverview, network?: string): string 
   };
 
   const showTxChart = hasTransactionChartData(data.hourlyData);
-  const showTokenChart = hasTokenChartData(data.tokens);
 
   const content = `
 ${header(network)}
@@ -104,22 +97,34 @@ ${header(network)}
     })}
   </div>
 
-  <!-- Charts Row -->
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-    <!-- Transaction Volume Chart -->
+  <!-- Transaction Volume Chart (full-width, with 24h/7d toggle) -->
+  <div class="mb-6" x-data="txChartApp()">
     <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">Transaction Volume (24h)</h3>
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="text-lg font-semibold text-white">Transaction Volume</h3>
+        <div class="flex items-center gap-1 bg-gray-800 rounded-lg p-1" x-show="${showTxChart ? 'true' : 'false'}">
+          <button
+            @click="setPeriod('24h')"
+            :class="period === '24h' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'"
+            class="px-3 py-1 rounded text-sm font-medium transition-colors min-h-[32px]">
+            24h
+          </button>
+          <button
+            @click="setPeriod('7d')"
+            :class="period === '7d' ? 'bg-gray-600 text-white' : 'text-gray-400 hover:text-white'"
+            class="px-3 py-1 rounded text-sm font-medium transition-colors min-h-[32px]">
+            7d
+          </button>
+        </div>
+      </div>
       ${showTxChart
-        ? `<div class="h-64"><canvas id="transactionChart"></canvas></div>`
+        ? `<div class="h-96 relative">
+        <div x-show="loading" class="absolute inset-0 flex items-center justify-center bg-gray-900 bg-opacity-50 rounded z-10">
+          <span class="text-gray-400 text-sm">Loading...</span>
+        </div>
+        <canvas id="transactionChart"></canvas>
+      </div>`
         : chartEmptyState("No transaction data yet")}
-    </div>
-
-    <!-- Token Distribution Chart -->
-    <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">Token Distribution</h3>
-      ${showTokenChart
-        ? `<div class="h-64"><canvas id="tokenChart"></canvas></div>`
-        : chartEmptyState("No token data yet")}
     </div>
   </div>
 
@@ -133,47 +138,79 @@ ${header(network)}
     </div>
   </div>
 
-  <!-- API Key Usage Section -->
-  ${data.apiKeys ? apiKeysSection(data.apiKeys) : ""}
-
-  <!-- Settlement Health Section -->
+  <!-- Stacks API Section -->
   <div class="mb-6">
     ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
   </div>
 </main>
 
-${footer(now + " UTC")}
+${footer(utcTimestamp())}
 
 <script>
-  // Initialize charts when DOM is ready
-  document.addEventListener('DOMContentLoaded', function() {
-    // Transaction volume chart (only if canvas exists and data is non-zero)
-    const txCtx = document.getElementById('transactionChart');
-    if (txCtx) {
-      new Chart(txCtx, ${transactionChartConfig(data.hourlyData)});
-    }
+  // Server-rendered 24h chart config (used by Alpine init)
+  var _chartConfig = ${transactionChartConfig(data.hourlyData)};
 
-    // Token distribution chart (only if canvas exists and data is non-zero)
-    const tokenCtx = document.getElementById('tokenChart');
-    if (tokenCtx) {
-      new Chart(tokenCtx, ${tokenPieChartConfig(data.tokens)});
-    }
+  // Module-scoped reference for auto-refresh interval
+  var _txChartInstance = null;
 
-    // Auto-refresh every 60 seconds (pre-validate network before reload)
-    setTimeout(() => {
-      const autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
-      if (autoRefresh) {
-        fetch(location.pathname + '/api/stats', { method: 'HEAD' })
-          .then(function(r) { if (r.ok) location.reload(); })
-          .catch(function() { /* network error — skip reload */ });
+  // Alpine.js component for the transaction volume chart with period toggle
+  function txChartApp() {
+    return {
+      period: '24h',
+      loading: false,
+      chartInstance: null,
+
+      init: function() {
+        var canvas = document.getElementById('transactionChart');
+        if (canvas && typeof Chart !== 'undefined') {
+          this.chartInstance = new Chart(canvas, _chartConfig);
+        }
+        _txChartInstance = this;
+      },
+
+      setPeriod: function(p) {
+        if (this.period === p || this.loading) return;
+        this.period = p;
+        this.loading = true;
+
+        var self = this;
+        fetch('/dashboard/api/stats?period=' + p)
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            var hourlyData = data.hourlyData || [];
+            self.rebuildChart(hourlyData);
+          })
+          .catch(function() { /* silently ignore fetch errors */ })
+          .finally(function() { self.loading = false; });
+      },
+
+      rebuildChart: function(hourlyData) {
+        if (!this.chartInstance) return;
+        this.chartInstance.data.labels = hourlyData.map(function(d) { return d.hour; });
+        this.chartInstance.data.datasets[0].data = hourlyData.map(function(d) { return d.transactions; });
+        this.chartInstance.data.datasets[1].data = hourlyData.map(function(d) { return d.success; });
+        this.chartInstance.update();
       }
-    }, 60000);
-  });
+    };
+  }
+
+  // Auto-refresh chart every 60 seconds via AJAX (no page reload)
+  setInterval(function() {
+    var autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
+    if (!autoRefresh || !_txChartInstance || !_txChartInstance.chartInstance) return;
+    var period = _txChartInstance.period || '24h';
+    fetch('/dashboard/api/stats?period=' + period)
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.hourlyData) _txChartInstance.rebuildChart(data.hourlyData);
+      })
+      .catch(function() {});
+  }, 60000);
 </script>
 `;
 
   return htmlDocument(content, "x402 Sponsor Relay - Dashboard", {
-    includeChartJs: showTxChart || showTokenChart,
+    includeChartJs: showTxChart,
   });
 }
 
@@ -187,10 +224,7 @@ ${header(network)}
 
 <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-8">
   <div class="brand-section p-12 text-center">
-    <svg class="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-    </svg>
+    ${barChartSvg("w-16 h-16", "mb-4")}
     <h2 class="text-xl font-semibold text-white mb-2">No Data Yet</h2>
     <p class="text-gray-400 mb-6">
       The relay hasn't processed any transactions yet. Stats will appear here once transactions are submitted.
@@ -204,7 +238,7 @@ ${header(network)}
   </div>
 </main>
 
-${footer(new Date().toLocaleString("en-US", { timeZone: "UTC", dateStyle: "medium", timeStyle: "short" }) + " UTC")}
+${footer(utcTimestamp())}
 `;
 
   return htmlDocument(content, "x402 Sponsor Relay - Dashboard");

@@ -63,7 +63,7 @@ function createEmptyHourlyStats(hour: string): HourlyStats {
 /**
  * Calculate trend based on current vs previous values
  */
-function calculateTrend(
+export function calculateTrend(
   current: number,
   previous: number
 ): "up" | "down" | "stable" {
@@ -206,9 +206,10 @@ export class StatsService {
         .toISOString()
         .split("T")[0];
 
-      const [todayStats, yesterdayStats] = await Promise.all([
+      const [todayStats, yesterdayStats, hourlyData] = await Promise.all([
         this.kv.get<DailyStats>(`stats:daily:${today}`, "json"),
         this.kv.get<DailyStats>(`stats:daily:${yesterday}`, "json"),
+        this.getHourlyStats(),
       ]);
 
       const current = todayStats || createEmptyDailyStats(today);
@@ -222,9 +223,6 @@ export class StatsService {
 
       const tokenPercentage = (count: number) =>
         totalTokenTx > 0 ? Math.round((count / totalTokenTx) * 100) : 0;
-
-      // Get hourly data for chart
-      const hourlyData = await this.getHourlyStats();
 
       // Calculate fee metrics
       const currentFees = current.fees || { total: "0", count: 0, min: "0", max: "0" };
@@ -293,6 +291,29 @@ export class StatsService {
       });
       return emptyOverview;
     }
+  }
+
+  /**
+   * Get daily stats aggregated as chart-compatible hourly-format entries.
+   * Returns one entry per day with a short date label (e.g. "Feb 12").
+   */
+  async getDailyChartData(
+    days: number
+  ): Promise<Array<{ hour: string; transactions: number; success: number }>> {
+    const daily = await this.getDailyStats(days);
+    return daily.map((d) => {
+      // Format YYYY-MM-DD as "Mon DD" (e.g. "Feb 12")
+      const [year, month, day] = d.date.split("-").map(Number);
+      const label = new Date(Date.UTC(year, month - 1, day)).toLocaleDateString(
+        "en-US",
+        { month: "short", day: "numeric", timeZone: "UTC" }
+      );
+      return {
+        hour: label,
+        transactions: d.transactions.total,
+        success: d.transactions.success,
+      };
+    });
   }
 
   /**
