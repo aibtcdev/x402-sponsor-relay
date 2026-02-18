@@ -48,7 +48,6 @@ export interface Env {
   /** Hex-encoded private key (fallback if no mnemonic) */
   SPONSOR_PRIVATE_KEY?: string;
   STACKS_NETWORK: "mainnet" | "testnet";
-  FACILITATOR_URL: string;
   /** Optional Hiro API key for higher rate limits */
   HIRO_API_KEY?: string;
   // LOGS is a service binding to worker-logs, typed loosely to avoid complex Service<> generics
@@ -185,11 +184,6 @@ export interface AuthContext {
   /** Whether auth is in grace period (no key provided but allowed) */
   gracePeriod: boolean;
 }
-
-/**
- * Token types as expected by the facilitator API
- */
-export type FacilitatorTokenType = "STX" | "SBTC" | "USDCX";
 
 // =============================================================================
 // x402 V2 Types (Coinbase x402 V2 spec compatible)
@@ -429,35 +423,6 @@ export interface RelayRequest {
 }
 
 /**
- * Facilitator settle request format
- */
-export interface FacilitatorSettleRequest {
-  signed_transaction: string;
-  expected_recipient: string;
-  min_amount: number;
-  network: string;
-  token_type: FacilitatorTokenType;
-  expected_sender?: string;
-  resource?: string;
-  method?: string;
-}
-
-/**
- * Facilitator settle response format
- */
-export interface FacilitatorSettleResponse {
-  success: boolean;
-  tx_id?: string;
-  status?: "pending" | "confirmed" | "failed";
-  sender_address?: string;
-  recipient_address?: string;
-  amount?: number;
-  block_height?: number;
-  error?: string;
-  validation_errors?: string[];
-}
-
-/**
  * Settlement result in API response format
  */
 export interface SettlementResult {
@@ -488,7 +453,7 @@ export interface PaymentReceipt {
   fee: string;
   /** Blockchain transaction ID */
   txid: string;
-  /** Settlement details from facilitator */
+  /** Settlement details */
   settlement: SettlementResult;
   /** Original settle options (resource, method, recipient, amount, tokenType) */
   settleOptions: SettleOptions;
@@ -754,7 +719,7 @@ export interface DailyStats {
     validation: number;
     rateLimit: number;
     sponsoring: number;
-    facilitator: number;
+    settlement: number;
     internal: number;
   };
   /** Fee statistics for the day */
@@ -779,9 +744,9 @@ export interface HourlyStats {
 }
 
 /**
- * Facilitator health check record
+ * Health check record (settlement health)
  */
-export interface FacilitatorHealthCheck {
+export interface HealthCheck {
   timestamp: string;
   status: "healthy" | "degraded" | "down";
   latencyMs: number;
@@ -820,7 +785,7 @@ export interface DashboardOverview {
     /** Total fees paid previous day */
     previousTotal: string;
   };
-  settlement: {
+  settlement?: {
     status: "healthy" | "degraded" | "down" | "unknown";
     avgLatencyMs: number;
     uptime24h: number;
@@ -869,7 +834,7 @@ export type ErrorCategory =
   | "validation"
   | "rateLimit"
   | "sponsoring"
-  | "facilitator"
+  | "settlement"
   | "internal";
 
 // =============================================================================

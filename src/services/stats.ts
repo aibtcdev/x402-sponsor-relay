@@ -41,7 +41,7 @@ function createEmptyDailyStats(date: string): DailyStats {
       validation: 0,
       rateLimit: 0,
       sponsoring: 0,
-      facilitator: 0,
+      settlement: 0,
       internal: 0,
     },
   };
@@ -142,7 +142,7 @@ export class StatsService {
 
       // Only count errors from actual transaction attempts as failed transactions
       // Validation and rate limit errors never become actual transactions
-      if (category === "sponsoring" || category === "facilitator" || category === "internal") {
+      if (category === "sponsoring" || category === "settlement" || category === "internal") {
         stats.transactions.total++;
         stats.transactions.failed++;
       }
@@ -284,12 +284,6 @@ export class StatsService {
           max: currentFees.max,
           trend: feeTrend,
           previousTotal: previousFees.total,
-        },
-        settlement: {
-          status: "unknown", // Will be populated by health monitor
-          avgLatencyMs: 0,
-          uptime24h: 0,
-          lastCheck: null,
         },
         hourlyData,
       };

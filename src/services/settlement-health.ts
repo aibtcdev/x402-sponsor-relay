@@ -7,13 +7,11 @@ const HIRO_CHECK_TIMEOUT_MS = 5000;
 /**
  * Service for monitoring native settlement health.
  *
- * Replaces the external FacilitatorService.checkHealth() which pinged an
- * external FACILITATOR_URL/health endpoint. This service performs a self-check:
+ * Performs a self-check:
  *   1. Sponsor wallet is configured (SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY set)
  *   2. Hiro API is reachable (GET /extended/v1/info returns HTTP 200)
  *
- * Health results are stored in KV under the "settlement" key prefix to
- * avoid collision with legacy "facilitator:health:*" entries.
+ * Health results are stored in KV under the "settlement" key prefix.
  */
 export class SettlementHealthService {
   private healthMonitor: HealthMonitor;

@@ -6,14 +6,6 @@ export type {
   SponsorResult,
 } from "./sponsor";
 
-export { FacilitatorService } from "./facilitator";
-export type {
-  FacilitatorResult,
-  SettleValidationResult,
-  SettleValidationSuccess,
-  SettleValidationFailure,
-} from "./facilitator";
-
 export { StatsService } from "./stats";
 
 export { AuthService, DuplicateAddressError, KVNotConfiguredError } from "./auth";

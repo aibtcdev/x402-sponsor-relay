@@ -130,10 +130,10 @@ export const Error500Response = {
 };
 
 /**
- * 502 Bad Gateway - Broadcast or facilitator failed
+ * 502 Bad Gateway - Broadcast or settlement failed
  */
 export const Error502Response = {
-  description: "Broadcast or facilitator error",
+  description: "Broadcast or settlement error",
   content: {
     "application/json": {
       schema: RetryableErrorSchema,
@@ -143,10 +143,10 @@ export const Error502Response = {
 };
 
 /**
- * 504 Gateway Timeout - Facilitator timeout
+ * 504 Gateway Timeout - Settlement timeout
  */
 export const Error504Response = {
-  description: "Facilitator timeout",
+  description: "Settlement timeout",
   content: {
     "application/json": {
       schema: RetryableErrorSchema,

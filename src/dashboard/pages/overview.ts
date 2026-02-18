@@ -70,6 +70,13 @@ export function overviewPage(data: DashboardOverview, network?: string): string 
     data.transactions.previousTotal
   );
 
+  const settlement = data.settlement ?? {
+    status: "unknown" as const,
+    avgLatencyMs: 0,
+    uptime24h: 0,
+    lastCheck: null,
+  };
+
   const showTxChart = hasTransactionChartData(data.hourlyData);
   const showTokenChart = hasTokenChartData(data.tokens);
 
@@ -86,13 +93,13 @@ ${header(network)}
 
     ${successRateCard(data.transactions.success, data.transactions.total)}
 
-    ${statsCard("Settlement", data.settlement.status.charAt(0).toUpperCase() + data.settlement.status.slice(1), {
-      colorClass: `status-${data.settlement.status}`,
+    ${statsCard("Settlement", settlement.status.charAt(0).toUpperCase() + settlement.status.slice(1), {
+      colorClass: `status-${settlement.status}`,
       icon: `<svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>`,
     })}
 
-    ${statsCard("Hiro Latency", `${data.settlement.avgLatencyMs}ms`, {
-      colorClass: data.settlement.avgLatencyMs > 2000 ? "text-yellow-400" : "text-white",
+    ${statsCard("Hiro Latency", `${settlement.avgLatencyMs}ms`, {
+      colorClass: settlement.avgLatencyMs > 2000 ? "text-yellow-400" : "text-white",
       icon: `<svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`,
     })}
   </div>
@@ -131,7 +138,7 @@ ${header(network)}
 
   <!-- Settlement Health Section -->
   <div class="mb-6">
-    ${healthCard(data.settlement.status, data.settlement.avgLatencyMs, data.settlement.uptime24h, data.settlement.lastCheck)}
+    ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
   </div>
 </main>
 

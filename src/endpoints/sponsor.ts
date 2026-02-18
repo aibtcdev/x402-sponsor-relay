@@ -17,7 +17,7 @@ import {
  * POST /sponsor
  *
  * Unlike /relay, this endpoint:
- * - Does NOT call the facilitator for settlement
+ * - Does NOT perform settlement verification
  * - Broadcasts directly to the Stacks node
  * - Requires API key authentication
  */
@@ -26,7 +26,7 @@ export class Sponsor extends BaseEndpoint {
     tags: ["Sponsor"],
     summary: "Sponsor and broadcast a transaction",
     description:
-      "Accepts a pre-signed sponsored transaction, adds the sponsor signature, and broadcasts directly to the Stacks network. Unlike /relay, this does NOT call the x402 facilitator for settlement verification. Requires API key authentication.",
+      "Accepts a pre-signed sponsored transaction, adds the sponsor signature, and broadcasts directly to the Stacks network. Unlike /relay, this does NOT perform settlement verification. Requires API key authentication.",
     security: [{ bearerAuth: [] }],
     request: {
       body: {
