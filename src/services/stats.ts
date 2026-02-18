@@ -206,9 +206,10 @@ export class StatsService {
         .toISOString()
         .split("T")[0];
 
-      const [todayStats, yesterdayStats] = await Promise.all([
+      const [todayStats, yesterdayStats, hourlyData] = await Promise.all([
         this.kv.get<DailyStats>(`stats:daily:${today}`, "json"),
         this.kv.get<DailyStats>(`stats:daily:${yesterday}`, "json"),
+        this.getHourlyStats(),
       ]);
 
       const current = todayStats || createEmptyDailyStats(today);
@@ -222,9 +223,6 @@ export class StatsService {
 
       const tokenPercentage = (count: number) =>
         totalTokenTx > 0 ? Math.round((count / totalTokenTx) * 100) : 0;
-
-      // Get hourly data for chart
-      const hourlyData = await this.getHourlyStats();
 
       // Calculate fee metrics
       const currentFees = current.fees || { total: "0", count: 0, min: "0", max: "0" };
