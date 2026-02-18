@@ -10,7 +10,6 @@ import {
 import {
   formatTrend,
   transactionChartConfig,
-  tokenPieChartConfig,
 } from "../components/charts";
 import { formatNumber, formatTokenAmount, escapeHtml } from "../styles";
 
@@ -24,24 +23,11 @@ function hasTransactionChartData(
 }
 
 /**
- * Check whether token data has any non-zero counts
- */
-function hasTokenChartData(tokens: {
-  STX: { count: number };
-  sBTC: { count: number };
-  USDCx: { count: number };
-}): boolean {
-  return (
-    tokens.STX.count > 0 || tokens.sBTC.count > 0 || tokens.USDCx.count > 0
-  );
-}
-
-/**
  * Empty-state div for charts with no data
  */
 function chartEmptyState(message: string): string {
   return `
-<div class="h-64 flex items-center justify-center">
+<div class="h-96 flex items-center justify-center">
   <div class="text-center">
     <svg class="w-10 h-10 text-gray-600 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -78,7 +64,6 @@ export function overviewPage(data: DashboardOverview, network?: string): string 
   };
 
   const showTxChart = hasTransactionChartData(data.hourlyData);
-  const showTokenChart = hasTokenChartData(data.tokens);
 
   const content = `
 ${header(network)}
@@ -104,22 +89,13 @@ ${header(network)}
     })}
   </div>
 
-  <!-- Charts Row -->
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-    <!-- Transaction Volume Chart -->
+  <!-- Transaction Volume Chart (full-width) -->
+  <div class="mb-6">
     <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">Transaction Volume (24h)</h3>
+      <h3 class="text-lg font-semibold text-white mb-4">Transaction Volume</h3>
       ${showTxChart
-        ? `<div class="h-64"><canvas id="transactionChart"></canvas></div>`
+        ? `<div class="h-96"><canvas id="transactionChart"></canvas></div>`
         : chartEmptyState("No transaction data yet")}
-    </div>
-
-    <!-- Token Distribution Chart -->
-    <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">Token Distribution</h3>
-      ${showTokenChart
-        ? `<div class="h-64"><canvas id="tokenChart"></canvas></div>`
-        : chartEmptyState("No token data yet")}
     </div>
   </div>
 
@@ -153,12 +129,6 @@ ${footer(now + " UTC")}
       new Chart(txCtx, ${transactionChartConfig(data.hourlyData)});
     }
 
-    // Token distribution chart (only if canvas exists and data is non-zero)
-    const tokenCtx = document.getElementById('tokenChart');
-    if (tokenCtx) {
-      new Chart(tokenCtx, ${tokenPieChartConfig(data.tokens)});
-    }
-
     // Auto-refresh every 60 seconds (pre-validate network before reload)
     setTimeout(() => {
       const autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
@@ -173,7 +143,7 @@ ${footer(now + " UTC")}
 `;
 
   return htmlDocument(content, "x402 Sponsor Relay - Dashboard", {
-    includeChartJs: showTxChart || showTokenChart,
+    includeChartJs: showTxChart,
   });
 }
 
