@@ -32,11 +32,11 @@ const openapi = fromHono(app, {
       title: "x402 Stacks Sponsor Relay",
       version: VERSION,
       description:
-        "A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, and calls the x402 facilitator for settlement verification.",
+        "A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, and performs native settlement verification directly.",
     },
     tags: [
       { name: "Health", description: "Service health endpoints" },
-      { name: "Relay", description: "Transaction relay endpoints (x402 facilitator)" },
+      { name: "Relay", description: "Transaction relay endpoints (native settlement)" },
       { name: "Sponsor", description: "Transaction sponsor endpoints (direct broadcast)" },
       { name: "Verify", description: "Payment receipt verification" },
       { name: "Access", description: "Protected resource access" },

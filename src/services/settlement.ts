@@ -22,6 +22,7 @@ import type {
   DedupResult,
   BroadcastAndConfirmResult,
 } from "../types";
+import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 
 // Known SIP-010 token contract addresses
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
@@ -73,26 +74,6 @@ export class SettlementService {
     return this.env.STACKS_NETWORK === "mainnet"
       ? STACKS_MAINNET
       : STACKS_TESTNET;
-  }
-
-  /**
-   * Get the Hiro API base URL based on environment configuration
-   */
-  private getHiroBaseUrl(): string {
-    return this.env.STACKS_NETWORK === "mainnet"
-      ? "https://api.hiro.so"
-      : "https://api.testnet.hiro.so";
-  }
-
-  /**
-   * Build headers for Hiro API requests, including optional API key
-   */
-  private getHiroHeaders(): Record<string, string> {
-    const headers: Record<string, string> = {};
-    if (this.env.HIRO_API_KEY) {
-      headers["x-hiro-api-key"] = this.env.HIRO_API_KEY;
-    }
-    return headers;
   }
 
   /**
@@ -511,8 +492,8 @@ export class SettlementService {
     }
 
     // Poll for confirmation with exponential backoff
-    const hiroBaseUrl = this.getHiroBaseUrl();
-    const hiroHeaders = this.getHiroHeaders();
+    const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
+    const hiroHeaders = getHiroHeaders(this.env.HIRO_API_KEY);
     const pollUrl = `${hiroBaseUrl}/extended/v1/tx/${txid}`;
 
     const startTime = Date.now();

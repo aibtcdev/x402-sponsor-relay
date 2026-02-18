@@ -58,12 +58,31 @@ export function tokenCard(
 }
 
 /**
+ * Format a timestamp as a relative "X minutes/hours ago" string
+ */
+function formatRelativeTime(isoTimestamp: string | null): string {
+  if (!isoTimestamp) return "Never";
+  const then = new Date(isoTimestamp).getTime();
+  const nowMs = Date.now();
+  const diffMs = nowMs - then;
+  if (diffMs < 0) return "Just now";
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return "Just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay}d ago`;
+}
+
+/**
  * Health status card
  */
 export function healthCard(
   status: "healthy" | "degraded" | "down" | "unknown",
   avgLatencyMs: number,
-  uptime24h: number
+  uptime24h: number,
+  lastCheck: string | null
 ): string {
   const statusConfig = {
     healthy: {
@@ -89,10 +108,11 @@ export function healthCard(
   };
 
   const config = statusConfig[status];
+  const lastCheckLabel = formatRelativeTime(lastCheck);
 
   return `
 <div class="brand-card p-6">
-  <h3 class="text-lg font-semibold text-white mb-4">Facilitator Health</h3>
+  <h3 class="text-lg font-semibold text-white mb-4">Settlement Health</h3>
 
   <div class="flex items-center space-x-3 mb-4">
     <div class="p-2 rounded-full" style="background-color: ${config.color}20; color: ${config.color}">
@@ -104,7 +124,7 @@ export function healthCard(
     </div>
   </div>
 
-  <div class="grid grid-cols-2 gap-4">
+  <div class="grid grid-cols-3 gap-4">
     <div>
       <p class="text-sm text-gray-400">Avg Latency</p>
       <p class="text-xl font-bold text-white">${avgLatencyMs}ms</p>
@@ -112,6 +132,10 @@ export function healthCard(
     <div>
       <p class="text-sm text-gray-400">Uptime (24h)</p>
       <p class="text-xl font-bold text-white">${uptime24h}%</p>
+    </div>
+    <div>
+      <p class="text-sm text-gray-400">Last Check</p>
+      <p class="text-xl font-bold text-white">${escapeHtml(lastCheckLabel)}</p>
     </div>
   </div>
 </div>`;

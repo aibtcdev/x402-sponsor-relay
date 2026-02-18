@@ -21,8 +21,7 @@
     { "binding": "API_KEYS_KV", "id": "3ce8d9d710884370873c561bfb98d6cf" }
   ],
   "vars": {
-    "STACKS_NETWORK": "testnet",
-    "FACILITATOR_URL": "https://facilitator.stacksx402.com"
+    "STACKS_NETWORK": "testnet"
   },
 
   /**
@@ -40,8 +39,7 @@
       "routes": [{ "pattern": "x402-relay.aibtc.dev", "custom_domain": true }],
       "observability": { "enabled": false },
       "vars": {
-        "STACKS_NETWORK": "testnet",
-        "FACILITATOR_URL": "https://facilitator.stacksx402.com"
+        "STACKS_NETWORK": "testnet"
       },
       // Bindings must be duplicated per environment
       "services": [
@@ -59,8 +57,7 @@
       "routes": [{ "pattern": "x402-relay.aibtc.com", "custom_domain": true }],
       "observability": { "enabled": false },
       "vars": {
-        "STACKS_NETWORK": "mainnet",
-        "FACILITATOR_URL": "https://facilitator.stacksx402.com"
+        "STACKS_NETWORK": "mainnet"
       },
       // Bindings must be duplicated per environment
       "services": [

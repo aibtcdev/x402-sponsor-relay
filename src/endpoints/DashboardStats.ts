@@ -1,12 +1,12 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import {
   StatsService,
-  HealthMonitor,
-  FacilitatorService,
+  SettlementHealthService,
   AuthService,
 } from "../services";
-import type { AppContext, DashboardOverview } from "../types";
+import type { AppContext } from "../types";
 import { Error500Response } from "../schemas";
+import { buildDashboardData } from "../dashboard/helpers";
 
 /**
  * Dashboard stats endpoint - returns stats as JSON
@@ -17,7 +17,7 @@ export class DashboardStats extends BaseEndpoint {
     tags: ["Dashboard"],
     summary: "Get relay statistics",
     description:
-      "Returns aggregated statistics about relay transactions, token breakdown, and facilitator health. This is a public endpoint.",
+      "Returns aggregated statistics about relay transactions, token breakdown, and settlement health. This is a public endpoint.",
     responses: {
       "200": {
         description: "Statistics retrieved successfully",
@@ -79,7 +79,7 @@ export class DashboardStats extends BaseEndpoint {
                     },
                   },
                 },
-                facilitator: {
+                settlement: {
                   type: "object" as const,
                   properties: {
                     status: {
@@ -163,36 +163,32 @@ export class DashboardStats extends BaseEndpoint {
 
     try {
       const statsService = new StatsService(c.env.RELAY_KV, logger);
-      const healthMonitor = new HealthMonitor(c.env.RELAY_KV, logger);
-      const facilitatorService = new FacilitatorService(c.env, logger);
+      const healthService = new SettlementHealthService(c.env, logger);
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
 
-      // Trigger a fresh health check (non-blocking - we'll still return cached data if this fails)
-      // Run health check and API key stats in parallel with data fetching
+      // Read cached health status from KV (no live Hiro call)
       const [overview, health, apiKeyStats] = await Promise.all([
         statsService.getOverview(),
-        // First do a fresh health check, then get the updated status
-        facilitatorService.checkHealth().then(() => healthMonitor.getStatus()),
-        // Get API key aggregate stats (returns empty stats if KV not configured)
+        healthService.getStatus(),
         authService.getAggregateKeyStats(),
       ]);
 
-      const dashboardData: DashboardOverview = {
-        ...overview,
-        facilitator: {
-          status: health.status,
-          avgLatencyMs: health.avgLatencyMs,
-          uptime24h: health.uptime24h,
-          lastCheck: health.lastCheck?.timestamp || null,
-        },
-        // Only include apiKeys if there are active keys or usage data
-        apiKeys:
-          apiKeyStats.totalActiveKeys > 0 || apiKeyStats.topKeys.length > 0
-            ? apiKeyStats
-            : undefined,
-      };
+      // Populate health KV in the background when no cached data exists
+      if (health.status === "unknown") {
+        c.executionCtx.waitUntil(
+          healthService.checkHealth().catch((e) => {
+            logger.warn("Background health check failed", {
+              error: e instanceof Error ? e.message : String(e),
+            });
+          })
+        );
+      }
 
-      return this.ok(c, dashboardData);
+      const dashboardData = buildDashboardData(overview, health, apiKeyStats);
+
+      return this.ok(c, dashboardData, {
+        "Cache-Control": "public, max-age=15",
+      });
     } catch (e) {
       logger.error("Failed to get stats", {
         error: e instanceof Error ? e.message : "Unknown error",

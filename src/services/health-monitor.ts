@@ -1,32 +1,34 @@
-import type { Logger, FacilitatorHealthCheck } from "../types";
+import type { Logger, HealthCheck } from "../types";
 
 const HEALTH_HISTORY_LIMIT = 100;
 
 /**
- * Facilitator health status with metrics
+ * Health status with metrics
  */
 export interface HealthStatus {
   status: "healthy" | "degraded" | "down" | "unknown";
   avgLatencyMs: number;
   uptime24h: number;
-  lastCheck: FacilitatorHealthCheck | null;
-  recentChecks: FacilitatorHealthCheck[];
+  lastCheck: HealthCheck | null;
+  recentChecks: HealthCheck[];
 }
 
 /**
- * Service for monitoring facilitator health
+ * Service for monitoring health checks.
+ * Requires a key prefix to namespace KV entries.
  */
 export class HealthMonitor {
   constructor(
     private kv: KVNamespace | undefined,
-    private logger: Logger
+    private logger: Logger,
+    private keyPrefix: string
   ) {}
 
   /**
-   * Record a health check result from a facilitator call
+   * Record a health check result
    */
   async recordCheck(
-    check: Omit<FacilitatorHealthCheck, "timestamp">
+    check: Omit<HealthCheck, "timestamp">
   ): Promise<void> {
     if (!this.kv) {
       this.logger.debug("KV not available, skipping health recording");
@@ -34,20 +36,20 @@ export class HealthMonitor {
     }
 
     try {
-      const healthCheck: FacilitatorHealthCheck = {
+      const healthCheck: HealthCheck = {
         ...check,
         timestamp: new Date().toISOString(),
       };
 
       // Update latest check
       await this.kv.put(
-        "facilitator:health:latest",
+        `${this.keyPrefix}:health:latest`,
         JSON.stringify(healthCheck)
       );
 
       // Update history (ring buffer)
-      const history = await this.kv.get<FacilitatorHealthCheck[]>(
-        "facilitator:health:history",
+      const history = await this.kv.get<HealthCheck[]>(
+        `${this.keyPrefix}:health:history`,
         "json"
       );
       const checks = history || [];
@@ -58,7 +60,7 @@ export class HealthMonitor {
       }
 
       await this.kv.put(
-        "facilitator:health:history",
+        `${this.keyPrefix}:health:history`,
         JSON.stringify(checks)
       );
     } catch (e) {
@@ -69,7 +71,7 @@ export class HealthMonitor {
   }
 
   /**
-   * Get current facilitator health status
+   * Get current health status
    */
   async getStatus(): Promise<HealthStatus> {
     const emptyStatus: HealthStatus = {
@@ -86,12 +88,12 @@ export class HealthMonitor {
 
     try {
       const [latest, history] = await Promise.all([
-        this.kv.get<FacilitatorHealthCheck>(
-          "facilitator:health:latest",
+        this.kv.get<HealthCheck>(
+          `${this.keyPrefix}:health:latest`,
           "json"
         ),
-        this.kv.get<FacilitatorHealthCheck[]>(
-          "facilitator:health:history",
+        this.kv.get<HealthCheck[]>(
+          `${this.keyPrefix}:health:history`,
           "json"
         ),
       ]);
@@ -150,7 +152,7 @@ export class HealthMonitor {
    * - unknown: no recent checks
    */
   private determineStatus(
-    checks: FacilitatorHealthCheck[]
+    checks: HealthCheck[]
   ): "healthy" | "degraded" | "down" | "unknown" {
     if (checks.length === 0) {
       return "unknown";

@@ -8,6 +8,7 @@ import type {
   FeePriority,
   FeePriorityTiers,
 } from "../types";
+import { getHiroBaseUrl } from "../utils";
 
 /**
  * Default clamp configuration (code defaults)
@@ -44,15 +45,6 @@ export class FeeService {
     this.network = env.STACKS_NETWORK;
     this.logger = logger;
     this.hiroApiKey = env.HIRO_API_KEY;
-  }
-
-  /**
-   * Get the Hiro API base URL for the current network
-   */
-  private getHiroBaseUrl(): string {
-    return this.network === "mainnet"
-      ? "https://api.hiro.so"
-      : "https://api.testnet.hiro.so";
   }
 
   /**
@@ -179,7 +171,7 @@ export class FeeService {
    * Fetch fee estimates from Hiro API
    */
   private async fetchFromHiro(): Promise<FeeEstimates | null> {
-    const baseUrl = this.getHiroBaseUrl();
+    const baseUrl = getHiroBaseUrl(this.network);
     const url = `${baseUrl}/extended/v2/mempool/fees`;
 
     try {

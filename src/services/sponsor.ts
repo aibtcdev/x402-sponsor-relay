@@ -12,6 +12,7 @@ import {
   generateWallet,
 } from "@stacks/wallet-sdk";
 import type { Env, Logger, FeeTransactionType } from "../types";
+import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 import { FeeService } from "./fee";
 
 /**
@@ -213,15 +214,8 @@ export class SponsorService {
    * Returns the nonce as a bigint, or null if all attempts fail.
    */
   private async fetchNonceWithRetry(sponsorAddress: string): Promise<bigint | null> {
-    const baseUrl = this.env.STACKS_NETWORK === "mainnet"
-      ? "https://api.hiro.so"
-      : "https://api.testnet.hiro.so";
-    const url = `${baseUrl}/v2/accounts/${sponsorAddress}?proof=0`;
-
-    const headers: Record<string, string> = {};
-    if (this.env.HIRO_API_KEY) {
-      headers["x-hiro-api-key"] = this.env.HIRO_API_KEY;
-    }
+    const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/v2/accounts/${sponsorAddress}?proof=0`;
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
 
     for (let attempt = 1; attempt <= NONCE_FETCH_MAX_ATTEMPTS; attempt++) {
       try {

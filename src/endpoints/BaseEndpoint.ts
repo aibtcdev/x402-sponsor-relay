@@ -31,12 +31,21 @@ export class BaseEndpoint extends OpenAPIRoute {
    * Return a success response with requestId
    * Use for simple endpoints that don't return transaction data
    */
-  protected ok<T extends object>(c: AppContext, data: T) {
+  protected ok<T extends object>(
+    c: AppContext,
+    data: T,
+    headers?: Record<string, string>
+  ) {
     const response = {
       success: true as const,
       requestId: this.getRequestId(c),
       ...data,
     };
+    if (headers) {
+      for (const [key, value] of Object.entries(headers)) {
+        c.header(key, value);
+      }
+    }
     return c.json(response);
   }
 

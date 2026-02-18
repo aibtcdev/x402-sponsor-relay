@@ -15,9 +15,50 @@ import {
 import { formatNumber, formatTokenAmount, escapeHtml } from "../styles";
 
 /**
- * Generate the main dashboard overview page
+ * Check whether hourly data has any non-zero transaction counts
  */
-export function overviewPage(data: DashboardOverview): string {
+function hasTransactionChartData(
+  hourlyData: Array<{ hour: string; transactions: number; success: number }>
+): boolean {
+  return hourlyData.some((h) => h.transactions > 0);
+}
+
+/**
+ * Check whether token data has any non-zero counts
+ */
+function hasTokenChartData(tokens: {
+  STX: { count: number };
+  sBTC: { count: number };
+  USDCx: { count: number };
+}): boolean {
+  return (
+    tokens.STX.count > 0 || tokens.sBTC.count > 0 || tokens.USDCx.count > 0
+  );
+}
+
+/**
+ * Empty-state div for charts with no data
+ */
+function chartEmptyState(message: string): string {
+  return `
+<div class="h-64 flex items-center justify-center">
+  <div class="text-center">
+    <svg class="w-10 h-10 text-gray-600 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+            d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+    </svg>
+    <p class="text-gray-400 mt-2">${escapeHtml(message)}</p>
+    <p class="text-sm text-gray-500 mt-1">Charts will appear once transactions are processed</p>
+  </div>
+</div>`;
+}
+
+/**
+ * Generate the main dashboard overview page
+ * @param data - Dashboard overview data
+ * @param network - Optional network context ("testnet" | "mainnet")
+ */
+export function overviewPage(data: DashboardOverview, network?: string): string {
   const now = new Date().toLocaleString("en-US", {
     timeZone: "UTC",
     dateStyle: "medium",
@@ -29,12 +70,22 @@ export function overviewPage(data: DashboardOverview): string {
     data.transactions.previousTotal
   );
 
-  const content = `
-${header()}
+  const settlement = data.settlement ?? {
+    status: "unknown" as const,
+    avgLatencyMs: 0,
+    uptime24h: 0,
+    lastCheck: null,
+  };
 
-<main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+  const showTxChart = hasTransactionChartData(data.hourlyData);
+  const showTokenChart = hasTokenChartData(data.tokens);
+
+  const content = `
+${header(network)}
+
+<main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-8">
   <!-- Stats Cards Row -->
-  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+  <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 mb-6">
     ${statsCard("Transactions (24h)", data.transactions.total, {
       trend: trend.html,
       icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`,
@@ -42,38 +93,38 @@ ${header()}
 
     ${successRateCard(data.transactions.success, data.transactions.total)}
 
-    ${statsCard("Facilitator", data.facilitator.status.charAt(0).toUpperCase() + data.facilitator.status.slice(1), {
-      colorClass: `status-${data.facilitator.status}`,
+    ${statsCard("Settlement", settlement.status.charAt(0).toUpperCase() + settlement.status.slice(1), {
+      colorClass: `status-${settlement.status}`,
       icon: `<svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>`,
     })}
 
-    ${statsCard("Avg Latency", `${data.facilitator.avgLatencyMs}ms`, {
-      colorClass: data.facilitator.avgLatencyMs > 2000 ? "text-yellow-400" : "text-white",
+    ${statsCard("Hiro Latency", `${settlement.avgLatencyMs}ms`, {
+      colorClass: settlement.avgLatencyMs > 2000 ? "text-yellow-400" : "text-white",
       icon: `<svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`,
     })}
   </div>
 
   <!-- Charts Row -->
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
     <!-- Transaction Volume Chart -->
     <div class="brand-section p-6">
       <h3 class="text-lg font-semibold text-white mb-4">Transaction Volume (24h)</h3>
-      <div class="h-64">
-        <canvas id="transactionChart"></canvas>
-      </div>
+      ${showTxChart
+        ? `<div class="h-64"><canvas id="transactionChart"></canvas></div>`
+        : chartEmptyState("No transaction data yet")}
     </div>
 
     <!-- Token Distribution Chart -->
     <div class="brand-section p-6">
       <h3 class="text-lg font-semibold text-white mb-4">Token Distribution</h3>
-      <div class="h-64">
-        <canvas id="tokenChart"></canvas>
-      </div>
+      ${showTokenChart
+        ? `<div class="h-64"><canvas id="tokenChart"></canvas></div>`
+        : chartEmptyState("No token data yet")}
     </div>
   </div>
 
   <!-- Token Breakdown Cards -->
-  <div class="mb-8">
+  <div class="mb-6">
     <h3 class="text-lg font-semibold text-white mb-4">Token Breakdown</h3>
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
       ${tokenCard("STX", data.tokens.STX.count, data.tokens.STX.percentage, data.tokens.STX.volume)}
@@ -85,32 +136,9 @@ ${header()}
   <!-- API Key Usage Section -->
   ${data.apiKeys ? apiKeysSection(data.apiKeys) : ""}
 
-  <!-- Facilitator Health Section -->
-  <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-    ${healthCard(data.facilitator.status, data.facilitator.avgLatencyMs, data.facilitator.uptime24h)}
-
-    <!-- Quick Stats -->
-    <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">Quick Stats</h3>
-      <div class="space-y-4">
-        <div class="flex justify-between items-center">
-          <span class="text-gray-400">Successful Transactions</span>
-          <span class="text-green-400 font-medium">${formatNumber(data.transactions.success)}</span>
-        </div>
-        <div class="flex justify-between items-center">
-          <span class="text-gray-400">Failed Transactions</span>
-          <span class="text-red-400 font-medium">${formatNumber(data.transactions.failed)}</span>
-        </div>
-        <div class="flex justify-between items-center">
-          <span class="text-gray-400">Total Volume (STX)</span>
-          <span class="text-purple-400 font-medium">${formatTokenAmount(data.tokens.STX.volume, "STX")} STX</span>
-        </div>
-        <div class="flex justify-between items-center">
-          <span class="text-gray-400">Period</span>
-          <span class="text-gray-300">${escapeHtml(data.period)}</span>
-        </div>
-      </div>
-    </div>
+  <!-- Settlement Health Section -->
+  <div class="mb-6">
+    ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
   </div>
 </main>
 
@@ -119,40 +147,45 @@ ${footer(now + " UTC")}
 <script>
   // Initialize charts when DOM is ready
   document.addEventListener('DOMContentLoaded', function() {
-    // Transaction volume chart
+    // Transaction volume chart (only if canvas exists and data is non-zero)
     const txCtx = document.getElementById('transactionChart');
     if (txCtx) {
       new Chart(txCtx, ${transactionChartConfig(data.hourlyData)});
     }
 
-    // Token distribution chart
+    // Token distribution chart (only if canvas exists and data is non-zero)
     const tokenCtx = document.getElementById('tokenChart');
     if (tokenCtx) {
       new Chart(tokenCtx, ${tokenPieChartConfig(data.tokens)});
     }
 
-    // Auto-refresh every 60 seconds
+    // Auto-refresh every 60 seconds (pre-validate network before reload)
     setTimeout(() => {
       const autoRefresh = localStorage.getItem('dashboardAutoRefresh') !== 'false';
       if (autoRefresh) {
-        location.reload();
+        fetch(location.pathname + '/api/stats', { method: 'HEAD' })
+          .then(function(r) { if (r.ok) location.reload(); })
+          .catch(function() { /* network error — skip reload */ });
       }
     }, 60000);
   });
 </script>
 `;
 
-  return htmlDocument(content, "x402 Sponsor Relay - Dashboard");
+  return htmlDocument(content, "x402 Sponsor Relay - Dashboard", {
+    includeChartJs: showTxChart || showTokenChart,
+  });
 }
 
 /**
  * Generate empty state page when no data is available
+ * @param network - Optional network context ("testnet" | "mainnet")
  */
-export function emptyStatePage(): string {
+export function emptyStatePage(network?: string): string {
   const content = `
-${header()}
+${header(network)}
 
-<main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+<main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-8">
   <div class="brand-section p-12 text-center">
     <svg class="w-16 h-16 text-gray-600 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -162,7 +195,7 @@ ${header()}
     <p class="text-gray-400 mb-6">
       The relay hasn't processed any transactions yet. Stats will appear here once transactions are submitted.
     </p>
-    <a href="/docs" class="brand-cta-button inline-flex items-center px-4 py-2 text-white rounded-lg transition-colors">
+    <a href="/docs" class="brand-cta-button inline-flex items-center min-h-[44px] px-4 py-2 text-white rounded-lg transition-colors">
       View API Docs
       <svg class="w-4 h-4 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
