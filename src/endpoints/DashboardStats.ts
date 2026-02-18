@@ -173,6 +173,17 @@ export class DashboardStats extends BaseEndpoint {
         authService.getAggregateKeyStats(),
       ]);
 
+      // Populate health KV in the background when no cached data exists
+      if (health.status === "unknown") {
+        c.executionCtx.waitUntil(
+          healthService.checkHealth().catch((e) => {
+            logger.warn("Background health check failed", {
+              error: e instanceof Error ? e.message : String(e),
+            });
+          })
+        );
+      }
+
       const dashboardData = buildDashboardData(overview, health, apiKeyStats);
 
       return this.ok(c, dashboardData, {

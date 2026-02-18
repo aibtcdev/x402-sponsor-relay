@@ -120,7 +120,7 @@ Success response:
 
 ## Quick Start: Broadcast a Sponsored Transaction (POST /sponsor)
 
-Direct broadcast without facilitator settlement. Requires API key.
+Direct broadcast without payment settlement. Requires API key.
 
 POST https://x402-relay.aibtc.com/sponsor
 Authorization: Bearer x402_sk_<env>_<32-char-hex>
@@ -799,9 +799,9 @@ When rate-limited, the response includes:
 
 ## Related Services
 
-- x402 Facilitator: https://facilitator.stacksx402.com
 - AIBTC Platform:   https://aibtc.com
 - GitHub:           https://github.com/aibtcdev/x402-sponsor-relay
+- x402 V2 Spec:     https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
 `;
 
   return new Response(content.replaceAll(BASE_URL_PLACEHOLDER, baseUrl), {
@@ -957,7 +957,7 @@ POST https://x402-relay.aibtc.com/access
 
 ## Step-by-Step: POST /sponsor
 
-For direct broadcast without facilitator settlement. Requires API key.
+For direct broadcast without payment settlement. Requires API key.
 
 POST https://x402-relay.aibtc.com/sponsor
 Authorization: Bearer x402_sk_prod_...
@@ -1641,9 +1641,9 @@ discovery.get("/.well-known/agent.json", (c) => {
       streaming: false,
       pushNotifications: false,
       stateTransitionHistory: false,
-      facilitator: true,
-      facilitatorSpec: "x402-v2",
-      facilitatorSpecUrl: "https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md",
+      x402Facilitator: true,
+      x402FacilitatorSpec: "x402-v2",
+      x402FacilitatorSpecUrl: "https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md",
     },
     authentication: {
       schemes: ["bearer"],
@@ -1668,9 +1668,9 @@ discovery.get("/.well-known/agent.json", (c) => {
     },
     supportedTokens: ["STX", "sBTC", "USDCx"],
     relatedServices: {
-      facilitator: "https://facilitator.stacksx402.com",
       aibtcPlatform: "https://aibtc.com",
       github: "https://github.com/aibtcdev/x402-sponsor-relay",
+      x402Spec: "https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md",
     },
     skills: [
       {
