@@ -1287,6 +1287,7 @@ All errors return JSON with this shape:
 | SPONSOR_CONFIG_ERROR           | 500  | false     | relay not configured (missing mnemonic) |
 | SPONSOR_FAILED                 | 500  | true      | sponsoring the tx failed |
 | SETTLEMENT_BROADCAST_FAILED    | 502  | true      | Stacks node rejected broadcast, retryAfter: 5 |
+| NONCE_CONFLICT                 | 409  | true      | Sponsor nonce conflict in mempool; resubmit with a new transaction |
 | SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but aborted/dropped on-chain |
 
 ## API Key Errors (POST /sponsor, POST /fees/config)
@@ -1353,10 +1354,11 @@ Do NOT retry:
 - 400 errors — the request body must be corrected first
 - 401 errors — fix auth (new key, fix signature)
 - 404 errors — the resource doesn't exist
-- 409 errors — the conflict must be resolved
+- 409 errors — the conflict must be resolved (except NONCE_CONFLICT)
 
 Do retry (after retryAfter):
 - 429 rate limit — wait for the window to reset
+- 409 NONCE_CONFLICT — rebuild and resubmit a new transaction
 - 502 SETTLEMENT_BROADCAST_FAILED — Stacks node may accept on retry
 - 500 INTERNAL_ERROR — may be transient
 
