@@ -41,6 +41,10 @@ const MAX_POLL_DELAY_MS = 8_000;
 const DEDUP_TTL_SECONDS = 300;
 const DEDUP_KEY_PREFIX = "dedup:";
 
+// Broadcast error reasons that indicate a nonce conflict
+const NONCE_CONFLICT_REASONS = ["ConflictingNonceInMempool", "BadNonce"];
+
+
 /** Shape of Hiro GET /extended/v1/tx/{txid} response (subset) */
 interface HiroTxResponse {
   tx_status?: string;
@@ -542,6 +546,24 @@ export class SettlementService {
           // Body is not JSON — use raw text as details
         }
 
+        const conflictDetails = `${errorMessage}: ${errorDetails}`;
+        const isNonceConflict = NONCE_CONFLICT_REASONS.some(
+          (reason) => conflictDetails.includes(reason)
+        );
+
+        if (isNonceConflict) {
+          this.logger.warn("Broadcast rejected due to nonce conflict", {
+            status: broadcastResponse.status,
+            details: conflictDetails,
+          });
+          return {
+            error: "Nonce conflict",
+            details: conflictDetails,
+            retryable: true,
+            nonceConflict: true,
+          };
+        }
+
         this.logger.error("Broadcast failed", {
           status: broadcastResponse.status,
           error: errorMessage,
@@ -549,7 +571,7 @@ export class SettlementService {
         });
         return {
           error: "Broadcast failed",
-          details: `${errorMessage}: ${errorDetails}`,
+          details: conflictDetails,
           retryable: true,
         };
       }
@@ -676,6 +698,10 @@ export class SettlementService {
     }
 
     try {
+      // Note: dedup keys are SHA-256 of the fully-sponsored tx hex.
+      // A resubmitted transaction after a NONCE_CONFLICT will have a new sponsor
+      // nonce and therefore a different hex — it will not match this cache entry.
+      // This is intentional: each sponsoring attempt is treated as a distinct event.
       const txHash = await this.computeTxHash(sponsoredTxHex);
       const key = `${DEDUP_KEY_PREFIX}${txHash}`;
       const cached = await this.env.RELAY_KV.get(key);

@@ -497,6 +497,7 @@ export type RelayErrorCode =
   | "BROADCAST_FAILED"
   | "SETTLEMENT_VERIFICATION_FAILED"
   | "SETTLEMENT_BROADCAST_FAILED"
+  | "NONCE_CONFLICT"
   | "SETTLEMENT_FAILED"
   | "NOT_FOUND"
   | "INTERNAL_ERROR"
@@ -962,4 +963,4 @@ export interface DedupResult {
 export type BroadcastAndConfirmResult =
   | { txid: string; status: "confirmed"; blockHeight: number }
   | { txid: string; status: "pending" }
-  | { error: string; details: string; retryable: boolean };
+  | { error: string; details: string; retryable: boolean; nonceConflict?: boolean };
