@@ -288,6 +288,47 @@ export class SponsorService {
   }
 
   /**
+   * Fetch the sponsor account nonce from NonceDO when available.
+   */
+  private async fetchNonceFromDO(
+    sponsorAddress: string
+  ): Promise<bigint | null> {
+    if (!this.env.NONCE_DO) {
+      this.logger.debug("Nonce DO not configured; skipping DO nonce fetch");
+      return null;
+    }
+
+    try {
+      const stub = this.env.NONCE_DO.idFromName("sponsor");
+      const response = await stub.fetch("https://nonce-do/assign", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sponsorAddress }),
+      });
+
+      if (!response.ok) {
+        this.logger.warn("Nonce DO responded with error", {
+          status: response.status,
+        });
+        return null;
+      }
+
+      const data = (await response.json()) as { nonce?: number };
+      if (typeof data?.nonce !== "number") {
+        this.logger.warn("Nonce DO response missing nonce field");
+        return null;
+      }
+
+      return BigInt(data.nonce);
+    } catch (e) {
+      this.logger.warn("Failed to fetch nonce from NonceDO", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
+  }
+
+  /**
    * Validate and deserialize a transaction
    */
   validateTransaction(txHex: string): TransactionValidationResult {
@@ -376,18 +417,33 @@ export class SponsorService {
     let sponsorNonce: bigint | undefined;
     try {
       const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
-      const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
-      if (fetchedNonce !== null) {
-        sponsorNonce = fetchedNonce;
-        this.logger.debug("Using pre-fetched sponsor nonce", { sponsorNonce: sponsorNonce.toString() });
+      const doNonce = await this.fetchNonceFromDO(sponsorAddress);
+      if (doNonce !== null) {
+        sponsorNonce = doNonce;
+        this.logger.debug("Using NonceDO sponsor nonce", {
+          sponsorNonce: sponsorNonce.toString(),
+        });
       } else {
-        // Fall back to letting @stacks/transactions fetch the nonce internally
-        this.logger.warn("Nonce pre-fetch failed, falling back to internal nonce fetch");
+        const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
+        if (fetchedNonce !== null) {
+          sponsorNonce = fetchedNonce;
+          this.logger.debug("Using fallback sponsor nonce", {
+            sponsorNonce: sponsorNonce.toString(),
+          });
+        } else {
+          // Fall back to letting @stacks/transactions fetch the nonce internally
+          this.logger.warn(
+            "Nonce pre-fetch failed, falling back to internal nonce fetch"
+          );
+        }
       }
     } catch (e) {
-      this.logger.warn("Error during nonce pre-fetch, falling back to internal nonce fetch", {
-        error: e instanceof Error ? e.message : String(e),
-      });
+      this.logger.warn(
+        "Error during nonce pre-fetch, falling back to internal nonce fetch",
+        {
+          error: e instanceof Error ? e.message : String(e),
+        }
+      );
     }
 
     try {

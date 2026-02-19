@@ -57,7 +57,7 @@ export interface Env {
   // KV namespace for API key storage
   API_KEYS_KV?: KVNamespace;
   // Durable Object namespace for nonce coordination
-  NONCE_DO: DurableObjectNamespace;
+  NONCE_DO?: DurableObjectNamespace;
 }
 
 /**
