@@ -174,6 +174,16 @@ export class Settle extends BaseEndpoint {
           tokenType: settleOptions.tokenType ?? "STX",
           amount: settleOptions.minAmount,
         });
+        c.executionCtx.waitUntil(
+          statsService.logTransaction({
+            timestamp: new Date().toISOString(),
+            endpoint: "settle",
+            success: false,
+            tokenType: settleOptions.tokenType ?? "STX",
+            amount: settleOptions.minAmount,
+            status: "failed",
+          })
+        );
         const errorReason = broadcastResult.nonceConflict
           ? "conflicting_nonce"
           : broadcastResult.retryable
@@ -207,6 +217,22 @@ export class Settle extends BaseEndpoint {
         amount: settleOptions.minAmount,
         // No fee: /settle does not sponsor, it only broadcasts pre-sponsored txs
       });
+      c.executionCtx.waitUntil(
+        statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "settle",
+          success: true,
+          tokenType: settleOptions.tokenType ?? "STX",
+          amount: settleOptions.minAmount,
+          txid: broadcastResult.txid,
+          sender: payer,
+          recipient: verifyResult.data.recipient,
+          status: broadcastResult.status,
+          ...(broadcastResult.status === "confirmed"
+            ? { blockHeight: broadcastResult.blockHeight }
+            : {}),
+        })
+      );
 
       logger.info("x402 V2 settle succeeded", {
         txid: broadcastResult.txid,

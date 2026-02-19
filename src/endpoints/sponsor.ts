@@ -366,6 +366,19 @@ export class Sponsor extends BaseEndpoint {
         amount: "0", // No settlement amount for direct sponsor
         fee: sponsorResult.fee,
       });
+      c.executionCtx.waitUntil(
+        statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "sponsor",
+          success: true,
+          tokenType: "STX",
+          amount: "0",
+          fee: sponsorResult.fee,
+          txid,
+          sender: validation.senderAddress,
+          status: "pending",
+        })
+      );
 
       // Also record usage for the API key (for volume tracking)
       await authService.recordUsage(metadata.keyId, {
