@@ -32,6 +32,9 @@ interface NonceStatsResponse {
   txidCount: number;
 }
 
+const ALARM_INTERVAL_MS = 5 * 60 * 1000;
+const SPONSOR_ADDRESS_KEY = "sponsor_address";
+
 export class NonceDO {
   private readonly sql: DurableObjectStorage["sql"];
   private readonly state: DurableObjectState;
@@ -108,6 +111,24 @@ export class NonceDO {
     this.setStateValue("last_assigned_at", Date.now());
   }
 
+  private incrementConflictsDetected(): void {
+    const conflictsDetected = this.getStoredCount("conflicts_detected") + 1;
+    this.setStateValue("conflicts_detected", conflictsDetected);
+  }
+
+  private async scheduleAlarm(): Promise<void> {
+    await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+  }
+
+  private async getStoredSponsorAddress(): Promise<string | null> {
+    const stored = await this.state.storage.get<string>(SPONSOR_ADDRESS_KEY);
+    return typeof stored === "string" && stored.length > 0 ? stored : null;
+  }
+
+  private async setStoredSponsorAddress(address: string): Promise<void> {
+    await this.state.storage.put(SPONSOR_ADDRESS_KEY, address);
+  }
+
   private async fetchPossibleNextNonce(sponsorAddress: string): Promise<number> {
     const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/address/${sponsorAddress}/nonces`;
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
@@ -145,6 +166,13 @@ export class NonceDO {
     }
 
     return this.state.blockConcurrencyWhile(async () => {
+      await this.setStoredSponsorAddress(sponsorAddress);
+
+      const currentAlarm = await this.state.storage.getAlarm();
+      if (currentAlarm === null) {
+        await this.scheduleAlarm();
+      }
+
       let currentNonce = this.getStoredNonce();
       if (currentNonce === null) {
         currentNonce = await this.fetchPossibleNextNonce(sponsorAddress);
@@ -220,6 +248,32 @@ export class NonceDO {
       nextNonce,
       txidCount,
     };
+  }
+
+  async alarm(): Promise<void> {
+    await this.state.blockConcurrencyWhile(async () => {
+      try {
+        const sponsorAddress = await this.getStoredSponsorAddress();
+        if (!sponsorAddress) {
+          return;
+        }
+
+        const possibleNextNonce = await this.fetchPossibleNextNonce(sponsorAddress);
+        const currentNonce = this.getStoredNonce();
+
+        if (currentNonce === null) {
+          this.setStoredNonce(possibleNextNonce);
+          return;
+        }
+
+        if (possibleNextNonce > currentNonce) {
+          this.setStoredNonce(possibleNextNonce);
+          this.incrementConflictsDetected();
+        }
+      } finally {
+        await this.scheduleAlarm();
+      }
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
