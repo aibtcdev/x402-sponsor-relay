@@ -13,6 +13,7 @@ import type { AppContext, RelayRequest, SettlementResult } from "../types";
 import {
   Error400Response,
   Error401Response,
+  Error409Response,
   Error429Response,
   Error500Response,
   Error502Response,
@@ -171,6 +172,7 @@ export class Relay extends BaseEndpoint {
       },
       "400": Error400Response,
       "401": { ...Error401Response, description: "Authentication failed (invalid or expired SIP-018 signature)" },
+      "409": { ...Error409Response, description: "Nonce conflict — resubmit with a new transaction" },
       "429": { ...Error429Response, description: "Rate limit exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Broadcast or network error" },
@@ -370,7 +372,11 @@ export class Relay extends BaseEndpoint {
 
       const sponsorNonce = extractSponsorNonce(verifyResult.data.transaction);
       if (sponsorNonce !== null) {
-        await recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce);
+        c.executionCtx.waitUntil(
+          recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce).catch((e) => {
+            logger.warn("Failed to record nonce txid", { error: String(e) });
+          })
+        );
       }
 
       // Step E — Record successful transaction stats

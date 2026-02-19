@@ -14,6 +14,7 @@ import { buildExplorerUrl } from "../utils";
 import {
   Error400Response,
   Error401Response,
+  Error409Response,
   Error429Response,
   Error500Response,
   Error502Response,
@@ -125,6 +126,7 @@ export class Sponsor extends BaseEndpoint {
       },
       "400": Error400Response,
       "401": Error401Response,
+      "409": { ...Error409Response, description: "Nonce conflict — resubmit with a new transaction" },
       "429": { ...Error429Response, description: "Spending cap exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Broadcast failed" },
@@ -346,7 +348,11 @@ export class Sponsor extends BaseEndpoint {
 
       const sponsorNonce = extractSponsorNonce(sponsoredTx);
       if (sponsorNonce !== null) {
-        await recordNonceTxid(c.env, logger, txid, sponsorNonce);
+        c.executionCtx.waitUntil(
+          recordNonceTxid(c.env, logger, txid, sponsorNonce).catch((e) => {
+            logger.warn("Failed to record nonce txid", { error: String(e) });
+          })
+        );
       }
 
       // Record fee spent against the API key

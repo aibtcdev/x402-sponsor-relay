@@ -56,6 +56,7 @@
       "durable_objects": {
         "bindings": [{ "name": "NONCE_DO", "class_name": "NonceDO" }]
       },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NonceDO"] }],
       // KV namespaces for dashboard stats and API keys
       "kv_namespaces": [
         { "binding": "RELAY_KV", "id": "3851254fa8f9494189689ce5a726b773" },
@@ -81,6 +82,7 @@
       "durable_objects": {
         "bindings": [{ "name": "NONCE_DO", "class_name": "NonceDO" }]
       },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NonceDO"] }],
       // KV namespaces for dashboard stats and API keys
       "kv_namespaces": [
         { "binding": "RELAY_KV", "id": "56f3b1596357434291161238d40cbd81" },
