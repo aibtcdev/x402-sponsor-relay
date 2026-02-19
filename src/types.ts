@@ -56,6 +56,8 @@ export interface Env {
   RELAY_KV?: KVNamespace;
   // KV namespace for API key storage
   API_KEYS_KV?: KVNamespace;
+  // Durable Object namespace for nonce coordination
+  NONCE_DO: DurableObjectNamespace;
 }
 
 /**
