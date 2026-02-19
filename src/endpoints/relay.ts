@@ -337,6 +337,18 @@ export class Relay extends BaseEndpoint {
           amount: body.settle.minAmount,
           fee: sponsorResult.fee,
         });
+
+        if (broadcastResult.nonceConflict) {
+          return this.err(c, {
+            error: "Nonce conflict — resubmit with a new transaction",
+            code: "NONCE_CONFLICT",
+            status: 409,
+            details: broadcastResult.details,
+            retryable: true,
+            retryAfter: 1,
+          });
+        }
+
         // Distinguish retryable broadcast failures from non-retryable on-chain failures
         const code = broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED";
         return this.err(c, {

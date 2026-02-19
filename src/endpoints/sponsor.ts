@@ -12,6 +12,8 @@ import {
   Error502Response,
 } from "../schemas";
 
+const NONCE_CONFLICT_REASONS = ["ConflictingNonceInMempool", "BadNonce"];
+
 /**
  * Sponsor endpoint - sponsors and broadcasts transactions directly
  * POST /sponsor
@@ -293,6 +295,22 @@ export class Sponsor extends BaseEndpoint {
             reason: errorReason,
           });
           await statsService.recordError("sponsoring");
+
+          const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
+            errorReason.includes(reason)
+          );
+
+          if (isNonceConflict) {
+            return this.err(c, {
+              error: "Nonce conflict — resubmit with a new transaction",
+              code: "NONCE_CONFLICT",
+              status: 409,
+              details: errorReason,
+              retryable: true,
+              retryAfter: 1,
+            });
+          }
+
           return this.err(c, {
             error: "Transaction rejected by network",
             code: "BROADCAST_FAILED",
