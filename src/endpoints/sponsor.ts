@@ -1,8 +1,15 @@
-import { AuthType, broadcastTransaction, deserializeTransaction, type StacksTransactionWire } from "@stacks/transactions";
+import { broadcastTransaction, deserializeTransaction } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, StatsService, AuthService, StxVerifyService } from "../services";
-import type { AppContext, Env, Logger, SponsorRequest } from "../types";
+import {
+  SponsorService,
+  StatsService,
+  AuthService,
+  StxVerifyService,
+  extractSponsorNonce,
+  recordNonceTxid,
+} from "../services";
+import type { AppContext, SponsorRequest } from "../types";
 import { buildExplorerUrl } from "../utils";
 import {
   Error400Response,
@@ -392,56 +399,3 @@ export class Sponsor extends BaseEndpoint {
   }
 }
 
-function extractSponsorNonce(transaction: StacksTransactionWire): number | null {
-  if (transaction.auth.authType !== AuthType.Sponsored) {
-    return null;
-  }
-
-  if (!("sponsorSpendingCondition" in transaction.auth)) {
-    return null;
-  }
-
-  const nonceNumber = Number(transaction.auth.sponsorSpendingCondition.nonce);
-
-  if (!Number.isFinite(nonceNumber)) {
-    return null;
-  }
-
-  return nonceNumber;
-}
-
-async function recordNonceTxid(
-  env: Env,
-  logger: Logger,
-  txid: string,
-  nonce: number
-): Promise<void> {
-  if (!env.NONCE_DO) {
-    return;
-  }
-
-  try {
-    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
-    const response = await stub.fetch("https://nonce-do/record", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ txid, nonce }),
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      logger.warn("Nonce DO record failed", {
-        status: response.status,
-        body,
-        txid,
-        nonce,
-      });
-    }
-  } catch (e) {
-    logger.warn("Failed to record nonce txid", {
-      error: e instanceof Error ? e.message : "Unknown error",
-      txid,
-      nonce,
-    });
-  }
-}

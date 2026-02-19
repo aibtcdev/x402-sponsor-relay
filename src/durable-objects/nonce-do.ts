@@ -34,6 +34,13 @@ interface NonceStatsResponse {
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 const SPONSOR_ADDRESS_KEY = "sponsor_address";
+const STATE_KEYS = {
+  current: "current",
+  totalAssigned: "total_assigned",
+  conflictsDetected: "conflicts_detected",
+  lastAssignedNonce: "last_assigned_nonce",
+  lastAssignedAt: "last_assigned_at",
+} as const;
 
 export class NonceDO {
   private readonly sql: DurableObjectStorage["sql"];
@@ -69,6 +76,37 @@ export class NonceDO {
     `);
   }
 
+  private jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  private async parseJson<T>(request: Request): Promise<{
+    value: T | null;
+    errorResponse: Response | null;
+  }> {
+    try {
+      const value = (await request.json()) as T;
+      return { value, errorResponse: null };
+    } catch (error) {
+      return {
+        value: null,
+        errorResponse: this.jsonResponse({ error: "Invalid JSON body" }, 400),
+      };
+    }
+  }
+
+  private badRequest(message: string): Response {
+    return this.jsonResponse({ error: message }, 400);
+  }
+
+  private internalError(error: unknown): Response {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    return this.jsonResponse({ error: message }, 500);
+  }
+
   private getStateValue(key: string): number | null {
     const rows = this.sql
       .exec<{ value: number }>(
@@ -93,11 +131,11 @@ export class NonceDO {
   }
 
   private getStoredNonce(): number | null {
-    return this.getStateValue("current");
+    return this.getStateValue(STATE_KEYS.current);
   }
 
   private setStoredNonce(value: number): void {
-    this.setStateValue("current", value);
+    this.setStateValue(STATE_KEYS.current, value);
   }
 
   private getStoredCount(key: string): number {
@@ -105,15 +143,15 @@ export class NonceDO {
   }
 
   private updateAssignedStats(assignedNonce: number): void {
-    const totalAssigned = this.getStoredCount("total_assigned") + 1;
-    this.setStateValue("total_assigned", totalAssigned);
-    this.setStateValue("last_assigned_nonce", assignedNonce);
-    this.setStateValue("last_assigned_at", Date.now());
+    const totalAssigned = this.getStoredCount(STATE_KEYS.totalAssigned) + 1;
+    this.setStateValue(STATE_KEYS.totalAssigned, totalAssigned);
+    this.setStateValue(STATE_KEYS.lastAssignedNonce, assignedNonce);
+    this.setStateValue(STATE_KEYS.lastAssignedAt, Date.now());
   }
 
   private incrementConflictsDetected(): void {
-    const conflictsDetected = this.getStoredCount("conflicts_detected") + 1;
-    this.setStateValue("conflicts_detected", conflictsDetected);
+    const conflictsDetected = this.getStoredCount(STATE_KEYS.conflictsDetected) + 1;
+    this.setStateValue(STATE_KEYS.conflictsDetected, conflictsDetected);
   }
 
   private async scheduleAlarm(): Promise<void> {
@@ -229,10 +267,10 @@ export class NonceDO {
   }
 
   async getStats(): Promise<NonceStatsResponse> {
-    const totalAssigned = this.getStoredCount("total_assigned");
-    const conflictsDetected = this.getStoredCount("conflicts_detected");
-    const lastAssignedNonce = this.getStateValue("last_assigned_nonce");
-    const lastAssignedAtMs = this.getStateValue("last_assigned_at");
+    const totalAssigned = this.getStoredCount(STATE_KEYS.totalAssigned);
+    const conflictsDetected = this.getStoredCount(STATE_KEYS.conflictsDetected);
+    const lastAssignedNonce = this.getStateValue(STATE_KEYS.lastAssignedNonce);
+    const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
     const nextNonce = this.getStoredNonce();
 
     const txidRows = this.sql
@@ -280,126 +318,74 @@ export class NonceDO {
     const url = new URL(request.url);
 
     if (request.method === "POST" && url.pathname === "/assign") {
-      let body: AssignNonceRequest | null = null;
-      try {
-        body = (await request.json()) as AssignNonceRequest;
-      } catch (error) {
-        return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
+      const { value: body, errorResponse } =
+        await this.parseJson<AssignNonceRequest>(request);
+      if (errorResponse) {
+        return errorResponse;
       }
 
       if (!body?.sponsorAddress) {
-        return new Response(JSON.stringify({ error: "Missing sponsorAddress" }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
+        return this.badRequest("Missing sponsorAddress");
       }
 
       try {
         const nonce = await this.assignNonce(body.sponsorAddress);
         const response: AssignNonceResponse = { nonce };
-        return new Response(JSON.stringify(response), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return this.jsonResponse(response);
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error";
-        return new Response(JSON.stringify({ error: message }), {
-          status: 500,
-          headers: { "content-type": "application/json" },
-        });
+        return this.internalError(error);
       }
     }
 
     if (request.method === "POST" && url.pathname === "/record") {
-      let body: RecordTxidRequest | null = null;
-      try {
-        body = (await request.json()) as RecordTxidRequest;
-      } catch (error) {
-        return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
+      const { value: body, errorResponse } =
+        await this.parseJson<RecordTxidRequest>(request);
+      if (errorResponse) {
+        return errorResponse;
       }
 
       if (!body?.txid || typeof body.nonce !== "number") {
-        return new Response(JSON.stringify({ error: "Missing txid or nonce" }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
+        return this.badRequest("Missing txid or nonce");
       }
 
       try {
         await this.recordTxid(body.txid, body.nonce);
-        return new Response(JSON.stringify({ success: true }), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return this.jsonResponse({ success: true });
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error";
-        return new Response(JSON.stringify({ error: message }), {
-          status: 500,
-          headers: { "content-type": "application/json" },
-        });
+        return this.internalError(error);
       }
     }
 
     if (request.method === "POST" && url.pathname === "/lookup") {
-      let body: LookupTxidRequest | null = null;
-      try {
-        body = (await request.json()) as LookupTxidRequest;
-      } catch (error) {
-        return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
+      const { value: body, errorResponse } =
+        await this.parseJson<LookupTxidRequest>(request);
+      if (errorResponse) {
+        return errorResponse;
       }
 
       if (!body?.txid) {
-        return new Response(JSON.stringify({ error: "Missing txid" }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
+        return this.badRequest("Missing txid");
       }
 
       try {
         const nonce = await this.getNonceForTxid(body.txid);
         const response: LookupTxidResponse =
           nonce === null ? { found: false } : { found: true, nonce };
-        return new Response(JSON.stringify(response), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return this.jsonResponse(response);
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error";
-        return new Response(JSON.stringify({ error: message }), {
-          status: 500,
-          headers: { "content-type": "application/json" },
-        });
+        return this.internalError(error);
       }
     }
 
     if (request.method === "GET" && url.pathname === "/stats") {
       try {
         const stats = await this.getStats();
-        return new Response(JSON.stringify(stats), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        });
+        return this.jsonResponse(stats);
       } catch (error) {
-        const message = error instanceof Error ? error.message : "Unknown error";
-        return new Response(JSON.stringify({ error: message }), {
-          status: 500,
-          headers: { "content-type": "application/json" },
-        });
+        return this.internalError(error);
       }
     }
 
     return new Response("Not found", { status: 404 });
   }
-
-  // Future phases will add public RPC methods for txid tracking, stats reporting,
-  // and reconciliation alarms.
 }

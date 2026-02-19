@@ -1,8 +1,15 @@
-import { AuthType, type StacksTransactionWire } from "@stacks/transactions";
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, SettlementService, StatsService, ReceiptService, StxVerifyService } from "../services";
+import {
+  SponsorService,
+  SettlementService,
+  StatsService,
+  ReceiptService,
+  StxVerifyService,
+  extractSponsorNonce,
+  recordNonceTxid,
+} from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
-import type { AppContext, Env, Logger, RelayRequest, SettlementResult } from "../types";
+import type { AppContext, RelayRequest, SettlementResult } from "../types";
 import {
   Error400Response,
   Error401Response,
@@ -450,56 +457,3 @@ export class Relay extends BaseEndpoint {
   }
 }
 
-function extractSponsorNonce(transaction: StacksTransactionWire): number | null {
-  if (transaction.auth.authType !== AuthType.Sponsored) {
-    return null;
-  }
-
-  if (!("sponsorSpendingCondition" in transaction.auth)) {
-    return null;
-  }
-
-  const nonceNumber = Number(transaction.auth.sponsorSpendingCondition.nonce);
-
-  if (!Number.isFinite(nonceNumber)) {
-    return null;
-  }
-
-  return nonceNumber;
-}
-
-async function recordNonceTxid(
-  env: Env,
-  logger: Logger,
-  txid: string,
-  nonce: number
-): Promise<void> {
-  if (!env.NONCE_DO) {
-    return;
-  }
-
-  try {
-    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
-    const response = await stub.fetch("https://nonce-do/record", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ txid, nonce }),
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      logger.warn("Nonce DO record failed", {
-        status: response.status,
-        body,
-        txid,
-        nonce,
-      });
-    }
-  } catch (e) {
-    logger.warn("Failed to record nonce txid", {
-      error: e instanceof Error ? e.message : "Unknown error",
-      txid,
-      nonce,
-    });
-  }
-}
