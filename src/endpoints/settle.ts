@@ -174,9 +174,11 @@ export class Settle extends BaseEndpoint {
           tokenType: settleOptions.tokenType ?? "STX",
           amount: settleOptions.minAmount,
         });
-        const errorReason = broadcastResult.retryable
-          ? X402_V2_ERROR_CODES.BROADCAST_FAILED
-          : X402_V2_ERROR_CODES.TRANSACTION_FAILED;
+        const errorReason = broadcastResult.nonceConflict
+          ? "conflicting_nonce"
+          : broadcastResult.retryable
+            ? X402_V2_ERROR_CODES.BROADCAST_FAILED
+            : X402_V2_ERROR_CODES.TRANSACTION_FAILED;
         return v2Error(errorReason, 200);
       }
 

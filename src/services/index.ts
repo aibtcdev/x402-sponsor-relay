@@ -1,4 +1,4 @@
-export { SponsorService } from "./sponsor";
+export { SponsorService, extractSponsorNonce, recordNonceTxid } from "./sponsor";
 export type {
   TransactionValidationResult,
   TransactionValidationSuccess,

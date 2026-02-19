@@ -288,6 +288,47 @@ export class SponsorService {
   }
 
   /**
+   * Fetch the sponsor account nonce from NonceDO when available.
+   */
+  private async fetchNonceFromDO(
+    sponsorAddress: string
+  ): Promise<bigint | null> {
+    if (!this.env.NONCE_DO) {
+      this.logger.debug("Nonce DO not configured; skipping DO nonce fetch");
+      return null;
+    }
+
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch("https://nonce-do/assign", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sponsorAddress }),
+      });
+
+      if (!response.ok) {
+        this.logger.warn("Nonce DO responded with error", {
+          status: response.status,
+        });
+        return null;
+      }
+
+      const data = (await response.json()) as { nonce?: number };
+      if (typeof data?.nonce !== "number") {
+        this.logger.warn("Nonce DO response missing nonce field");
+        return null;
+      }
+
+      return BigInt(data.nonce);
+    } catch (e) {
+      this.logger.warn("Failed to fetch nonce from NonceDO", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
+  }
+
+  /**
    * Validate and deserialize a transaction
    */
   validateTransaction(txHex: string): TransactionValidationResult {
@@ -376,18 +417,33 @@ export class SponsorService {
     let sponsorNonce: bigint | undefined;
     try {
       const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
-      const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
-      if (fetchedNonce !== null) {
-        sponsorNonce = fetchedNonce;
-        this.logger.debug("Using pre-fetched sponsor nonce", { sponsorNonce: sponsorNonce.toString() });
+      const doNonce = await this.fetchNonceFromDO(sponsorAddress);
+      if (doNonce !== null) {
+        sponsorNonce = doNonce;
+        this.logger.debug("Using NonceDO sponsor nonce", {
+          sponsorNonce: sponsorNonce.toString(),
+        });
       } else {
-        // Fall back to letting @stacks/transactions fetch the nonce internally
-        this.logger.warn("Nonce pre-fetch failed, falling back to internal nonce fetch");
+        const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
+        if (fetchedNonce !== null) {
+          sponsorNonce = fetchedNonce;
+          this.logger.debug("Using fallback sponsor nonce", {
+            sponsorNonce: sponsorNonce.toString(),
+          });
+        } else {
+          // Fall back to letting @stacks/transactions fetch the nonce internally
+          this.logger.warn(
+            "Nonce pre-fetch failed, falling back to internal nonce fetch"
+          );
+        }
       }
     } catch (e) {
-      this.logger.warn("Error during nonce pre-fetch, falling back to internal nonce fetch", {
-        error: e instanceof Error ? e.message : String(e),
-      });
+      this.logger.warn(
+        "Error during nonce pre-fetch, falling back to internal nonce fetch",
+        {
+          error: e instanceof Error ? e.message : String(e),
+        }
+      );
     }
 
     try {
@@ -439,5 +495,61 @@ export class SponsorService {
         details: e instanceof Error ? e.message : "Unknown error",
       };
     }
+  }
+}
+
+export function extractSponsorNonce(
+  transaction: StacksTransactionWire
+): number | null {
+  if (transaction.auth.authType !== AuthType.Sponsored) {
+    return null;
+  }
+
+  if (!("sponsorSpendingCondition" in transaction.auth)) {
+    return null;
+  }
+
+  const nonceNumber = Number(transaction.auth.sponsorSpendingCondition.nonce);
+
+  if (!Number.isFinite(nonceNumber)) {
+    return null;
+  }
+
+  return nonceNumber;
+}
+
+export async function recordNonceTxid(
+  env: Env,
+  logger: Logger,
+  txid: string,
+  nonce: number
+): Promise<void> {
+  if (!env.NONCE_DO) {
+    return;
+  }
+
+  try {
+    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch("https://nonce-do/record", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ txid, nonce }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      logger.warn("Nonce DO record failed", {
+        status: response.status,
+        body,
+        txid,
+        nonce,
+      });
+    }
+  } catch (e) {
+    logger.warn("Failed to record nonce txid", {
+      error: e instanceof Error ? e.message : "Unknown error",
+      txid,
+      nonce,
+    });
   }
 }

@@ -1,16 +1,26 @@
 import { broadcastTransaction, deserializeTransaction } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, StatsService, AuthService, StxVerifyService } from "../services";
+import {
+  SponsorService,
+  StatsService,
+  AuthService,
+  StxVerifyService,
+  extractSponsorNonce,
+  recordNonceTxid,
+} from "../services";
 import type { AppContext, SponsorRequest } from "../types";
 import { buildExplorerUrl } from "../utils";
 import {
   Error400Response,
   Error401Response,
+  Error409Response,
   Error429Response,
   Error500Response,
   Error502Response,
 } from "../schemas";
+
+const NONCE_CONFLICT_REASONS = ["ConflictingNonceInMempool", "BadNonce"];
 
 /**
  * Sponsor endpoint - sponsors and broadcasts transactions directly
@@ -116,6 +126,7 @@ export class Sponsor extends BaseEndpoint {
       },
       "400": Error400Response,
       "401": Error401Response,
+      "409": { ...Error409Response, description: "Nonce conflict — resubmit with a new transaction" },
       "429": { ...Error429Response, description: "Spending cap exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Broadcast failed" },
@@ -293,6 +304,22 @@ export class Sponsor extends BaseEndpoint {
             reason: errorReason,
           });
           await statsService.recordError("sponsoring");
+
+          const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
+            errorReason.includes(reason)
+          );
+
+          if (isNonceConflict) {
+            return this.err(c, {
+              error: "Nonce conflict — resubmit with a new transaction",
+              code: "NONCE_CONFLICT",
+              status: 409,
+              details: errorReason,
+              retryable: true,
+              retryAfter: 1,
+            });
+          }
+
           return this.err(c, {
             error: "Transaction rejected by network",
             code: "BROADCAST_FAILED",
@@ -317,6 +344,15 @@ export class Sponsor extends BaseEndpoint {
           retryable: true,
           retryAfter: 5,
         });
+      }
+
+      const sponsorNonce = extractSponsorNonce(sponsoredTx);
+      if (sponsorNonce !== null) {
+        c.executionCtx.waitUntil(
+          recordNonceTxid(c.env, logger, txid, sponsorNonce).catch((e) => {
+            logger.warn("Failed to record nonce txid", { error: String(e) });
+          })
+        );
       }
 
       // Record fee spent against the API key
@@ -368,3 +404,4 @@ export class Sponsor extends BaseEndpoint {
     }
   }
 }
+

@@ -1,10 +1,19 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { SponsorService, SettlementService, StatsService, ReceiptService, StxVerifyService } from "../services";
+import {
+  SponsorService,
+  SettlementService,
+  StatsService,
+  ReceiptService,
+  StxVerifyService,
+  extractSponsorNonce,
+  recordNonceTxid,
+} from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest, SettlementResult } from "../types";
 import {
   Error400Response,
   Error401Response,
+  Error409Response,
   Error429Response,
   Error500Response,
   Error502Response,
@@ -163,6 +172,7 @@ export class Relay extends BaseEndpoint {
       },
       "400": Error400Response,
       "401": { ...Error401Response, description: "Authentication failed (invalid or expired SIP-018 signature)" },
+      "409": { ...Error409Response, description: "Nonce conflict — resubmit with a new transaction" },
       "429": { ...Error429Response, description: "Rate limit exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Broadcast or network error" },
@@ -336,6 +346,18 @@ export class Relay extends BaseEndpoint {
           amount: body.settle.minAmount,
           fee: sponsorResult.fee,
         });
+
+        if (broadcastResult.nonceConflict) {
+          return this.err(c, {
+            error: "Nonce conflict — resubmit with a new transaction",
+            code: "NONCE_CONFLICT",
+            status: 409,
+            details: broadcastResult.details,
+            retryable: true,
+            retryAfter: 1,
+          });
+        }
+
         // Distinguish retryable broadcast failures from non-retryable on-chain failures
         const code = broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED";
         return this.err(c, {
@@ -346,6 +368,15 @@ export class Relay extends BaseEndpoint {
           retryable: broadcastResult.retryable,
           ...(broadcastResult.retryable ? { retryAfter: 5 } : {}),
         });
+      }
+
+      const sponsorNonce = extractSponsorNonce(verifyResult.data.transaction);
+      if (sponsorNonce !== null) {
+        c.executionCtx.waitUntil(
+          recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce).catch((e) => {
+            logger.warn("Failed to record nonce txid", { error: String(e) });
+          })
+        );
       }
 
       // Step E — Record successful transaction stats
@@ -431,3 +462,4 @@ export class Relay extends BaseEndpoint {
     }
   }
 }
+

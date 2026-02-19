@@ -16,6 +16,10 @@
   "services": [
     { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
   ],
+  "durable_objects": {
+    "bindings": [{ "name": "NONCE_DO", "class_name": "NonceDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NonceDO"] }],
   "kv_namespaces": [
     { "binding": "RELAY_KV", "id": "5de48f1c8a1746e49d09fbf1c7072a5f" },
     { "binding": "API_KEYS_KV", "id": "3ce8d9d710884370873c561bfb98d6cf" }
@@ -49,6 +53,10 @@
       "services": [
         { "binding": "LOGS", "service": "worker-logs-staging", "entrypoint": "LogsRPC" }
       ],
+      "durable_objects": {
+        "bindings": [{ "name": "NONCE_DO", "class_name": "NonceDO" }]
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NonceDO"] }],
       // KV namespaces for dashboard stats and API keys
       "kv_namespaces": [
         { "binding": "RELAY_KV", "id": "3851254fa8f9494189689ce5a726b773" },
@@ -71,6 +79,10 @@
       "services": [
         { "binding": "LOGS", "service": "worker-logs-production", "entrypoint": "LogsRPC" }
       ],
+      "durable_objects": {
+        "bindings": [{ "name": "NONCE_DO", "class_name": "NonceDO" }]
+      },
+      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["NonceDO"] }],
       // KV namespaces for dashboard stats and API keys
       "kv_namespaces": [
         { "binding": "RELAY_KV", "id": "56f3b1596357434291161238d40cbd81" },
