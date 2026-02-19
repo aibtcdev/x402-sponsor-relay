@@ -88,6 +88,13 @@ export function footer(lastUpdated: string): string {
         <span class="text-gray-600">|</span>
         <span>Last updated: ${escapeHtml(lastUpdated)} · Chart times: <span id="tz-label">UTC</span></span>
       </div>
+      <script>
+        (function() {
+          var tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
+          var el = document.getElementById('tz-label');
+          if (el) el.textContent = tz;
+        })();
+      </script>
       <div x-data="{ autoRefresh: localStorage.getItem('dashboardAutoRefresh') !== 'false' }" class="flex items-center space-x-2">
         <span>Auto-refresh:</span>
         <button

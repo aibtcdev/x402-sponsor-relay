@@ -192,13 +192,6 @@ ${footer(utcTimestamp())}
     return labels.map(toLocalHour);
   }
 
-  // Update footer timezone display
-  (function() {
-    var tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
-    var el = document.getElementById('tz-label');
-    if (el) el.textContent = tz;
-  })();
-
   // Localize the server-rendered config labels before first render
   _chartConfig.data.labels = localizeLabels(_chartConfig.data.labels);
 
