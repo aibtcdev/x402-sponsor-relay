@@ -8,6 +8,7 @@ export { Provision } from "./provision";
 export { ProvisionStx } from "./provision-stx";
 export { Fees } from "./fees";
 export { FeesConfig } from "./fees-config";
+export { NonceStatsEndpoint } from "./nonce-stats";
 export { Settle } from "./settle";
 export { VerifyV2 } from "./verify-v2";
 export { Supported } from "./supported";

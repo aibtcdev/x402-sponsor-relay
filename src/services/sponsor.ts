@@ -299,7 +299,7 @@ export class SponsorService {
     }
 
     try {
-      const stub = this.env.NONCE_DO.idFromName("sponsor");
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
       const response = await stub.fetch("https://nonce-do/assign", {
         method: "POST",
         headers: { "content-type": "application/json" },
