@@ -45,6 +45,8 @@ export interface Env {
   SPONSOR_MNEMONIC?: string;
   /** Account index to derive from mnemonic (default: 0) */
   SPONSOR_ACCOUNT_INDEX?: string;
+  /** Number of sponsor wallets to rotate through (default: "1", max: 10) */
+  SPONSOR_WALLET_COUNT?: string;
   /** Hex-encoded private key (fallback if no mnemonic) */
   SPONSOR_PRIVATE_KEY?: string;
   STACKS_NETWORK: "mainnet" | "testnet";

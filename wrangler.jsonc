@@ -31,7 +31,8 @@
     { "binding": "API_KEYS_KV", "id": "3ce8d9d710884370873c561bfb98d6cf" }
   ],
   "vars": {
-    "STACKS_NETWORK": "testnet"
+    "STACKS_NETWORK": "testnet",
+    "SPONSOR_WALLET_COUNT": "1"
   },
   // Cron trigger: run health check every 5 minutes
   "triggers": {
@@ -54,7 +55,8 @@
       "routes": [{ "pattern": "x402-relay.aibtc.dev", "custom_domain": true }],
       "observability": { "enabled": false },
       "vars": {
-        "STACKS_NETWORK": "testnet"
+        "STACKS_NETWORK": "testnet",
+        "SPONSOR_WALLET_COUNT": "1"
       },
       // Bindings must be duplicated per environment
       "services": [
@@ -86,7 +88,8 @@
       "routes": [{ "pattern": "x402-relay.aibtc.com", "custom_domain": true }],
       "observability": { "enabled": false },
       "vars": {
-        "STACKS_NETWORK": "mainnet"
+        "STACKS_NETWORK": "mainnet",
+        "SPONSOR_WALLET_COUNT": "1"
       },
       // Bindings must be duplicated per environment
       "services": [
