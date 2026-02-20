@@ -8,9 +8,10 @@ import {
   StxVerifyService,
   extractSponsorNonce,
   recordNonceTxid,
+  releaseNonceDO,
 } from "../services";
 import type { AppContext, SponsorRequest } from "../types";
-import { buildExplorerUrl } from "../utils";
+import { buildExplorerUrl, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 import {
   Error400Response,
   Error401Response,
@@ -20,8 +21,6 @@ import {
   Error502Response,
   Error503Response,
 } from "../schemas";
-
-const NONCE_CONFLICT_REASONS = ["ConflictingNonceInMempool", "BadNonce"];
 
 /**
  * Sponsor endpoint - sponsors and broadcasts transactions directly
@@ -223,9 +222,7 @@ export class Sponsor extends BaseEndpoint {
 
       // Estimate fee based on transaction size for spending cap check.
       // Conservative: 50 microSTX/byte, floor of 10,000 microSTX (0.01 STX).
-      const cleanTxHex = body.transaction.startsWith("0x")
-        ? body.transaction.slice(2)
-        : body.transaction;
+      const cleanTxHex = stripHexPrefix(body.transaction);
       const txByteLength = Buffer.from(cleanTxHex, "hex").length;
       const baseFee = 10_000n;
       const sizeBasedEstimate = BigInt(txByteLength) * 50n;
@@ -274,10 +271,13 @@ export class Sponsor extends BaseEndpoint {
         c.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
 
       // Deserialize the sponsored transaction for broadcast
-      const cleanHex = sponsorResult.sponsoredTxHex.startsWith("0x")
-        ? sponsorResult.sponsoredTxHex.slice(2)
-        : sponsorResult.sponsoredTxHex;
+      const cleanHex = stripHexPrefix(sponsorResult.sponsoredTxHex);
       const sponsoredTx = deserializeTransaction(cleanHex);
+
+      // Extract nonce before broadcast so it's available in all failure and success paths
+      const sponsorNonce = extractSponsorNonce(sponsoredTx);
+      // walletIndex from NonceDO assignment — routes release to the correct per-wallet pool
+      const sponsorWalletIndex = sponsorResult.walletIndex;
 
       let txid: string;
       try {
@@ -295,6 +295,15 @@ export class Sponsor extends BaseEndpoint {
             reason: errorReason,
           });
           c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
+
+          // Return nonce to pool — broadcast was rejected, nonce can be reused
+          if (sponsorNonce !== null) {
+            c.executionCtx.waitUntil(
+              releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
+                logger.warn("Failed to release nonce after broadcast rejection", { error: String(e) });
+              })
+            );
+          }
 
           const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
             errorReason.includes(reason)
@@ -328,6 +337,16 @@ export class Sponsor extends BaseEndpoint {
           error: e instanceof Error ? e.message : "Unknown error",
         });
         c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
+
+        // Return nonce to pool — broadcast threw an exception, nonce can be reused
+        if (sponsorNonce !== null) {
+          c.executionCtx.waitUntil(
+            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e2) => {
+              logger.warn("Failed to release nonce after broadcast exception", { error: String(e2) });
+            })
+          );
+        }
+
         return this.err(c, {
           error: "Failed to broadcast transaction",
           code: "BROADCAST_FAILED",
@@ -338,8 +357,15 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
-      const sponsorNonce = extractSponsorNonce(sponsoredTx);
       if (sponsorNonce !== null) {
+        // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
+        // Also records the fee in NonceDO's cumulative per-wallet fee stats
+        c.executionCtx.waitUntil(
+          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex, sponsorResult.fee).catch((e) => {
+            logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
+          })
+        );
+        // Also record nonce→txid mapping in NonceDO SQL table for gap detection
         c.executionCtx.waitUntil(
           recordNonceTxid(c.env, logger, txid, sponsorNonce).catch((e) => {
             logger.warn("Failed to record nonce txid", { error: String(e) });

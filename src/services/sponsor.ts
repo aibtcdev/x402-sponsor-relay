@@ -11,8 +11,8 @@ import {
   generateNewAccount,
   generateWallet,
 } from "@stacks/wallet-sdk";
-import type { Env, Logger, FeeTransactionType } from "../types";
-import { getHiroBaseUrl, getHiroHeaders } from "../utils";
+import type { Env, Logger, FeeTransactionType, WalletStatus, WalletsResponse } from "../types";
+import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix } from "../utils";
 import { FeeService } from "./fee";
 
 /**
@@ -48,6 +48,8 @@ export interface SponsorSuccess {
   sponsoredTxHex: string;
   /** Fee in microSTX paid by sponsor */
   fee: string;
+  /** Index of the wallet that signed this transaction (for nonce release routing) */
+  walletIndex: number;
 }
 
 /**
@@ -66,14 +68,14 @@ export interface SponsorFailure {
  */
 export type SponsorResult = SponsorSuccess | SponsorFailure;
 
-// Module-level cache for derived sponsor key.
-// Env vars cannot change during a worker instance's lifetime - when secrets are
+// Module-level cache for derived sponsor keys (accountIndex → privateKey).
+// Env vars cannot change during a worker instance's lifetime — when secrets are
 // updated via `wrangler secret put`, workers restart with fresh instances.
-let cachedSponsorKey: string | null = null;
-let cachedAccountIndex: number | null = null;
+const cachedSponsorKeys: Map<number, string> = new Map();
 
 // Validation constants
 const MAX_ACCOUNT_INDEX = 1000;
+const MAX_WALLET_COUNT = 10;
 const VALID_MNEMONIC_LENGTHS = [12, 24];
 
 // Nonce fetch retry configuration
@@ -95,10 +97,25 @@ export class SponsorService {
   }
 
   /**
-   * Derive private key from mnemonic phrase
-   * Results are cached at module level to avoid re-derivation per request
+   * Parse and validate SPONSOR_WALLET_COUNT from env.
+   * Returns a number in [1, MAX_WALLET_COUNT], defaulting to 1.
    */
-  private async deriveSponsorKey(): Promise<string | null> {
+  private getWalletCount(): number {
+    const raw = this.env.SPONSOR_WALLET_COUNT;
+    if (!raw) return 1;
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_WALLET_COUNT) {
+      this.logger.warn("Invalid SPONSOR_WALLET_COUNT; using 1", { raw });
+      return 1;
+    }
+    return n;
+  }
+
+  /**
+   * Derive private key for a specific account index from the mnemonic phrase.
+   * Results are cached at module level to avoid re-derivation per request.
+   */
+  private async deriveSponsorKeyForIndex(accountIndex: number): Promise<string | null> {
     if (!this.env.SPONSOR_MNEMONIC) {
       return null;
     }
@@ -110,24 +127,23 @@ export class SponsorService {
       return null;
     }
 
-    // Parse and validate account index
-    const accountIndex = parseInt(this.env.SPONSOR_ACCOUNT_INDEX || "0", 10);
-
+    // Validate account index range
     if (
       !Number.isInteger(accountIndex) ||
       accountIndex < 0 ||
       accountIndex > MAX_ACCOUNT_INDEX
     ) {
-      this.logger.error("Invalid SPONSOR_ACCOUNT_INDEX; must be 0-1000");
+      this.logger.error("Invalid account index; must be 0-1000", { accountIndex });
       return null;
     }
 
-    // Return cached key if available (env can't change during worker lifetime)
-    if (cachedSponsorKey !== null && cachedAccountIndex === accountIndex) {
-      return cachedSponsorKey;
+    // Return cached key if available
+    const cached = cachedSponsorKeys.get(accountIndex);
+    if (cached !== undefined) {
+      return cached;
     }
 
-    this.logger.info("Deriving sponsor key from mnemonic");
+    this.logger.info("Deriving sponsor key from mnemonic", { accountIndex });
 
     try {
       const wallet = await generateWallet({
@@ -149,13 +165,13 @@ export class SponsorService {
       }
 
       // Cache the derived key
-      cachedSponsorKey = account.stxPrivateKey;
-      cachedAccountIndex = accountIndex;
+      cachedSponsorKeys.set(accountIndex, account.stxPrivateKey);
 
-      this.logger.info("Sponsor key derived successfully");
-      return cachedSponsorKey;
+      this.logger.info("Sponsor key derived successfully", { accountIndex });
+      return account.stxPrivateKey;
     } catch (e) {
       this.logger.error("Failed to derive sponsor key from mnemonic", {
+        accountIndex,
         error: e instanceof Error ? e.message : "Unknown error",
       });
       return null;
@@ -163,17 +179,25 @@ export class SponsorService {
   }
 
   /**
-   * Get the sponsor private key (from mnemonic or direct config)
+   * Get the sponsor private key for a specific wallet index.
+   * walletIndex maps directly to the BIP-44 account index derived from the mnemonic.
+   * Falls back to SPONSOR_PRIVATE_KEY only for walletIndex=0.
    */
-  private async getSponsorKey(): Promise<string | null> {
-    // Prefer mnemonic derivation
+  private async getSponsorKeyForWallet(walletIndex: number): Promise<string | null> {
     if (this.env.SPONSOR_MNEMONIC) {
-      return this.deriveSponsorKey();
+      return this.deriveSponsorKeyForIndex(walletIndex);
     }
 
-    // Fall back to direct private key
-    if (this.env.SPONSOR_PRIVATE_KEY) {
+    // SPONSOR_PRIVATE_KEY fallback is only valid for wallet 0
+    if (this.env.SPONSOR_PRIVATE_KEY && walletIndex === 0) {
       return this.env.SPONSOR_PRIVATE_KEY;
+    }
+
+    if (walletIndex !== 0) {
+      this.logger.error(
+        "Multi-wallet rotation requires SPONSOR_MNEMONIC; SPONSOR_PRIVATE_KEY only supports wallet 0",
+        { walletIndex }
+      );
     }
 
     return null;
@@ -349,43 +373,87 @@ export class SponsorService {
   }
 
   /**
+   * Derive Stacks addresses for all configured wallets.
+   * Returns a map of walletIndex (as string) → Stacks address.
+   */
+  private async deriveWalletAddresses(): Promise<Record<string, string>> {
+    const network = this.getNetwork();
+    const walletCount = this.getWalletCount();
+    const addresses: Record<string, string> = {};
+    for (let i = 0; i < walletCount; i++) {
+      const key = await this.getSponsorKeyForWallet(i);
+      if (key) {
+        addresses[String(i)] = getAddressFromPrivateKey(key, network);
+      }
+    }
+    return addresses;
+  }
+
+  /**
    * Fetch the sponsor account nonce from NonceDO when available.
+   * Passes walletCount and per-wallet addresses so NonceDO can do round-robin
+   * and seed each wallet's pool from the correct on-chain nonce.
+   * Returns both nonce and walletIndex so SponsorService can pick the right key.
+   *
+   * On NonceDO error: returns a structured error with code instead of null,
+   * so callers can propagate the correct HTTP status (e.g. 429 for chaining limit).
    */
   private async fetchNonceFromDO(
     sponsorAddress: string
-  ): Promise<bigint | null> {
+  ): Promise<
+    | { ok: true; nonce: bigint; walletIndex: number }
+    | { ok: false; code?: string; error: string; status: number }
+  > {
     if (!this.env.NONCE_DO) {
       this.logger.debug("Nonce DO not configured; skipping DO nonce fetch");
-      return null;
+      return { ok: false, error: "NONCE_DO not configured", status: 503 };
     }
+
+    const walletCount = this.getWalletCount();
+    const addresses = walletCount > 1 ? await this.deriveWalletAddresses() : undefined;
 
     try {
       const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
       const response = await stub.fetch("https://nonce-do/assign", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sponsorAddress }),
+        body: JSON.stringify({ sponsorAddress, walletCount, addresses }),
       });
 
       if (!response.ok) {
+        // Parse the error body so callers can propagate specific codes (e.g. 429)
+        let errorBody: { error?: string; code?: string } = {};
+        try {
+          errorBody = (await response.json()) as { error?: string; code?: string };
+        } catch {
+          // response may not be JSON
+        }
         this.logger.warn("Nonce DO responded with error", {
           status: response.status,
+          code: errorBody.code,
+          error: errorBody.error,
         });
-        return null;
+        return {
+          ok: false,
+          code: errorBody.code,
+          error: errorBody.error ?? `NonceDO error ${response.status}`,
+          status: response.status,
+        };
       }
 
-      const data = (await response.json()) as { nonce?: number };
+      const data = (await response.json()) as { nonce?: number; walletIndex?: number };
       if (typeof data?.nonce !== "number") {
         this.logger.warn("Nonce DO response missing nonce field");
-        return null;
+        return { ok: false, error: "NonceDO response missing nonce field", status: 500 };
       }
 
-      return BigInt(data.nonce);
+      const walletIndex = typeof data.walletIndex === "number" ? data.walletIndex : 0;
+      return { ok: true, nonce: BigInt(data.nonce), walletIndex };
     } catch (e) {
       this.logger.warn("Failed to fetch nonce from NonceDO", {
         error: e instanceof Error ? e.message : String(e),
       });
-      return null;
+      return { ok: false, error: e instanceof Error ? e.message : String(e), status: 503 };
     }
   }
 
@@ -393,8 +461,7 @@ export class SponsorService {
    * Validate and deserialize a transaction
    */
   validateTransaction(txHex: string): TransactionValidationResult {
-    // Remove 0x prefix if present
-    const cleanHex = txHex.startsWith("0x") ? txHex.slice(2) : txHex;
+    const cleanHex = stripHexPrefix(txHex);
 
     // Deserialize the transaction
     let transaction: StacksTransactionWire;
@@ -436,22 +503,15 @@ export class SponsorService {
   }
 
   /**
-   * Sponsor a validated transaction
+   * Sponsor a validated transaction using round-robin wallet selection.
+   *
+   * When NONCE_DO is configured, fetchNonceFromDO returns both nonce and walletIndex.
+   * The walletIndex determines which BIP-44 account key is used for signing.
+   * The walletIndex is included in SponsorSuccess so callers can route release calls.
    */
   async sponsorTransaction(
     transaction: StacksTransactionWire
   ): Promise<SponsorResult> {
-    const sponsorKey = await this.getSponsorKey();
-
-    if (!sponsorKey) {
-      this.logger.error("Sponsor key not configured");
-      return {
-        success: false,
-        error: "Service not configured",
-        details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
-      };
-    }
-
     const network = this.getNetwork();
 
     // Determine fee from FeeService to prevent overpayment
@@ -472,34 +532,58 @@ export class SponsorService {
       fee = undefined;
     }
 
-    // Pre-fetch the sponsor nonce to avoid hitting Hiro API rate limits from the
-    // internal fetchNonce() call inside sponsorTransaction(). Passing sponsorNonce
-    // explicitly skips the internal nonce fetch entirely.
-    //
-    // When NONCE_DO is configured, it is the authoritative nonce source.
+    // Pre-fetch the sponsor nonce from NonceDO (authoritative coordinator).
+    // When NONCE_DO is configured, it also returns walletIndex for key selection.
     // If the DO is unreachable we fail fast (503) rather than silently falling back
     // to the uncoordinated Hiro path which causes nonce races.
     // When NONCE_DO is NOT configured (e.g. local dev), we fall back to Hiro with a warning.
     let sponsorNonce: bigint | undefined;
-    const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
+    let walletIndex = 0;
+    // Track whether NonceDO assigned a nonce so we can release it on any failure path
+    let nonceFromDO = false;
+    let assignedNonceValue: number | undefined;
 
     if (this.env.NONCE_DO) {
+      // Derive wallet 0 address for the NonceDO request.
+      // The DO will do round-robin internally and return the actual walletIndex used.
+      const wallet0Key = await this.getSponsorKeyForWallet(0);
+      if (!wallet0Key) {
+        this.logger.error("Sponsor key not configured");
+        return {
+          success: false,
+          error: "Service not configured",
+          details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
+        };
+      }
+      const wallet0Address = getAddressFromPrivateKey(wallet0Key, network);
+
       // NONCE_DO is configured — it is the authoritative source; fail fast if unavailable
-      const doNonce = await this.fetchNonceFromDO(sponsorAddress);
-      if (doNonce !== null) {
-        sponsorNonce = doNonce;
+      const doResult = await this.fetchNonceFromDO(wallet0Address);
+      if (doResult.ok) {
+        sponsorNonce = doResult.nonce;
+        walletIndex = doResult.walletIndex;
+        nonceFromDO = true;
+        assignedNonceValue = Number(doResult.nonce);
         this.logger.debug("Using NonceDO sponsor nonce", {
           sponsorNonce: sponsorNonce.toString(),
+          walletIndex,
         });
       } else {
+        // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED)
+        const code = doResult.code === "CHAINING_LIMIT_EXCEEDED"
+          ? "RATE_LIMIT_EXCEEDED"
+          : "NONCE_DO_UNAVAILABLE";
         this.logger.error(
-          "NonceDO is configured but unavailable; refusing to fall back to uncoordinated nonce"
+          "NonceDO nonce assignment failed",
+          { code: doResult.code, error: doResult.error, status: doResult.status }
         );
         return {
           success: false,
-          error: "Nonce coordination service unavailable",
-          details: "NonceDO did not return a nonce; retry in a few seconds",
-          code: "NONCE_DO_UNAVAILABLE",
+          error: doResult.error,
+          details: doResult.code === "CHAINING_LIMIT_EXCEEDED"
+            ? "All sponsor wallets at chaining limit; retry in a few seconds"
+            : "NonceDO did not return a nonce; retry in a few seconds",
+          code,
         };
       }
     } else {
@@ -507,6 +591,18 @@ export class SponsorService {
       this.logger.warn(
         "NONCE_DO not configured; falling back to uncoordinated Hiro nonce fetch"
       );
+      // walletIndex stays 0 (initialized above) — single-wallet fallback
+
+      const wallet0Key = await this.getSponsorKeyForWallet(0);
+      if (!wallet0Key) {
+        this.logger.error("Sponsor key not configured");
+        return {
+          success: false,
+          error: "Service not configured",
+          details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
+        };
+      }
+      const sponsorAddress = getAddressFromPrivateKey(wallet0Key, network);
       const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
       if (fetchedNonce !== null) {
         sponsorNonce = fetchedNonce;
@@ -519,6 +615,21 @@ export class SponsorService {
           "Hiro nonce fetch failed; falling back to internal nonce fetch"
         );
       }
+    }
+
+    // Get the sponsor key for the wallet index selected by NonceDO
+    const sponsorKey = await this.getSponsorKeyForWallet(walletIndex);
+    if (!sponsorKey) {
+      this.logger.error("Sponsor key not configured for wallet", { walletIndex });
+      // Release the reserved nonce back to pool since we can't sign
+      if (nonceFromDO && assignedNonceValue !== undefined) {
+        await releaseNonceDO(this.env, this.logger, assignedNonceValue, undefined, walletIndex);
+      }
+      return {
+        success: false,
+        error: "Service not configured",
+        details: `Could not derive key for wallet index ${walletIndex}. Set SPONSOR_MNEMONIC.`,
+      };
     }
 
     try {
@@ -554,23 +665,241 @@ export class SponsorService {
         }
       }
 
-      this.logger.info("Transaction sponsored", { fee: actualFee });
+      this.logger.info("Transaction sponsored", { fee: actualFee, walletIndex });
 
       return {
         success: true,
         sponsoredTxHex,
         fee: actualFee,
+        walletIndex,
       };
     } catch (e) {
       this.logger.error("Failed to sponsor transaction", {
         error: e instanceof Error ? e.message : "Unknown error",
+        walletIndex,
       });
+      // Release the reserved nonce back to pool since broadcast never happened
+      if (nonceFromDO && assignedNonceValue !== undefined) {
+        await releaseNonceDO(this.env, this.logger, assignedNonceValue, undefined, walletIndex);
+      }
       return {
         success: false,
         error: "Failed to sponsor transaction",
         details: e instanceof Error ? e.message : "Unknown error",
       };
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Wallet status monitoring
+  // ---------------------------------------------------------------------------
+
+  /** Balance thresholds in microSTX for classifying wallet health */
+  private static readonly LOW_BALANCE_WARNING = "1000000";   // 1 STX
+  private static readonly DEPLETED_THRESHOLD = "100000";     // 0.1 STX
+
+  /**
+   * Fetch the STX balance for a sponsor wallet address from Hiro.
+   * Caches the result in RELAY_KV for 60 seconds to avoid hammering the API.
+   * Returns balance as a microSTX string, or "0" on failure.
+   */
+  private async fetchWalletBalance(address: string): Promise<string> {
+    const cacheKey = `wallet_balance:${address}`;
+
+    // Try cache first
+    if (this.env.RELAY_KV) {
+      try {
+        const cached = await this.env.RELAY_KV.get(cacheKey);
+        if (cached !== null) {
+          return cached;
+        }
+      } catch (_e) {
+        // Cache miss — proceed to live fetch
+      }
+    }
+
+    // Live fetch from Hiro
+    const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/v2/accounts/${address}?proof=0`;
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    try {
+      const response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        this.logger.warn("Hiro account endpoint error for wallet balance", {
+          address,
+          status: response.status,
+        });
+        return "0";
+      }
+      const data = (await response.json()) as { balance?: string };
+      const balance = typeof data?.balance === "string" ? data.balance : "0";
+
+      // Cache the result for 60 seconds
+      if (this.env.RELAY_KV) {
+        await this.env.RELAY_KV.put(cacheKey, balance, { expirationTtl: 60 }).catch(() => {});
+      }
+
+      return balance;
+    } catch (e) {
+      this.logger.warn("Failed to fetch wallet balance from Hiro", {
+        address,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return "0";
+    }
+  }
+
+  /**
+   * Fetch per-wallet fee stats from NonceDO /wallet-fees/:index.
+   * Returns zeroed stats on failure.
+   */
+  private async fetchWalletFeeStats(walletIndex: number): Promise<{
+    totalFeesSpent: string;
+    txCount: number;
+    txCountToday: number;
+    feesToday: string;
+  }> {
+    const empty = { totalFeesSpent: "0", txCount: 0, txCountToday: 0, feesToday: "0" };
+    if (!this.env.NONCE_DO) {
+      return empty;
+    }
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch(`https://nonce-do/wallet-fees/${walletIndex}`, {
+        method: "GET",
+      });
+      if (!response.ok) {
+        return empty;
+      }
+      const data = (await response.json()) as Partial<typeof empty>;
+      return {
+        totalFeesSpent: typeof data.totalFeesSpent === "string" ? data.totalFeesSpent : "0",
+        txCount: typeof data.txCount === "number" ? data.txCount : 0,
+        txCountToday: typeof data.txCountToday === "number" ? data.txCountToday : 0,
+        feesToday: typeof data.feesToday === "string" ? data.feesToday : "0",
+      };
+    } catch (e) {
+      this.logger.warn("Failed to fetch wallet fee stats from NonceDO", {
+        walletIndex,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return empty;
+    }
+  }
+
+  /**
+   * Fetch the current pool state for all wallets from NonceDO /stats.
+   * Returns a map of walletIndex → { available, reserved, maxNonce }.
+   */
+  private async fetchNoncePoolStats(): Promise<Map<number, { available: number; reserved: number; maxNonce: number }>> {
+    const result = new Map<number, { available: number; reserved: number; maxNonce: number }>();
+    if (!this.env.NONCE_DO) {
+      return result;
+    }
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch("https://nonce-do/stats", { method: "GET" });
+      if (!response.ok) {
+        return result;
+      }
+      const data = (await response.json()) as { wallets?: Array<{ walletIndex: number; available: number; reserved: number; maxNonce: number }> };
+      for (const w of data.wallets ?? []) {
+        result.set(w.walletIndex, {
+          available: w.available ?? 0,
+          reserved: w.reserved ?? 0,
+          maxNonce: w.maxNonce ?? 0,
+        });
+      }
+    } catch (e) {
+      this.logger.warn("Failed to fetch nonce pool stats from NonceDO", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Classify wallet health based on current STX balance.
+   */
+  private classifyWalletStatus(balance: string): "healthy" | "low_balance" | "depleted" {
+    try {
+      const b = BigInt(balance || "0");
+      if (b >= BigInt(SponsorService.LOW_BALANCE_WARNING)) return "healthy";
+      if (b >= BigInt(SponsorService.DEPLETED_THRESHOLD)) return "low_balance";
+      return "depleted";
+    } catch {
+      return "depleted";
+    }
+  }
+
+  /**
+   * Get the status of all configured sponsor wallets.
+   * Fetches balances from Hiro (60s cache), fee stats from NonceDO,
+   * and pool state from NonceDO. Returns a WalletsResponse for GET /wallets.
+   */
+  async getWalletStatuses(): Promise<WalletsResponse> {
+    const network = this.getNetwork();
+    const walletCount = this.getWalletCount();
+
+    // Fetch pool stats once (all wallets in one NonceDO call)
+    const poolStats = await this.fetchNoncePoolStats();
+
+    // Build per-wallet status in parallel
+    const walletPromises: Promise<WalletStatus>[] = [];
+    for (let i = 0; i < walletCount; i++) {
+      walletPromises.push((async (walletIndex: number): Promise<WalletStatus> => {
+        const key = await this.getSponsorKeyForWallet(walletIndex);
+        const address = key ? getAddressFromPrivateKey(key, network) : `wallet-${walletIndex}-unconfigured`;
+
+        const [balance, feeStats] = await Promise.all([
+          key ? this.fetchWalletBalance(address) : Promise.resolve("0"),
+          this.fetchWalletFeeStats(walletIndex),
+        ]);
+
+        const pool = poolStats.get(walletIndex) ?? { available: 0, reserved: 0, maxNonce: 0 };
+        const status = this.classifyWalletStatus(balance);
+
+        return {
+          index: walletIndex,
+          address,
+          balance,
+          totalFeesSpent: feeStats.totalFeesSpent,
+          txCount: feeStats.txCount,
+          txCountToday: feeStats.txCountToday,
+          feesToday: feeStats.feesToday,
+          pool,
+          status,
+        };
+      })(i));
+    }
+
+    const wallets = await Promise.all(walletPromises);
+
+    // Aggregate totals
+    let totalBalance = BigInt(0);
+    let totalFeesSpent = BigInt(0);
+    let totalTxCount = 0;
+    for (const w of wallets) {
+      try { totalBalance += BigInt(w.balance || "0"); } catch { /* skip */ }
+      try { totalFeesSpent += BigInt(w.totalFeesSpent || "0"); } catch { /* skip */ }
+      totalTxCount += w.txCount;
+    }
+
+    return {
+      wallets,
+      totals: {
+        totalBalance: totalBalance.toString(),
+        totalFeesSpent: totalFeesSpent.toString(),
+        totalTxCount,
+        walletCount,
+      },
+      thresholds: {
+        lowBalanceWarning: SponsorService.LOW_BALANCE_WARNING,
+        depletedThreshold: SponsorService.DEPLETED_THRESHOLD,
+      },
+    };
   }
 }
 
@@ -626,6 +955,69 @@ export async function recordNonceTxid(
       error: e instanceof Error ? e.message : "Unknown error",
       txid,
       nonce,
+    });
+  }
+}
+
+/**
+ * Release a nonce from the NonceDO reservation pool after a broadcast attempt.
+ *
+ * When txid is provided (broadcast succeeded): marks the nonce as consumed —
+ * it is removed from reserved and NOT returned to available for reuse.
+ * If fee is also provided, it is recorded in NonceDO's cumulative wallet stats.
+ *
+ * When txid is absent (broadcast failed): returns the nonce to available[]
+ * in sorted order so it can be reused for the next request.
+ *
+ * walletIndex specifies which wallet pool to release to (default: 0).
+ * Must match the walletIndex returned by the NonceDO /assign response.
+ *
+ * Call via executionCtx.waitUntil() as fire-and-forget — never blocks the response.
+ * Never throws — all errors are logged as warnings.
+ */
+export async function releaseNonceDO(
+  env: Env,
+  logger: Logger,
+  nonce: number,
+  txid?: string,
+  walletIndex: number = 0,
+  fee?: string
+): Promise<void> {
+  if (!env.NONCE_DO) {
+    return;
+  }
+
+  try {
+    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch("https://nonce-do/release", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        nonce,
+        walletIndex,
+        ...(txid ? { txid } : {}),
+        ...(fee ? { fee } : {}),
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      logger.warn("Nonce DO release failed", {
+        status: response.status,
+        body,
+        nonce,
+        walletIndex,
+        ...(txid ? { txid } : {}),
+        ...(fee ? { fee } : {}),
+      });
+    }
+  } catch (e) {
+    logger.warn("Failed to release nonce to NonceDO", {
+      error: e instanceof Error ? e.message : String(e),
+      nonce,
+      walletIndex,
+      ...(txid ? { txid } : {}),
+      ...(fee ? { fee } : {}),
     });
   }
 }

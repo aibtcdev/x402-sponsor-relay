@@ -43,8 +43,9 @@ export interface Logger {
 export interface Env {
   /** 24-word mnemonic phrase for sponsor wallet (preferred) */
   SPONSOR_MNEMONIC?: string;
-  /** Account index to derive from mnemonic (default: 0) */
-  SPONSOR_ACCOUNT_INDEX?: string;
+  /** Number of sponsor wallets to rotate through (default: "1", max: 10).
+   *  Derives BIP-44 accounts 0..N-1 from the mnemonic for round-robin sponsoring. */
+  SPONSOR_WALLET_COUNT?: string;
   /** Hex-encoded private key (fallback if no mnemonic) */
   SPONSOR_PRIVATE_KEY?: string;
   STACKS_NETWORK: "mainnet" | "testnet";
@@ -850,6 +851,64 @@ export interface TransactionLogEntry {
   status?: "confirmed" | "pending" | "failed";
   /** Block height (if confirmed) */
   blockHeight?: number;
+  /** Sponsor wallet address that paid the fee (optional, for per-wallet tracking) */
+  sponsorAddress?: string;
+  /** Sponsor wallet index (0-based) that paid the fee (optional, for per-wallet tracking) */
+  walletIndex?: number;
+}
+
+// =============================================================================
+// Wallet Monitoring Types
+// =============================================================================
+
+/**
+ * Status of a single sponsor wallet
+ */
+export interface WalletStatus {
+  /** 0-based wallet index (BIP-44 account index) */
+  index: number;
+  /** Stacks address for this wallet */
+  address: string;
+  /** Current STX balance in microSTX (as string to avoid overflow) */
+  balance: string;
+  /** Cumulative fees paid by this wallet since tracking began (microSTX string) */
+  totalFeesSpent: string;
+  /** Total number of transactions sponsored by this wallet */
+  txCount: number;
+  /** Number of transactions sponsored today */
+  txCountToday: number;
+  /** Total fees paid today in microSTX (as string) */
+  feesToday: string;
+  /** Live nonce pool state */
+  pool: {
+    available: number;
+    reserved: number;
+    maxNonce: number;
+  };
+  /** Health status based on current balance */
+  status: "healthy" | "low_balance" | "depleted";
+}
+
+/**
+ * Response from GET /wallets endpoint
+ */
+export interface WalletsResponse {
+  /** Per-wallet status array (ordered by wallet index) */
+  wallets: WalletStatus[];
+  /** Aggregate totals across all wallets */
+  totals: {
+    totalBalance: string;
+    totalFeesSpent: string;
+    totalTxCount: number;
+    walletCount: number;
+  };
+  /** Balance thresholds used to classify wallet health */
+  thresholds: {
+    /** Balance below this value triggers low_balance warning (microSTX) */
+    lowBalanceWarning: string;
+    /** Balance below this value marks wallet as depleted (microSTX) */
+    depletedThreshold: string;
+  };
 }
 
 /**

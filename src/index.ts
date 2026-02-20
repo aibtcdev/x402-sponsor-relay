@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, Settle, VerifyV2, Supported } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, Settle, VerifyV2, Supported, Wallets } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -50,6 +50,7 @@ const openapi = fromHono(app, {
       { name: "Dashboard", description: "Public statistics endpoints" },
       { name: "Nonce", description: "Nonce coordinator diagnostics" },
       { name: "x402 V2", description: "x402 V2 facilitator API (spec-compliant)" },
+      { name: "Wallets", description: "Sponsor wallet monitoring (balance, fees, pool state)" },
     ],
     servers: [
       {
@@ -97,6 +98,7 @@ openapi.post("/settle", Settle as unknown as typeof Settle);
 // share the /verify path but use different HTTP methods — no route collision.
 openapi.post("/verify", VerifyV2 as unknown as typeof VerifyV2);
 openapi.get("/supported", Supported as unknown as typeof Supported);
+openapi.get("/wallets", Wallets as unknown as typeof Wallets);
 
 // --------------------------------------------------------------------------
 // Admin: one-time KV → StatsDO backfill (remove after migration)
@@ -310,6 +312,7 @@ app.get("/", (c) => {
       nonceStats: "GET /nonce/stats - Nonce coordinator stats",
       nonceReset: "POST /nonce/reset - Trigger on-demand nonce recovery (admin, requires API key)",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
+      wallets: "GET /wallets - Sponsor wallet status (balance, fees, pool)",
       settle: "POST /settle - x402 V2 facilitator settle",
       verifyV2: "POST /verify - x402 V2 facilitator verify",
       supported: "GET /supported - x402 V2 supported payment kinds",

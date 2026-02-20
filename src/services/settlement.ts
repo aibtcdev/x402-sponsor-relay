@@ -21,7 +21,7 @@ import type {
   DedupResult,
   BroadcastAndConfirmResult,
 } from "../types";
-import { getHiroBaseUrl, getHiroHeaders } from "../utils";
+import { getHiroBaseUrl, getHiroHeaders, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 
 // Known SIP-010 token contract addresses
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
@@ -40,10 +40,6 @@ const MAX_POLL_DELAY_MS = 8_000;
 // KV dedup configuration
 const DEDUP_TTL_SECONDS = 300;
 const DEDUP_KEY_PREFIX = "dedup:";
-
-// Broadcast error reasons that indicate a nonce conflict
-const NONCE_CONFLICT_REASONS = ["ConflictingNonceInMempool", "BadNonce"];
-
 
 /** Shape of Hiro GET /extended/v1/tx/{txid} response (subset) */
 interface HiroTxResponse {
@@ -74,8 +70,7 @@ export class SettlementService {
    * Strip 0x prefix and deserialize a transaction hex string
    */
   private deserializeTx(txHex: string): StacksTransactionWire {
-    const cleanHex = txHex.startsWith("0x") ? txHex.slice(2) : txHex;
-    return deserializeTransaction(cleanHex);
+    return deserializeTransaction(stripHexPrefix(txHex));
   }
 
   /**
@@ -83,8 +78,7 @@ export class SettlementService {
    * Strips 0x prefix before hashing so the same tx always produces the same key.
    */
   private async computeTxHash(txHex: string): Promise<string> {
-    const normalized = txHex.startsWith("0x") ? txHex.slice(2) : txHex;
-    const data = new TextEncoder().encode(normalized);
+    const data = new TextEncoder().encode(stripHexPrefix(txHex));
     const hashBuffer = await crypto.subtle.digest("SHA-256", data);
     const bytes = new Uint8Array(hashBuffer);
     return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
@@ -168,6 +162,7 @@ export class SettlementService {
    * - "SBTC" or "sBTC" (case-insensitive) → "sBTC"
    * - "USDCX" or "USDCx" (case-insensitive) → "USDCx"
    * - CAIP-19 Stacks FT identifiers whose contract address is known → mapped token
+   * - Bare Stacks contract principals (e.g., "SM3...Q4.sbtc-token") → mapped token
    * - Unknown → null (caller should return unsupported_scheme error)
    */
   mapAssetToTokenType(asset: string): TokenType | null {
@@ -185,6 +180,39 @@ export class SettlementService {
       return "USDCx";
     }
 
+    // Try bare contract principal format: "address.contract-name"
+    const bareMatch = this.matchBareContractPrincipal(asset);
+    if (bareMatch !== null) {
+      return bareMatch;
+    }
+
+    return null;
+  }
+
+  /**
+   * Match a bare Stacks contract principal (address.contract-name) against
+   * known token contracts. Returns the mapped TokenType or null if unrecognized.
+   *
+   * Handles:
+   * - "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token" → "sBTC" (mainnet)
+   * - "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4.sbtc-token"  → "sBTC" (testnet)
+   * - "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9.token-aeusdc" → "USDCx"
+   */
+  private matchBareContractPrincipal(asset: string): TokenType | null {
+    const dotIndex = asset.indexOf(".");
+    if (dotIndex === -1) return null;
+    const address = asset.substring(0, dotIndex).toUpperCase();
+    const contractName = asset.substring(dotIndex + 1);
+
+    if (
+      (address === SBTC_CONTRACT_MAINNET || address === SBTC_CONTRACT_TESTNET) &&
+      contractName === SBTC_CONTRACT_NAME
+    ) {
+      return "sBTC";
+    }
+    if (address === USDCX_CONTRACT_MAINNET && contractName === USDCX_CONTRACT_NAME) {
+      return "USDCx";
+    }
     return null;
   }
 
