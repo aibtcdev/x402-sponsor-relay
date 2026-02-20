@@ -2,6 +2,9 @@ import { BaseEndpoint } from "./BaseEndpoint";
 import type { AppContext } from "../types";
 import { Error500Response } from "../schemas";
 
+/** Window within which a gap detection is considered "recent" (10 minutes) */
+const RECENT_GAP_WINDOW_MS = 10 * 60 * 1000;
+
 interface NonceStats {
   totalAssigned: number;
   conflictsDetected: number;
@@ -17,6 +20,28 @@ interface NonceStats {
   lastGapDetected: string | null;
 }
 
+/** Human-readable summary of current gap state */
+type GapStatus = "recent_gap" | "gaps_recovered_historically" | "no_gaps";
+
+/**
+ * Derive a human-readable gap status from raw NonceStats fields.
+ * - "recent_gap": lastGapDetected is within the last 10 minutes
+ * - "gaps_recovered_historically": at least one gap was recovered but not recently
+ * - "no_gaps": no gap has ever been detected
+ */
+function deriveGapStatus(stats: NonceStats): GapStatus {
+  if (stats.lastGapDetected !== null) {
+    const gapAgeMs = Date.now() - new Date(stats.lastGapDetected).getTime();
+    if (gapAgeMs <= RECENT_GAP_WINDOW_MS) {
+      return "recent_gap";
+    }
+  }
+  if (stats.gapsRecovered > 0) {
+    return "gaps_recovered_historically";
+  }
+  return "no_gaps";
+}
+
 /**
  * Nonce stats endpoint - returns Durable Object stats
  * GET /nonce/stats
@@ -26,7 +51,7 @@ export class NonceStatsEndpoint extends BaseEndpoint {
     tags: ["Nonce"],
     summary: "Get nonce coordinator stats",
     description:
-      "Returns nonce assignment and txid tracking statistics from the Nonce Durable Object.",
+      "Returns nonce assignment and txid tracking statistics from the Nonce Durable Object. Includes gap recovery counters and a derived gapStatus summary.",
     responses: {
       "200": {
         description: "Nonce stats retrieved successfully",
@@ -52,7 +77,7 @@ export class NonceStatsEndpoint extends BaseEndpoint {
                     txidCount: { type: "number" as const },
                     gapsRecovered: {
                       type: "number" as const,
-                      description: "Number of times the alarm recovered from a nonce gap",
+                      description: "Number of times the alarm or on-demand resync recovered from a nonce gap",
                     },
                     lastHiroSync: {
                       type: "string" as const,
@@ -63,6 +88,12 @@ export class NonceStatsEndpoint extends BaseEndpoint {
                       type: "string" as const,
                       nullable: true,
                       description: "ISO timestamp of last gap detection",
+                    },
+                    gapStatus: {
+                      type: "string" as const,
+                      enum: ["recent_gap", "gaps_recovered_historically", "no_gaps"],
+                      description:
+                        "Derived gap health summary. 'recent_gap' = gap detected within the last 10 minutes; 'gaps_recovered_historically' = at least one gap was recovered but not recently; 'no_gaps' = no gap ever detected.",
                     },
                   },
                 },
@@ -109,7 +140,10 @@ export class NonceStatsEndpoint extends BaseEndpoint {
         });
       }
 
-      const stats = (await response.json()) as NonceStats;
+      const rawStats = (await response.json()) as NonceStats;
+      const gapStatus = deriveGapStatus(rawStats);
+      const stats = { ...rawStats, gapStatus };
+
       return this.ok(c, { stats });
     } catch (e) {
       logger.error("Nonce stats request failed", {
