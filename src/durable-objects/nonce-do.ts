@@ -1097,7 +1097,8 @@ export class NonceDO {
     if (
       poolHead !== null &&
       poolHead.available.length < POOL_SEED_SIZE &&
-      poolHead.reserved.length === 0
+      poolHead.reserved.length === 0 &&
+      (effectivePreviousNonce === null || possible_next_nonce === effectivePreviousNonce)
     ) {
       await this.resetPoolAvailableForWallet(
         walletIndex,
@@ -1106,7 +1107,7 @@ export class NonceDO {
       );
       return {
         previousNonce: effectivePreviousNonce,
-        newNonce: effectivePreviousNonce,
+        newNonce: effectivePreviousNonce ?? possible_next_nonce,
         changed: true,
         reason: `POOL REFILL: available ${poolHead.available.length} < ${POOL_SEED_SIZE}, re-seeded from nonce ${effectivePreviousNonce ?? possible_next_nonce}`,
       };
@@ -1154,7 +1155,13 @@ export class NonceDO {
     }>;
   }> {
     const initializedWallets = await this.getInitializedWallets();
-    const wallets = [];
+    const wallets: Array<{
+      walletIndex: number;
+      previousNonce: number | null;
+      newNonce: number | null;
+      changed: boolean;
+      reason: string;
+    }> = [];
     for (const { walletIndex, address } of initializedWallets) {
       const result = await this.reconcileNonceForWallet(walletIndex, address);
       if (result === null) {
@@ -1179,7 +1186,12 @@ export class NonceDO {
     }>;
   }> {
     const initializedWallets = await this.getInitializedWallets();
-    const wallets = [];
+    const wallets: Array<{
+      walletIndex: number;
+      previousNonce: number | null;
+      newNonce: number;
+      changed: boolean;
+    }> = [];
     for (const { walletIndex, address } of initializedWallets) {
       let nonceInfo: HiroNonceInfo;
       try {
