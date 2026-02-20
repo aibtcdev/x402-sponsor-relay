@@ -361,6 +361,13 @@ export class Relay extends BaseEndpoint {
         );
 
         if (broadcastResult.nonceConflict) {
+          // Trigger immediate DO resync so the next request gets a clean nonce.
+          // Fire-and-forget: does not block the error response.
+          c.executionCtx.waitUntil(
+            sponsorService.resyncNonceDO().catch((e) => {
+              logger.warn("resyncNonceDO failed after nonce conflict", { error: String(e) });
+            })
+          );
           return this.err(c, {
             error: "Nonce conflict — resubmit with a new transaction",
             code: "NONCE_CONFLICT",

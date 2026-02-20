@@ -23,6 +23,26 @@ interface LookupTxidResponse {
   nonce?: number;
 }
 
+/**
+ * Full response from Hiro GET /extended/v1/address/{addr}/nonces
+ */
+interface HiroNonceInfo {
+  /** Last confirmed nonce for this address (null if no confirmed txs yet) */
+  last_executed_tx_nonce: number | null;
+  /** Next nonce the network considers valid for submission */
+  possible_next_nonce: number;
+  /** Nonces in the mempool that are creating gaps (missing nonces below them) */
+  detected_missing_nonces: number[];
+}
+
+/** Result of a nonce reconciliation pass (shared by alarm and resync) */
+interface ReconcileResult {
+  previousNonce: number | null;
+  newNonce: number | null;
+  changed: boolean;
+  reason: string;
+}
+
 interface NonceStatsResponse {
   totalAssigned: number;
   conflictsDetected: number;
@@ -30,9 +50,17 @@ interface NonceStatsResponse {
   lastAssignedAt: string | null;
   nextNonce: number | null;
   txidCount: number;
+  /** Number of times the alarm has recovered from a nonce gap */
+  gapsRecovered: number;
+  /** ISO timestamp of last successful Hiro nonce sync (null if never synced) */
+  lastHiroSync: string | null;
+  /** ISO timestamp of last gap detection (null if no gaps detected) */
+  lastGapDetected: string | null;
 }
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
+/** Reset to possible_next_nonce if no assignment in this window and we are ahead */
+const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 const SPONSOR_ADDRESS_KEY = "sponsor_address";
 const STATE_KEYS = {
   current: "current",
@@ -40,6 +68,9 @@ const STATE_KEYS = {
   conflictsDetected: "conflicts_detected",
   lastAssignedNonce: "last_assigned_nonce",
   lastAssignedAt: "last_assigned_at",
+  gapsRecovered: "gaps_recovered",
+  lastHiroSync: "last_hiro_sync",
+  lastGapDetected: "last_gap_detected",
 } as const;
 
 export class NonceDO {
@@ -154,6 +185,11 @@ export class NonceDO {
     this.setStateValue(STATE_KEYS.conflictsDetected, conflictsDetected);
   }
 
+  private incrementGapsRecovered(): void {
+    const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered) + 1;
+    this.setStateValue(STATE_KEYS.gapsRecovered, gapsRecovered);
+  }
+
   private async scheduleAlarm(): Promise<void> {
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
   }
@@ -167,7 +203,7 @@ export class NonceDO {
     await this.state.storage.put(SPONSOR_ADDRESS_KEY, address);
   }
 
-  private async fetchPossibleNextNonce(sponsorAddress: string): Promise<number> {
+  private async fetchNonceInfo(sponsorAddress: string): Promise<HiroNonceInfo> {
     const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/address/${sponsorAddress}/nonces`;
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
     const response = await fetch(url, {
@@ -179,12 +215,20 @@ export class NonceDO {
       throw new Error(`Hiro nonce endpoint responded with ${response.status}`);
     }
 
-    const data = (await response.json()) as { possible_next_nonce?: number };
+    const data = (await response.json()) as Partial<HiroNonceInfo>;
     if (typeof data?.possible_next_nonce !== "number") {
       throw new Error("Hiro nonce response missing possible_next_nonce");
     }
 
-    return data.possible_next_nonce;
+    return {
+      last_executed_tx_nonce: typeof data.last_executed_tx_nonce === "number"
+        ? data.last_executed_tx_nonce
+        : null,
+      possible_next_nonce: data.possible_next_nonce,
+      detected_missing_nonces: Array.isArray(data.detected_missing_nonces)
+        ? data.detected_missing_nonces
+        : [],
+    };
   }
 
   private async writeNonceCache(
@@ -213,7 +257,8 @@ export class NonceDO {
 
       let currentNonce = this.getStoredNonce();
       if (currentNonce === null) {
-        currentNonce = await this.fetchPossibleNextNonce(sponsorAddress);
+        const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+        currentNonce = nonceInfo.possible_next_nonce;
       }
 
       const assignedNonce = currentNonce;
@@ -272,6 +317,9 @@ export class NonceDO {
     const lastAssignedNonce = this.getStateValue(STATE_KEYS.lastAssignedNonce);
     const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
     const nextNonce = this.getStoredNonce();
+    const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered);
+    const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
+    const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
 
     const txidRows = this.sql
       .exec<{ count: number }>("SELECT COUNT(*) as count FROM nonce_txids")
@@ -285,6 +333,167 @@ export class NonceDO {
       lastAssignedAt: lastAssignedAtMs ? new Date(lastAssignedAtMs).toISOString() : null,
       nextNonce,
       txidCount,
+      gapsRecovered,
+      lastHiroSync: lastHiroSyncMs ? new Date(lastHiroSyncMs).toISOString() : null,
+      lastGapDetected: lastGapDetectedMs ? new Date(lastGapDetectedMs).toISOString() : null,
+    };
+  }
+
+  /**
+   * Core gap-aware nonce reconciliation against Hiro.
+   * Shared by alarm(), performResync(), and called within blockConcurrencyWhile.
+   *
+   * Applies three recovery strategies in order:
+   * 1. GAP RECOVERY — reset to the lowest missing nonce if we've advanced past it
+   * 2. FORWARD BUMP — advance to possible_next_nonce if chain is ahead
+   * 3. STALE DETECTION — reset if idle and our counter is ahead of the chain
+   *
+   * Returns null if nonceInfo could not be fetched (caller decides how to handle).
+   */
+  private async reconcileNonce(
+    sponsorAddress: string
+  ): Promise<ReconcileResult | null> {
+    let nonceInfo: HiroNonceInfo;
+    try {
+      nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+    } catch (_e) {
+      return null;
+    }
+
+    this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
+
+    const previousNonce = this.getStoredNonce();
+
+    if (previousNonce === null) {
+      this.setStoredNonce(nonceInfo.possible_next_nonce);
+      return {
+        previousNonce: null,
+        newNonce: nonceInfo.possible_next_nonce,
+        changed: true,
+        reason: "initialized from Hiro possible_next_nonce",
+      };
+    }
+
+    const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+
+    if (detected_missing_nonces.length > 0) {
+      const sortedGaps = [...detected_missing_nonces].sort((a, b) => a - b);
+      const lowestGap = sortedGaps[0];
+
+      if (previousNonce > lowestGap) {
+        this.setStoredNonce(lowestGap);
+        this.incrementGapsRecovered();
+        this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+        this.incrementConflictsDetected();
+        return {
+          previousNonce,
+          newNonce: lowestGap,
+          changed: true,
+          reason: `GAP RECOVERY: reset to lowest gap nonce ${lowestGap} (gaps: ${sortedGaps.join(",")})`,
+        };
+      }
+
+      // When previousNonce <= lowestGap, natural nonce progression will fill
+      // the gap — no adjustment needed. Record that gaps were detected.
+      this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+      return {
+        previousNonce,
+        newNonce: previousNonce,
+        changed: false,
+        reason: `gaps detected (${sortedGaps.join(",")}) but nonce ${previousNonce} will fill naturally`,
+      };
+    }
+
+    if (possible_next_nonce > previousNonce) {
+      this.setStoredNonce(possible_next_nonce);
+      this.incrementConflictsDetected();
+      return {
+        previousNonce,
+        newNonce: possible_next_nonce,
+        changed: true,
+        reason: `FORWARD BUMP: chain advanced to ${possible_next_nonce}`,
+      };
+    }
+
+    const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
+    const idleMs = lastAssignedAtMs !== null
+      ? Date.now() - lastAssignedAtMs
+      : Infinity;
+
+    if (idleMs > STALE_THRESHOLD_MS && previousNonce > possible_next_nonce) {
+      this.setStoredNonce(possible_next_nonce);
+      this.incrementConflictsDetected();
+      return {
+        previousNonce,
+        newNonce: possible_next_nonce,
+        changed: true,
+        reason: `STALE DETECTION: idle ${Math.round(idleMs / 1000)}s, reset to chain nonce ${possible_next_nonce}`,
+      };
+    }
+
+    return {
+      previousNonce,
+      newNonce: previousNonce,
+      changed: false,
+      reason: "nonce is consistent with chain state",
+    };
+  }
+
+  /**
+   * Gap-aware nonce reconciliation, returning a structured response for the RPC caller.
+   */
+  private async performResync(sponsorAddress: string): Promise<{
+    success: true;
+    action: "resync";
+    previousNonce: number | null;
+    newNonce: number | null;
+    changed: boolean;
+    reason: string;
+  }> {
+    const result = await this.reconcileNonce(sponsorAddress);
+    if (result === null) {
+      throw new Error("Hiro API unavailable");
+    }
+    return { success: true, action: "resync", ...result };
+  }
+
+  /**
+   * Perform a hard nonce reset to the safe floor: last_executed_tx_nonce + 1.
+   * This is the lowest nonce that cannot conflict with any confirmed transaction.
+   */
+  private async performReset(sponsorAddress: string): Promise<{
+    success: true;
+    action: "reset";
+    previousNonce: number | null;
+    newNonce: number;
+    changed: boolean;
+  }> {
+    let nonceInfo: HiroNonceInfo;
+    try {
+      nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+    } catch (_e) {
+      throw new Error("Hiro API unavailable");
+    }
+
+    this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
+
+    const currentNonce = this.getStoredNonce();
+    const safeFloor = nonceInfo.last_executed_tx_nonce === null
+      ? 0
+      : nonceInfo.last_executed_tx_nonce + 1;
+
+    const changed = currentNonce !== safeFloor;
+    this.setStoredNonce(safeFloor);
+    if (changed) {
+      this.incrementConflictsDetected();
+    }
+
+    return {
+      success: true,
+      action: "reset",
+      previousNonce: currentNonce,
+      newNonce: safeFloor,
+      changed,
     };
   }
 
@@ -295,23 +504,37 @@ export class NonceDO {
         if (!sponsorAddress) {
           return;
         }
-
-        const possibleNextNonce = await this.fetchPossibleNextNonce(sponsorAddress);
-        const currentNonce = this.getStoredNonce();
-
-        if (currentNonce === null) {
-          this.setStoredNonce(possibleNextNonce);
-          return;
-        }
-
-        if (possibleNextNonce > currentNonce) {
-          this.setStoredNonce(possibleNextNonce);
-          this.incrementConflictsDetected();
-        }
+        // reconcileNonce returns null when Hiro is unreachable — silently
+        // skip this cycle and let the next alarm retry.
+        await this.reconcileNonce(sponsorAddress);
       } finally {
         await this.scheduleAlarm();
       }
     });
+  }
+
+  /**
+   * Shared handler for /resync and /reset RPC routes.
+   * Gets sponsor address, runs the appropriate recovery action inside
+   * blockConcurrencyWhile, and maps "Hiro API unavailable" to 503.
+   */
+  private async handleRecoveryAction(action: "resync" | "reset"): Promise<Response> {
+    try {
+      const sponsorAddress = await this.getStoredSponsorAddress();
+      if (!sponsorAddress) {
+        return this.badRequest("No sponsor address stored; call /assign first");
+      }
+      const result = action === "reset"
+        ? await this.state.blockConcurrencyWhile(() => this.performReset(sponsorAddress))
+        : await this.state.blockConcurrencyWhile(() => this.performResync(sponsorAddress));
+      return this.jsonResponse(result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      if (message === "Hiro API unavailable") {
+        return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
+      }
+      return this.internalError(error);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -384,6 +607,12 @@ export class NonceDO {
       } catch (error) {
         return this.internalError(error);
       }
+    }
+
+    if (request.method === "POST" && (url.pathname === "/resync" || url.pathname === "/reset")) {
+      return this.handleRecoveryAction(
+        url.pathname === "/reset" ? "reset" : "resync"
+      );
     }
 
     return new Response("Not found", { status: 404 });
