@@ -1038,6 +1038,8 @@ export interface DedupResult {
   blockHeight?: number;
   /** Hex-encoded fully-sponsored transaction for consistent dedup responses */
   sponsoredTx?: string;
+  /** Unix timestamp (ms) when this dedup entry was recorded */
+  recordedAt?: number;
 }
 
 /**

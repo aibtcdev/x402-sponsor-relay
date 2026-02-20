@@ -144,8 +144,11 @@ const VALID_MNEMONIC_LENGTHS = [12, 24];
 const GAP_FILL_AMOUNT = 1n;
 /** Gap-fill fee: 30,000 uSTX (high enough for RBF priority) */
 const GAP_FILL_FEE = 30_000n;
-/** Default recipient for gap-fill self-transfers */
-const DEFAULT_FLUSH_RECIPIENT = "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC";
+/** Default recipient for gap-fill self-transfers, per network */
+const DEFAULT_FLUSH_RECIPIENT_MAINNET = "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC";
+const DEFAULT_FLUSH_RECIPIENT_TESTNET = "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB";
+/** Maximum number of gap-fill broadcasts per alarm cycle per wallet */
+const MAX_GAP_FILLS_PER_ALARM = 5;
 
 // Legacy single-wallet pool key (migrated to pool:0 on first access)
 const POOL_KEY = "pool";
@@ -415,7 +418,10 @@ export class NonceDO {
     privateKey: string
   ): Promise<string | null> {
     const network = this.env.STACKS_NETWORK ?? "testnet";
-    const recipient = this.env.FLUSH_RECIPIENT ?? DEFAULT_FLUSH_RECIPIENT;
+    const defaultRecipient = network === "mainnet"
+      ? DEFAULT_FLUSH_RECIPIENT_MAINNET
+      : DEFAULT_FLUSH_RECIPIENT_TESTNET;
+    const recipient = this.env.FLUSH_RECIPIENT ?? defaultRecipient;
     try {
       const tx = await makeSTXTokenTransfer({
         recipient,
@@ -968,11 +974,13 @@ export class NonceDO {
 
       this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
 
-      // Actively fill gaps: derive key and broadcast 1 uSTX transfers for each gap nonce
+      // Actively fill gaps: derive key and broadcast 1 uSTX transfers for each gap nonce.
+      // Cap per-alarm fills to avoid exceeding Cloudflare alarm execution time limits.
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
       const filled: number[] = [];
+      const gapsToFill = sortedGaps.slice(0, MAX_GAP_FILLS_PER_ALARM);
       if (privateKey) {
-        for (const gapNonce of sortedGaps) {
+        for (const gapNonce of gapsToFill) {
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
           if (txid) {
             console.log(

@@ -40,6 +40,8 @@ const MAX_POLL_DELAY_MS = 8_000;
 // KV dedup configuration
 const DEDUP_TTL_SECONDS = 300;
 const DEDUP_KEY_PREFIX = "dedup:";
+/** Only verify liveness of pending dedup entries older than this (ms) */
+const DEDUP_LIVENESS_AGE_MS = 60_000;
 
 /** Shape of Hiro GET /extended/v1/tx/{txid} response (subset) */
 interface HiroTxResponse {
@@ -804,10 +806,11 @@ export class SettlementService {
 
       const result = JSON.parse(cached) as DedupResult;
 
-      // For "pending" entries, verify the txid is still alive before returning.
-      // If the transaction was dropped or replaced, the cached entry is stale and
-      // must be invalidated so the caller can submit a fresh broadcast.
-      if (result.status === "pending") {
+      // For "pending" entries older than DEDUP_LIVENESS_AGE_MS, verify the txid is
+      // still alive. Fresh entries are trusted to avoid adding Hiro API latency to
+      // the hot path on every dedup hit.
+      const entryAge = result.recordedAt ? Date.now() - result.recordedAt : Infinity;
+      if (result.status === "pending" && entryAge > DEDUP_LIVENESS_AGE_MS) {
         const alive = await this.verifyTxidAlive(result.txid);
         if (!alive) {
           this.logger.warn("Dedup stale: pending txid is dead, invalidating cache entry", {
@@ -848,9 +851,11 @@ export class SettlementService {
     try {
       const txHash = await this.computeTxHash(sponsoredTxHex);
       const key = `${DEDUP_KEY_PREFIX}${txHash}`;
-      await this.env.RELAY_KV.put(key, JSON.stringify(result), {
-        expirationTtl: DEDUP_TTL_SECONDS,
-      });
+      await this.env.RELAY_KV.put(
+        key,
+        JSON.stringify({ ...result, recordedAt: Date.now() }),
+        { expirationTtl: DEDUP_TTL_SECONDS }
+      );
 
       this.logger.debug("Dedup result recorded in KV", {
         txHash: this.truncateHash(txHash),
