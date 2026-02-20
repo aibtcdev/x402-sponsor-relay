@@ -11,7 +11,7 @@ import {
   generateNewAccount,
   generateWallet,
 } from "@stacks/wallet-sdk";
-import type { Env, Logger, FeeTransactionType } from "../types";
+import type { Env, Logger, FeeTransactionType, WalletStatus, WalletsResponse } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 import { FeeService } from "./fee";
 
@@ -630,6 +630,218 @@ export class SponsorService {
         details: e instanceof Error ? e.message : "Unknown error",
       };
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Wallet status monitoring
+  // ---------------------------------------------------------------------------
+
+  /** Balance thresholds in microSTX for classifying wallet health */
+  private static readonly LOW_BALANCE_WARNING = "1000000";   // 1 STX
+  private static readonly DEPLETED_THRESHOLD = "100000";     // 0.1 STX
+
+  /**
+   * Fetch the STX balance for a sponsor wallet address from Hiro.
+   * Caches the result in RELAY_KV for 60 seconds to avoid hammering the API.
+   * Returns balance as a microSTX string, or "0" on failure.
+   */
+  private async fetchWalletBalance(address: string): Promise<string> {
+    const cacheKey = `wallet_balance:${address}`;
+
+    // Try cache first
+    if (this.env.RELAY_KV) {
+      try {
+        const cached = await this.env.RELAY_KV.get(cacheKey);
+        if (cached !== null) {
+          return cached;
+        }
+      } catch (_e) {
+        // Cache miss — proceed to live fetch
+      }
+    }
+
+    // Live fetch from Hiro
+    const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/v2/accounts/${address}?proof=0`;
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    try {
+      const response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        this.logger.warn("Hiro account endpoint error for wallet balance", {
+          address,
+          status: response.status,
+        });
+        return "0";
+      }
+      const data = (await response.json()) as { balance?: string };
+      const balance = typeof data?.balance === "string" ? data.balance : "0";
+
+      // Cache the result for 60 seconds
+      if (this.env.RELAY_KV) {
+        await this.env.RELAY_KV.put(cacheKey, balance, { expirationTtl: 60 }).catch(() => {});
+      }
+
+      return balance;
+    } catch (e) {
+      this.logger.warn("Failed to fetch wallet balance from Hiro", {
+        address,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return "0";
+    }
+  }
+
+  /**
+   * Fetch per-wallet fee stats from NonceDO /wallet-fees/:index.
+   * Returns zeroed stats on failure.
+   */
+  private async fetchWalletFeeStats(walletIndex: number): Promise<{
+    totalFeesSpent: string;
+    txCount: number;
+    txCountToday: number;
+    feesToday: string;
+  }> {
+    const empty = { totalFeesSpent: "0", txCount: 0, txCountToday: 0, feesToday: "0" };
+    if (!this.env.NONCE_DO) {
+      return empty;
+    }
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch(`https://nonce-do/wallet-fees/${walletIndex}`, {
+        method: "GET",
+      });
+      if (!response.ok) {
+        return empty;
+      }
+      const data = (await response.json()) as Partial<typeof empty>;
+      return {
+        totalFeesSpent: typeof data.totalFeesSpent === "string" ? data.totalFeesSpent : "0",
+        txCount: typeof data.txCount === "number" ? data.txCount : 0,
+        txCountToday: typeof data.txCountToday === "number" ? data.txCountToday : 0,
+        feesToday: typeof data.feesToday === "string" ? data.feesToday : "0",
+      };
+    } catch (e) {
+      this.logger.warn("Failed to fetch wallet fee stats from NonceDO", {
+        walletIndex,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return empty;
+    }
+  }
+
+  /**
+   * Fetch the current pool state for all wallets from NonceDO /stats.
+   * Returns a map of walletIndex → { available, reserved, maxNonce }.
+   */
+  private async fetchNoncePoolStats(): Promise<Map<number, { available: number; reserved: number; maxNonce: number }>> {
+    const result = new Map<number, { available: number; reserved: number; maxNonce: number }>();
+    if (!this.env.NONCE_DO) {
+      return result;
+    }
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch("https://nonce-do/stats", { method: "GET" });
+      if (!response.ok) {
+        return result;
+      }
+      const data = (await response.json()) as { wallets?: Array<{ walletIndex: number; available: number; reserved: number; maxNonce: number }> };
+      for (const w of data.wallets ?? []) {
+        result.set(w.walletIndex, {
+          available: w.available ?? 0,
+          reserved: w.reserved ?? 0,
+          maxNonce: w.maxNonce ?? 0,
+        });
+      }
+    } catch (e) {
+      this.logger.warn("Failed to fetch nonce pool stats from NonceDO", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    return result;
+  }
+
+  /**
+   * Classify wallet health based on current STX balance.
+   */
+  private classifyWalletStatus(balance: string): "healthy" | "low_balance" | "depleted" {
+    try {
+      const b = BigInt(balance || "0");
+      if (b >= BigInt(SponsorService.LOW_BALANCE_WARNING)) return "healthy";
+      if (b >= BigInt(SponsorService.DEPLETED_THRESHOLD)) return "low_balance";
+      return "depleted";
+    } catch {
+      return "depleted";
+    }
+  }
+
+  /**
+   * Get the status of all configured sponsor wallets.
+   * Fetches balances from Hiro (60s cache), fee stats from NonceDO,
+   * and pool state from NonceDO. Returns a WalletsResponse for GET /wallets.
+   */
+  async getWalletStatuses(): Promise<WalletsResponse> {
+    const network = this.getNetwork();
+    const walletCount = this.getWalletCount();
+
+    // Fetch pool stats once (all wallets in one NonceDO call)
+    const poolStats = await this.fetchNoncePoolStats();
+
+    // Build per-wallet status in parallel
+    const walletPromises: Promise<WalletStatus>[] = [];
+    for (let i = 0; i < walletCount; i++) {
+      walletPromises.push((async (walletIndex: number): Promise<WalletStatus> => {
+        const key = await this.getSponsorKeyForWallet(walletIndex);
+        const address = key ? getAddressFromPrivateKey(key, network) : `wallet-${walletIndex}-unconfigured`;
+
+        const [balance, feeStats] = await Promise.all([
+          key ? this.fetchWalletBalance(address) : Promise.resolve("0"),
+          this.fetchWalletFeeStats(walletIndex),
+        ]);
+
+        const pool = poolStats.get(walletIndex) ?? { available: 0, reserved: 0, maxNonce: 0 };
+        const status = this.classifyWalletStatus(balance);
+
+        return {
+          index: walletIndex,
+          address,
+          balance,
+          totalFeesSpent: feeStats.totalFeesSpent,
+          txCount: feeStats.txCount,
+          txCountToday: feeStats.txCountToday,
+          feesToday: feeStats.feesToday,
+          pool,
+          status,
+        };
+      })(i));
+    }
+
+    const wallets = await Promise.all(walletPromises);
+
+    // Aggregate totals
+    let totalBalance = BigInt(0);
+    let totalFeesSpent = BigInt(0);
+    let totalTxCount = 0;
+    for (const w of wallets) {
+      try { totalBalance += BigInt(w.balance || "0"); } catch { /* skip */ }
+      try { totalFeesSpent += BigInt(w.totalFeesSpent || "0"); } catch { /* skip */ }
+      totalTxCount += w.txCount;
+    }
+
+    return {
+      wallets,
+      totals: {
+        totalBalance: totalBalance.toString(),
+        totalFeesSpent: totalFeesSpent.toString(),
+        totalTxCount,
+        walletCount,
+      },
+      thresholds: {
+        lowBalanceWarning: SponsorService.LOW_BALANCE_WARNING,
+        depletedThreshold: SponsorService.DEPLETED_THRESHOLD,
+      },
+    };
   }
 }
 
