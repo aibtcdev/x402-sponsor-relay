@@ -1,6 +1,6 @@
 import type { Logger, PaymentReceipt, SettlementResult, SettleOptions } from "../types";
 
-const DEFAULT_RECEIPT_TTL_SECONDS = 3600; // 1 hour
+const DEFAULT_RECEIPT_TTL_SECONDS = 2592000; // 30 days
 const KV_PREFIX = "receipt:";
 
 export class ReceiptService {

@@ -142,11 +142,11 @@ export class SettlementService {
 
     // Token type must be one of the currently supported values
     const tokenType = settle.tokenType || "STX";
-    if (tokenType !== "STX" && tokenType !== "sBTC") {
+    if (tokenType !== "STX" && tokenType !== "sBTC" && tokenType !== "USDCx") {
       return {
         valid: false,
         error: "Invalid token type",
-        details: `Unsupported token type: ${tokenType}. Valid types: STX, sBTC`,
+        details: `Unsupported token type: ${tokenType}. Valid types: STX, sBTC, USDCx`,
       };
     }
 
