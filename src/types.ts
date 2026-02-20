@@ -58,6 +58,8 @@ export interface Env {
   API_KEYS_KV?: KVNamespace;
   // Durable Object namespace for nonce coordination
   NONCE_DO?: DurableObjectNamespace;
+  // Durable Object namespace for atomic stats (replaces KV read-modify-write)
+  STATS_DO?: DurableObjectNamespace;
 }
 
 /**

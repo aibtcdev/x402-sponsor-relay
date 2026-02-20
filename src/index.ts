@@ -9,6 +9,7 @@ import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
 import { SettlementHealthService } from "./services";
 export { NonceDO } from "./durable-objects/nonce-do";
+export { StatsDO } from "./durable-objects/stats-do";
 
 // Create Hono app with type safety
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
