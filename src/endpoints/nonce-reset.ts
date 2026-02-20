@@ -4,6 +4,7 @@ import {
   Error400Response,
   Error401Response,
   Error500Response,
+  Error502Response,
 } from "../schemas";
 
 type NonceResetAction = "resync" | "reset";
@@ -104,6 +105,7 @@ export class NonceReset extends BaseEndpoint {
       "400": Error400Response,
       "401": Error401Response,
       "500": Error500Response,
+      "502": { ...Error502Response, description: "Hiro API unavailable during nonce recovery" },
     },
   };
 

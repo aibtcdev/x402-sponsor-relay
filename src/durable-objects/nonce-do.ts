@@ -393,23 +393,14 @@ export class NonceDO {
         };
       }
 
-      if (previousNonce < possible_next_nonce) {
-        this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
-        this.setStoredNonce(possible_next_nonce);
-        this.incrementConflictsDetected();
-        return {
-          previousNonce,
-          newNonce: possible_next_nonce,
-          changed: true,
-          reason: `FORWARD BUMP with gaps: advanced to possible_next_nonce ${possible_next_nonce}`,
-        };
-      }
-
+      // When previousNonce <= lowestGap, natural nonce progression will fill
+      // the gap — no adjustment needed. Record that gaps were detected.
+      this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
       return {
         previousNonce,
         newNonce: previousNonce,
         changed: false,
-        reason: "gaps detected but no adjustment needed",
+        reason: `gaps detected (${sortedGaps.join(",")}) but nonce ${previousNonce} will fill naturally`,
       };
     }
 
