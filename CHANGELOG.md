@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.8.2...v1.9.0) (2026-02-20)
+
+
+### Features
+
+* **dashboard:** local timezone + per-transaction log ([#65](https://github.com/aibtcdev/x402-sponsor-relay/issues/65)) ([c090ab5](https://github.com/aibtcdev/x402-sponsor-relay/commit/c090ab55658ee11f6b135b6c302bf4983ca4833d))
+
 ## [1.8.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.8.1...v1.8.2) (2026-02-18)
 
 
