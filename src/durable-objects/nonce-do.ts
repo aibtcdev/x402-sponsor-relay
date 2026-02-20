@@ -326,6 +326,168 @@ export class NonceDO {
     };
   }
 
+  /**
+   * Perform a gap-aware nonce reconciliation against Hiro without rescheduling the alarm.
+   * Applies the same three recovery strategies as alarm() (GAP RECOVERY, FORWARD BUMP, STALE DETECTION).
+   */
+  private async performResync(sponsorAddress: string): Promise<{
+    success: true;
+    action: "resync";
+    previousNonce: number | null;
+    newNonce: number | null;
+    changed: boolean;
+    reason: string;
+  }> {
+    let nonceInfo: HiroNonceInfo;
+    try {
+      nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+    } catch (_e) {
+      throw new Error("Hiro API unavailable");
+    }
+
+    this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
+
+    const currentNonce = this.getStoredNonce();
+
+    if (currentNonce === null) {
+      this.setStoredNonce(nonceInfo.possible_next_nonce);
+      return {
+        success: true,
+        action: "resync",
+        previousNonce: null,
+        newNonce: nonceInfo.possible_next_nonce,
+        changed: true,
+        reason: "initialized from Hiro possible_next_nonce",
+      };
+    }
+
+    const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+
+    if (detected_missing_nonces.length > 0) {
+      const sortedGaps = [...detected_missing_nonces].sort((a, b) => a - b);
+      const lowestGap = sortedGaps[0];
+
+      if (currentNonce > lowestGap) {
+        const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered) + 1;
+        this.setStoredNonce(lowestGap);
+        this.setStateValue(STATE_KEYS.gapsRecovered, gapsRecovered);
+        this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+        this.incrementConflictsDetected();
+        return {
+          success: true,
+          action: "resync",
+          previousNonce: currentNonce,
+          newNonce: lowestGap,
+          changed: true,
+          reason: `GAP RECOVERY: reset to lowest gap nonce ${lowestGap} (gaps: ${sortedGaps.join(",")})`,
+        };
+      }
+
+      if (currentNonce < possible_next_nonce) {
+        this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+        this.setStoredNonce(possible_next_nonce);
+        this.incrementConflictsDetected();
+        return {
+          success: true,
+          action: "resync",
+          previousNonce: currentNonce,
+          newNonce: possible_next_nonce,
+          changed: true,
+          reason: `FORWARD BUMP with gaps: advanced to possible_next_nonce ${possible_next_nonce}`,
+        };
+      }
+
+      return {
+        success: true,
+        action: "resync",
+        previousNonce: currentNonce,
+        newNonce: currentNonce,
+        changed: false,
+        reason: "gaps detected but no adjustment needed",
+      };
+    }
+
+    if (possible_next_nonce > currentNonce) {
+      this.setStoredNonce(possible_next_nonce);
+      this.incrementConflictsDetected();
+      return {
+        success: true,
+        action: "resync",
+        previousNonce: currentNonce,
+        newNonce: possible_next_nonce,
+        changed: true,
+        reason: `FORWARD BUMP: chain advanced to ${possible_next_nonce}`,
+      };
+    }
+
+    const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
+    const idleMs = lastAssignedAtMs !== null
+      ? Date.now() - lastAssignedAtMs
+      : Infinity;
+
+    if (idleMs > STALE_THRESHOLD_MS && currentNonce > possible_next_nonce) {
+      this.setStoredNonce(possible_next_nonce);
+      this.incrementConflictsDetected();
+      return {
+        success: true,
+        action: "resync",
+        previousNonce: currentNonce,
+        newNonce: possible_next_nonce,
+        changed: true,
+        reason: `STALE DETECTION: idle ${Math.round(idleMs / 1000)}s, reset to chain nonce ${possible_next_nonce}`,
+      };
+    }
+
+    return {
+      success: true,
+      action: "resync",
+      previousNonce: currentNonce,
+      newNonce: currentNonce,
+      changed: false,
+      reason: "nonce is consistent with chain state",
+    };
+  }
+
+  /**
+   * Perform a hard nonce reset to the safe floor: last_executed_tx_nonce + 1.
+   * This is the lowest nonce that cannot conflict with any confirmed transaction.
+   */
+  private async performReset(sponsorAddress: string): Promise<{
+    success: true;
+    action: "reset";
+    previousNonce: number | null;
+    newNonce: number;
+    changed: boolean;
+  }> {
+    let nonceInfo: HiroNonceInfo;
+    try {
+      nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+    } catch (_e) {
+      throw new Error("Hiro API unavailable");
+    }
+
+    this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
+
+    const currentNonce = this.getStoredNonce();
+    const safeFloor = nonceInfo.last_executed_tx_nonce === null
+      ? 0
+      : nonceInfo.last_executed_tx_nonce + 1;
+
+    const changed = currentNonce !== safeFloor;
+    this.setStoredNonce(safeFloor);
+    if (changed) {
+      this.incrementConflictsDetected();
+    }
+
+    return {
+      success: true,
+      action: "reset",
+      previousNonce: currentNonce,
+      newNonce: safeFloor,
+      changed,
+    };
+  }
+
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
@@ -477,6 +639,44 @@ export class NonceDO {
         const stats = await this.getStats();
         return this.jsonResponse(stats);
       } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/resync") {
+      try {
+        const sponsorAddress = await this.getStoredSponsorAddress();
+        if (!sponsorAddress) {
+          return this.badRequest("No sponsor address stored; call /assign first");
+        }
+        const result = await this.state.blockConcurrencyWhile(() =>
+          this.performResync(sponsorAddress)
+        );
+        return this.jsonResponse(result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        if (message === "Hiro API unavailable") {
+          return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
+        }
+        return this.internalError(error);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/reset") {
+      try {
+        const sponsorAddress = await this.getStoredSponsorAddress();
+        if (!sponsorAddress) {
+          return this.badRequest("No sponsor address stored; call /assign first");
+        }
+        const result = await this.state.blockConcurrencyWhile(() =>
+          this.performReset(sponsorAddress)
+        );
+        return this.jsonResponse(result);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        if (message === "Hiro API unavailable") {
+          return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
+        }
         return this.internalError(error);
       }
     }
