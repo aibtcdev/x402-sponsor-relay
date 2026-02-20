@@ -1,3 +1,8 @@
+import {
+  makeSTXTokenTransfer,
+  broadcastTransaction,
+} from "@stacks/transactions";
+import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
 import type { Env } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 
@@ -274,6 +279,93 @@ export class NonceDO {
   private incrementGapsFilled(): void {
     const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled) + 1;
     this.setStateValue(STATE_KEYS.gapsFilled, gapsFilled);
+  }
+
+  /**
+   * Derive the private key for a specific wallet index from the mnemonic.
+   * Falls back to SPONSOR_PRIVATE_KEY for wallet 0 if no mnemonic is set.
+   * Uses the same derivation pattern as SponsorService.deriveSponsorKeyForIndex.
+   */
+  private async derivePrivateKeyForWallet(walletIndex: number): Promise<string | null> {
+    if (this.env.SPONSOR_MNEMONIC) {
+      const words = this.env.SPONSOR_MNEMONIC.trim().split(/\s+/);
+      if (![12, 24].includes(words.length)) return null;
+      try {
+        const wallet = await generateWallet({
+          secretKey: this.env.SPONSOR_MNEMONIC,
+          password: "",
+        });
+        for (let i = wallet.accounts.length; i <= walletIndex; i++) {
+          generateNewAccount(wallet);
+        }
+        const account = wallet.accounts[walletIndex];
+        return account?.stxPrivateKey ?? null;
+      } catch {
+        return null;
+      }
+    }
+    // Fallback: SPONSOR_PRIVATE_KEY is only valid for wallet 0
+    if (walletIndex === 0 && this.env.SPONSOR_PRIVATE_KEY) {
+      return this.env.SPONSOR_PRIVATE_KEY;
+    }
+    return null;
+  }
+
+  /**
+   * Broadcast a gap-fill STX transfer for a specific nonce.
+   * Returns the txid on success, null if the nonce is already occupied or on error.
+   * Amount: 1 uSTX. Fee: 30,000 uSTX (RBF-capable). Memo: gap-fill-{nonce}.
+   */
+  private async fillGapNonce(
+    walletIndex: number,
+    gapNonce: number,
+    privateKey: string
+  ): Promise<string | null> {
+    const network = this.env.STACKS_NETWORK ?? "testnet";
+    const flushRecipient = this.env.FLUSH_RECIPIENT ?? "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC";
+    try {
+      const tx = await makeSTXTokenTransfer({
+        recipient: flushRecipient,
+        amount: 1n,
+        senderKey: privateKey,
+        network,
+        nonce: BigInt(gapNonce),
+        fee: 30000n,
+        memo: `gap-fill-${gapNonce}`,
+      });
+      const result = await broadcastTransaction({ transaction: tx, network });
+      if ("txid" in result) {
+        return result.txid;
+      }
+      // Cast to access raw reason string — Hiro may return values not in the typed union
+      // (e.g. "ConflictingNonceInMempool" when a tx with same nonce is already in mempool)
+      const rejection = result as unknown as { reason?: string; error?: string };
+      if (rejection.reason === "ConflictingNonceInMempool") {
+        // Nonce already occupied — not an error, just skip
+        return null;
+      }
+      // Other rejection — log and continue
+      console.warn(
+        JSON.stringify({
+          action: "gap_fill_rejected",
+          walletIndex,
+          nonce: gapNonce,
+          reason: rejection.reason ?? "unknown",
+          error: rejection.error ?? "",
+        })
+      );
+      return null;
+    } catch (e) {
+      console.warn(
+        JSON.stringify({
+          action: "gap_fill_error",
+          walletIndex,
+          nonce: gapNonce,
+          error: e instanceof Error ? e.message : String(e),
+        })
+      );
+      return null;
+    }
   }
 
   private async scheduleAlarm(): Promise<void> {
@@ -773,11 +865,36 @@ export class NonceDO {
       }
 
       this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+
+      // Actively fill gaps: derive key and broadcast 1 uSTX transfers for each gap nonce
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      const filled: number[] = [];
+      if (privateKey) {
+        for (const gapNonce of sortedGaps) {
+          const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
+          if (txid) {
+            console.log(
+              JSON.stringify({
+                action: "gap_filled",
+                walletIndex,
+                nonce: gapNonce,
+                txid,
+              })
+            );
+            this.incrementGapsFilled();
+            filled.push(gapNonce);
+          }
+        }
+      }
+
       return {
         previousNonce,
         newNonce: previousNonce,
-        changed: false,
-        reason: `gaps detected (${sortedGaps.join(",")}) but nonce will fill naturally`,
+        changed: filled.length > 0,
+        reason:
+          filled.length > 0
+            ? `gap_filled: broadcast ${filled.length} fill tx(s) for nonces [${filled.join(",")}]`
+            : `gaps detected (${sortedGaps.join(",")}) but could not fill (no key or already occupied)`,
       };
     }
 
