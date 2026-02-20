@@ -576,10 +576,51 @@ Agent                    Relay                              Stacks
 
 **Idempotency:** Submitting the same sponsored tx hex within 5 minutes returns the cached result from KV (dedup). Safe for agents to retry on network failure.
 
+## Known Issues and Mitigations
+
+### Receipt Consumption Race Condition
+
+**Location:** `src/services/receipt.ts` — `markConsumed` method
+
+**The problem:** `markConsumed` performs a read-then-write without atomicity:
+1. Read the receipt from KV (`getReceipt`)
+2. Mutate `consumed = true` in memory
+3. Write the updated receipt back to KV
+
+Two concurrent POST /access requests for the same receiptId can both read `consumed=false`
+before either write completes, granting double access to the protected resource.
+
+**Severity:** Medium. Exploitable only when the same agent sends concurrent /access
+requests (e.g., aggressive retry on network timeout) or when two processes race on the
+same receiptId. Low risk on testnet; unacceptable for high-value production resources.
+
+**Mitigation options (ranked by implementation complexity):**
+
+1. **Durable Object — ReceiptDO** (best correctness)
+   - Each receipt lives in its own DO instance keyed by receiptId
+   - `markConsumed` is a single-threaded atomic operation inside the DO
+   - Use DO SQLite `UPDATE WHERE consumed=0 RETURNING` for compare-and-swap
+   - Requires: new DO class, migration, update ReceiptService to delegate to DO
+
+2. **D1 database** (good correctness, lower overhead than DO per instance)
+   - Store receipts in D1 instead of KV
+   - `markConsumed` uses `UPDATE receipts SET consumed=1 WHERE id=? AND consumed=0`
+   - Check rows affected: 0 means already consumed, reject access
+   - Requires: D1 binding, schema migration, rewrite of ReceiptService
+
+3. **Idempotency key on /access** (partial mitigation, no infra change)
+   - Client sends a unique idempotency key with each /access request
+   - Relay caches the first response in KV for 60s, keyed by (receiptId, idempotencyKey)
+   - Subsequent requests with the same key return the cached response without re-consuming
+   - Does not prevent two different idempotency keys from racing; reduces blast radius only
+
+**Current status:** KV read-then-write is the current implementation. Acceptable for
+testnet and low-concurrency scenarios. Migrate to option 1 or 2 before high-concurrency
+production use or high-value gated resources.
+
 ## Future Enhancements
 
 See GitHub issues for planned enhancements:
 - [#6 - SIP-018 signature verification](https://github.com/aibtcdev/x402-sponsor-relay/issues/6)
 - [#7 - ERC-8004 agent registry integration](https://github.com/aibtcdev/x402-sponsor-relay/issues/7)
-- Atomic receipt consumption (Durable Object or D1) for concurrent access safety
 - Configurable targetUrl allowlist for proxy endpoint
