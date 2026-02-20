@@ -156,6 +156,20 @@ const STATE_KEYS = {
 /** Round-robin wallet index storage key */
 const NEXT_WALLET_INDEX_KEY = "next_wallet_index";
 
+/**
+ * Structured error thrown when all sponsor wallets are at the chaining limit.
+ * Carries mempoolDepth so the /assign handler can build an actionable 429 response.
+ */
+class ChainingLimitError extends Error {
+  readonly mempoolDepth: number;
+
+  constructor(mempoolDepth: number) {
+    super("CHAINING_LIMIT_EXCEEDED");
+    this.name = "ChainingLimitError";
+    this.mempoolDepth = mempoolDepth;
+  }
+}
+
 /** Safely add two microSTX string amounts using BigInt to avoid overflow */
 function addMicroSTX(a: string, b: string): string {
   try {
@@ -709,19 +723,21 @@ export class NonceDO {
 
       // Try each wallet in round-robin order; skip any at chaining limit
       let attempts = 0;
+      let totalMempoolDepth = 0;
       while (attempts < effectiveWalletCount) {
         pool = await this.loadPoolOrInit(walletIndex, resolveAddress(walletIndex));
         if (pool.reserved.length < CHAINING_LIMIT) {
           break;
         }
-        // This wallet is at its chaining limit; try the next
+        // This wallet is at its chaining limit; accumulate depth and try the next
+        totalMempoolDepth += pool.reserved.length;
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
         pool = null;
         attempts++;
       }
 
       if (attempts === effectiveWalletCount || pool === null) {
-        throw new Error("CHAINING_LIMIT_EXCEEDED");
+        throw new ChainingLimitError(totalMempoolDepth);
       }
 
       // Store the per-wallet sponsor address (used by alarm reconciliation)
@@ -1206,9 +1222,17 @@ export class NonceDO {
         };
         return this.jsonResponse(response);
       } catch (error) {
-        if (error instanceof Error && error.message === "CHAINING_LIMIT_EXCEEDED") {
+        if (error instanceof ChainingLimitError) {
+          const mempoolDepth = error.mempoolDepth;
+          // Assume ~2 txs/s drain rate (conservative estimate for Stacks testnet/mainnet)
+          const estimatedDrainSeconds = Math.ceil(mempoolDepth / 2);
           return this.jsonResponse(
-            { error: "Chaining limit exceeded; too many in-flight nonces", code: "CHAINING_LIMIT_EXCEEDED" },
+            {
+              error: "Chaining limit exceeded; too many in-flight nonces",
+              code: "CHAINING_LIMIT_EXCEEDED",
+              mempoolDepth,
+              estimatedDrainSeconds,
+            },
             429
           );
         }
