@@ -23,6 +23,11 @@ interface LookupTxidResponse {
   nonce?: number;
 }
 
+interface ReleaseNonceRequest {
+  nonce: number;
+  txid?: string;
+}
+
 /**
  * Full response from Hiro GET /extended/v1/address/{addr}/nonces
  */
@@ -43,6 +48,18 @@ interface ReconcileResult {
   reason: string;
 }
 
+/**
+ * Reservation pool state — persisted as a single JSON object under the "pool" KV key.
+ * available: nonces ready to be assigned (pre-seeded, sorted ascending)
+ * reserved: nonces currently in-flight (assigned but not yet confirmed or released)
+ * maxNonce: highest nonce ever placed in the pool (used to extend when available runs low)
+ */
+interface PoolState {
+  available: number[];
+  reserved: number[];
+  maxNonce: number;
+}
+
 interface NonceStatsResponse {
   totalAssigned: number;
   conflictsDetected: number;
@@ -56,12 +73,24 @@ interface NonceStatsResponse {
   lastHiroSync: string | null;
   /** ISO timestamp of last gap detection (null if no gaps detected) */
   lastGapDetected: string | null;
+  /** Number of nonces currently available in the pool */
+  poolAvailable: number;
+  /** Number of nonces currently in-flight (reserved) */
+  poolReserved: number;
+  /** Maximum allowed concurrent in-flight nonces */
+  chainingLimit: number;
 }
+
+/** Maximum number of in-flight nonces allowed concurrently per sponsor wallet */
+const CHAINING_LIMIT = 25;
+/** Initial pool pre-seeds this many nonces ahead of the current head */
+const POOL_SEED_SIZE = CHAINING_LIMIT;
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 /** Reset to possible_next_nonce if no assignment in this window and we are ahead */
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 const SPONSOR_ADDRESS_KEY = "sponsor_address";
+const POOL_KEY = "pool";
 const STATE_KEYS = {
   current: "current",
   totalAssigned: "total_assigned",
@@ -203,6 +232,44 @@ export class NonceDO {
     await this.state.storage.put(SPONSOR_ADDRESS_KEY, address);
   }
 
+  // ---------------------------------------------------------------------------
+  // Pool state helpers (KV-style storage alongside SQLite)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Load the reservation pool state from DO storage.
+   * Returns null when no pool has been initialized yet.
+   */
+  private async loadPool(): Promise<PoolState | null> {
+    const pool = await this.state.storage.get<PoolState>(POOL_KEY);
+    return pool ?? null;
+  }
+
+  /**
+   * Persist the reservation pool state to DO storage.
+   */
+  private async savePool(pool: PoolState): Promise<void> {
+    await this.state.storage.put(POOL_KEY, pool);
+  }
+
+  /**
+   * Create and persist a fresh pool seeded from the given nonce.
+   * Pre-seeds POOL_SEED_SIZE nonces: [seedNonce, seedNonce+1, ..., seedNonce+(POOL_SEED_SIZE-1)]
+   */
+  private async initPool(seedNonce: number): Promise<PoolState> {
+    const available: number[] = [];
+    for (let i = 0; i < POOL_SEED_SIZE; i++) {
+      available.push(seedNonce + i);
+    }
+    const pool: PoolState = {
+      available,
+      reserved: [],
+      maxNonce: seedNonce + POOL_SEED_SIZE - 1,
+    };
+    await this.savePool(pool);
+    return pool;
+  }
+
   private async fetchNonceInfo(sponsorAddress: string): Promise<HiroNonceInfo> {
     const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/address/${sponsorAddress}/nonces`;
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
@@ -231,6 +298,13 @@ export class NonceDO {
     };
   }
 
+  /**
+   * Assign a nonce from the reservation pool.
+   *
+   * On first call: seeds the pool from the stored SQL counter (or Hiro if no counter yet).
+   * Enforces CHAINING_LIMIT — throws if too many nonces are already in-flight.
+   * Extends the pool automatically if available[] is empty.
+   */
   async assignNonce(sponsorAddress: string): Promise<number> {
     if (!sponsorAddress) {
       throw new Error("Missing sponsor address");
@@ -244,17 +318,80 @@ export class NonceDO {
         await this.scheduleAlarm();
       }
 
-      let currentNonce = this.getStoredNonce();
-      if (currentNonce === null) {
-        const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
-        currentNonce = nonceInfo.possible_next_nonce;
+      // Load or initialize the pool
+      let pool = await this.loadPool();
+      if (pool === null) {
+        // Migration: seed from existing SQL counter, or fetch from Hiro
+        let seedNonce = this.getStoredNonce();
+        if (seedNonce === null) {
+          const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+          seedNonce = nonceInfo.possible_next_nonce;
+          this.setStoredNonce(seedNonce);
+        }
+        pool = await this.initPool(seedNonce);
       }
 
-      const assignedNonce = currentNonce;
-      this.setStoredNonce(assignedNonce + 1);
+      // Enforce chaining limit
+      if (pool.reserved.length >= CHAINING_LIMIT) {
+        throw new Error("CHAINING_LIMIT_EXCEEDED");
+      }
+
+      // Extend pool if available is exhausted
+      if (pool.available.length === 0) {
+        const nextNonce = pool.maxNonce + 1;
+        pool.available.push(nextNonce);
+        pool.maxNonce = nextNonce;
+      }
+
+      // Assign the next available nonce
+      const assignedNonce = pool.available.shift()!;
+      pool.reserved.push(assignedNonce);
+
+      await this.savePool(pool);
       this.updateAssignedStats(assignedNonce);
+      // Keep the SQL counter in sync for stats compatibility
+      this.setStoredNonce(pool.available[0] ?? assignedNonce + 1);
 
       return assignedNonce;
+    });
+  }
+
+  /**
+   * Release a nonce back to the pool or mark it as consumed.
+   *
+   * txid present  → nonce was broadcast successfully (consumed); remove from reserved only.
+   * txid absent   → nonce was NOT broadcast (e.g. broadcast failure); return to available
+   *                 in sorted order so it can be reused.
+   */
+  async releaseNonce(nonce: number, txid?: string): Promise<void> {
+    return this.state.blockConcurrencyWhile(async () => {
+      const pool = await this.loadPool();
+      if (pool === null) {
+        // Pool not initialized yet — nothing to release
+        return;
+      }
+
+      const reservedIdx = pool.reserved.indexOf(nonce);
+      if (reservedIdx === -1) {
+        // Nonce not in reserved — already released or was never assigned from this pool
+        return;
+      }
+
+      // Remove from reserved
+      pool.reserved.splice(reservedIdx, 1);
+
+      if (!txid) {
+        // Unused nonce: return to available in sorted order
+        const insertIdx = pool.available.findIndex((n) => n > nonce);
+        if (insertIdx === -1) {
+          pool.available.push(nonce);
+        } else {
+          pool.available.splice(insertIdx, 0, nonce);
+        }
+      }
+      // If txid is provided, the nonce is consumed — do not return to available
+
+      await this.savePool(pool);
     });
   }
 
@@ -313,6 +450,9 @@ export class NonceDO {
       .toArray();
     const txidCount = txidRows.length > 0 ? txidRows[0].count : 0;
 
+    // Load pool state for reporting (non-blocking read outside blockConcurrencyWhile)
+    const pool = await this.loadPool();
+
     return {
       totalAssigned,
       conflictsDetected,
@@ -323,6 +463,9 @@ export class NonceDO {
       gapsRecovered,
       lastHiroSync: lastHiroSyncMs ? new Date(lastHiroSyncMs).toISOString() : null,
       lastGapDetected: lastGapDetectedMs ? new Date(lastGapDetectedMs).toISOString() : null,
+      poolAvailable: pool?.available.length ?? 0,
+      poolReserved: pool?.reserved.length ?? 0,
+      chainingLimit: CHAINING_LIMIT,
     };
   }
 
@@ -331,10 +474,11 @@ export class NonceDO {
    * Shared by alarm(), performResync(), and called within blockConcurrencyWhile.
    *
    * Applies three recovery strategies in order:
-   * 1. GAP RECOVERY — reset to the lowest missing nonce if we've advanced past it
-   * 2. FORWARD BUMP — advance to possible_next_nonce if chain is ahead
-   * 3. STALE DETECTION — reset if idle and our counter is ahead of the chain
+   * 1. GAP RECOVERY — reset pool.available to fresh range from lowest gap nonce
+   * 2. FORWARD BUMP — advance pool.available to possible_next_nonce
+   * 3. STALE DETECTION — reset pool.available if idle and counter is ahead of chain
    *
+   * IMPORTANT: never modifies pool.reserved (in-flight nonces).
    * Returns null if nonceInfo could not be fetched (caller decides how to handle).
    */
   private async reconcileNonce(
@@ -353,6 +497,11 @@ export class NonceDO {
 
     if (previousNonce === null) {
       this.setStoredNonce(nonceInfo.possible_next_nonce);
+      // Also reset pool if it exists
+      const pool = await this.loadPool();
+      if (pool !== null) {
+        await this.resetPoolAvailable(pool, nonceInfo.possible_next_nonce);
+      }
       return {
         previousNonce: null,
         newNonce: nonceInfo.possible_next_nonce,
@@ -372,6 +521,13 @@ export class NonceDO {
         this.incrementGapsRecovered();
         this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
         this.incrementConflictsDetected();
+
+        // Reset pool.available to fill from the gap; never touch pool.reserved
+        const pool = await this.loadPool();
+        if (pool !== null) {
+          await this.resetPoolAvailable(pool, lowestGap);
+        }
+
         return {
           previousNonce,
           newNonce: lowestGap,
@@ -394,6 +550,13 @@ export class NonceDO {
     if (possible_next_nonce > previousNonce) {
       this.setStoredNonce(possible_next_nonce);
       this.incrementConflictsDetected();
+
+      // Forward bump: pool.available should start at the chain's next nonce
+      const pool = await this.loadPool();
+      if (pool !== null) {
+        await this.resetPoolAvailable(pool, possible_next_nonce);
+      }
+
       return {
         previousNonce,
         newNonce: possible_next_nonce,
@@ -410,6 +573,13 @@ export class NonceDO {
     if (idleMs > STALE_THRESHOLD_MS && previousNonce > possible_next_nonce) {
       this.setStoredNonce(possible_next_nonce);
       this.incrementConflictsDetected();
+
+      // Stale detection: reset pool.available to chain's nonce
+      const pool = await this.loadPool();
+      if (pool !== null) {
+        await this.resetPoolAvailable(pool, possible_next_nonce);
+      }
+
       return {
         previousNonce,
         newNonce: possible_next_nonce,
@@ -424,6 +594,23 @@ export class NonceDO {
       changed: false,
       reason: "nonce is consistent with chain state",
     };
+  }
+
+  /**
+   * Reset pool.available to a fresh range starting at newHead.
+   * The number of slots pre-seeded is POOL_SEED_SIZE minus current reserved count,
+   * so we never overshoot the chaining limit.
+   * NEVER touches pool.reserved.
+   */
+  private async resetPoolAvailable(pool: PoolState, newHead: number): Promise<void> {
+    const availableSlots = Math.max(1, POOL_SEED_SIZE - pool.reserved.length);
+    const newAvailable: number[] = [];
+    for (let i = 0; i < availableSlots; i++) {
+      newAvailable.push(newHead + i);
+    }
+    pool.available = newAvailable;
+    pool.maxNonce = newHead + availableSlots - 1;
+    await this.savePool(pool);
   }
 
   /**
@@ -473,6 +660,12 @@ export class NonceDO {
     this.setStoredNonce(safeFloor);
     if (changed) {
       this.incrementConflictsDetected();
+    }
+
+    // Reset pool to safe floor
+    const pool = await this.loadPool();
+    if (pool !== null) {
+      await this.resetPoolAvailable(pool, safeFloor);
     }
 
     return {
@@ -542,6 +735,31 @@ export class NonceDO {
         const nonce = await this.assignNonce(body.sponsorAddress);
         const response: AssignNonceResponse = { nonce };
         return this.jsonResponse(response);
+      } catch (error) {
+        if (error instanceof Error && error.message === "CHAINING_LIMIT_EXCEEDED") {
+          return this.jsonResponse(
+            { error: "Chaining limit exceeded; too many in-flight nonces", code: "CHAINING_LIMIT_EXCEEDED" },
+            429
+          );
+        }
+        return this.internalError(error);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/release") {
+      const { value: body, errorResponse } =
+        await this.parseJson<ReleaseNonceRequest>(request);
+      if (errorResponse) {
+        return errorResponse;
+      }
+
+      if (typeof body?.nonce !== "number") {
+        return this.badRequest("Missing nonce");
+      }
+
+      try {
+        await this.releaseNonce(body.nonce, body.txid);
+        return this.jsonResponse({ success: true });
       } catch (error) {
         return this.internalError(error);
       }

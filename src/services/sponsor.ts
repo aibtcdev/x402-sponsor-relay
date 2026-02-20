@@ -629,3 +629,42 @@ export async function recordNonceTxid(
     });
   }
 }
+
+/**
+ * Return an unused nonce to the NonceDO reservation pool after a broadcast failure.
+ * Call this (via executionCtx.waitUntil or directly) when a sponsored transaction
+ * fails to broadcast so the nonce slot can be reused for the next request.
+ * Never throws — all errors are logged as warnings.
+ */
+export async function releaseNonceDO(
+  env: Env,
+  logger: Logger,
+  nonce: number
+): Promise<void> {
+  if (!env.NONCE_DO) {
+    return;
+  }
+
+  try {
+    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch("https://nonce-do/release", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      logger.warn("Nonce DO release failed", {
+        status: response.status,
+        body,
+        nonce,
+      });
+    }
+  } catch (e) {
+    logger.warn("Failed to release nonce to NonceDO", {
+      error: e instanceof Error ? e.message : String(e),
+      nonce,
+    });
+  }
+}
