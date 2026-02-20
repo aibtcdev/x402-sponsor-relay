@@ -231,17 +231,6 @@ export class NonceDO {
     };
   }
 
-  private async writeNonceCache(
-    sponsorAddress: string,
-    nonce: number
-  ): Promise<void> {
-    if (!this.env.RELAY_KV) {
-      return;
-    }
-
-    await this.env.RELAY_KV.put(`nonce:${sponsorAddress}`, nonce.toString());
-  }
-
   async assignNonce(sponsorAddress: string): Promise<number> {
     if (!sponsorAddress) {
       throw new Error("Missing sponsor address");
@@ -264,8 +253,6 @@ export class NonceDO {
       const assignedNonce = currentNonce;
       this.setStoredNonce(assignedNonce + 1);
       this.updateAssignedStats(assignedNonce);
-
-      this.state.waitUntil(this.writeNonceCache(sponsorAddress, assignedNonce));
 
       return assignedNonce;
     });
