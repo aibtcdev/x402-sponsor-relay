@@ -831,6 +831,39 @@ export interface AggregateKeyStats {
 }
 
 /**
+ * Endpoint that processed a transaction
+ */
+export type RelayEndpointName = "relay" | "sponsor" | "settle";
+
+/**
+ * Individual transaction log entry stored in KV
+ */
+export interface TransactionLogEntry {
+  /** ISO 8601 timestamp */
+  timestamp: string;
+  /** Which endpoint processed this transaction */
+  endpoint: RelayEndpointName;
+  /** Whether the transaction was successful */
+  success: boolean;
+  /** Token type */
+  tokenType: TokenType;
+  /** Payment amount in smallest unit */
+  amount: string;
+  /** Sponsor fee in microSTX (only for relay/sponsor) */
+  fee?: string;
+  /** On-chain txid (if broadcast succeeded) */
+  txid?: string;
+  /** Sender address (if known) */
+  sender?: string;
+  /** Recipient address (if known) */
+  recipient?: string;
+  /** Settlement status */
+  status?: "confirmed" | "pending" | "failed";
+  /** Block height (if confirmed) */
+  blockHeight?: number;
+}
+
+/**
  * Error categories for metrics tracking
  */
 export type ErrorCategory =

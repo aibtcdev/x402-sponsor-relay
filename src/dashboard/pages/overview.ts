@@ -21,7 +21,7 @@ function barChartSvg(sizeClass: string, extraClass = ""): string {
     </svg>`;
 }
 
-/** Formatted UTC timestamp for footer display */
+/** Formatted UTC timestamp for footer display (server-side) */
 function utcTimestamp(): string {
   return new Date().toLocaleString("en-US", {
     timeZone: "UTC",
@@ -177,6 +177,24 @@ ${footer(utcTimestamp())}
   // Module-scoped reference for auto-refresh interval
   var _txChartInstance = null;
 
+  // Convert UTC hour label ("HH:00") to visitor's local timezone.
+  // For non-hour labels (e.g. "Feb 12" from 7d view), return as-is.
+  function toLocalHour(utcLabel) {
+    var m = utcLabel.match(/^(\\d{2}):00$/);
+    if (!m) return utcLabel;
+    var now = new Date();
+    var d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), parseInt(m[1], 10)));
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  }
+
+  // Convert all labels in a chart config to local timezone
+  function localizeLabels(labels) {
+    return labels.map(toLocalHour);
+  }
+
+  // Localize the server-rendered config labels before first render
+  _chartConfig.data.labels = localizeLabels(_chartConfig.data.labels);
+
   // Alpine.js component for the transaction volume chart with period toggle
   function txChartApp() {
     return {
@@ -216,7 +234,7 @@ ${footer(utcTimestamp())}
         var canvas = document.getElementById('transactionChart');
         if (!canvas || typeof Chart === 'undefined') return;
         var config = JSON.parse(JSON.stringify(_chartConfig));
-        config.data.labels = hourlyData.map(function(d) { return d.hour; });
+        config.data.labels = localizeLabels(hourlyData.map(function(d) { return d.hour; }));
         config.data.datasets[0].data = hourlyData.map(function(d) { return d.transactions; });
         config.data.datasets[1].data = hourlyData.map(function(d) { return d.success; });
         this.chartInstance = new Chart(canvas, config);

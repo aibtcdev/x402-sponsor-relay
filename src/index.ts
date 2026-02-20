@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, Settle, VerifyV2, Supported } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, Settle, VerifyV2, Supported } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -87,6 +87,7 @@ openapi.post("/keys/provision-stx", ProvisionStx as unknown as typeof ProvisionS
 openapi.get("/fees", Fees as unknown as typeof Fees);
 openapi.post("/fees/config", FeesConfig as unknown as typeof FeesConfig);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
+openapi.get("/stats/transactions", TransactionLog as unknown as typeof Health);
 openapi.get("/nonce/stats", NonceStatsEndpoint as unknown as typeof NonceStatsEndpoint);
 openapi.post("/settle", Settle as unknown as typeof Settle);
 // Note: POST /verify (V2 facilitator) and GET /verify/:receiptId (receipt check)
@@ -123,6 +124,7 @@ app.get("/", (c) => {
       feesConfig: "POST /fees/config - Update fee clamps (admin, requires API key)",
       health: "GET /health - Health check with network info",
       stats: "GET /stats - Relay statistics (JSON)",
+      transactionLog: "GET /stats/transactions - Recent individual transactions",
       nonceStats: "GET /nonce/stats - Nonce coordinator stats",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
       settle: "POST /settle - x402 V2 facilitator settle",

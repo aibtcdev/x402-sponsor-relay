@@ -346,6 +346,19 @@ export class Relay extends BaseEndpoint {
           amount: body.settle.minAmount,
           fee: sponsorResult.fee,
         });
+        c.executionCtx.waitUntil(
+          statsService.logTransaction({
+            timestamp: new Date().toISOString(),
+            endpoint: "relay",
+            success: false,
+            tokenType: tokenTypeFailed,
+            amount: body.settle.minAmount,
+            fee: sponsorResult.fee,
+            sender: validation.senderAddress,
+            recipient: body.settle.expectedRecipient,
+            status: "failed",
+          })
+        );
 
         if (broadcastResult.nonceConflict) {
           return this.err(c, {
@@ -387,6 +400,29 @@ export class Relay extends BaseEndpoint {
         amount: body.settle.minAmount,
         fee: sponsorResult.fee,
       });
+
+      // Log individual transaction (non-blocking)
+      const logSenderAddress = settlementService.senderToAddress(
+        verifyResult.data.transaction,
+        c.env.STACKS_NETWORK
+      );
+      c.executionCtx.waitUntil(
+        statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "relay",
+          success: true,
+          tokenType,
+          amount: body.settle.minAmount,
+          fee: sponsorResult.fee,
+          txid: broadcastResult.txid,
+          sender: logSenderAddress,
+          recipient: verifyResult.data.recipient,
+          status: broadcastResult.status,
+          ...(broadcastResult.status === "confirmed"
+            ? { blockHeight: broadcastResult.blockHeight }
+            : {}),
+        })
+      );
 
       // Step F — Build settlement result and store payment receipt
       // Convert signer hash160 to human-readable Stacks address

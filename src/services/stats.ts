@@ -6,6 +6,7 @@ import type {
   DashboardOverview,
   ErrorCategory,
   FeeStats,
+  TransactionLogEntry,
 } from "../types";
 
 /**
@@ -484,5 +485,91 @@ export class StatsService {
     await this.kv.put(key, JSON.stringify(stats), {
       expirationTtl: HOURLY_TTL,
     });
+  }
+
+  // ===========================================================================
+  // Transaction Log — per-transaction records for recent history
+  // ===========================================================================
+
+  /** Max entries per day in the transaction log */
+  private static readonly TX_LOG_MAX = 500;
+  /** TTL for transaction log entries (7 days) */
+  private static readonly TX_LOG_TTL = 7 * 24 * 60 * 60;
+
+  /**
+   * Append a transaction to the daily log.
+   * Stored as a JSON array per day, capped at TX_LOG_MAX entries.
+   */
+  async logTransaction(entry: TransactionLogEntry): Promise<void> {
+    if (!this.kv) return;
+
+    try {
+      const dateKey = getDateKey();
+      const key = `tx:log:${dateKey}`;
+      const existing = await this.kv.get<TransactionLogEntry[]>(key, "json");
+      const log = existing || [];
+
+      log.push(entry);
+
+      // Cap at max entries per day (drop oldest)
+      if (log.length > StatsService.TX_LOG_MAX) {
+        log.splice(0, log.length - StatsService.TX_LOG_MAX);
+      }
+
+      await this.kv.put(key, JSON.stringify(log), {
+        expirationTtl: StatsService.TX_LOG_TTL,
+      });
+    } catch (e) {
+      this.logger.error("Failed to log transaction", {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+    }
+  }
+
+  /**
+   * Get recent transaction log entries across multiple days.
+   * Returns newest-first, up to `limit` entries.
+   */
+  async getTransactionLog(opts?: {
+    days?: number;
+    limit?: number;
+    endpoint?: string;
+  }): Promise<TransactionLogEntry[]> {
+    if (!this.kv) return [];
+
+    const days = opts?.days ?? 1;
+    const limit = opts?.limit ?? 50;
+
+    try {
+      const now = Date.now();
+      const dateKeys: string[] = [];
+      for (let i = 0; i < days; i++) {
+        dateKeys.push(
+          new Date(now - i * DAY_MS).toISOString().split("T")[0]
+        );
+      }
+
+      const results = await Promise.all(
+        dateKeys.map((d) => this.kv!.get<TransactionLogEntry[]>(`tx:log:${d}`, "json"))
+      );
+
+      let entries: TransactionLogEntry[] = [];
+      for (const dayLog of results) {
+        if (dayLog) entries.push(...dayLog);
+      }
+
+      // Filter by endpoint if requested
+      if (opts?.endpoint) {
+        entries = entries.filter((e) => e.endpoint === opts.endpoint);
+      }
+
+      // Return newest-first, capped at limit
+      return entries.reverse().slice(0, limit);
+    } catch (e) {
+      this.logger.error("Failed to get transaction log", {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+      return [];
+    }
   }
 }
