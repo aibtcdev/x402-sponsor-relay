@@ -38,7 +38,11 @@ export class Provision extends BaseEndpoint {
               properties: {
                 btcAddress: {
                   type: "string" as const,
-                  description: "Bitcoin address used to sign the message (any format: P2PKH, P2SH, Bech32, etc.)",
+                  description:
+                    "Bitcoin address used to sign the message. Best support: P2PKH (1...) and " +
+                    "P2SH-P2WPKH (3...). Native SegWit (bc1q...) may work with wallets that implement " +
+                    "BIP-137 SegWit extensions (e.g. Electrum, Sparrow). Taproot (bc1p...) is not " +
+                    "supported. For Stacks addresses, use POST /keys/provision-stx instead.",
                   example: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
                 },
                 signature: {

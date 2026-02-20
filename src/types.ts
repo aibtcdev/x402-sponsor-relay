@@ -527,7 +527,8 @@ export type RelayErrorCode =
   | "INVALID_AUTH_SIGNATURE"
   | "AUTH_EXPIRED"
   | "NONCE_RESET_FAILED"
-  | "NONCE_DO_UNAVAILABLE";
+  | "NONCE_DO_UNAVAILABLE"
+  | "UNSUPPORTED_ADDRESS_TYPE";
 
 /**
  * Structured error response with retry guidance
