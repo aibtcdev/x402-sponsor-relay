@@ -3,10 +3,16 @@ import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 
 interface AssignNonceRequest {
   sponsorAddress: string;
+  /** Number of wallets in rotation (default: 1). Controls round-robin range. */
+  walletCount?: number;
 }
 
 interface AssignNonceResponse {
   nonce: number;
+  /** Index of the wallet that was assigned this nonce (0-based) */
+  walletIndex: number;
+  /** Sponsor address echoed back for convenience */
+  sponsorAddress: string;
 }
 
 interface RecordTxidRequest {
@@ -26,6 +32,8 @@ interface LookupTxidResponse {
 interface ReleaseNonceRequest {
   nonce: number;
   txid?: string;
+  /** Which wallet pool to release to (default: 0) */
+  walletIndex?: number;
 }
 
 /**
@@ -49,7 +57,7 @@ interface ReconcileResult {
 }
 
 /**
- * Reservation pool state — persisted as a single JSON object under the "pool" KV key.
+ * Reservation pool state — persisted as a single JSON object per wallet.
  * available: nonces ready to be assigned (pre-seeded, sorted ascending)
  * reserved: nonces currently in-flight (assigned but not yet confirmed or released)
  * maxNonce: highest nonce ever placed in the pool (used to extend when available runs low)
@@ -58,6 +66,13 @@ interface PoolState {
   available: number[];
   reserved: number[];
   maxNonce: number;
+}
+
+interface WalletPoolStats {
+  walletIndex: number;
+  available: number;
+  reserved: number;
+  sponsorAddress: string | null;
 }
 
 interface NonceStatsResponse {
@@ -73,12 +88,14 @@ interface NonceStatsResponse {
   lastHiroSync: string | null;
   /** ISO timestamp of last gap detection (null if no gaps detected) */
   lastGapDetected: string | null;
-  /** Number of nonces currently available in the pool */
+  /** Number of nonces currently available in the pool (wallet 0, backward compat) */
   poolAvailable: number;
-  /** Number of nonces currently in-flight (reserved) */
+  /** Number of nonces currently in-flight (wallet 0, backward compat) */
   poolReserved: number;
-  /** Maximum allowed concurrent in-flight nonces */
+  /** Maximum allowed concurrent in-flight nonces per wallet */
   chainingLimit: number;
+  /** Per-wallet pool state (multi-wallet rotation) */
+  wallets: WalletPoolStats[];
 }
 
 /** Maximum number of in-flight nonces allowed concurrently per sponsor wallet */
@@ -89,7 +106,10 @@ const POOL_SEED_SIZE = CHAINING_LIMIT;
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 /** Reset to possible_next_nonce if no assignment in this window and we are ahead */
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
-const SPONSOR_ADDRESS_KEY = "sponsor_address";
+/** Maximum number of sponsor wallets supported */
+const MAX_WALLET_COUNT = 10;
+
+// Legacy single-wallet pool key (migrated to pool:0 on first access)
 const POOL_KEY = "pool";
 const STATE_KEYS = {
   current: "current",
@@ -101,6 +121,9 @@ const STATE_KEYS = {
   lastHiroSync: "last_hiro_sync",
   lastGapDetected: "last_gap_detected",
 } as const;
+
+/** Round-robin wallet index storage key */
+const NEXT_WALLET_INDEX_KEY = "next_wallet_index";
 
 export class NonceDO {
   private readonly sql: DurableObjectStorage["sql"];
@@ -223,51 +246,80 @@ export class NonceDO {
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
   }
 
-  private async getStoredSponsorAddress(): Promise<string | null> {
-    const stored = await this.state.storage.get<string>(SPONSOR_ADDRESS_KEY);
+  // ---------------------------------------------------------------------------
+  // Per-wallet pool helpers
+  // ---------------------------------------------------------------------------
+
+  /** KV key for per-wallet pool state */
+  private poolKey(walletIndex: number): string {
+    return `pool:${walletIndex}`;
+  }
+
+  /** KV key for per-wallet sponsor address */
+  private sponsorAddressKey(walletIndex: number): string {
+    return `sponsor_address:${walletIndex}`;
+  }
+
+  /**
+   * Load the reservation pool state for a specific wallet.
+   * Handles one-time migration from legacy "pool" key (wallet 0 only).
+   */
+  private async loadPoolForWallet(walletIndex: number): Promise<PoolState | null> {
+    // Try per-wallet key first
+    const pool = await this.state.storage.get<PoolState>(this.poolKey(walletIndex));
+    if (pool != null) return pool;
+
+    // Migration: wallet 0 may have state under legacy "pool" key
+    if (walletIndex === 0) {
+      const legacy = await this.state.storage.get<PoolState>(POOL_KEY);
+      if (legacy != null) {
+        // Migrate to per-wallet key, remove legacy
+        await this.state.storage.put(this.poolKey(0), legacy);
+        await this.state.storage.delete(POOL_KEY);
+        return legacy;
+      }
+    }
+
+    return null;
+  }
+
+  /** Persist the reservation pool state for a specific wallet. */
+  private async savePoolForWallet(walletIndex: number, pool: PoolState): Promise<void> {
+    await this.state.storage.put(this.poolKey(walletIndex), pool);
+  }
+
+  /** Get the stored sponsor address for a specific wallet. */
+  private async getStoredSponsorAddressForWallet(walletIndex: number): Promise<string | null> {
+    const key = this.sponsorAddressKey(walletIndex);
+    const stored = await this.state.storage.get<string>(key);
     return typeof stored === "string" && stored.length > 0 ? stored : null;
   }
 
-  private async setStoredSponsorAddress(address: string): Promise<void> {
-    await this.state.storage.put(SPONSOR_ADDRESS_KEY, address);
+  /** Store the sponsor address for a specific wallet. */
+  private async setStoredSponsorAddressForWallet(walletIndex: number, address: string): Promise<void> {
+    await this.state.storage.put(this.sponsorAddressKey(walletIndex), address);
+  }
+
+  /** Get the current round-robin wallet index. */
+  private async getNextWalletIndex(): Promise<number> {
+    return (await this.state.storage.get<number>(NEXT_WALLET_INDEX_KEY)) ?? 0;
+  }
+
+  /** Persist the round-robin wallet index. */
+  private async setNextWalletIndex(index: number): Promise<void> {
+    await this.state.storage.put(NEXT_WALLET_INDEX_KEY, index);
   }
 
   // ---------------------------------------------------------------------------
-  // Pool state helpers (KV-style storage alongside SQLite)
+  // Legacy single-wallet helpers (kept for internal use by alarm/resync/reset)
   // ---------------------------------------------------------------------------
 
   /**
-   * Load the reservation pool state from DO storage.
-   * Returns null when no pool has been initialized yet.
+   * @deprecated Use getStoredSponsorAddressForWallet(0) instead.
+   * Kept for backward-compatible reads by alarm and resync handlers.
    */
-  private async loadPool(): Promise<PoolState | null> {
-    const pool = await this.state.storage.get<PoolState>(POOL_KEY);
-    return pool ?? null;
-  }
-
-  /**
-   * Persist the reservation pool state to DO storage.
-   */
-  private async savePool(pool: PoolState): Promise<void> {
-    await this.state.storage.put(POOL_KEY, pool);
-  }
-
-  /**
-   * Create and persist a fresh pool seeded from the given nonce.
-   * Pre-seeds POOL_SEED_SIZE nonces: [seedNonce, seedNonce+1, ..., seedNonce+(POOL_SEED_SIZE-1)]
-   */
-  private async initPool(seedNonce: number): Promise<PoolState> {
-    const available: number[] = [];
-    for (let i = 0; i < POOL_SEED_SIZE; i++) {
-      available.push(seedNonce + i);
-    }
-    const pool: PoolState = {
-      available,
-      reserved: [],
-      maxNonce: seedNonce + POOL_SEED_SIZE - 1,
-    };
-    await this.savePool(pool);
-    return pool;
+  private async getStoredSponsorAddress(): Promise<string | null> {
+    return this.getStoredSponsorAddressForWallet(0);
   }
 
   private async fetchNonceInfo(sponsorAddress: string): Promise<HiroNonceInfo> {
@@ -299,42 +351,104 @@ export class NonceDO {
   }
 
   /**
-   * Assign a nonce from the reservation pool.
-   *
-   * On first call: seeds the pool from the stored SQL counter (or Hiro if no counter yet).
-   * Enforces CHAINING_LIMIT — throws if too many nonces are already in-flight.
-   * Extends the pool automatically if available[] is empty.
+   * Load or initialize a pool for a specific wallet.
+   * On first init, fetches nonce from Hiro for that wallet's address.
    */
-  async assignNonce(sponsorAddress: string): Promise<number> {
+  private async loadPoolOrInit(walletIndex: number, sponsorAddress: string): Promise<PoolState> {
+    let pool = await this.loadPoolForWallet(walletIndex);
+    if (pool !== null) return pool;
+
+    // Pool not yet initialized for this wallet — seed from Hiro
+    let seedNonce: number;
+    if (walletIndex === 0) {
+      // Wallet 0: prefer the SQL counter if it exists (backward compat migration)
+      const stored = this.getStoredNonce();
+      if (stored !== null) {
+        seedNonce = stored;
+      } else {
+        const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+        seedNonce = nonceInfo.possible_next_nonce;
+        this.setStoredNonce(seedNonce);
+      }
+    } else {
+      // Other wallets: always fetch fresh from Hiro
+      const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+      seedNonce = nonceInfo.possible_next_nonce;
+    }
+
+    pool = await this.initPoolForWallet(walletIndex, seedNonce);
+    return pool;
+  }
+
+  /**
+   * Create and persist a fresh pool seeded from the given nonce for a specific wallet.
+   */
+  private async initPoolForWallet(walletIndex: number, seedNonce: number): Promise<PoolState> {
+    const available: number[] = [];
+    for (let i = 0; i < POOL_SEED_SIZE; i++) {
+      available.push(seedNonce + i);
+    }
+    const pool: PoolState = {
+      available,
+      reserved: [],
+      maxNonce: seedNonce + POOL_SEED_SIZE - 1,
+    };
+    await this.savePoolForWallet(walletIndex, pool);
+    return pool;
+  }
+
+  /**
+   * Assign a nonce from the reservation pool using round-robin wallet selection.
+   *
+   * With walletCount=1 (default): identical behavior to single-wallet mode.
+   * With walletCount=N: round-robin across N wallets, each with independent CHAINING_LIMIT.
+   *
+   * On first call for a wallet: seeds pool from chain nonce via Hiro.
+   * Enforces CHAINING_LIMIT per wallet — throws if all wallets are at limit.
+   * Returns both the nonce and the walletIndex for the caller to use.
+   */
+  async assignNonce(
+    sponsorAddress: string,
+    walletCount: number = 1
+  ): Promise<{ nonce: number; walletIndex: number }> {
     if (!sponsorAddress) {
       throw new Error("Missing sponsor address");
     }
 
     return this.state.blockConcurrencyWhile(async () => {
-      await this.setStoredSponsorAddress(sponsorAddress);
-
       const currentAlarm = await this.state.storage.getAlarm();
       if (currentAlarm === null) {
         await this.scheduleAlarm();
       }
 
-      // Load or initialize the pool
-      let pool = await this.loadPool();
-      if (pool === null) {
-        // Migration: seed from existing SQL counter, or fetch from Hiro
-        let seedNonce = this.getStoredNonce();
-        if (seedNonce === null) {
-          const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
-          seedNonce = nonceInfo.possible_next_nonce;
-          this.setStoredNonce(seedNonce);
+      const effectiveWalletCount = Math.max(1, Math.min(walletCount, MAX_WALLET_COUNT));
+
+      // Round-robin: start from stored nextWalletIndex, find a wallet under chaining limit
+      let walletIndex = (await this.getNextWalletIndex()) % effectiveWalletCount;
+
+      // Try each wallet in round-robin order; skip any at chaining limit
+      let attempts = 0;
+      while (attempts < effectiveWalletCount) {
+        // Pre-check: load pool to see if it has room
+        // We need to init here if needed to check reserved length
+        const pool = await this.loadPoolOrInit(walletIndex, sponsorAddress);
+        if (pool.reserved.length < CHAINING_LIMIT) {
+          break;
         }
-        pool = await this.initPool(seedNonce);
+        // This wallet is at its chaining limit; try the next
+        walletIndex = (walletIndex + 1) % effectiveWalletCount;
+        attempts++;
       }
 
-      // Enforce chaining limit
-      if (pool.reserved.length >= CHAINING_LIMIT) {
+      if (attempts === effectiveWalletCount) {
         throw new Error("CHAINING_LIMIT_EXCEEDED");
       }
+
+      // Store the sponsor address for this wallet (used by alarm reconciliation)
+      await this.setStoredSponsorAddressForWallet(walletIndex, sponsorAddress);
+
+      // Load pool for chosen wallet (already initialized above in the loop)
+      const pool = await this.loadPoolOrInit(walletIndex, sponsorAddress);
 
       // Extend pool if available is exhausted
       if (pool.available.length === 0) {
@@ -347,25 +461,31 @@ export class NonceDO {
       const assignedNonce = pool.available.shift()!;
       pool.reserved.push(assignedNonce);
 
-      await this.savePool(pool);
+      await this.savePoolForWallet(walletIndex, pool);
       this.updateAssignedStats(assignedNonce);
-      // Keep the SQL counter in sync for stats compatibility
-      this.setStoredNonce(pool.available[0] ?? assignedNonce + 1);
+      // Keep the SQL counter in sync for wallet 0 (stats compatibility)
+      if (walletIndex === 0) {
+        this.setStoredNonce(pool.available[0] ?? assignedNonce + 1);
+      }
 
-      return assignedNonce;
+      // Advance round-robin to next wallet
+      await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
+
+      return { nonce: assignedNonce, walletIndex };
     });
   }
 
   /**
-   * Release a nonce back to the pool or mark it as consumed.
+   * Release a nonce back to the specified wallet's pool or mark it as consumed.
    *
    * txid present  → nonce was broadcast successfully (consumed); remove from reserved only.
    * txid absent   → nonce was NOT broadcast (e.g. broadcast failure); return to available
    *                 in sorted order so it can be reused.
+   * walletIndex   → which wallet pool to release to (default: 0)
    */
-  async releaseNonce(nonce: number, txid?: string): Promise<void> {
+  async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0): Promise<void> {
     return this.state.blockConcurrencyWhile(async () => {
-      const pool = await this.loadPool();
+      const pool = await this.loadPoolForWallet(walletIndex);
       if (pool === null) {
         // Pool not initialized yet — nothing to release
         return;
@@ -391,7 +511,7 @@ export class NonceDO {
       }
       // If txid is provided, the nonce is consumed — do not return to available
 
-      await this.savePool(pool);
+      await this.savePoolForWallet(walletIndex, pool);
     });
   }
 
@@ -450,8 +570,22 @@ export class NonceDO {
       .toArray();
     const txidCount = txidRows.length > 0 ? txidRows[0].count : 0;
 
-    // Load pool state for reporting (non-blocking read outside blockConcurrencyWhile)
-    const pool = await this.loadPool();
+    // Load per-wallet pool state for reporting
+    const wallets: WalletPoolStats[] = [];
+    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+      const addr = await this.getStoredSponsorAddressForWallet(wi);
+      if (!addr) break; // no more initialized wallets
+      const pool = await this.loadPoolForWallet(wi);
+      wallets.push({
+        walletIndex: wi,
+        available: pool?.available.length ?? 0,
+        reserved: pool?.reserved.length ?? 0,
+        sponsorAddress: addr,
+      });
+    }
+
+    // Wallet 0 backward-compat fields
+    const wallet0 = wallets[0];
 
     return {
       totalAssigned,
@@ -463,25 +597,19 @@ export class NonceDO {
       gapsRecovered,
       lastHiroSync: lastHiroSyncMs ? new Date(lastHiroSyncMs).toISOString() : null,
       lastGapDetected: lastGapDetectedMs ? new Date(lastGapDetectedMs).toISOString() : null,
-      poolAvailable: pool?.available.length ?? 0,
-      poolReserved: pool?.reserved.length ?? 0,
+      poolAvailable: wallet0?.available ?? 0,
+      poolReserved: wallet0?.reserved ?? 0,
       chainingLimit: CHAINING_LIMIT,
+      wallets,
     };
   }
 
   /**
-   * Core gap-aware nonce reconciliation against Hiro.
-   * Shared by alarm(), performResync(), and called within blockConcurrencyWhile.
-   *
-   * Applies three recovery strategies in order:
-   * 1. GAP RECOVERY — reset pool.available to fresh range from lowest gap nonce
-   * 2. FORWARD BUMP — advance pool.available to possible_next_nonce
-   * 3. STALE DETECTION — reset pool.available if idle and counter is ahead of chain
-   *
-   * IMPORTANT: never modifies pool.reserved (in-flight nonces).
-   * Returns null if nonceInfo could not be fetched (caller decides how to handle).
+   * Core gap-aware nonce reconciliation against Hiro for a specific wallet.
+   * Shared by alarm() (all wallets), performResync() (wallet 0), and performReset() (wallet 0).
    */
-  private async reconcileNonce(
+  private async reconcileNonceForWallet(
+    walletIndex: number,
     sponsorAddress: string
   ): Promise<ReconcileResult | null> {
     let nonceInfo: HiroNonceInfo;
@@ -493,14 +621,13 @@ export class NonceDO {
 
     this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
 
-    const previousNonce = this.getStoredNonce();
+    const previousNonce = walletIndex === 0 ? this.getStoredNonce() : null;
 
-    if (previousNonce === null) {
+    if (walletIndex === 0 && previousNonce === null) {
       this.setStoredNonce(nonceInfo.possible_next_nonce);
-      // Also reset pool if it exists
-      const pool = await this.loadPool();
+      const pool = await this.loadPoolForWallet(walletIndex);
       if (pool !== null) {
-        await this.resetPoolAvailable(pool, nonceInfo.possible_next_nonce);
+        await this.resetPoolAvailableForWallet(walletIndex, pool, nonceInfo.possible_next_nonce);
       }
       return {
         previousNonce: null,
@@ -516,16 +643,15 @@ export class NonceDO {
       const sortedGaps = [...detected_missing_nonces].sort((a, b) => a - b);
       const lowestGap = sortedGaps[0];
 
-      if (previousNonce > lowestGap) {
-        this.setStoredNonce(lowestGap);
+      if (previousNonce !== null && previousNonce > lowestGap) {
+        if (walletIndex === 0) this.setStoredNonce(lowestGap);
         this.incrementGapsRecovered();
         this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
         this.incrementConflictsDetected();
 
-        // Reset pool.available to fill from the gap; never touch pool.reserved
-        const pool = await this.loadPool();
+        const pool = await this.loadPoolForWallet(walletIndex);
         if (pool !== null) {
-          await this.resetPoolAvailable(pool, lowestGap);
+          await this.resetPoolAvailableForWallet(walletIndex, pool, lowestGap);
         }
 
         return {
@@ -536,29 +662,33 @@ export class NonceDO {
         };
       }
 
-      // When previousNonce <= lowestGap, natural nonce progression will fill
-      // the gap — no adjustment needed. Record that gaps were detected.
       this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
       return {
-        previousNonce,
-        newNonce: previousNonce,
+        previousNonce: previousNonce ?? null,
+        newNonce: previousNonce ?? null,
         changed: false,
-        reason: `gaps detected (${sortedGaps.join(",")}) but nonce ${previousNonce} will fill naturally`,
+        reason: `gaps detected (${sortedGaps.join(",")}) but nonce will fill naturally`,
       };
     }
 
-    if (possible_next_nonce > previousNonce) {
-      this.setStoredNonce(possible_next_nonce);
+    // For wallets other than 0 we don't have a SQL counter, so compare pool head
+    const poolHead = await this.loadPoolForWallet(walletIndex);
+    const effectivePreviousNonce = walletIndex === 0
+      ? previousNonce
+      : (poolHead?.available[0] ?? null);
+
+    if (effectivePreviousNonce !== null && possible_next_nonce > effectivePreviousNonce) {
+      if (walletIndex === 0) {
+        this.setStoredNonce(possible_next_nonce);
+      }
       this.incrementConflictsDetected();
 
-      // Forward bump: pool.available should start at the chain's next nonce
-      const pool = await this.loadPool();
-      if (pool !== null) {
-        await this.resetPoolAvailable(pool, possible_next_nonce);
+      if (poolHead !== null) {
+        await this.resetPoolAvailableForWallet(walletIndex, poolHead, possible_next_nonce);
       }
 
       return {
-        previousNonce,
+        previousNonce: effectivePreviousNonce,
         newNonce: possible_next_nonce,
         changed: true,
         reason: `FORWARD BUMP: chain advanced to ${possible_next_nonce}`,
@@ -570,18 +700,22 @@ export class NonceDO {
       ? Date.now() - lastAssignedAtMs
       : Infinity;
 
-    if (idleMs > STALE_THRESHOLD_MS && previousNonce > possible_next_nonce) {
-      this.setStoredNonce(possible_next_nonce);
+    if (
+      idleMs > STALE_THRESHOLD_MS &&
+      effectivePreviousNonce !== null &&
+      effectivePreviousNonce > possible_next_nonce
+    ) {
+      if (walletIndex === 0) {
+        this.setStoredNonce(possible_next_nonce);
+      }
       this.incrementConflictsDetected();
 
-      // Stale detection: reset pool.available to chain's nonce
-      const pool = await this.loadPool();
-      if (pool !== null) {
-        await this.resetPoolAvailable(pool, possible_next_nonce);
+      if (poolHead !== null) {
+        await this.resetPoolAvailableForWallet(walletIndex, poolHead, possible_next_nonce);
       }
 
       return {
-        previousNonce,
+        previousNonce: effectivePreviousNonce,
         newNonce: possible_next_nonce,
         changed: true,
         reason: `STALE DETECTION: idle ${Math.round(idleMs / 1000)}s, reset to chain nonce ${possible_next_nonce}`,
@@ -589,20 +723,22 @@ export class NonceDO {
     }
 
     return {
-      previousNonce,
-      newNonce: previousNonce,
+      previousNonce: effectivePreviousNonce ?? null,
+      newNonce: effectivePreviousNonce ?? null,
       changed: false,
       reason: "nonce is consistent with chain state",
     };
   }
 
   /**
-   * Reset pool.available to a fresh range starting at newHead.
-   * The number of slots pre-seeded is POOL_SEED_SIZE minus current reserved count,
-   * so we never overshoot the chaining limit.
+   * Reset pool.available for a specific wallet to a fresh range starting at newHead.
    * NEVER touches pool.reserved.
    */
-  private async resetPoolAvailable(pool: PoolState, newHead: number): Promise<void> {
+  private async resetPoolAvailableForWallet(
+    walletIndex: number,
+    pool: PoolState,
+    newHead: number
+  ): Promise<void> {
     const availableSlots = Math.max(1, POOL_SEED_SIZE - pool.reserved.length);
     const newAvailable: number[] = [];
     for (let i = 0; i < availableSlots; i++) {
@@ -610,11 +746,11 @@ export class NonceDO {
     }
     pool.available = newAvailable;
     pool.maxNonce = newHead + availableSlots - 1;
-    await this.savePool(pool);
+    await this.savePoolForWallet(walletIndex, pool);
   }
 
   /**
-   * Gap-aware nonce reconciliation, returning a structured response for the RPC caller.
+   * Gap-aware nonce reconciliation for wallet 0, returning a structured response.
    */
   private async performResync(sponsorAddress: string): Promise<{
     success: true;
@@ -624,7 +760,7 @@ export class NonceDO {
     changed: boolean;
     reason: string;
   }> {
-    const result = await this.reconcileNonce(sponsorAddress);
+    const result = await this.reconcileNonceForWallet(0, sponsorAddress);
     if (result === null) {
       throw new Error("Hiro API unavailable");
     }
@@ -632,8 +768,7 @@ export class NonceDO {
   }
 
   /**
-   * Perform a hard nonce reset to the safe floor: last_executed_tx_nonce + 1.
-   * This is the lowest nonce that cannot conflict with any confirmed transaction.
+   * Perform a hard nonce reset for wallet 0 to the safe floor: last_executed_tx_nonce + 1.
    */
   private async performReset(sponsorAddress: string): Promise<{
     success: true;
@@ -662,10 +797,10 @@ export class NonceDO {
       this.incrementConflictsDetected();
     }
 
-    // Reset pool to safe floor
-    const pool = await this.loadPool();
+    // Reset pool for wallet 0
+    const pool = await this.loadPoolForWallet(0);
     if (pool !== null) {
-      await this.resetPoolAvailable(pool, safeFloor);
+      await this.resetPoolAvailableForWallet(0, pool, safeFloor);
     }
 
     return {
@@ -680,13 +815,13 @@ export class NonceDO {
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
-        const sponsorAddress = await this.getStoredSponsorAddress();
-        if (!sponsorAddress) {
-          return;
+        // Reconcile all wallets that have been initialized (up to MAX_WALLET_COUNT)
+        for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+          const addr = await this.getStoredSponsorAddressForWallet(wi);
+          if (!addr) break; // no more initialized wallets
+          // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
+          await this.reconcileNonceForWallet(wi, addr);
         }
-        // reconcileNonce returns null when Hiro is unreachable — silently
-        // skip this cycle and let the next alarm retry.
-        await this.reconcileNonce(sponsorAddress);
       } finally {
         await this.scheduleAlarm();
       }
@@ -694,9 +829,7 @@ export class NonceDO {
   }
 
   /**
-   * Shared handler for /resync and /reset RPC routes.
-   * Gets sponsor address, runs the appropriate recovery action inside
-   * blockConcurrencyWhile, and maps "Hiro API unavailable" to 503.
+   * Shared handler for /resync and /reset RPC routes (operates on wallet 0).
    */
   private async handleRecoveryAction(action: "resync" | "reset"): Promise<Response> {
     try {
@@ -731,9 +864,17 @@ export class NonceDO {
         return this.badRequest("Missing sponsorAddress");
       }
 
+      const walletCount = typeof body.walletCount === "number"
+        ? Math.max(1, Math.min(body.walletCount, MAX_WALLET_COUNT))
+        : 1;
+
       try {
-        const nonce = await this.assignNonce(body.sponsorAddress);
-        const response: AssignNonceResponse = { nonce };
+        const result = await this.assignNonce(body.sponsorAddress, walletCount);
+        const response: AssignNonceResponse = {
+          nonce: result.nonce,
+          walletIndex: result.walletIndex,
+          sponsorAddress: body.sponsorAddress,
+        };
         return this.jsonResponse(response);
       } catch (error) {
         if (error instanceof Error && error.message === "CHAINING_LIMIT_EXCEEDED") {
@@ -757,8 +898,12 @@ export class NonceDO {
         return this.badRequest("Missing nonce");
       }
 
+      const walletIndex = typeof body.walletIndex === "number"
+        ? Math.max(0, Math.min(body.walletIndex, MAX_WALLET_COUNT - 1))
+        : 0;
+
       try {
-        await this.releaseNonce(body.nonce, body.txid);
+        await this.releaseNonce(body.nonce, body.txid, walletIndex);
         return this.jsonResponse({ success: true });
       } catch (error) {
         return this.internalError(error);
