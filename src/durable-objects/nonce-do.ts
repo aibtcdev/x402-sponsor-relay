@@ -1239,8 +1239,29 @@ export class NonceDO {
       }
       // Reset round-robin index
       await this.state.storage.put("next_wallet_index", 0);
-      console.log(JSON.stringify({ action: "pools_cleared", walletsCleared: cleared }));
-      return this.jsonResponse({ success: true, walletsCleared: cleared });
+      console.log(
+        JSON.stringify({
+          action: "clear_pools",
+          previousNonce: null,
+          newNonce: null,
+          changed: cleared > 0,
+          reason:
+            cleared > 0
+              ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
+              : "No wallets to clear",
+        })
+      );
+      return this.jsonResponse({
+        success: true,
+        action: "clear_pools",
+        previousNonce: null,
+        newNonce: null,
+        changed: cleared > 0,
+        reason:
+          cleared > 0
+            ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
+            : "No wallets to clear",
+      });
     });
   }
 
