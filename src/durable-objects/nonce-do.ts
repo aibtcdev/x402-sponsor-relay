@@ -105,6 +105,8 @@ interface NonceStatsResponse {
   lastHiroSync: string | null;
   /** ISO timestamp of last gap detection (null if no gaps detected) */
   lastGapDetected: string | null;
+  /** Number of gap-fill transactions broadcast by the alarm */
+  gapsFilled: number;
   /** Number of nonces currently available in the pool (wallet 0, backward compat) */
   poolAvailable: number;
   /** Number of nonces currently in-flight (wallet 0, backward compat) */
@@ -135,6 +137,7 @@ const STATE_KEYS = {
   lastAssignedNonce: "last_assigned_nonce",
   lastAssignedAt: "last_assigned_at",
   gapsRecovered: "gaps_recovered",
+  gapsFilled: "gaps_filled",
   lastHiroSync: "last_hiro_sync",
   lastGapDetected: "last_gap_detected",
 } as const;
@@ -266,6 +269,11 @@ export class NonceDO {
   private incrementGapsRecovered(): void {
     const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered) + 1;
     this.setStateValue(STATE_KEYS.gapsRecovered, gapsRecovered);
+  }
+
+  private incrementGapsFilled(): void {
+    const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled) + 1;
+    this.setStateValue(STATE_KEYS.gapsFilled, gapsFilled);
   }
 
   private async scheduleAlarm(): Promise<void> {
@@ -661,6 +669,7 @@ export class NonceDO {
     const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
     const nextNonce = this.getStoredNonce();
     const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered);
+    const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled);
     const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
     const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
 
@@ -695,6 +704,7 @@ export class NonceDO {
       nextNonce,
       txidCount,
       gapsRecovered,
+      gapsFilled,
       lastHiroSync: lastHiroSyncMs ? new Date(lastHiroSyncMs).toISOString() : null,
       lastGapDetected: lastGapDetectedMs ? new Date(lastGapDetectedMs).toISOString() : null,
       poolAvailable: wallet0?.available ?? 0,
