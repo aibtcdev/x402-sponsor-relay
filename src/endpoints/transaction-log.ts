@@ -80,7 +80,7 @@ export class TransactionLog extends BaseEndpoint {
       const days = Math.min(Math.max(rawDays, 1), 7);
       const limit = Math.min(Math.max(rawLimit, 1), 200);
 
-      const statsService = new StatsService(c.env.RELAY_KV, logger);
+      const statsService = new StatsService(c.env, logger);
       const transactions = await statsService.getTransactionLog({
         days,
         limit,

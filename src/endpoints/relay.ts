@@ -184,7 +184,7 @@ export class Relay extends BaseEndpoint {
     logger.info("Relay request received");
 
     // Initialize stats service for metrics recording
-    const statsService = new StatsService(c.env.RELAY_KV, logger);
+    const statsService = new StatsService(c.env, logger);
 
     try {
       // Parse request body
@@ -192,7 +192,7 @@ export class Relay extends BaseEndpoint {
 
       // Validate required fields
       if (!body.transaction) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
@@ -202,7 +202,7 @@ export class Relay extends BaseEndpoint {
       }
 
       if (!body.settle) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: "Missing settle options",
           code: "MISSING_SETTLE_OPTIONS",
@@ -216,7 +216,7 @@ export class Relay extends BaseEndpoint {
         const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
         const authError = stxVerifyService.verifySip018Auth(body.auth, "relay");
         if (authError) {
-          await statsService.recordError("validation");
+          c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
           return this.err(c, {
             error: authError.error,
             code: authError.code,
@@ -235,7 +235,7 @@ export class Relay extends BaseEndpoint {
         body.settle
       );
       if (settleValidation.valid === false) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: settleValidation.error,
           code: "INVALID_SETTLE_OPTIONS",
@@ -248,7 +248,7 @@ export class Relay extends BaseEndpoint {
       // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         // Determine error code based on validation failure
         const code = validation.error === "Transaction must be sponsored"
           ? "NOT_SPONSORED"
@@ -265,7 +265,7 @@ export class Relay extends BaseEndpoint {
       // Check rate limit using sender address from transaction
       if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
-        await statsService.recordError("rateLimit");
+        c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));
         return this.err(c, {
           error: "Rate limit exceeded",
           code: "RATE_LIMIT_EXCEEDED",
@@ -303,7 +303,7 @@ export class Relay extends BaseEndpoint {
         validation.transaction
       );
       if (sponsorResult.success === false) {
-        await statsService.recordError("sponsoring");
+        c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
         const code = sponsorResult.code === "NONCE_DO_UNAVAILABLE"
           ? "NONCE_DO_UNAVAILABLE"
           : sponsorResult.error === "Service not configured"
@@ -325,7 +325,7 @@ export class Relay extends BaseEndpoint {
         body.settle
       );
       if (!verifyResult.valid) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: verifyResult.error,
           code: "SETTLEMENT_VERIFICATION_FAILED",
@@ -340,15 +340,10 @@ export class Relay extends BaseEndpoint {
         verifyResult.data.transaction
       );
       if ("error" in broadcastResult) {
-        await statsService.recordError("internal");
         // Record fee even for failed broadcasts — sponsor already paid
+        // Both calls are fire-and-forget (waitUntil) — never block the error response.
         const tokenTypeFailed = body.settle.tokenType || "STX";
-        await statsService.recordTransaction({
-          success: false,
-          tokenType: tokenTypeFailed,
-          amount: body.settle.minAmount,
-          fee: sponsorResult.fee,
-        });
+        c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
         c.executionCtx.waitUntil(
           statsService.logTransaction({
             timestamp: new Date().toISOString(),
@@ -360,7 +355,7 @@ export class Relay extends BaseEndpoint {
             sender: validation.senderAddress,
             recipient: body.settle.expectedRecipient,
             status: "failed",
-          })
+          }).catch(() => {})
         );
 
         if (broadcastResult.nonceConflict) {
@@ -403,16 +398,8 @@ export class Relay extends BaseEndpoint {
         );
       }
 
-      // Step E — Record successful transaction stats
+      // Step E — Record successful transaction stats (fire-and-forget, never blocks response)
       const tokenType = body.settle.tokenType || "STX";
-      await statsService.recordTransaction({
-        success: true,
-        tokenType,
-        amount: body.settle.minAmount,
-        fee: sponsorResult.fee,
-      });
-
-      // Log individual transaction (non-blocking)
       const logSenderAddress = settlementService.senderToAddress(
         verifyResult.data.transaction,
         c.env.STACKS_NETWORK
@@ -432,7 +419,7 @@ export class Relay extends BaseEndpoint {
           ...(broadcastResult.status === "confirmed"
             ? { blockHeight: broadcastResult.blockHeight }
             : {}),
-        })
+        }).catch(() => {})
       );
 
       // Step F — Build settlement result and store payment receipt
@@ -497,7 +484,7 @@ export class Relay extends BaseEndpoint {
       logger.error("Unexpected error", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
-      await statsService.recordError("internal");
+      c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
       return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",

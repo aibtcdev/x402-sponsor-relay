@@ -17,7 +17,7 @@ export const dashboard = new Hono<{
  */
 dashboard.get("/", async (c) => {
   const logger = c.get("logger");
-  const statsService = new StatsService(c.env.RELAY_KV, logger);
+  const statsService = new StatsService(c.env, logger);
   const healthService = new SettlementHealthService(c.env, logger);
 
   try {
@@ -64,7 +64,7 @@ dashboard.get("/", async (c) => {
  */
 dashboard.get("/api/stats", async (c) => {
   const logger = c.get("logger");
-  const statsService = new StatsService(c.env.RELAY_KV, logger);
+  const statsService = new StatsService(c.env, logger);
   const healthService = new SettlementHealthService(c.env, logger);
 
   const period = c.req.query("period") === "7d" ? "7d" : "24h";
