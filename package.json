@@ -17,8 +17,7 @@
     "test:sip018-auth": "set -a && . ./.env && set +a && tsx scripts/test-sip018-auth.ts",
     "test:settle": "set -a && . ./.env && set +a && tsx scripts/test-settle.ts",
     "test:fees": "set -a && . ./.env && set +a && tsx scripts/test-fees.ts",
-    "keys": "set -a && . ./.env && set +a && tsx scripts/manage-api-keys.ts",
-    "backfill": "set -a && . ./.env && set +a && tsx scripts/backfill-stats.ts"
+    "keys": "set -a && . ./.env && set +a && tsx scripts/manage-api-keys.ts"
   },
   "devDependencies": {
     "@types/node": "^25.0.3",
