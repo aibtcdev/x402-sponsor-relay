@@ -1079,6 +1079,25 @@ export class NonceDO {
       };
     }
 
+    // POOL REFILL: pool is aligned with chain but below target size — refill without bumping head
+    if (
+      poolHead !== null &&
+      poolHead.available.length < POOL_SEED_SIZE &&
+      poolHead.reserved.length === 0
+    ) {
+      await this.resetPoolAvailableForWallet(
+        walletIndex,
+        poolHead,
+        effectivePreviousNonce ?? possible_next_nonce
+      );
+      return {
+        previousNonce: effectivePreviousNonce,
+        newNonce: effectivePreviousNonce,
+        changed: true,
+        reason: `POOL REFILL: available ${poolHead.available.length} < ${POOL_SEED_SIZE}, re-seeded from nonce ${effectivePreviousNonce ?? possible_next_nonce}`,
+      };
+    }
+
     return {
       previousNonce: effectivePreviousNonce,
       newNonce: effectivePreviousNonce,
@@ -1107,66 +1126,86 @@ export class NonceDO {
   }
 
   /**
-   * Gap-aware nonce reconciliation for wallet 0, returning a structured response.
+   * Gap-aware nonce reconciliation for all initialized wallets, returning a structured response.
    */
-  private async performResync(sponsorAddress: string): Promise<{
+  private async performResync(): Promise<{
     success: true;
     action: "resync";
-    previousNonce: number | null;
-    newNonce: number | null;
-    changed: boolean;
-    reason: string;
+    wallets: Array<{
+      walletIndex: number;
+      previousNonce: number | null;
+      newNonce: number | null;
+      changed: boolean;
+      reason: string;
+    }>;
   }> {
-    const result = await this.reconcileNonceForWallet(0, sponsorAddress);
-    if (result === null) {
-      throw new Error("Hiro API unavailable");
+    const wallets = [];
+    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+      const addr = await this.getStoredSponsorAddressForWallet(wi);
+      if (!addr) break;
+      const result = await this.reconcileNonceForWallet(wi, addr);
+      if (result === null) {
+        throw new Error("Hiro API unavailable");
+      }
+      wallets.push({ walletIndex: wi, ...result });
     }
-    return { success: true, action: "resync", ...result };
+    return { success: true, action: "resync", wallets };
   }
 
   /**
-   * Perform a hard nonce reset for wallet 0 to the safe floor: last_executed_tx_nonce + 1.
+   * Perform a hard nonce reset for all initialized wallets to safe floor: last_executed_tx_nonce + 1.
    */
-  private async performReset(sponsorAddress: string): Promise<{
+  private async performReset(): Promise<{
     success: true;
     action: "reset";
-    previousNonce: number | null;
-    newNonce: number;
-    changed: boolean;
+    wallets: Array<{
+      walletIndex: number;
+      previousNonce: number | null;
+      newNonce: number;
+      changed: boolean;
+    }>;
   }> {
-    let nonceInfo: HiroNonceInfo;
-    try {
-      nonceInfo = await this.fetchNonceInfo(sponsorAddress);
-    } catch (_e) {
-      throw new Error("Hiro API unavailable");
+    const wallets = [];
+    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+      const addr = await this.getStoredSponsorAddressForWallet(wi);
+      if (!addr) break;
+
+      let nonceInfo: HiroNonceInfo;
+      try {
+        nonceInfo = await this.fetchNonceInfo(addr);
+      } catch (_e) {
+        throw new Error("Hiro API unavailable");
+      }
+
+      this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
+
+      const safeFloor = nonceInfo.last_executed_tx_nonce === null
+        ? 0
+        : nonceInfo.last_executed_tx_nonce + 1;
+
+      // For wallet 0, also update the stored scalar nonce used by legacy paths
+      const previousNonce = wi === 0 ? this.getStoredNonce() : null;
+      const changed = wi === 0 ? previousNonce !== safeFloor : true;
+      if (wi === 0) {
+        this.setStoredNonce(safeFloor);
+        if (changed) {
+          this.incrementConflictsDetected();
+        }
+      }
+
+      const pool = await this.loadPoolForWallet(wi);
+      if (pool !== null) {
+        await this.resetPoolAvailableForWallet(wi, pool, safeFloor);
+      }
+
+      wallets.push({
+        walletIndex: wi,
+        previousNonce,
+        newNonce: safeFloor,
+        changed,
+      });
     }
-
-    this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
-
-    const currentNonce = this.getStoredNonce();
-    const safeFloor = nonceInfo.last_executed_tx_nonce === null
-      ? 0
-      : nonceInfo.last_executed_tx_nonce + 1;
-
-    const changed = currentNonce !== safeFloor;
-    this.setStoredNonce(safeFloor);
-    if (changed) {
-      this.incrementConflictsDetected();
-    }
-
-    // Reset pool for wallet 0
-    const pool = await this.loadPoolForWallet(0);
-    if (pool !== null) {
-      await this.resetPoolAvailableForWallet(0, pool, safeFloor);
-    }
-
-    return {
-      success: true,
-      action: "reset",
-      previousNonce: currentNonce,
-      newNonce: safeFloor,
-      changed,
-    };
+    return { success: true, action: "reset", wallets };
   }
 
   async alarm(): Promise<void> {
@@ -1202,17 +1241,18 @@ export class NonceDO {
   }
 
   /**
-   * Shared handler for /resync and /reset RPC routes (operates on wallet 0).
+   * Shared handler for /resync and /reset RPC routes (operates on all initialized wallets).
    */
   private async handleRecoveryAction(action: "resync" | "reset"): Promise<Response> {
     try {
-      const sponsorAddress = await this.getStoredSponsorAddressForWallet(0);
-      if (!sponsorAddress) {
+      // Verify at least wallet 0 is initialized before attempting recovery
+      const wallet0Address = await this.getStoredSponsorAddressForWallet(0);
+      if (!wallet0Address) {
         return this.badRequest("No sponsor address stored; call /assign first");
       }
       const result = action === "reset"
-        ? await this.state.blockConcurrencyWhile(() => this.performReset(sponsorAddress))
-        : await this.state.blockConcurrencyWhile(() => this.performResync(sponsorAddress));
+        ? await this.state.blockConcurrencyWhile(() => this.performReset())
+        : await this.state.blockConcurrencyWhile(() => this.performResync());
       return this.jsonResponse(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
