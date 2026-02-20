@@ -655,6 +655,25 @@ export class NonceDO {
    */
   private async loadPoolOrInit(walletIndex: number, sponsorAddress: string): Promise<PoolState> {
     let pool = await this.loadPoolForWallet(walletIndex);
+
+    // Detect address change: if the stored address differs from the requested one
+    // (e.g. after a wallet derivation fix), wipe the stale pool so it reinitializes
+    // from Hiro with the correct address's nonce.
+    if (pool !== null) {
+      const storedAddr = await this.getStoredSponsorAddressForWallet(walletIndex);
+      if (storedAddr && storedAddr !== sponsorAddress) {
+        console.log(
+          JSON.stringify({
+            action: "pool_address_changed",
+            walletIndex,
+            oldAddress: storedAddr,
+            newAddress: sponsorAddress,
+          })
+        );
+        pool = null;
+      }
+    }
+
     if (pool !== null) return pool;
 
     // Pool not yet initialized for this wallet — seed from Hiro
@@ -1204,6 +1223,48 @@ export class NonceDO {
     }
   }
 
+  /**
+   * Clear all per-wallet pool state and stored addresses.
+   * Pools will reinitialize from Hiro on the next /assign call.
+   */
+  private async handleClearPools(): Promise<Response> {
+    return this.state.blockConcurrencyWhile(async () => {
+      let cleared = 0;
+      for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+        const addr = await this.getStoredSponsorAddressForWallet(wi);
+        if (!addr) break;
+        await this.state.storage.delete(this.poolKey(wi));
+        await this.state.storage.delete(this.sponsorAddressKey(wi));
+        cleared++;
+      }
+      // Reset round-robin index
+      await this.state.storage.put("next_wallet_index", 0);
+      console.log(
+        JSON.stringify({
+          action: "clear_pools",
+          previousNonce: null,
+          newNonce: null,
+          changed: cleared > 0,
+          reason:
+            cleared > 0
+              ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
+              : "No wallets to clear",
+        })
+      );
+      return this.jsonResponse({
+        success: true,
+        action: "clear_pools",
+        previousNonce: null,
+        newNonce: null,
+        changed: cleared > 0,
+        reason:
+          cleared > 0
+            ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
+            : "No wallets to clear",
+      });
+    });
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -1343,6 +1404,10 @@ export class NonceDO {
       return this.handleRecoveryAction(
         url.pathname === "/reset" ? "reset" : "resync"
       );
+    }
+
+    if (request.method === "POST" && url.pathname === "/clear-pools") {
+      return this.handleClearPools();
     }
 
     return new Response("Not found", { status: 404 });
