@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.11.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.10.1...v1.11.0) (2026-02-20)
+
+
+### Features
+
+* nonce reservation pool, multi-wallet rotation, and wallet monitoring ([#74](https://github.com/aibtcdev/x402-sponsor-relay/issues/74)) ([5c0fb22](https://github.com/aibtcdev/x402-sponsor-relay/commit/5c0fb22ea0c8e5cc488a1c7d50da1eb49c089ae6))
+
+
+### Bug Fixes
+
+* add KV → StatsDO backfill for dashboard stats recovery ([#72](https://github.com/aibtcdev/x402-sponsor-relay/issues/72)) ([c5edfe4](https://github.com/aibtcdev/x402-sponsor-relay/commit/c5edfe4498b4bd40e6542e9bcb55cb0d1902000d))
+
 ## [1.10.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.10.0...v1.10.1) (2026-02-20)
 
 
