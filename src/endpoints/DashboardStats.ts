@@ -162,7 +162,7 @@ export class DashboardStats extends BaseEndpoint {
     const logger = this.getLogger(c);
 
     try {
-      const statsService = new StatsService(c.env.RELAY_KV, logger);
+      const statsService = new StatsService(c.env, logger);
       const healthService = new SettlementHealthService(c.env, logger);
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
 

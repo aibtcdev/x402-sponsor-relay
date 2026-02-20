@@ -17,6 +17,7 @@ import {
   Error429Response,
   Error500Response,
   Error502Response,
+  Error503Response,
 } from "../schemas";
 
 /**
@@ -176,6 +177,7 @@ export class Relay extends BaseEndpoint {
       "429": { ...Error429Response, description: "Rate limit exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Broadcast or network error" },
+      "503": { ...Error503Response, description: "Nonce coordinator unavailable — retry after delay" },
     },
   };
 
@@ -184,7 +186,7 @@ export class Relay extends BaseEndpoint {
     logger.info("Relay request received");
 
     // Initialize stats service for metrics recording
-    const statsService = new StatsService(c.env.RELAY_KV, logger);
+    const statsService = new StatsService(c.env, logger);
 
     try {
       // Parse request body
@@ -192,7 +194,7 @@ export class Relay extends BaseEndpoint {
 
       // Validate required fields
       if (!body.transaction) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
@@ -202,7 +204,7 @@ export class Relay extends BaseEndpoint {
       }
 
       if (!body.settle) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: "Missing settle options",
           code: "MISSING_SETTLE_OPTIONS",
@@ -216,7 +218,7 @@ export class Relay extends BaseEndpoint {
         const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
         const authError = stxVerifyService.verifySip018Auth(body.auth, "relay");
         if (authError) {
-          await statsService.recordError("validation");
+          c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
           return this.err(c, {
             error: authError.error,
             code: authError.code,
@@ -235,7 +237,7 @@ export class Relay extends BaseEndpoint {
         body.settle
       );
       if (settleValidation.valid === false) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: settleValidation.error,
           code: "INVALID_SETTLE_OPTIONS",
@@ -248,7 +250,7 @@ export class Relay extends BaseEndpoint {
       // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         // Determine error code based on validation failure
         const code = validation.error === "Transaction must be sponsored"
           ? "NOT_SPONSORED"
@@ -265,7 +267,7 @@ export class Relay extends BaseEndpoint {
       // Check rate limit using sender address from transaction
       if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
-        await statsService.recordError("rateLimit");
+        c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));
         return this.err(c, {
           error: "Rate limit exceeded",
           code: "RATE_LIMIT_EXCEEDED",
@@ -291,10 +293,10 @@ export class Relay extends BaseEndpoint {
             sender: dedupResult.sender,
             recipient: dedupResult.recipient,
             amount: dedupResult.amount,
-            ...(dedupResult.blockHeight ? { blockHeight: dedupResult.blockHeight } : {}),
+            blockHeight: dedupResult.blockHeight,
           },
-          ...(dedupResult.sponsoredTx ? { sponsoredTx: dedupResult.sponsoredTx } : {}),
-          ...(dedupResult.receiptId ? { receiptId: dedupResult.receiptId } : {}),
+          sponsoredTx: dedupResult.sponsoredTx,
+          receiptId: dedupResult.receiptId,
         });
       }
 
@@ -303,17 +305,11 @@ export class Relay extends BaseEndpoint {
         validation.transaction
       );
       if (sponsorResult.success === false) {
-        await statsService.recordError("sponsoring");
-        const code = sponsorResult.error === "Service not configured"
-          ? "SPONSOR_CONFIG_ERROR"
-          : "SPONSOR_FAILED";
-        return this.err(c, {
-          error: sponsorResult.error,
-          code,
-          status: 500,
-          details: sponsorResult.details,
-          retryable: code === "SPONSOR_FAILED",
-        });
+        return this.sponsorFailureResponse(
+          c,
+          sponsorResult,
+          statsService.recordError("sponsoring").catch(() => {})
+        );
       }
 
       // Step C — Verify payment parameters locally
@@ -322,7 +318,7 @@ export class Relay extends BaseEndpoint {
         body.settle
       );
       if (!verifyResult.valid) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: verifyResult.error,
           code: "SETTLEMENT_VERIFICATION_FAILED",
@@ -337,15 +333,10 @@ export class Relay extends BaseEndpoint {
         verifyResult.data.transaction
       );
       if ("error" in broadcastResult) {
-        await statsService.recordError("internal");
         // Record fee even for failed broadcasts — sponsor already paid
+        // Both calls are fire-and-forget (waitUntil) — never block the error response.
         const tokenTypeFailed = body.settle.tokenType || "STX";
-        await statsService.recordTransaction({
-          success: false,
-          tokenType: tokenTypeFailed,
-          amount: body.settle.minAmount,
-          fee: sponsorResult.fee,
-        });
+        c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
         c.executionCtx.waitUntil(
           statsService.logTransaction({
             timestamp: new Date().toISOString(),
@@ -357,17 +348,11 @@ export class Relay extends BaseEndpoint {
             sender: validation.senderAddress,
             recipient: body.settle.expectedRecipient,
             status: "failed",
-          })
+          }).catch(() => {})
         );
 
         if (broadcastResult.nonceConflict) {
-          // Trigger immediate DO resync so the next request gets a clean nonce.
-          // Fire-and-forget: does not block the error response.
-          c.executionCtx.waitUntil(
-            sponsorService.resyncNonceDO().catch((e) => {
-              logger.warn("resyncNonceDO failed after nonce conflict", { error: String(e) });
-            })
-          );
+          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
           return this.err(c, {
             error: "Nonce conflict — resubmit with a new transaction",
             code: "NONCE_CONFLICT",
@@ -379,14 +364,13 @@ export class Relay extends BaseEndpoint {
         }
 
         // Distinguish retryable broadcast failures from non-retryable on-chain failures
-        const code = broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED";
         return this.err(c, {
           error: broadcastResult.error,
-          code,
+          code: broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED",
           status: broadcastResult.retryable ? 502 : 422,
           details: broadcastResult.details,
           retryable: broadcastResult.retryable,
-          ...(broadcastResult.retryable ? { retryAfter: 5 } : {}),
+          retryAfter: broadcastResult.retryable ? 5 : undefined,
         });
       }
 
@@ -399,20 +383,18 @@ export class Relay extends BaseEndpoint {
         );
       }
 
-      // Step E — Record successful transaction stats
+      // Step E — Derive common fields (reused for stats, settlement, dedup)
       const tokenType = body.settle.tokenType || "STX";
-      await statsService.recordTransaction({
-        success: true,
-        tokenType,
-        amount: body.settle.minAmount,
-        fee: sponsorResult.fee,
-      });
-
-      // Log individual transaction (non-blocking)
-      const logSenderAddress = settlementService.senderToAddress(
+      const senderAddress = settlementService.senderToAddress(
         verifyResult.data.transaction,
         c.env.STACKS_NETWORK
       );
+      const confirmedBlockHeight =
+        broadcastResult.status === "confirmed"
+          ? broadcastResult.blockHeight
+          : undefined;
+
+      // Record successful transaction stats (fire-and-forget, never blocks response)
       c.executionCtx.waitUntil(
         statsService.logTransaction({
           timestamp: new Date().toISOString(),
@@ -422,30 +404,21 @@ export class Relay extends BaseEndpoint {
           amount: body.settle.minAmount,
           fee: sponsorResult.fee,
           txid: broadcastResult.txid,
-          sender: logSenderAddress,
+          sender: senderAddress,
           recipient: verifyResult.data.recipient,
           status: broadcastResult.status,
-          ...(broadcastResult.status === "confirmed"
-            ? { blockHeight: broadcastResult.blockHeight }
-            : {}),
-        })
+          blockHeight: confirmedBlockHeight,
+        }).catch(() => {})
       );
 
       // Step F — Build settlement result and store payment receipt
-      // Convert signer hash160 to human-readable Stacks address
-      const senderAddress = settlementService.senderToAddress(
-        verifyResult.data.transaction,
-        c.env.STACKS_NETWORK
-      );
       const settlement: SettlementResult = {
         success: true,
         status: broadcastResult.status,
         sender: senderAddress,
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
-        ...(broadcastResult.status === "confirmed"
-          ? { blockHeight: broadcastResult.blockHeight }
-          : {}),
+        blockHeight: confirmedBlockHeight,
       };
 
       const receiptService = new ReceiptService(c.env.RELAY_KV, logger);
@@ -469,9 +442,7 @@ export class Relay extends BaseEndpoint {
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
         sponsoredTx: sponsorResult.sponsoredTxHex,
-        ...(broadcastResult.status === "confirmed"
-          ? { blockHeight: broadcastResult.blockHeight }
-          : {}),
+        blockHeight: confirmedBlockHeight,
       });
 
       // Step H — Log and return
@@ -486,14 +457,13 @@ export class Relay extends BaseEndpoint {
         txid: broadcastResult.txid,
         settlement,
         sponsoredTx: sponsorResult.sponsoredTxHex,
-        // Only return receiptId if storage succeeded
-        ...(storedReceipt ? { receiptId } : {}),
+        receiptId: storedReceipt ? receiptId : undefined,
       });
     } catch (e) {
       logger.error("Unexpected error", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
-      await statsService.recordError("internal");
+      c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
       return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",

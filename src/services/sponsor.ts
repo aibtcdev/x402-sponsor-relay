@@ -57,6 +57,8 @@ export interface SponsorFailure {
   success: false;
   error: string;
   details: string;
+  /** Optional machine-readable error code for callers */
+  code?: string;
 }
 
 /**
@@ -208,6 +210,23 @@ export class SponsorService {
   }
 
   /**
+   * Compute the capped exponential backoff delay for a retry attempt.
+   * For 429 responses, honours the Retry-After header when present.
+   */
+  private getRetryDelayMs(attempt: number, retryAfterHeader?: string | null): number {
+    let delayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+
+    if (retryAfterHeader != null) {
+      const retryAfterMs = parseInt(retryAfterHeader, 10) * 1000;
+      if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+        delayMs = retryAfterMs;
+      }
+    }
+
+    return Math.min(delayMs, NONCE_FETCH_MAX_DELAY_MS);
+  }
+
+  /**
    * Fetch the sponsor account nonce from Hiro API with retry-with-backoff.
    * Retries on 429 (rate limit) and network errors up to NONCE_FETCH_MAX_ATTEMPTS.
    * Uses HIRO_API_KEY if configured for higher rate limits.
@@ -218,6 +237,8 @@ export class SponsorService {
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
 
     for (let attempt = 1; attempt <= NONCE_FETCH_MAX_ATTEMPTS; attempt++) {
+      const isLastAttempt = attempt === NONCE_FETCH_MAX_ATTEMPTS;
+
       try {
         const response = await fetch(url, {
           headers,
@@ -225,38 +246,18 @@ export class SponsorService {
         });
 
         if (response.status === 429) {
-          const retryAfter = response.headers.get("Retry-After");
-          const baseDelayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-          let delayMs = baseDelayMs;
-
-          if (retryAfter !== null) {
-            const parsedSeconds = parseInt(retryAfter, 10);
-            const retryAfterDelayMs = parsedSeconds * 1000;
-            if (Number.isFinite(retryAfterDelayMs) && retryAfterDelayMs > 0) {
-              delayMs = retryAfterDelayMs;
-            }
-          }
-
-          // Cap delay to prevent exceeding Worker request time limits
-          delayMs = Math.min(delayMs, NONCE_FETCH_MAX_DELAY_MS);
-          this.logger.warn("Hiro API rate limited on nonce fetch, retrying", {
-            attempt,
-            delayMs,
-          });
-          if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
+          this.logger.warn("Hiro API rate limited on nonce fetch, retrying", { attempt });
+          if (!isLastAttempt) {
+            const delayMs = this.getRetryDelayMs(attempt, response.headers.get("Retry-After"));
             await new Promise((resolve) => setTimeout(resolve, delayMs));
           }
           continue;
         }
 
         if (!response.ok) {
-          this.logger.warn("Hiro API error on nonce fetch", {
-            attempt,
-            status: response.status,
-          });
-          if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
-            const delayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          this.logger.warn("Hiro API error on nonce fetch", { attempt, status: response.status });
+          if (!isLastAttempt) {
+            await new Promise((resolve) => setTimeout(resolve, this.getRetryDelayMs(attempt)));
           }
           continue;
         }
@@ -274,9 +275,8 @@ export class SponsorService {
           attempt,
           error: e instanceof Error ? e.message : String(e),
         });
-        if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
-          const delayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (!isLastAttempt) {
+          await new Promise((resolve) => setTimeout(resolve, this.getRetryDelayMs(attempt)));
         }
       }
     }
@@ -326,6 +326,23 @@ export class SponsorService {
       });
     } catch (e) {
       this.logger.warn("Failed to resync NonceDO", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Delayed resync: waits delayMs before calling resyncNonceDO so Hiro's mempool
+   * index has time to catch up after a conflicting transaction is broadcast.
+   * Call via executionCtx.waitUntil() after a nonce conflict broadcast failure.
+   * Never throws — all errors are logged as warnings.
+   */
+  async resyncNonceDODelayed(delayMs = 2000): Promise<void> {
+    try {
+      await new Promise((r) => setTimeout(r, delayMs));
+      await this.resyncNonceDO();
+    } catch (e) {
+      this.logger.warn("Failed to run delayed NonceDO resync", {
         error: e instanceof Error ? e.message : String(e),
       });
     }
@@ -455,12 +472,19 @@ export class SponsorService {
       fee = undefined;
     }
 
-    // Pre-fetch the sponsor nonce with retry-with-backoff to avoid hitting Hiro
-    // API rate limits from the internal fetchNonce() call inside sponsorTransaction().
-    // Passing sponsorNonce explicitly skips the internal nonce fetch entirely.
+    // Pre-fetch the sponsor nonce to avoid hitting Hiro API rate limits from the
+    // internal fetchNonce() call inside sponsorTransaction(). Passing sponsorNonce
+    // explicitly skips the internal nonce fetch entirely.
+    //
+    // When NONCE_DO is configured, it is the authoritative nonce source.
+    // If the DO is unreachable we fail fast (503) rather than silently falling back
+    // to the uncoordinated Hiro path which causes nonce races.
+    // When NONCE_DO is NOT configured (e.g. local dev), we fall back to Hiro with a warning.
     let sponsorNonce: bigint | undefined;
-    try {
-      const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
+    const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
+
+    if (this.env.NONCE_DO) {
+      // NONCE_DO is configured — it is the authoritative source; fail fast if unavailable
       const doNonce = await this.fetchNonceFromDO(sponsorAddress);
       if (doNonce !== null) {
         sponsorNonce = doNonce;
@@ -468,36 +492,44 @@ export class SponsorService {
           sponsorNonce: sponsorNonce.toString(),
         });
       } else {
-        const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
-        if (fetchedNonce !== null) {
-          sponsorNonce = fetchedNonce;
-          this.logger.debug("Using fallback sponsor nonce", {
-            sponsorNonce: sponsorNonce.toString(),
-          });
-        } else {
-          // Fall back to letting @stacks/transactions fetch the nonce internally
-          this.logger.warn(
-            "Nonce pre-fetch failed, falling back to internal nonce fetch"
-          );
-        }
+        this.logger.error(
+          "NonceDO is configured but unavailable; refusing to fall back to uncoordinated nonce"
+        );
+        return {
+          success: false,
+          error: "Nonce coordination service unavailable",
+          details: "NonceDO did not return a nonce; retry in a few seconds",
+          code: "NONCE_DO_UNAVAILABLE",
+        };
       }
-    } catch (e) {
+    } else {
+      // NONCE_DO not configured — fall back to Hiro with a warning (local dev / unconfigured)
       this.logger.warn(
-        "Error during nonce pre-fetch, falling back to internal nonce fetch",
-        {
-          error: e instanceof Error ? e.message : String(e),
-        }
+        "NONCE_DO not configured; falling back to uncoordinated Hiro nonce fetch"
       );
+      const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
+      if (fetchedNonce !== null) {
+        sponsorNonce = fetchedNonce;
+        this.logger.debug("Using Hiro fallback sponsor nonce", {
+          sponsorNonce: sponsorNonce.toString(),
+        });
+      } else {
+        // Let @stacks/transactions fetch internally as last resort
+        this.logger.warn(
+          "Hiro nonce fetch failed; falling back to internal nonce fetch"
+        );
+      }
     }
 
     try {
-      const sponsoredTx = await sponsorTransaction({
+      const sponsorOpts = {
         transaction,
         sponsorPrivateKey: sponsorKey,
         network,
         fee,
-        ...(sponsorNonce !== undefined ? { sponsorNonce } : {}),
-      });
+        sponsorNonce,
+      };
+      const sponsoredTx = await sponsorTransaction(sponsorOpts);
 
       // v7: serialize() returns hex string directly
       const sponsoredTxHex = sponsoredTx.serialize();

@@ -52,12 +52,14 @@ export interface Env {
   HIRO_API_KEY?: string;
   // LOGS is a service binding to worker-logs, typed loosely to avoid complex Service<> generics
   LOGS?: unknown;
-  // KV namespace for dashboard stats storage
+  // KV namespace for receipts, dedup, fee cache, and health checks
   RELAY_KV?: KVNamespace;
   // KV namespace for API key storage
   API_KEYS_KV?: KVNamespace;
   // Durable Object namespace for nonce coordination
   NONCE_DO?: DurableObjectNamespace;
+  // Durable Object namespace for atomic stats (replaces KV read-modify-write)
+  STATS_DO?: DurableObjectNamespace;
 }
 
 /**
@@ -524,7 +526,10 @@ export type RelayErrorCode =
   | "MISSING_STX_ADDRESS"
   | "INVALID_AUTH_SIGNATURE"
   | "AUTH_EXPIRED"
-  | "NONCE_RESET_FAILED";
+  | "NONCE_RESET_FAILED"
+  | "NONCE_DO_UNAVAILABLE"
+  | "UNSUPPORTED_ADDRESS_TYPE"
+  | "INVALID_BTC_ADDRESS";
 
 /**
  * Structured error response with retry guidance
@@ -705,7 +710,7 @@ export interface FeeStats {
 }
 
 /**
- * Daily statistics stored in KV
+ * Daily statistics (stored in StatsDO SQLite)
  */
 export interface DailyStats {
   date: string;
@@ -728,23 +733,6 @@ export interface DailyStats {
   };
   /** Fee statistics for the day */
   fees?: FeeStats;
-}
-
-/**
- * Hourly stats for granular 24h view
- */
-export interface HourlyStats {
-  hour: string;
-  transactions: number;
-  success: number;
-  failed: number;
-  tokens: {
-    STX: number;
-    sBTC: number;
-    USDCx: number;
-  };
-  /** Total fees paid this hour in microSTX */
-  fees?: string;
 }
 
 /**
@@ -837,7 +825,7 @@ export interface AggregateKeyStats {
 export type RelayEndpointName = "relay" | "sponsor" | "settle";
 
 /**
- * Individual transaction log entry stored in KV
+ * Individual transaction log entry (stored in StatsDO SQLite)
  */
 export interface TransactionLogEntry {
   /** ISO 8601 timestamp */

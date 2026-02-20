@@ -18,6 +18,7 @@ import {
   Error429Response,
   Error500Response,
   Error502Response,
+  Error503Response,
 } from "../schemas";
 
 const NONCE_CONFLICT_REASONS = ["ConflictingNonceInMempool", "BadNonce"];
@@ -130,6 +131,7 @@ export class Sponsor extends BaseEndpoint {
       "429": { ...Error429Response, description: "Spending cap exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Broadcast failed" },
+      "503": { ...Error503Response, description: "Nonce coordinator unavailable — retry after delay" },
     },
   };
 
@@ -138,7 +140,7 @@ export class Sponsor extends BaseEndpoint {
     logger.info("Sponsor request received");
 
     // Initialize stats service for metrics recording
-    const statsService = new StatsService(c.env.RELAY_KV, logger);
+    const statsService = new StatsService(c.env, logger);
 
     try {
       // Auth is guaranteed by requireAuthMiddleware - get the auth context
@@ -149,7 +151,7 @@ export class Sponsor extends BaseEndpoint {
 
       // Validate required fields
       if (!body.transaction) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
@@ -163,7 +165,7 @@ export class Sponsor extends BaseEndpoint {
         const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
         const authError = stxVerifyService.verifySip018Auth(body.auth, "sponsor");
         if (authError) {
-          await statsService.recordError("validation");
+          c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
           return this.err(c, {
             error: authError.error,
             code: authError.code,
@@ -179,7 +181,7 @@ export class Sponsor extends BaseEndpoint {
       // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
-        await statsService.recordError("validation");
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         const code =
           validation.error === "Transaction must be sponsored"
             ? "NOT_SPONSORED"
@@ -200,37 +202,33 @@ export class Sponsor extends BaseEndpoint {
       // Check rate limits before processing
       const rateLimitResult = await authService.checkRateLimit(metadata.keyId, metadata.tier);
       if (!rateLimitResult.allowed) {
-        await statsService.recordError("rateLimit");
+        c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));
         logger.warn("Rate limit exceeded", {
           keyId: metadata.keyId,
           tier: metadata.tier,
           code: rateLimitResult.code,
         });
+        const isDaily = rateLimitResult.code === "DAILY_LIMIT_EXCEEDED";
         return this.err(c, {
-          error: rateLimitResult.code === "DAILY_LIMIT_EXCEEDED"
-            ? "Daily request limit exceeded"
-            : "Rate limit exceeded",
+          error: isDaily ? "Daily request limit exceeded" : "Rate limit exceeded",
           code: rateLimitResult.code,
           status: 429,
-          details: rateLimitResult.code === "DAILY_LIMIT_EXCEEDED"
+          details: isDaily
             ? "Your API key has exceeded its daily request limit. Limit resets at midnight UTC."
-            : `Too many requests. Please wait before trying again.`,
+            : "Too many requests. Please wait before trying again.",
           retryable: true,
           retryAfter: rateLimitResult.retryAfter,
         });
       }
 
-      // Estimate fee based on transaction size since sponsored tx has fee=0
-      // Use conservative size-based estimation for spending cap check
-      const txHex = body.transaction;
-      const txByteLength = typeof txHex === "string"
-        ? Buffer.from(txHex.startsWith("0x") ? txHex.slice(2) : txHex, "hex").length
-        : 0;
-      const perByteFee = 50n; // microSTX per byte (conservative rate)
-      const baseFee = 10000n; // minimum fallback estimate (0.01 STX)
-      const sizeBasedEstimate = txByteLength > 0
-        ? BigInt(txByteLength) * perByteFee
-        : baseFee;
+      // Estimate fee based on transaction size for spending cap check.
+      // Conservative: 50 microSTX/byte, floor of 10,000 microSTX (0.01 STX).
+      const cleanTxHex = body.transaction.startsWith("0x")
+        ? body.transaction.slice(2)
+        : body.transaction;
+      const txByteLength = Buffer.from(cleanTxHex, "hex").length;
+      const baseFee = 10_000n;
+      const sizeBasedEstimate = BigInt(txByteLength) * 50n;
       const estimatedFee = sizeBasedEstimate > baseFee ? sizeBasedEstimate : baseFee;
 
       // Check spending cap before sponsoring
@@ -243,7 +241,7 @@ export class Sponsor extends BaseEndpoint {
       );
 
       if (!spendingCapResult.allowed) {
-        await statsService.recordError("rateLimit");
+        c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));
         logger.warn("Spending cap exceeded", {
           keyId: metadata.keyId,
           tier: metadata.tier,
@@ -264,18 +262,11 @@ export class Sponsor extends BaseEndpoint {
         validation.transaction
       );
       if (sponsorResult.success === false) {
-        await statsService.recordError("sponsoring");
-        const code =
-          sponsorResult.error === "Service not configured"
-            ? "SPONSOR_CONFIG_ERROR"
-            : "SPONSOR_FAILED";
-        return this.err(c, {
-          error: sponsorResult.error,
-          code,
-          status: 500,
-          details: sponsorResult.details,
-          retryable: code === "SPONSOR_FAILED",
-        });
+        return this.sponsorFailureResponse(
+          c,
+          sponsorResult,
+          statsService.recordError("sponsoring").catch(() => {})
+        );
       }
 
       // Broadcast directly to Stacks node
@@ -303,20 +294,14 @@ export class Sponsor extends BaseEndpoint {
             error: result.error,
             reason: errorReason,
           });
-          await statsService.recordError("sponsoring");
+          c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
 
           const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
             errorReason.includes(reason)
           );
 
           if (isNonceConflict) {
-            // Trigger immediate DO resync so the next request gets a clean nonce.
-            // Fire-and-forget: does not block the error response.
-            c.executionCtx.waitUntil(
-              sponsorService.resyncNonceDO().catch((e) => {
-                logger.warn("resyncNonceDO failed after nonce conflict", { error: String(e) });
-              })
-            );
+            this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
             return this.err(c, {
               error: "Nonce conflict — resubmit with a new transaction",
               code: "NONCE_CONFLICT",
@@ -342,7 +327,7 @@ export class Sponsor extends BaseEndpoint {
         logger.error("Broadcast failed", {
           error: e instanceof Error ? e.message : "Unknown error",
         });
-        await statsService.recordError("sponsoring");
+        c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
         return this.err(c, {
           error: "Failed to broadcast transaction",
           code: "BROADCAST_FAILED",
@@ -366,13 +351,7 @@ export class Sponsor extends BaseEndpoint {
       const actualFee = BigInt(sponsorResult.fee);
       await authService.recordFeeSpent(metadata.keyId, actualFee);
 
-      // Record successful transaction in global stats
-      await statsService.recordTransaction({
-        success: true,
-        tokenType: "STX", // Default for sponsor endpoint
-        amount: "0", // No settlement amount for direct sponsor
-        fee: sponsorResult.fee,
-      });
+      // Record successful transaction in global stats (fire-and-forget, never blocks response)
       c.executionCtx.waitUntil(
         statsService.logTransaction({
           timestamp: new Date().toISOString(),
@@ -384,7 +363,7 @@ export class Sponsor extends BaseEndpoint {
           txid,
           sender: validation.senderAddress,
           status: "pending",
-        })
+        }).catch(() => {})
       );
 
       // Also record usage for the API key (for volume tracking)
@@ -412,7 +391,7 @@ export class Sponsor extends BaseEndpoint {
       logger.error("Unexpected error", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
-      await statsService.recordError("internal");
+      c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
       return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",

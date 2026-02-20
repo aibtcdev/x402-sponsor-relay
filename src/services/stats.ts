@@ -1,65 +1,12 @@
 import type {
+  Env,
   Logger,
   TokenType,
   DailyStats,
-  HourlyStats,
   DashboardOverview,
   ErrorCategory,
-  FeeStats,
   TransactionLogEntry,
 } from "../types";
-
-/**
- * Get current date in YYYY-MM-DD format (UTC)
- */
-function getDateKey(): string {
-  return new Date().toISOString().split("T")[0];
-}
-
-/**
- * Get current hour key in YYYY-MM-DD:HH format (UTC)
- */
-function getHourKey(): string {
-  const now = new Date();
-  const date = now.toISOString().split("T")[0];
-  const hour = now.getUTCHours().toString().padStart(2, "0");
-  return `${date}:${hour}`;
-}
-
-/**
- * Create empty daily stats for a given date
- */
-function createEmptyDailyStats(date: string): DailyStats {
-  return {
-    date,
-    transactions: { total: 0, success: 0, failed: 0 },
-    tokens: {
-      STX: { count: 0, volume: "0" },
-      sBTC: { count: 0, volume: "0" },
-      USDCx: { count: 0, volume: "0" },
-    },
-    errors: {
-      validation: 0,
-      rateLimit: 0,
-      sponsoring: 0,
-      settlement: 0,
-      internal: 0,
-    },
-  };
-}
-
-/**
- * Create empty hourly stats for a given hour
- */
-function createEmptyHourlyStats(hour: string): HourlyStats {
-  return {
-    hour,
-    transactions: 0,
-    success: 0,
-    failed: 0,
-    tokens: { STX: 0, sBTC: 0, USDCx: 0 },
-  };
-}
 
 /**
  * Calculate trend based on current vs previous values
@@ -75,25 +22,88 @@ export function calculateTrend(
   return "stable";
 }
 
-// Time constants
-const HOUR_MS = 60 * 60 * 1000; // 1 hour in milliseconds
-const DAY_MS = 24 * HOUR_MS; // 24 hours in milliseconds
-
-// TTL values in seconds
-const HOURLY_TTL = 48 * 60 * 60; // 48 hours
-const DAILY_TTL = 90 * 24 * 60 * 60; // 90 days
-
 /**
- * Service for tracking and retrieving relay statistics
+ * StatsService — thin proxy to StatsDO for atomic stats recording.
+ *
+ * All write methods (recordTransaction, recordError, logTransaction) are
+ * fire-and-forget-friendly: callers should wrap them in waitUntil() so
+ * they never block the HTTP response.
+ *
+ * All read methods (getOverview, getDailyStats, etc.) call StatsDO and
+ * return the same shapes as the previous KV implementation.
+ *
+ * If STATS_DO is unavailable, all methods degrade silently (same
+ * behaviour as the previous KV fallback).
  */
 export class StatsService {
-  constructor(
-    private kv: KVNamespace | undefined,
-    private logger: Logger
-  ) {}
+  private readonly env: Env;
+  private readonly logger: Logger;
+
+  constructor(env: Env, logger: Logger) {
+    this.env = env;
+    this.logger = logger;
+  }
+
+  // ===========================================================================
+  // Private helpers
+  // ===========================================================================
+
+  private getStub(): DurableObjectStub | null {
+    if (!this.env.STATS_DO) {
+      this.logger.debug("STATS_DO not available, skipping stats");
+      return null;
+    }
+    try {
+      const id = this.env.STATS_DO.idFromName("global");
+      return this.env.STATS_DO.get(id);
+    } catch (e) {
+      this.logger.debug("Failed to get STATS_DO stub", {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+      return null;
+    }
+  }
+
+  private async doPost(path: string, body: unknown): Promise<void> {
+    const stub = this.getStub();
+    if (!stub) return;
+    try {
+      await stub.fetch(
+        new Request(`http://do${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        })
+      );
+    } catch (e) {
+      this.logger.debug(`StatsDO POST ${path} failed`, {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+    }
+  }
+
+  private async doGet<T>(path: string): Promise<T | null> {
+    const stub = this.getStub();
+    if (!stub) return null;
+    try {
+      const resp = await stub.fetch(new Request(`http://do${path}`));
+      if (!resp.ok) return null;
+      return (await resp.json()) as T;
+    } catch (e) {
+      this.logger.debug(`StatsDO GET ${path} failed`, {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+      return null;
+    }
+  }
+
+  // ===========================================================================
+  // Write methods (fire-and-forget — wrap callers in waitUntil)
+  // ===========================================================================
 
   /**
-   * Record a successful or failed transaction
+   * Record a successful or failed transaction.
+   * Callers should use c.executionCtx.waitUntil(statsService.recordTransaction(...).catch(() => {}))
    */
   async recordTransaction(data: {
     success: boolean;
@@ -102,77 +112,42 @@ export class StatsService {
     /** Fee paid by sponsor in microSTX */
     fee?: string;
   }): Promise<void> {
-    if (!this.kv) {
-      this.logger.debug("KV not available, skipping stats recording");
-      return;
-    }
-
-    try {
-      const dateKey = getDateKey();
-      const hourKey = getHourKey();
-
-      // Update daily stats
-      await this.updateDailyStats(dateKey, data);
-
-      // Update hourly stats
-      await this.updateHourlyStats(hourKey, data);
-    } catch (e) {
-      this.logger.error("Failed to record transaction stats", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-    }
+    await this.doPost("/record", {
+      timestamp: new Date().toISOString(),
+      endpoint: "relay" as const,
+      success: data.success,
+      tokenType: data.tokenType,
+      amount: data.amount,
+      fee: data.fee,
+    });
   }
 
   /**
-   * Record an error by category
+   * Record an error by category.
+   * Callers should use c.executionCtx.waitUntil(statsService.recordError(...).catch(() => {}))
    */
   async recordError(category: ErrorCategory): Promise<void> {
-    if (!this.kv) {
-      this.logger.debug("KV not available, skipping error recording");
-      return;
-    }
-
-    try {
-      const dateKey = getDateKey();
-      const key = `stats:daily:${dateKey}`;
-
-      const existing = await this.kv.get<DailyStats>(key, "json");
-      const stats = existing || createEmptyDailyStats(dateKey);
-
-      stats.errors[category]++;
-
-      // Only count errors from actual transaction attempts as failed transactions
-      // Validation and rate limit errors never become actual transactions
-      if (category === "sponsoring" || category === "settlement" || category === "internal") {
-        stats.transactions.total++;
-        stats.transactions.failed++;
-      }
-
-      await this.kv.put(key, JSON.stringify(stats), {
-        expirationTtl: DAILY_TTL,
-      });
-    } catch (e) {
-      this.logger.error("Failed to record error stats", {
-        error: e instanceof Error ? e.message : "Unknown error",
-        category,
-      });
-    }
+    await this.doPost("/error", { category });
   }
 
   /**
-   * Get dashboard overview data
+   * Append an individual transaction log entry.
+   * Callers should use c.executionCtx.waitUntil(statsService.logTransaction(...).catch(() => {}))
+   */
+  async logTransaction(entry: TransactionLogEntry): Promise<void> {
+    await this.doPost("/record", entry);
+  }
+
+  // ===========================================================================
+  // Read methods (for dashboard and stats endpoints)
+  // ===========================================================================
+
+  /**
+   * Get dashboard overview data (today + trend vs yesterday).
    */
   async getOverview(): Promise<DashboardOverview> {
-    const emptyFees = {
-      total: "0",
-      average: "0",
-      min: "0",
-      max: "0",
-      trend: "stable" as const,
-      previousTotal: "0",
-    };
-
-    const emptyOverview: DashboardOverview = {
+    const data = await this.doGet<DashboardOverview>("/overview");
+    return data ?? {
       period: "24h",
       transactions: {
         total: 0,
@@ -186,7 +161,14 @@ export class StatsService {
         sBTC: { count: 0, volume: "0", percentage: 0 },
         USDCx: { count: 0, volume: "0", percentage: 0 },
       },
-      fees: emptyFees,
+      fees: {
+        total: "0",
+        average: "0",
+        min: "0",
+        max: "0",
+        trend: "stable",
+        previousTotal: "0",
+      },
       settlement: {
         status: "unknown",
         avgLatencyMs: 0,
@@ -195,107 +177,17 @@ export class StatsService {
       },
       hourlyData: [],
     };
-
-    if (!this.kv) {
-      return emptyOverview;
-    }
-
-    try {
-      // Get today and yesterday stats for trend calculation
-      const today = getDateKey();
-      const yesterday = new Date(Date.now() - DAY_MS)
-        .toISOString()
-        .split("T")[0];
-
-      const [todayStats, yesterdayStats, hourlyData] = await Promise.all([
-        this.kv.get<DailyStats>(`stats:daily:${today}`, "json"),
-        this.kv.get<DailyStats>(`stats:daily:${yesterday}`, "json"),
-        this.getHourlyStats(),
-      ]);
-
-      const current = todayStats || createEmptyDailyStats(today);
-      const previous = yesterdayStats || createEmptyDailyStats(yesterday);
-
-      // Calculate token percentages
-      const totalTokenTx =
-        current.tokens.STX.count +
-        current.tokens.sBTC.count +
-        current.tokens.USDCx.count;
-
-      const tokenPercentage = (count: number) =>
-        totalTokenTx > 0 ? Math.round((count / totalTokenTx) * 100) : 0;
-
-      // Calculate fee metrics
-      const currentFees = current.fees || { total: "0", count: 0, min: "0", max: "0" };
-      const previousFees = previous.fees || { total: "0", count: 0, min: "0", max: "0" };
-
-      const avgFee = currentFees.count > 0
-        ? (BigInt(currentFees.total) / BigInt(currentFees.count)).toString()
-        : "0";
-
-      // Calculate fee trend using BigInt comparison
-      const currentFeeTotal = BigInt(currentFees.total);
-      const previousFeeTotal = BigInt(previousFees.total);
-      let feeTrend: "up" | "down" | "stable" = "stable";
-      if (previousFeeTotal === 0n) {
-        feeTrend = currentFeeTotal > 0n ? "up" : "stable";
-      } else {
-        // Calculate percentage change: (current - previous) / previous * 100
-        const diff = currentFeeTotal - previousFeeTotal;
-        const percentChange = (diff * 100n) / previousFeeTotal;
-        if (percentChange > 5n) feeTrend = "up";
-        else if (percentChange < -5n) feeTrend = "down";
-      }
-
-      return {
-        period: "24h",
-        transactions: {
-          total: current.transactions.total,
-          success: current.transactions.success,
-          failed: current.transactions.failed,
-          trend: calculateTrend(
-            current.transactions.total,
-            previous.transactions.total
-          ),
-          previousTotal: previous.transactions.total,
-        },
-        tokens: {
-          STX: {
-            count: current.tokens.STX.count,
-            volume: current.tokens.STX.volume,
-            percentage: tokenPercentage(current.tokens.STX.count),
-          },
-          sBTC: {
-            count: current.tokens.sBTC.count,
-            volume: current.tokens.sBTC.volume,
-            percentage: tokenPercentage(current.tokens.sBTC.count),
-          },
-          USDCx: {
-            count: current.tokens.USDCx.count,
-            volume: current.tokens.USDCx.volume,
-            percentage: tokenPercentage(current.tokens.USDCx.count),
-          },
-        },
-        fees: {
-          total: currentFees.total,
-          average: avgFee,
-          min: currentFees.min,
-          max: currentFees.max,
-          trend: feeTrend,
-          previousTotal: previousFees.total,
-        },
-        hourlyData,
-      };
-    } catch (e) {
-      this.logger.error("Failed to get overview stats", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-      return emptyOverview;
-    }
   }
 
   /**
-   * Get daily stats aggregated as chart-compatible hourly-format entries.
+   * Get daily stats for a date range (oldest-first, N days back from today).
+   */
+  async getDailyStats(days: number): Promise<DailyStats[]> {
+    return (await this.doGet<DailyStats[]>(`/daily?days=${days}`)) ?? [];
+  }
+
+  /**
+   * Get daily stats aggregated as chart-compatible entries.
    * Returns one entry per day with a short date label (e.g. "Feb 12").
    */
   async getDailyChartData(
@@ -303,7 +195,6 @@ export class StatsService {
   ): Promise<Array<{ hour: string; transactions: number; success: number }>> {
     const daily = await this.getDailyStats(days);
     return daily.map((d) => {
-      // Format YYYY-MM-DD as "Mon DD" (e.g. "Feb 12")
       const [year, month, day] = d.date.split("-").map(Number);
       const label = new Date(Date.UTC(year, month - 1, day)).toLocaleDateString(
         "en-US",
@@ -318,258 +209,30 @@ export class StatsService {
   }
 
   /**
-   * Get daily stats for a date range
-   */
-  async getDailyStats(days: number): Promise<DailyStats[]> {
-    if (!this.kv) {
-      return [];
-    }
-
-    try {
-      const now = Date.now();
-
-      // Build date keys for all requested days
-      const dateKeys: string[] = [];
-      for (let i = 0; i < days; i++) {
-        dateKeys.push(
-          new Date(now - i * DAY_MS).toISOString().split("T")[0]
-        );
-      }
-
-      // Fetch all days in parallel
-      const results = await Promise.all(
-        dateKeys.map((date) =>
-          this.kv!.get<DailyStats>(`stats:daily:${date}`, "json")
-        )
-      );
-
-      return dateKeys
-        .map((date, i) => results[i] || createEmptyDailyStats(date))
-        .reverse(); // Oldest first
-    } catch (e) {
-      this.logger.error("Failed to get daily stats", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-      return [];
-    }
-  }
-
-  /**
-   * Get hourly stats for last 24 hours
+   * Get hourly stats for last 24 hours.
    */
   async getHourlyStats(): Promise<
     Array<{ hour: string; transactions: number; success: number; fees?: string }>
   > {
-    if (!this.kv) {
-      return [];
-    }
-
-    try {
-      const now = Date.now();
-
-      // Build keys for all 24 hours
-      const hourEntries: Array<{ key: string; hourLabel: string }> = [];
-      for (let i = 23; i >= 0; i--) {
-        const hourDate = new Date(now - i * HOUR_MS);
-        const date = hourDate.toISOString().split("T")[0];
-        const hour = hourDate.getUTCHours().toString().padStart(2, "0");
-        hourEntries.push({
-          key: `stats:hourly:${date}:${hour}`,
-          hourLabel: `${hour}:00`,
-        });
-      }
-
-      // Fetch all 24 hours in parallel
-      const results = await Promise.all(
-        hourEntries.map((entry) => this.kv!.get<HourlyStats>(entry.key, "json"))
-      );
-
-      return hourEntries.map((entry, i) => {
-        const data = results[i];
-        return {
-          hour: entry.hourLabel,
-          transactions: data?.transactions || 0,
-          success: data?.success || 0,
-          fees: data?.fees,
-        };
-      });
-    } catch (e) {
-      this.logger.error("Failed to get hourly stats", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-      return [];
-    }
+    return (await this.doGet<
+      Array<{ hour: string; transactions: number; success: number; fees?: string }>
+    >("/hourly")) ?? [];
   }
 
   /**
-   * Update daily stats with transaction data
-   */
-  private async updateDailyStats(
-    dateKey: string,
-    data: { success: boolean; tokenType: TokenType; amount: string; fee?: string }
-  ): Promise<void> {
-    if (!this.kv) return;
-
-    const key = `stats:daily:${dateKey}`;
-    const existing = await this.kv.get<DailyStats>(key, "json");
-    const stats = existing || createEmptyDailyStats(dateKey);
-
-    stats.transactions.total++;
-    if (data.success) {
-      stats.transactions.success++;
-    } else {
-      stats.transactions.failed++;
-    }
-
-    // Update token stats
-    const tokenStats = stats.tokens[data.tokenType];
-    tokenStats.count++;
-    tokenStats.volume = (
-      BigInt(tokenStats.volume) + BigInt(data.amount)
-    ).toString();
-
-    // Update fee stats if fee is provided
-    if (data.fee && data.success) {
-      const feeValue = BigInt(data.fee);
-      if (!stats.fees) {
-        stats.fees = {
-          total: "0",
-          count: 0,
-          min: data.fee,
-          max: data.fee,
-        };
-      }
-      stats.fees.total = (BigInt(stats.fees.total) + feeValue).toString();
-      stats.fees.count++;
-      // Update min/max
-      if (feeValue < BigInt(stats.fees.min)) {
-        stats.fees.min = data.fee;
-      }
-      if (feeValue > BigInt(stats.fees.max)) {
-        stats.fees.max = data.fee;
-      }
-    }
-
-    await this.kv.put(key, JSON.stringify(stats), {
-      expirationTtl: DAILY_TTL,
-    });
-  }
-
-  /**
-   * Update hourly stats with transaction data
-   */
-  private async updateHourlyStats(
-    hourKey: string,
-    data: { success: boolean; tokenType: TokenType; amount: string; fee?: string }
-  ): Promise<void> {
-    if (!this.kv) return;
-
-    const key = `stats:hourly:${hourKey}`;
-    const existing = await this.kv.get<HourlyStats>(key, "json");
-    const stats = existing || createEmptyHourlyStats(hourKey);
-
-    stats.transactions++;
-    if (data.success) {
-      stats.success++;
-    } else {
-      stats.failed++;
-    }
-    stats.tokens[data.tokenType]++;
-
-    // Track fees for the hour
-    if (data.fee && data.success) {
-      const currentFees = BigInt(stats.fees || "0");
-      stats.fees = (currentFees + BigInt(data.fee)).toString();
-    }
-
-    await this.kv.put(key, JSON.stringify(stats), {
-      expirationTtl: HOURLY_TTL,
-    });
-  }
-
-  // ===========================================================================
-  // Transaction Log — per-transaction records for recent history
-  // ===========================================================================
-
-  /** Max entries per day in the transaction log */
-  private static readonly TX_LOG_MAX = 500;
-  /** TTL for transaction log entries (7 days) */
-  private static readonly TX_LOG_TTL = 7 * 24 * 60 * 60;
-
-  /**
-   * Append a transaction to the daily log.
-   * Stored as a JSON array per day, capped at TX_LOG_MAX entries.
-   */
-  async logTransaction(entry: TransactionLogEntry): Promise<void> {
-    if (!this.kv) return;
-
-    try {
-      const dateKey = getDateKey();
-      const key = `tx:log:${dateKey}`;
-      const existing = await this.kv.get<TransactionLogEntry[]>(key, "json");
-      const log = existing || [];
-
-      log.push(entry);
-
-      // Cap at max entries per day (drop oldest)
-      if (log.length > StatsService.TX_LOG_MAX) {
-        log.splice(0, log.length - StatsService.TX_LOG_MAX);
-      }
-
-      await this.kv.put(key, JSON.stringify(log), {
-        expirationTtl: StatsService.TX_LOG_TTL,
-      });
-    } catch (e) {
-      this.logger.error("Failed to log transaction", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-    }
-  }
-
-  /**
-   * Get recent transaction log entries across multiple days.
-   * Returns newest-first, up to `limit` entries.
+   * Get recent transaction log entries.
    */
   async getTransactionLog(opts?: {
     days?: number;
     limit?: number;
     endpoint?: string;
   }): Promise<TransactionLogEntry[]> {
-    if (!this.kv) return [];
-
-    const days = opts?.days ?? 1;
-    const limit = opts?.limit ?? 50;
-
-    try {
-      const now = Date.now();
-      const dateKeys: string[] = [];
-      for (let i = 0; i < days; i++) {
-        dateKeys.push(
-          new Date(now - i * DAY_MS).toISOString().split("T")[0]
-        );
-      }
-
-      const results = await Promise.all(
-        dateKeys.map((d) => this.kv!.get<TransactionLogEntry[]>(`tx:log:${d}`, "json"))
-      );
-
-      let entries: TransactionLogEntry[] = [];
-      for (const dayLog of results) {
-        if (dayLog) entries.push(...dayLog);
-      }
-
-      // Filter by endpoint if requested
-      if (opts?.endpoint) {
-        entries = entries.filter((e) => e.endpoint === opts.endpoint);
-      }
-
-      // Return newest-first, capped at limit
-      return entries.reverse().slice(0, limit);
-    } catch (e) {
-      this.logger.error("Failed to get transaction log", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-      return [];
-    }
+    const params = new URLSearchParams();
+    if (opts?.days != null) params.set("days", String(opts.days));
+    if (opts?.limit != null) params.set("limit", String(opts.limit));
+    if (opts?.endpoint) params.set("endpoint", opts.endpoint);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    return (await this.doGet<TransactionLogEntry[]>(`/recent${qs}`)) ?? [];
   }
 }
+
