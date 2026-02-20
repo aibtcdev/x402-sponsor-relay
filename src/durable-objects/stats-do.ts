@@ -299,27 +299,16 @@ export class StatsDO {
     const col = colMap[category];
     if (!col) return;
 
-    // For non-validation errors, also count as a failed transaction
-    const countAsFailed = category === "sponsoring" || category === "settlement" || category === "internal";
-    if (countAsFailed) {
-      this.sql.exec(
-        `INSERT INTO daily_stats (date, total, failed, ${col})
-         VALUES (?, 1, 1, 1)
-         ON CONFLICT(date) DO UPDATE SET
-           total = total + 1,
-           failed = failed + 1,
-           ${col} = ${col} + 1`,
-        today
-      );
-    } else {
-      this.sql.exec(
-        `INSERT INTO daily_stats (date, ${col})
-         VALUES (?, 1)
-         ON CONFLICT(date) DO UPDATE SET
-           ${col} = ${col} + 1`,
-        today
-      );
-    }
+    // Only update the specific error column here.
+    // Transaction totals (total/failed) are maintained via /record
+    // to avoid double-counting when both /record and /error are used.
+    this.sql.exec(
+      `INSERT INTO daily_stats (date, ${col})
+       VALUES (?, 1)
+       ON CONFLICT(date) DO UPDATE SET
+         ${col} = ${col} + 1`,
+      today
+    );
   }
 
   // ===========================================================================

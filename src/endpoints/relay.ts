@@ -17,6 +17,7 @@ import {
   Error429Response,
   Error500Response,
   Error502Response,
+  Error503Response,
 } from "../schemas";
 
 /**
@@ -176,6 +177,7 @@ export class Relay extends BaseEndpoint {
       "429": { ...Error429Response, description: "Rate limit exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Broadcast or network error" },
+      "503": { ...Error503Response, description: "Nonce coordinator unavailable — retry after delay" },
     },
   };
 

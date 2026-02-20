@@ -150,7 +150,7 @@ export class Provision extends BaseEndpoint {
       if (!BTC_ADDRESS_REGEX.test(body.btcAddress)) {
         return this.err(c, {
           error: "Invalid Bitcoin address format. Supported: P2PKH (1...), P2SH (3...), native SegWit (bc1q.../tb1q...). Taproot (bc1p...) is not supported — use POST /keys/provision-stx instead.",
-          code: "UNSUPPORTED_ADDRESS_TYPE",
+          code: "INVALID_BTC_ADDRESS",
           status: 400,
           retryable: false,
         });

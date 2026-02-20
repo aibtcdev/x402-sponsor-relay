@@ -528,7 +528,8 @@ export type RelayErrorCode =
   | "AUTH_EXPIRED"
   | "NONCE_RESET_FAILED"
   | "NONCE_DO_UNAVAILABLE"
-  | "UNSUPPORTED_ADDRESS_TYPE";
+  | "UNSUPPORTED_ADDRESS_TYPE"
+  | "INVALID_BTC_ADDRESS";
 
 /**
  * Structured error response with retry guidance

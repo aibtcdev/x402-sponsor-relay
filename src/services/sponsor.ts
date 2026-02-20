@@ -338,8 +338,14 @@ export class SponsorService {
    * Never throws — all errors are logged as warnings.
    */
   async resyncNonceDODelayed(delayMs = 2000): Promise<void> {
-    await new Promise((r) => setTimeout(r, delayMs));
-    await this.resyncNonceDO();
+    try {
+      await new Promise((r) => setTimeout(r, delayMs));
+      await this.resyncNonceDO();
+    } catch (e) {
+      this.logger.warn("Failed to run delayed NonceDO resync", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   /**

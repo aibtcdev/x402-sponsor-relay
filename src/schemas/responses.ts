@@ -130,6 +130,19 @@ export const Error500Response = {
 };
 
 /**
+ * 503 Service Unavailable - Nonce coordinator unavailable
+ */
+export const Error503Response = {
+  description: "Service temporarily unavailable (e.g. nonce coordinator unreachable)",
+  content: {
+    "application/json": {
+      schema: RetryableErrorSchema,
+    },
+  },
+  headers: RetryAfterHeader,
+};
+
+/**
  * 502 Bad Gateway - Broadcast or settlement failed
  */
 export const Error502Response = {
