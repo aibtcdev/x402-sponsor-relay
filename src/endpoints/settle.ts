@@ -5,7 +5,7 @@ import {
   V2_REQUEST_BODY_SCHEMA,
   V2_ERROR_RESPONSE_SCHEMA,
 } from "./v2-helpers";
-import { StatsService } from "../services";
+import { StatsService, SponsorService } from "../services";
 import type { AppContext, X402SettlementResponseV2 } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
@@ -184,6 +184,19 @@ export class Settle extends BaseEndpoint {
             status: "failed",
           })
         );
+        if (broadcastResult.nonceConflict) {
+          // Trigger delayed DO resync so the next request gets a clean nonce.
+          // The 2s delay gives Hiro's mempool index time to catch up.
+          // Fire-and-forget: does not block the error response.
+          const sponsorService = new SponsorService(c.env, logger);
+          c.executionCtx.waitUntil(
+            sponsorService.resyncNonceDODelayed().catch((e) => {
+              logger.warn("resyncNonceDODelayed failed after nonce conflict in settle", {
+                error: String(e),
+              });
+            })
+          );
+        }
         const errorReason = broadcastResult.nonceConflict
           ? "conflicting_nonce"
           : broadcastResult.retryable

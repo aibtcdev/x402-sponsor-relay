@@ -304,15 +304,18 @@ export class Relay extends BaseEndpoint {
       );
       if (sponsorResult.success === false) {
         await statsService.recordError("sponsoring");
-        const code = sponsorResult.error === "Service not configured"
-          ? "SPONSOR_CONFIG_ERROR"
-          : "SPONSOR_FAILED";
+        const code = sponsorResult.code === "NONCE_DO_UNAVAILABLE"
+          ? "NONCE_DO_UNAVAILABLE"
+          : sponsorResult.error === "Service not configured"
+            ? "SPONSOR_CONFIG_ERROR"
+            : "SPONSOR_FAILED";
         return this.err(c, {
           error: sponsorResult.error,
           code,
-          status: 500,
+          status: code === "NONCE_DO_UNAVAILABLE" ? 503 : 500,
           details: sponsorResult.details,
-          retryable: code === "SPONSOR_FAILED",
+          retryable: code === "NONCE_DO_UNAVAILABLE" || code === "SPONSOR_FAILED",
+          ...(code === "NONCE_DO_UNAVAILABLE" ? { retryAfter: 3 } : {}),
         });
       }
 
@@ -361,11 +364,12 @@ export class Relay extends BaseEndpoint {
         );
 
         if (broadcastResult.nonceConflict) {
-          // Trigger immediate DO resync so the next request gets a clean nonce.
+          // Trigger delayed DO resync so the next request gets a clean nonce.
+          // The 2s delay gives Hiro's mempool index time to catch up.
           // Fire-and-forget: does not block the error response.
           c.executionCtx.waitUntil(
-            sponsorService.resyncNonceDO().catch((e) => {
-              logger.warn("resyncNonceDO failed after nonce conflict", { error: String(e) });
+            sponsorService.resyncNonceDODelayed().catch((e) => {
+              logger.warn("resyncNonceDODelayed failed after nonce conflict", { error: String(e) });
             })
           );
           return this.err(c, {
