@@ -288,6 +288,50 @@ export class SponsorService {
   }
 
   /**
+   * Fire-and-forget: trigger an immediate gap-aware nonce resync in the NonceDO.
+   * Call this via executionCtx.waitUntil() after a BadNonce or ConflictingNonceInMempool
+   * broadcast failure so the DO self-heals before the next request arrives.
+   * Never throws — all errors are logged as warnings.
+   */
+  async resyncNonceDO(): Promise<void> {
+    if (!this.env.NONCE_DO) {
+      this.logger.debug("Nonce DO not configured; skipping resync");
+      return;
+    }
+
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch("https://nonce-do/resync", {
+        method: "POST",
+      });
+
+      if (!response.ok) {
+        const body = await response.text();
+        this.logger.warn("Nonce DO resync responded with error", {
+          status: response.status,
+          body,
+        });
+        return;
+      }
+
+      const data = (await response.json()) as {
+        success?: boolean;
+        action?: string;
+        changed?: boolean;
+        reason?: string;
+      };
+      this.logger.info("Nonce DO resync completed", {
+        changed: data.changed,
+        reason: data.reason,
+      });
+    } catch (e) {
+      this.logger.warn("Failed to resync NonceDO", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
    * Fetch the sponsor account nonce from NonceDO when available.
    */
   private async fetchNonceFromDO(
