@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.12.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.12.0...v1.12.1) (2026-02-20)
+
+
+### Bug Fixes
+
+* capture generateNewAccount return value for wallet derivation ([#80](https://github.com/aibtcdev/x402-sponsor-relay/issues/80)) ([4db3929](https://github.com/aibtcdev/x402-sponsor-relay/commit/4db3929a6001d8fbdab3b68ec2d4d9236e54f15c)), closes [#79](https://github.com/aibtcdev/x402-sponsor-relay/issues/79)
+
 ## [1.12.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.11.0...v1.12.0) (2026-02-20)
 
 
