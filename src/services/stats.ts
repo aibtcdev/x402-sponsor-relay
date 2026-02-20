@@ -146,16 +146,8 @@ export class StatsService {
    * Get dashboard overview data (today + trend vs yesterday).
    */
   async getOverview(): Promise<DashboardOverview> {
-    const emptyFees = {
-      total: "0",
-      average: "0",
-      min: "0",
-      max: "0",
-      trend: "stable" as const,
-      previousTotal: "0",
-    };
-
-    const emptyOverview: DashboardOverview = {
+    const data = await this.doGet<DashboardOverview>("/overview");
+    return data ?? {
       period: "24h",
       transactions: {
         total: 0,
@@ -169,7 +161,14 @@ export class StatsService {
         sBTC: { count: 0, volume: "0", percentage: 0 },
         USDCx: { count: 0, volume: "0", percentage: 0 },
       },
-      fees: emptyFees,
+      fees: {
+        total: "0",
+        average: "0",
+        min: "0",
+        max: "0",
+        trend: "stable",
+        previousTotal: "0",
+      },
       settlement: {
         status: "unknown",
         avgLatencyMs: 0,
@@ -178,31 +177,13 @@ export class StatsService {
       },
       hourlyData: [],
     };
-
-    try {
-      const data = await this.doGet<DashboardOverview>("/overview");
-      return data ?? emptyOverview;
-    } catch (e) {
-      this.logger.error("Failed to get overview stats", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-      return emptyOverview;
-    }
   }
 
   /**
    * Get daily stats for a date range (oldest-first, N days back from today).
    */
   async getDailyStats(days: number): Promise<DailyStats[]> {
-    try {
-      const data = await this.doGet<DailyStats[]>(`/daily?days=${days}`);
-      return data ?? [];
-    } catch (e) {
-      this.logger.error("Failed to get daily stats", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-      return [];
-    }
+    return (await this.doGet<DailyStats[]>(`/daily?days=${days}`)) ?? [];
   }
 
   /**
@@ -233,17 +214,9 @@ export class StatsService {
   async getHourlyStats(): Promise<
     Array<{ hour: string; transactions: number; success: number; fees?: string }>
   > {
-    try {
-      const data = await this.doGet<
-        Array<{ hour: string; transactions: number; success: number; fees?: string }>
-      >("/hourly");
-      return data ?? [];
-    } catch (e) {
-      this.logger.error("Failed to get hourly stats", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-      return [];
-    }
+    return (await this.doGet<
+      Array<{ hour: string; transactions: number; success: number; fees?: string }>
+    >("/hourly")) ?? [];
   }
 
   /**
@@ -254,20 +227,12 @@ export class StatsService {
     limit?: number;
     endpoint?: string;
   }): Promise<TransactionLogEntry[]> {
-    try {
-      const params = new URLSearchParams();
-      if (opts?.days != null) params.set("days", String(opts.days));
-      if (opts?.limit != null) params.set("limit", String(opts.limit));
-      if (opts?.endpoint) params.set("endpoint", opts.endpoint);
-      const qs = params.toString() ? `?${params.toString()}` : "";
-      const data = await this.doGet<TransactionLogEntry[]>(`/recent${qs}`);
-      return data ?? [];
-    } catch (e) {
-      this.logger.error("Failed to get transaction log", {
-        error: e instanceof Error ? e.message : "Unknown error",
-      });
-      return [];
-    }
+    const params = new URLSearchParams();
+    if (opts?.days != null) params.set("days", String(opts.days));
+    if (opts?.limit != null) params.set("limit", String(opts.limit));
+    if (opts?.endpoint) params.set("endpoint", opts.endpoint);
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    return (await this.doGet<TransactionLogEntry[]>(`/recent${qs}`)) ?? [];
   }
 }
 

@@ -7,6 +7,10 @@ import {
   Error500Response,
 } from "../schemas";
 
+/** BTC address format regex: P2PKH (1...), P2SH (3...), Bech32 (bc1.../tb1...) */
+const BTC_ADDRESS_REGEX =
+  /^(1[1-9A-HJ-NP-Za-km-z]{25,34}|3[1-9A-HJ-NP-Za-km-z]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{25,90}|tb1[a-zA-HJ-NP-Z0-9]{25,90})$/;
+
 /**
  * Provision endpoint - programmatic API key provisioning via BTC signature
  * POST /keys/provision
@@ -143,11 +147,10 @@ export class Provision extends BaseEndpoint {
       }
 
       // Validate BTC address format (P2PKH, P2SH, Bech32, Bech32m)
-      const BTC_ADDRESS_REGEX = /^(1[1-9A-HJ-NP-Za-km-z]{25,34}|3[1-9A-HJ-NP-Za-km-z]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{25,90}|tb1[a-zA-HJ-NP-Z0-9]{25,90})$/;
       if (!BTC_ADDRESS_REGEX.test(body.btcAddress)) {
         return this.err(c, {
-          error: "Invalid Bitcoin address format",
-          code: "MISSING_BTC_ADDRESS",
+          error: "Invalid Bitcoin address format. Supported: P2PKH (1...), P2SH (3...), native SegWit (bc1q.../tb1q...). Taproot (bc1p...) is not supported — use POST /keys/provision-stx instead.",
+          code: "UNSUPPORTED_ADDRESS_TYPE",
           status: 400,
           retryable: false,
         });

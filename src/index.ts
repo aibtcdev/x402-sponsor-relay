@@ -61,8 +61,8 @@ const openapi = fromHono(app, {
         description: "Production (mainnet)",
       },
     ],
-    // Security scheme for API key authentication
-    // Cast needed as Chanfana types don't expose components directly
+    // Security scheme — spread as Record<string, unknown> since Chanfana
+    // doesn't type the components property
     ...({
       components: {
         securitySchemes: {
@@ -78,8 +78,7 @@ const openapi = fromHono(app, {
   },
 });
 
-// Register endpoints with Chanfana
-// Type cast needed as Chanfana expects endpoint classes
+// Register endpoints with Chanfana (casts needed for extended endpoint classes)
 openapi.get("/health", Health as unknown as typeof Health);
 openapi.post("/relay", Relay as unknown as typeof Relay);
 openapi.post("/sponsor", Sponsor as unknown as typeof Sponsor);
@@ -90,7 +89,7 @@ openapi.post("/keys/provision-stx", ProvisionStx as unknown as typeof ProvisionS
 openapi.get("/fees", Fees as unknown as typeof Fees);
 openapi.post("/fees/config", FeesConfig as unknown as typeof FeesConfig);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
-openapi.get("/stats/transactions", TransactionLog as unknown as typeof Health);
+openapi.get("/stats/transactions", TransactionLog as unknown as typeof TransactionLog);
 openapi.get("/nonce/stats", NonceStatsEndpoint as unknown as typeof NonceStatsEndpoint);
 openapi.post("/nonce/reset", NonceReset as unknown as typeof NonceReset);
 openapi.post("/settle", Settle as unknown as typeof Settle);

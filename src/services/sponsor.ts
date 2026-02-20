@@ -210,6 +210,23 @@ export class SponsorService {
   }
 
   /**
+   * Compute the capped exponential backoff delay for a retry attempt.
+   * For 429 responses, honours the Retry-After header when present.
+   */
+  private getRetryDelayMs(attempt: number, retryAfterHeader?: string | null): number {
+    let delayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+
+    if (retryAfterHeader != null) {
+      const retryAfterMs = parseInt(retryAfterHeader, 10) * 1000;
+      if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) {
+        delayMs = retryAfterMs;
+      }
+    }
+
+    return Math.min(delayMs, NONCE_FETCH_MAX_DELAY_MS);
+  }
+
+  /**
    * Fetch the sponsor account nonce from Hiro API with retry-with-backoff.
    * Retries on 429 (rate limit) and network errors up to NONCE_FETCH_MAX_ATTEMPTS.
    * Uses HIRO_API_KEY if configured for higher rate limits.
@@ -220,6 +237,8 @@ export class SponsorService {
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
 
     for (let attempt = 1; attempt <= NONCE_FETCH_MAX_ATTEMPTS; attempt++) {
+      const isLastAttempt = attempt === NONCE_FETCH_MAX_ATTEMPTS;
+
       try {
         const response = await fetch(url, {
           headers,
@@ -227,38 +246,18 @@ export class SponsorService {
         });
 
         if (response.status === 429) {
-          const retryAfter = response.headers.get("Retry-After");
-          const baseDelayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-          let delayMs = baseDelayMs;
-
-          if (retryAfter !== null) {
-            const parsedSeconds = parseInt(retryAfter, 10);
-            const retryAfterDelayMs = parsedSeconds * 1000;
-            if (Number.isFinite(retryAfterDelayMs) && retryAfterDelayMs > 0) {
-              delayMs = retryAfterDelayMs;
-            }
-          }
-
-          // Cap delay to prevent exceeding Worker request time limits
-          delayMs = Math.min(delayMs, NONCE_FETCH_MAX_DELAY_MS);
-          this.logger.warn("Hiro API rate limited on nonce fetch, retrying", {
-            attempt,
-            delayMs,
-          });
-          if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
+          this.logger.warn("Hiro API rate limited on nonce fetch, retrying", { attempt });
+          if (!isLastAttempt) {
+            const delayMs = this.getRetryDelayMs(attempt, response.headers.get("Retry-After"));
             await new Promise((resolve) => setTimeout(resolve, delayMs));
           }
           continue;
         }
 
         if (!response.ok) {
-          this.logger.warn("Hiro API error on nonce fetch", {
-            attempt,
-            status: response.status,
-          });
-          if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
-            const delayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
+          this.logger.warn("Hiro API error on nonce fetch", { attempt, status: response.status });
+          if (!isLastAttempt) {
+            await new Promise((resolve) => setTimeout(resolve, this.getRetryDelayMs(attempt)));
           }
           continue;
         }
@@ -276,9 +275,8 @@ export class SponsorService {
           attempt,
           error: e instanceof Error ? e.message : String(e),
         });
-        if (attempt < NONCE_FETCH_MAX_ATTEMPTS) {
-          const delayMs = NONCE_FETCH_BASE_DELAY_MS * Math.pow(2, attempt - 1);
-          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (!isLastAttempt) {
+          await new Promise((resolve) => setTimeout(resolve, this.getRetryDelayMs(attempt)));
         }
       }
     }
@@ -518,13 +516,14 @@ export class SponsorService {
     }
 
     try {
-      const sponsoredTx = await sponsorTransaction({
+      const sponsorOpts = {
         transaction,
         sponsorPrivateKey: sponsorKey,
         network,
         fee,
-        ...(sponsorNonce !== undefined ? { sponsorNonce } : {}),
-      });
+        sponsorNonce,
+      };
+      const sponsoredTx = await sponsorTransaction(sponsorOpts);
 
       // v7: serialize() returns hex string directly
       const sponsoredTxHex = sponsoredTx.serialize();

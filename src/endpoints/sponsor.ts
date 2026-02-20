@@ -206,31 +206,27 @@ export class Sponsor extends BaseEndpoint {
           tier: metadata.tier,
           code: rateLimitResult.code,
         });
+        const isDaily = rateLimitResult.code === "DAILY_LIMIT_EXCEEDED";
         return this.err(c, {
-          error: rateLimitResult.code === "DAILY_LIMIT_EXCEEDED"
-            ? "Daily request limit exceeded"
-            : "Rate limit exceeded",
+          error: isDaily ? "Daily request limit exceeded" : "Rate limit exceeded",
           code: rateLimitResult.code,
           status: 429,
-          details: rateLimitResult.code === "DAILY_LIMIT_EXCEEDED"
+          details: isDaily
             ? "Your API key has exceeded its daily request limit. Limit resets at midnight UTC."
-            : `Too many requests. Please wait before trying again.`,
+            : "Too many requests. Please wait before trying again.",
           retryable: true,
           retryAfter: rateLimitResult.retryAfter,
         });
       }
 
-      // Estimate fee based on transaction size since sponsored tx has fee=0
-      // Use conservative size-based estimation for spending cap check
-      const txHex = body.transaction;
-      const txByteLength = typeof txHex === "string"
-        ? Buffer.from(txHex.startsWith("0x") ? txHex.slice(2) : txHex, "hex").length
-        : 0;
-      const perByteFee = 50n; // microSTX per byte (conservative rate)
-      const baseFee = 10000n; // minimum fallback estimate (0.01 STX)
-      const sizeBasedEstimate = txByteLength > 0
-        ? BigInt(txByteLength) * perByteFee
-        : baseFee;
+      // Estimate fee based on transaction size for spending cap check.
+      // Conservative: 50 microSTX/byte, floor of 10,000 microSTX (0.01 STX).
+      const cleanTxHex = body.transaction.startsWith("0x")
+        ? body.transaction.slice(2)
+        : body.transaction;
+      const txByteLength = Buffer.from(cleanTxHex, "hex").length;
+      const baseFee = 10_000n;
+      const sizeBasedEstimate = BigInt(txByteLength) * 50n;
       const estimatedFee = sizeBasedEstimate > baseFee ? sizeBasedEstimate : baseFee;
 
       // Check spending cap before sponsoring
@@ -264,20 +260,11 @@ export class Sponsor extends BaseEndpoint {
         validation.transaction
       );
       if (sponsorResult.success === false) {
-        c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
-        const code = sponsorResult.code === "NONCE_DO_UNAVAILABLE"
-          ? "NONCE_DO_UNAVAILABLE"
-          : sponsorResult.error === "Service not configured"
-            ? "SPONSOR_CONFIG_ERROR"
-            : "SPONSOR_FAILED";
-        return this.err(c, {
-          error: sponsorResult.error,
-          code,
-          status: code === "NONCE_DO_UNAVAILABLE" ? 503 : 500,
-          details: sponsorResult.details,
-          retryable: code === "NONCE_DO_UNAVAILABLE" || code === "SPONSOR_FAILED",
-          ...(code === "NONCE_DO_UNAVAILABLE" ? { retryAfter: 3 } : {}),
-        });
+        return this.sponsorFailureResponse(
+          c,
+          sponsorResult,
+          statsService.recordError("sponsoring").catch(() => {})
+        );
       }
 
       // Broadcast directly to Stacks node
@@ -312,14 +299,7 @@ export class Sponsor extends BaseEndpoint {
           );
 
           if (isNonceConflict) {
-            // Trigger delayed DO resync so the next request gets a clean nonce.
-            // The 2s delay gives Hiro's mempool index time to catch up.
-            // Fire-and-forget: does not block the error response.
-            c.executionCtx.waitUntil(
-              sponsorService.resyncNonceDODelayed().catch((e) => {
-                logger.warn("resyncNonceDODelayed failed after nonce conflict", { error: String(e) });
-              })
-            );
+            this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
             return this.err(c, {
               error: "Nonce conflict — resubmit with a new transaction",
               code: "NONCE_CONFLICT",

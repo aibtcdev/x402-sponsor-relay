@@ -291,10 +291,10 @@ export class Relay extends BaseEndpoint {
             sender: dedupResult.sender,
             recipient: dedupResult.recipient,
             amount: dedupResult.amount,
-            ...(dedupResult.blockHeight ? { blockHeight: dedupResult.blockHeight } : {}),
+            blockHeight: dedupResult.blockHeight,
           },
-          ...(dedupResult.sponsoredTx ? { sponsoredTx: dedupResult.sponsoredTx } : {}),
-          ...(dedupResult.receiptId ? { receiptId: dedupResult.receiptId } : {}),
+          sponsoredTx: dedupResult.sponsoredTx,
+          receiptId: dedupResult.receiptId,
         });
       }
 
@@ -303,20 +303,11 @@ export class Relay extends BaseEndpoint {
         validation.transaction
       );
       if (sponsorResult.success === false) {
-        c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
-        const code = sponsorResult.code === "NONCE_DO_UNAVAILABLE"
-          ? "NONCE_DO_UNAVAILABLE"
-          : sponsorResult.error === "Service not configured"
-            ? "SPONSOR_CONFIG_ERROR"
-            : "SPONSOR_FAILED";
-        return this.err(c, {
-          error: sponsorResult.error,
-          code,
-          status: code === "NONCE_DO_UNAVAILABLE" ? 503 : 500,
-          details: sponsorResult.details,
-          retryable: code === "NONCE_DO_UNAVAILABLE" || code === "SPONSOR_FAILED",
-          ...(code === "NONCE_DO_UNAVAILABLE" ? { retryAfter: 3 } : {}),
-        });
+        return this.sponsorFailureResponse(
+          c,
+          sponsorResult,
+          statsService.recordError("sponsoring").catch(() => {})
+        );
       }
 
       // Step C — Verify payment parameters locally
@@ -359,14 +350,7 @@ export class Relay extends BaseEndpoint {
         );
 
         if (broadcastResult.nonceConflict) {
-          // Trigger delayed DO resync so the next request gets a clean nonce.
-          // The 2s delay gives Hiro's mempool index time to catch up.
-          // Fire-and-forget: does not block the error response.
-          c.executionCtx.waitUntil(
-            sponsorService.resyncNonceDODelayed().catch((e) => {
-              logger.warn("resyncNonceDODelayed failed after nonce conflict", { error: String(e) });
-            })
-          );
+          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
           return this.err(c, {
             error: "Nonce conflict — resubmit with a new transaction",
             code: "NONCE_CONFLICT",
@@ -378,14 +362,13 @@ export class Relay extends BaseEndpoint {
         }
 
         // Distinguish retryable broadcast failures from non-retryable on-chain failures
-        const code = broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED";
         return this.err(c, {
           error: broadcastResult.error,
-          code,
+          code: broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED",
           status: broadcastResult.retryable ? 502 : 422,
           details: broadcastResult.details,
           retryable: broadcastResult.retryable,
-          ...(broadcastResult.retryable ? { retryAfter: 5 } : {}),
+          retryAfter: broadcastResult.retryable ? 5 : undefined,
         });
       }
 
@@ -398,12 +381,18 @@ export class Relay extends BaseEndpoint {
         );
       }
 
-      // Step E — Record successful transaction stats (fire-and-forget, never blocks response)
+      // Step E — Derive common fields (reused for stats, settlement, dedup)
       const tokenType = body.settle.tokenType || "STX";
-      const logSenderAddress = settlementService.senderToAddress(
+      const senderAddress = settlementService.senderToAddress(
         verifyResult.data.transaction,
         c.env.STACKS_NETWORK
       );
+      const confirmedBlockHeight =
+        broadcastResult.status === "confirmed"
+          ? broadcastResult.blockHeight
+          : undefined;
+
+      // Record successful transaction stats (fire-and-forget, never blocks response)
       c.executionCtx.waitUntil(
         statsService.logTransaction({
           timestamp: new Date().toISOString(),
@@ -413,30 +402,21 @@ export class Relay extends BaseEndpoint {
           amount: body.settle.minAmount,
           fee: sponsorResult.fee,
           txid: broadcastResult.txid,
-          sender: logSenderAddress,
+          sender: senderAddress,
           recipient: verifyResult.data.recipient,
           status: broadcastResult.status,
-          ...(broadcastResult.status === "confirmed"
-            ? { blockHeight: broadcastResult.blockHeight }
-            : {}),
+          blockHeight: confirmedBlockHeight,
         }).catch(() => {})
       );
 
       // Step F — Build settlement result and store payment receipt
-      // Convert signer hash160 to human-readable Stacks address
-      const senderAddress = settlementService.senderToAddress(
-        verifyResult.data.transaction,
-        c.env.STACKS_NETWORK
-      );
       const settlement: SettlementResult = {
         success: true,
         status: broadcastResult.status,
         sender: senderAddress,
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
-        ...(broadcastResult.status === "confirmed"
-          ? { blockHeight: broadcastResult.blockHeight }
-          : {}),
+        blockHeight: confirmedBlockHeight,
       };
 
       const receiptService = new ReceiptService(c.env.RELAY_KV, logger);
@@ -460,9 +440,7 @@ export class Relay extends BaseEndpoint {
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
         sponsoredTx: sponsorResult.sponsoredTxHex,
-        ...(broadcastResult.status === "confirmed"
-          ? { blockHeight: broadcastResult.blockHeight }
-          : {}),
+        blockHeight: confirmedBlockHeight,
       });
 
       // Step H — Log and return
@@ -477,8 +455,7 @@ export class Relay extends BaseEndpoint {
         txid: broadcastResult.txid,
         settlement,
         sponsoredTx: sponsorResult.sponsoredTxHex,
-        // Only return receiptId if storage succeeded
-        ...(storedReceipt ? { receiptId } : {}),
+        receiptId: storedReceipt ? receiptId : undefined,
       });
     } catch (e) {
       logger.error("Unexpected error", {

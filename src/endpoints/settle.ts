@@ -181,23 +181,18 @@ export class Settle extends BaseEndpoint {
           }).catch(() => {})
         );
         if (broadcastResult.nonceConflict) {
-          // Trigger delayed DO resync so the next request gets a clean nonce.
-          // The 2s delay gives Hiro's mempool index time to catch up.
-          // Fire-and-forget: does not block the error response.
           const sponsorService = new SponsorService(c.env, logger);
-          c.executionCtx.waitUntil(
-            sponsorService.resyncNonceDODelayed().catch((e) => {
-              logger.warn("resyncNonceDODelayed failed after nonce conflict in settle", {
-                error: String(e),
-              });
-            })
-          );
+          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
         }
-        const errorReason = broadcastResult.nonceConflict
-          ? "conflicting_nonce"
-          : broadcastResult.retryable
-            ? X402_V2_ERROR_CODES.BROADCAST_FAILED
-            : X402_V2_ERROR_CODES.TRANSACTION_FAILED;
+
+        let errorReason: string;
+        if (broadcastResult.nonceConflict) {
+          errorReason = "conflicting_nonce";
+        } else if (broadcastResult.retryable) {
+          errorReason = X402_V2_ERROR_CODES.BROADCAST_FAILED;
+        } else {
+          errorReason = X402_V2_ERROR_CODES.TRANSACTION_FAILED;
+        }
         return v2Error(errorReason, 200);
       }
 
@@ -207,6 +202,11 @@ export class Settle extends BaseEndpoint {
         c.env.STACKS_NETWORK
       );
 
+      const confirmedBlockHeight =
+        broadcastResult.status === "confirmed"
+          ? broadcastResult.blockHeight
+          : undefined;
+
       // Record dedup for idempotent retries
       await settlementService.recordDedup(txHex, {
         txid: broadcastResult.txid,
@@ -214,9 +214,7 @@ export class Settle extends BaseEndpoint {
         sender: payer,
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
-        ...(broadcastResult.status === "confirmed"
-          ? { blockHeight: broadcastResult.blockHeight }
-          : {}),
+        blockHeight: confirmedBlockHeight,
       });
 
       // Record successful transaction stats (fire-and-forget, never blocks response)
@@ -232,9 +230,7 @@ export class Settle extends BaseEndpoint {
           sender: payer,
           recipient: verifyResult.data.recipient,
           status: broadcastResult.status,
-          ...(broadcastResult.status === "confirmed"
-            ? { blockHeight: broadcastResult.blockHeight }
-            : {}),
+          blockHeight: confirmedBlockHeight,
         }).catch(() => {})
       );
 

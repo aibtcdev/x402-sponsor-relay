@@ -509,76 +509,11 @@ export class StatsDO {
   }
 
   private buildOverview(): DashboardOverview {
-    const now = Date.now();
-    const todayKey = getDateKey(now);
-    const yesterdayKey = getDateKey(now - DAY_MS);
-
-    const [todayStats, yesterdayStats] = [
-      this.readDailyStats(1)[0],
-      (() => {
-        // Get yesterday explicitly
-        const rows = this.sql
-          .exec<{
-            total: number;
-            success: number;
-            failed: number;
-            stx_count: number;
-            stx_volume: string;
-            sbtc_count: number;
-            sbtc_volume: string;
-            usdcx_count: number;
-            usdcx_volume: string;
-            fee_total: string;
-            fee_count: number;
-            fee_min: string | null;
-            fee_max: string | null;
-            err_validation: number;
-            err_rate_limit: number;
-            err_sponsoring: number;
-            err_settlement: number;
-            err_internal: number;
-          }>(
-            `SELECT total, success, failed,
-                    stx_count, stx_volume,
-                    sbtc_count, sbtc_volume,
-                    usdcx_count, usdcx_volume,
-                    fee_total, fee_count, fee_min, fee_max,
-                    err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal
-             FROM daily_stats WHERE date = ? LIMIT 1`,
-            yesterdayKey
-          )
-          .toArray();
-        if (rows.length === 0) return null;
-        const r = rows[0];
-        const ds: DailyStats = {
-          date: yesterdayKey,
-          transactions: { total: r.total, success: r.success, failed: r.failed },
-          tokens: {
-            STX: { count: r.stx_count, volume: r.stx_volume || "0" },
-            sBTC: { count: r.sbtc_count, volume: r.sbtc_volume || "0" },
-            USDCx: { count: r.usdcx_count, volume: r.usdcx_volume || "0" },
-          },
-          errors: {
-            validation: r.err_validation,
-            rateLimit: r.err_rate_limit,
-            sponsoring: r.err_sponsoring,
-            settlement: r.err_settlement,
-            internal: r.err_internal,
-          },
-        };
-        if (r.fee_count > 0) {
-          ds.fees = { total: r.fee_total || "0", count: r.fee_count, min: r.fee_min || "0", max: r.fee_max || "0" };
-        }
-        return ds;
-      })(),
-    ];
-
-    // Suppress unused variable warning — todayKey/yesterdayKey used above
-    void todayKey;
-    void yesterdayKey;
-
-    const current = todayStats;
-    const previous = yesterdayStats;
+    // readDailyStats(2) returns [yesterday, today] — reuse instead of
+    // duplicating the raw SQL query for yesterday's row.
+    const twoDays = this.readDailyStats(2);
+    const previous = twoDays[0] ?? null;
+    const current = twoDays[1];
 
     // Token percentages
     const totalTokenTx =

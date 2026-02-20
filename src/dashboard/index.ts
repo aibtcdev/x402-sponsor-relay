@@ -65,12 +65,11 @@ dashboard.get("/", async (c) => {
 dashboard.get("/api/stats", async (c) => {
   const logger = c.get("logger");
   const statsService = new StatsService(c.env, logger);
-  const healthService = new SettlementHealthService(c.env, logger);
 
   const period = c.req.query("period") === "7d" ? "7d" : "24h";
 
   try {
-    // 7d only needs chart data — skip getOverview() (26 reads) and getStatus() (2 reads)
+    // 7d only needs chart data — skip getOverview() and getStatus()
     if (period === "7d") {
       const dailyChartData = await statsService.getDailyChartData(7);
       return c.json(
@@ -80,6 +79,7 @@ dashboard.get("/api/stats", async (c) => {
       );
     }
 
+    const healthService = new SettlementHealthService(c.env, logger);
     const [overview, health] = await Promise.all([
       statsService.getOverview(),
       healthService.getStatus(),

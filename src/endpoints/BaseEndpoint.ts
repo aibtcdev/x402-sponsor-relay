@@ -75,6 +75,66 @@ export class BaseEndpoint extends OpenAPIRoute {
   }
 
   /**
+   * Map a sponsor failure to a structured error response.
+   * Shared by /relay and /sponsor to avoid duplicated nested ternary logic.
+   */
+  protected sponsorFailureResponse(
+    c: AppContext,
+    failure: { error: string; details: string; code?: string },
+    statsWaitUntil: Promise<void>
+  ) {
+    c.executionCtx.waitUntil(statsWaitUntil);
+
+    let code: RelayErrorCode;
+    let status: number;
+    let retryable: boolean;
+    let retryAfter: number | undefined;
+
+    if (failure.code === "NONCE_DO_UNAVAILABLE") {
+      code = "NONCE_DO_UNAVAILABLE";
+      status = 503;
+      retryable = true;
+      retryAfter = 3;
+    } else if (failure.error === "Service not configured") {
+      code = "SPONSOR_CONFIG_ERROR";
+      status = 500;
+      retryable = false;
+    } else {
+      code = "SPONSOR_FAILED";
+      status = 500;
+      retryable = true;
+    }
+
+    return this.err(c, {
+      error: failure.error,
+      code,
+      status,
+      details: failure.details,
+      retryable,
+      retryAfter,
+    });
+  }
+
+  /**
+   * Schedule a delayed nonce DO resync after a nonce conflict.
+   * Fire-and-forget via waitUntil -- never blocks the response.
+   * Pass the promise from sponsorService.resyncNonceDODelayed().
+   */
+  protected scheduleNonceResync(
+    c: AppContext,
+    resyncPromise: Promise<void>,
+    logger: Logger
+  ): void {
+    c.executionCtx.waitUntil(
+      resyncPromise.catch((e) => {
+        logger.warn("resyncNonceDODelayed failed after nonce conflict", {
+          error: String(e),
+        });
+      })
+    );
+  }
+
+  /**
    * Return a structured error response with retry guidance
    */
   protected err(

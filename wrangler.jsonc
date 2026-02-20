@@ -44,7 +44,8 @@
    * Each environment must explicitly define all bindings it needs.
    *
    * Secrets (set via `wrangler secret put --env <env>`):
-   * - SPONSOR_PRIVATE_KEY: Private key for sponsoring transactions
+   * - SPONSOR_MNEMONIC: 24-word mnemonic for sponsor wallet (preferred)
+   * - SPONSOR_PRIVATE_KEY: Hex private key (fallback, not recommended)
    */
   "env": {
     "staging": {
@@ -69,7 +70,7 @@
         { "tag": "v1", "new_sqlite_classes": ["NonceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["StatsDO"] }
       ],
-      // KV namespaces for dashboard stats and API keys
+      // KV namespaces for receipts, dedup, fee cache, health checks, and API keys
       "kv_namespaces": [
         { "binding": "RELAY_KV", "id": "3851254fa8f9494189689ce5a726b773" },
         { "binding": "API_KEYS_KV", "id": "20be33ef450a4c31a128dd80a1ff3bd9" }
@@ -101,7 +102,7 @@
         { "tag": "v1", "new_sqlite_classes": ["NonceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["StatsDO"] }
       ],
-      // KV namespaces for dashboard stats and API keys
+      // KV namespaces for receipts, dedup, fee cache, health checks, and API keys
       "kv_namespaces": [
         { "binding": "RELAY_KV", "id": "56f3b1596357434291161238d40cbd81" },
         { "binding": "API_KEYS_KV", "id": "307c3134a46e4d5a94e2d0b7f1d97cbf" }
