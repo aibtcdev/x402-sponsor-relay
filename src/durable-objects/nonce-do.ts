@@ -82,11 +82,13 @@ interface ReconcileResult {
  * available: nonces ready to be assigned (pre-seeded, sorted ascending)
  * reserved: nonces currently in-flight (assigned but not yet confirmed or released)
  * maxNonce: highest nonce ever placed in the pool (used to extend when available runs low)
+ * reservedAt: unix ms timestamp of when each nonce was reserved (keyed by nonce as string)
  */
 interface PoolState {
   available: number[];
   reserved: number[];
   maxNonce: number;
+  reservedAt: Record<number, number>;
 }
 
 interface WalletPoolStats {
@@ -393,13 +395,22 @@ export class NonceDO {
   private async loadPoolForWallet(walletIndex: number): Promise<PoolState | null> {
     // Try per-wallet key first
     const pool = await this.state.storage.get<PoolState>(this.poolKey(walletIndex));
-    if (pool != null) return pool;
+    if (pool != null) {
+      // Backward compat: pools persisted before reservedAt was added won't have the field
+      if (!pool.reservedAt) {
+        pool.reservedAt = {};
+      }
+      return pool;
+    }
 
     // Migration: wallet 0 may have state under legacy "pool" key
     if (walletIndex === 0) {
       const legacy = await this.state.storage.get<PoolState>(POOL_KEY);
       if (legacy != null) {
         // Migrate to per-wallet key, remove legacy
+        if (!legacy.reservedAt) {
+          legacy.reservedAt = {};
+        }
         await this.state.storage.put(this.poolKey(0), legacy);
         await this.state.storage.delete(POOL_KEY);
         return legacy;
@@ -582,6 +593,7 @@ export class NonceDO {
       available,
       reserved: [],
       maxNonce: seedNonce + POOL_SEED_SIZE - 1,
+      reservedAt: {},
     };
     await this.savePoolForWallet(walletIndex, pool);
     return pool;
@@ -653,6 +665,7 @@ export class NonceDO {
       // Assign the next available nonce
       const assignedNonce = pool.available.shift()!;
       pool.reserved.push(assignedNonce);
+      pool.reservedAt[assignedNonce] = Date.now();
 
       await this.savePoolForWallet(walletIndex, pool);
       this.updateAssignedStats(assignedNonce);
@@ -691,8 +704,9 @@ export class NonceDO {
         return;
       }
 
-      // Remove from reserved
+      // Remove from reserved and clear the reservation timestamp
       pool.reserved.splice(reservedIdx, 1);
+      delete pool.reservedAt[nonce];
 
       if (!txid) {
         // Unused nonce: return to available in sorted order
