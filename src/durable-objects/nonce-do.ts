@@ -23,6 +23,18 @@ interface LookupTxidResponse {
   nonce?: number;
 }
 
+/**
+ * Full response from Hiro GET /extended/v1/address/{addr}/nonces
+ */
+interface HiroNonceInfo {
+  /** Last confirmed nonce for this address (null if no confirmed txs yet) */
+  last_executed_tx_nonce: number | null;
+  /** Next nonce the network considers valid for submission */
+  possible_next_nonce: number;
+  /** Nonces in the mempool that are creating gaps (missing nonces below them) */
+  detected_missing_nonces: number[];
+}
+
 interface NonceStatsResponse {
   totalAssigned: number;
   conflictsDetected: number;
@@ -30,9 +42,17 @@ interface NonceStatsResponse {
   lastAssignedAt: string | null;
   nextNonce: number | null;
   txidCount: number;
+  /** Number of times the alarm has recovered from a nonce gap */
+  gapsRecovered: number;
+  /** ISO timestamp of last successful Hiro nonce sync (null if never synced) */
+  lastHiroSync: string | null;
+  /** ISO timestamp of last gap detection (null if no gaps detected) */
+  lastGapDetected: string | null;
 }
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
+/** Reset to possible_next_nonce if no assignment in this window and we are ahead */
+const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 const SPONSOR_ADDRESS_KEY = "sponsor_address";
 const STATE_KEYS = {
   current: "current",
@@ -40,6 +60,9 @@ const STATE_KEYS = {
   conflictsDetected: "conflicts_detected",
   lastAssignedNonce: "last_assigned_nonce",
   lastAssignedAt: "last_assigned_at",
+  gapsRecovered: "gaps_recovered",
+  lastHiroSync: "last_hiro_sync",
+  lastGapDetected: "last_gap_detected",
 } as const;
 
 export class NonceDO {
@@ -167,7 +190,7 @@ export class NonceDO {
     await this.state.storage.put(SPONSOR_ADDRESS_KEY, address);
   }
 
-  private async fetchPossibleNextNonce(sponsorAddress: string): Promise<number> {
+  private async fetchNonceInfo(sponsorAddress: string): Promise<HiroNonceInfo> {
     const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/address/${sponsorAddress}/nonces`;
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
     const response = await fetch(url, {
@@ -179,12 +202,20 @@ export class NonceDO {
       throw new Error(`Hiro nonce endpoint responded with ${response.status}`);
     }
 
-    const data = (await response.json()) as { possible_next_nonce?: number };
+    const data = (await response.json()) as Partial<HiroNonceInfo>;
     if (typeof data?.possible_next_nonce !== "number") {
       throw new Error("Hiro nonce response missing possible_next_nonce");
     }
 
-    return data.possible_next_nonce;
+    return {
+      last_executed_tx_nonce: typeof data.last_executed_tx_nonce === "number"
+        ? data.last_executed_tx_nonce
+        : null,
+      possible_next_nonce: data.possible_next_nonce,
+      detected_missing_nonces: Array.isArray(data.detected_missing_nonces)
+        ? data.detected_missing_nonces
+        : [],
+    };
   }
 
   private async writeNonceCache(
@@ -213,7 +244,8 @@ export class NonceDO {
 
       let currentNonce = this.getStoredNonce();
       if (currentNonce === null) {
-        currentNonce = await this.fetchPossibleNextNonce(sponsorAddress);
+        const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+        currentNonce = nonceInfo.possible_next_nonce;
       }
 
       const assignedNonce = currentNonce;
@@ -272,6 +304,9 @@ export class NonceDO {
     const lastAssignedNonce = this.getStateValue(STATE_KEYS.lastAssignedNonce);
     const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
     const nextNonce = this.getStoredNonce();
+    const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered);
+    const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
+    const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
 
     const txidRows = this.sql
       .exec<{ count: number }>("SELECT COUNT(*) as count FROM nonce_txids")
@@ -285,6 +320,9 @@ export class NonceDO {
       lastAssignedAt: lastAssignedAtMs ? new Date(lastAssignedAtMs).toISOString() : null,
       nextNonce,
       txidCount,
+      gapsRecovered,
+      lastHiroSync: lastHiroSyncMs ? new Date(lastHiroSyncMs).toISOString() : null,
+      lastGapDetected: lastGapDetectedMs ? new Date(lastGapDetectedMs).toISOString() : null,
     };
   }
 
@@ -296,16 +334,73 @@ export class NonceDO {
           return;
         }
 
-        const possibleNextNonce = await this.fetchPossibleNextNonce(sponsorAddress);
-        const currentNonce = this.getStoredNonce();
-
-        if (currentNonce === null) {
-          this.setStoredNonce(possibleNextNonce);
+        let nonceInfo: HiroNonceInfo;
+        try {
+          nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+        } catch (_e) {
+          // Hiro API unavailable; reschedule and try again next alarm cycle
           return;
         }
 
-        if (possibleNextNonce > currentNonce) {
-          this.setStoredNonce(possibleNextNonce);
+        // Record successful Hiro sync timestamp
+        this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
+
+        const currentNonce = this.getStoredNonce();
+        if (currentNonce === null) {
+          // No nonce seeded yet — initialize from Hiro
+          this.setStoredNonce(nonceInfo.possible_next_nonce);
+          return;
+        }
+
+        const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+
+        if (detected_missing_nonces.length > 0) {
+          // GAP RECOVERY: the network sees missing nonces in the mempool
+          const sortedGaps = [...detected_missing_nonces].sort((a, b) => a - b);
+          const lowestGap = sortedGaps[0];
+
+          if (currentNonce > lowestGap) {
+            // We have assigned nonces past a gap — reset to the lowest gap so the
+            // next transaction fills it and the chain can make progress.
+            const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered) + 1;
+            this.setStoredNonce(lowestGap);
+            this.setStateValue(STATE_KEYS.gapsRecovered, gapsRecovered);
+            this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+            // Count this as a conflict for visibility in existing metrics
+            this.incrementConflictsDetected();
+            return;
+          }
+
+          // Our nextNonce is at or below the lowest gap — but we may still be
+          // behind the chain's possible_next_nonce.
+          if (currentNonce < possible_next_nonce) {
+            // FORWARD BUMP with gaps present: advance to possible_next_nonce so we
+            // stop re-using nonces the chain has already processed.
+            this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+            this.setStoredNonce(possible_next_nonce);
+            this.incrementConflictsDetected();
+          }
+          return;
+        }
+
+        // NO GAPS: mempool is clean
+        if (possible_next_nonce > currentNonce) {
+          // FORWARD BUMP: chain has advanced past our counter (e.g., external tx submitted)
+          this.setStoredNonce(possible_next_nonce);
+          this.incrementConflictsDetected();
+          return;
+        }
+
+        // STALE DETECTION: no assignment recently and we are ahead of the chain
+        const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
+        const idleMs = lastAssignedAtMs !== null
+          ? Date.now() - lastAssignedAtMs
+          : Infinity;
+
+        if (idleMs > STALE_THRESHOLD_MS && currentNonce > possible_next_nonce) {
+          // We advanced our counter but the chain never confirmed those nonces.
+          // Reset to what the chain expects so we don't drift further.
+          this.setStoredNonce(possible_next_nonce);
           this.incrementConflictsDetected();
         }
       } finally {

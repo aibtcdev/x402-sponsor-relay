@@ -9,6 +9,12 @@ interface NonceStats {
   lastAssignedAt: string | null;
   nextNonce: number | null;
   txidCount: number;
+  /** Number of times the alarm recovered from a nonce gap */
+  gapsRecovered: number;
+  /** ISO timestamp of last successful Hiro nonce sync (null if never) */
+  lastHiroSync: string | null;
+  /** ISO timestamp of last gap detection (null if no gaps detected) */
+  lastGapDetected: string | null;
 }
 
 /**
@@ -44,6 +50,20 @@ export class NonceStatsEndpoint extends BaseEndpoint {
                     lastAssignedAt: { type: "string" as const, nullable: true },
                     nextNonce: { type: "number" as const, nullable: true },
                     txidCount: { type: "number" as const },
+                    gapsRecovered: {
+                      type: "number" as const,
+                      description: "Number of times the alarm recovered from a nonce gap",
+                    },
+                    lastHiroSync: {
+                      type: "string" as const,
+                      nullable: true,
+                      description: "ISO timestamp of last successful Hiro nonce sync",
+                    },
+                    lastGapDetected: {
+                      type: "string" as const,
+                      nullable: true,
+                      description: "ISO timestamp of last gap detection",
+                    },
                   },
                 },
               },
