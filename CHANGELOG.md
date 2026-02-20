@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.9.0...v1.10.0) (2026-02-20)
+
+
+### Features
+
+* nonce gap detection and self-healing recovery ([#67](https://github.com/aibtcdev/x402-sponsor-relay/issues/67)) ([d28ea6d](https://github.com/aibtcdev/x402-sponsor-relay/commit/d28ea6d61f395657ae2101dac06a0bd0d4aa8efd))
+
 ## [1.9.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.8.2...v1.9.0) (2026-02-20)
 
 
