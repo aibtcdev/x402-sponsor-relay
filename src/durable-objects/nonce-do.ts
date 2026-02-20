@@ -387,12 +387,13 @@ export class NonceDO {
       const words = this.env.SPONSOR_MNEMONIC.trim().split(/\s+/);
       if (!VALID_MNEMONIC_LENGTHS.includes(words.length)) return null;
       try {
-        const wallet = await generateWallet({
+        let wallet = await generateWallet({
           secretKey: this.env.SPONSOR_MNEMONIC,
           password: "",
         });
+        // generateNewAccount returns a new wallet object (wallet-sdk v7)
         for (let i = wallet.accounts.length; i <= walletIndex; i++) {
-          generateNewAccount(wallet);
+          wallet = generateNewAccount(wallet);
         }
         const account = wallet.accounts[walletIndex];
         return account?.stxPrivateKey ?? null;

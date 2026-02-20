@@ -157,7 +157,7 @@ export class SponsorService {
     this.logger.info("Deriving sponsor key from mnemonic", { accountIndex });
 
     try {
-      const wallet = await generateWallet({
+      let wallet = await generateWallet({
         secretKey: this.env.SPONSOR_MNEMONIC,
         // Empty password is intentional: the mnemonic is the sole secret in this
         // server-side context, no additional user passphrase is used.
@@ -165,8 +165,9 @@ export class SponsorService {
       });
 
       // Generate accounts up to the needed index
+      // generateNewAccount returns a new wallet object (wallet-sdk v7)
       for (let i = wallet.accounts.length; i <= accountIndex; i++) {
-        generateNewAccount(wallet);
+        wallet = generateNewAccount(wallet);
       }
 
       const account = wallet.accounts[accountIndex];
