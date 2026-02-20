@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.12.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.12.1...v1.12.2) (2026-02-20)
+
+
+### Bug Fixes
+
+* detect wallet address changes and reinitialize stale nonce pools ([#85](https://github.com/aibtcdev/x402-sponsor-relay/issues/85)) ([b37cd0e](https://github.com/aibtcdev/x402-sponsor-relay/commit/b37cd0ec1e866729884876898f85aaa7c5a45fb2))
+
 ## [1.12.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.12.0...v1.12.1) (2026-02-20)
 
 
