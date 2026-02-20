@@ -124,8 +124,12 @@ interface NonceStatsResponse {
   wallets: WalletPoolStats[];
 }
 
-/** Maximum number of in-flight nonces allowed concurrently per sponsor wallet */
-const CHAINING_LIMIT = 25;
+/**
+ * Maximum number of in-flight nonces allowed concurrently per sponsor wallet.
+ * The Stacks node hard-rejects at 25 (TooMuchChaining). We cap at 20 to leave
+ * a buffer of 5 for concurrent in-flight requests and gap-fill transactions.
+ */
+const CHAINING_LIMIT = 20;
 /** Initial pool pre-seeds this many nonces ahead of the current head */
 const POOL_SEED_SIZE = CHAINING_LIMIT;
 
@@ -281,6 +285,74 @@ export class NonceDO {
   private incrementGapsFilled(): void {
     const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled) + 1;
     this.setStateValue(STATE_KEYS.gapsFilled, gapsFilled);
+  }
+
+  /**
+   * Return true if any txid has been recorded for this nonce in nonce_txids.
+   * Used by cleanStaleReservations to distinguish reserved-but-broadcast nonces
+   * from reserved-but-never-broadcast (orphaned) nonces.
+   */
+  private hasTxidForNonce(nonce: number): boolean {
+    const rows = this.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ? LIMIT 1",
+        nonce
+      )
+      .toArray();
+    return rows.length > 0 && rows[0].count > 0;
+  }
+
+  /**
+   * Release stale reservations for a wallet pool back to available.
+   * A reservation is "stale" when:
+   *   - It has been reserved longer than STALE_THRESHOLD_MS (10 minutes), AND
+   *   - No txid has been recorded for it in nonce_txids (never broadcast).
+   *
+   * This recovers pool capacity lost to fire-and-forget releaseNonceDO failures.
+   * Returns the number of nonces returned to available.
+   */
+  private cleanStaleReservations(pool: PoolState): number {
+    const now = Date.now();
+    const staleNonces: number[] = [];
+
+    for (const nonce of pool.reserved) {
+      const reservedAt = pool.reservedAt[nonce];
+      if (reservedAt === undefined) {
+        // No timestamp — treat as potentially stale only if STALE_THRESHOLD_MS has passed
+        // since we can't know when it was reserved; conservatively skip.
+        continue;
+      }
+      const ageMs = now - reservedAt;
+      if (ageMs < STALE_THRESHOLD_MS) {
+        continue; // Still within the grace window
+      }
+      if (this.hasTxidForNonce(nonce)) {
+        continue; // Was broadcast — consumed legitimately, do not reclaim
+      }
+      staleNonces.push(nonce);
+    }
+
+    if (staleNonces.length === 0) {
+      return 0;
+    }
+
+    // Remove stale nonces from reserved and return to available in sorted order
+    for (const nonce of staleNonces) {
+      const idx = pool.reserved.indexOf(nonce);
+      if (idx !== -1) {
+        pool.reserved.splice(idx, 1);
+      }
+      delete pool.reservedAt[nonce];
+
+      const insertIdx = pool.available.findIndex((n) => n > nonce);
+      if (insertIdx === -1) {
+        pool.available.push(nonce);
+      } else {
+        pool.available.splice(insertIdx, 0, nonce);
+      }
+    }
+
+    return staleNonces.length;
   }
 
   /**
@@ -1062,6 +1134,22 @@ export class NonceDO {
           if (!addr) break; // no more initialized wallets
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
           await this.reconcileNonceForWallet(wi, addr);
+
+          // Clean stale reservations: release nonces reserved > 10 min ago with no broadcast
+          const pool = await this.loadPoolForWallet(wi);
+          if (pool !== null) {
+            const released = this.cleanStaleReservations(pool);
+            if (released > 0) {
+              await this.savePoolForWallet(wi, pool);
+              console.log(
+                JSON.stringify({
+                  action: "stale_reservations_cleaned",
+                  walletIndex: wi,
+                  released,
+                })
+              );
+            }
+          }
         }
       } finally {
         await this.scheduleAlarm();
