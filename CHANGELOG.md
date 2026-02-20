@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.10.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.10.0...v1.10.1) (2026-02-20)
+
+
+### Bug Fixes
+
+* production hardening — nonce fail-fast, StatsDO, BTC provision errors ([#70](https://github.com/aibtcdev/x402-sponsor-relay/issues/70)) ([cb986a7](https://github.com/aibtcdev/x402-sponsor-relay/commit/cb986a7891f72590b643627ad1fc536a58e65cf6))
+
 ## [1.10.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.9.0...v1.10.0) (2026-02-20)
 
 
