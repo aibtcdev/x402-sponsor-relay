@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.12.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.11.0...v1.12.0) (2026-02-20)
+
+
+### Features
+
+* nonce mastery — self-healing gaps, dedup liveness, chaining pressure ([#77](https://github.com/aibtcdev/x402-sponsor-relay/issues/77)) ([5d3f0c0](https://github.com/aibtcdev/x402-sponsor-relay/commit/5d3f0c0d0a5ef2abe8bcf031a7a9df137f954dbb))
+
 ## [1.11.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/v1.10.1...v1.11.0) (2026-02-20)
 
 
