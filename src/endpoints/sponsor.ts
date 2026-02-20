@@ -11,7 +11,7 @@ import {
   releaseNonceDO,
 } from "../services";
 import type { AppContext, SponsorRequest } from "../types";
-import { buildExplorerUrl } from "../utils";
+import { buildExplorerUrl, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 import {
   Error400Response,
   Error401Response,
@@ -21,8 +21,6 @@ import {
   Error502Response,
   Error503Response,
 } from "../schemas";
-
-const NONCE_CONFLICT_REASONS = ["ConflictingNonceInMempool", "BadNonce"];
 
 /**
  * Sponsor endpoint - sponsors and broadcasts transactions directly
@@ -224,9 +222,7 @@ export class Sponsor extends BaseEndpoint {
 
       // Estimate fee based on transaction size for spending cap check.
       // Conservative: 50 microSTX/byte, floor of 10,000 microSTX (0.01 STX).
-      const cleanTxHex = body.transaction.startsWith("0x")
-        ? body.transaction.slice(2)
-        : body.transaction;
+      const cleanTxHex = stripHexPrefix(body.transaction);
       const txByteLength = Buffer.from(cleanTxHex, "hex").length;
       const baseFee = 10_000n;
       const sizeBasedEstimate = BigInt(txByteLength) * 50n;
@@ -275,9 +271,7 @@ export class Sponsor extends BaseEndpoint {
         c.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
 
       // Deserialize the sponsored transaction for broadcast
-      const cleanHex = sponsorResult.sponsoredTxHex.startsWith("0x")
-        ? sponsorResult.sponsoredTxHex.slice(2)
-        : sponsorResult.sponsoredTxHex;
+      const cleanHex = stripHexPrefix(sponsorResult.sponsoredTxHex);
       const sponsoredTx = deserializeTransaction(cleanHex);
 
       // Extract nonce before broadcast so it's available in all failure and success paths

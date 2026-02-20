@@ -12,7 +12,7 @@ import {
   generateWallet,
 } from "@stacks/wallet-sdk";
 import type { Env, Logger, FeeTransactionType, WalletStatus, WalletsResponse } from "../types";
-import { getHiroBaseUrl, getHiroHeaders } from "../utils";
+import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix } from "../utils";
 import { FeeService } from "./fee";
 
 /**
@@ -422,8 +422,7 @@ export class SponsorService {
    * Validate and deserialize a transaction
    */
   validateTransaction(txHex: string): TransactionValidationResult {
-    // Remove 0x prefix if present
-    const cleanHex = txHex.startsWith("0x") ? txHex.slice(2) : txHex;
+    const cleanHex = stripHexPrefix(txHex);
 
     // Deserialize the transaction
     let transaction: StacksTransactionWire;
@@ -541,7 +540,7 @@ export class SponsorService {
       this.logger.warn(
         "NONCE_DO not configured; falling back to uncoordinated Hiro nonce fetch"
       );
-      walletIndex = 0; // single-wallet fallback always uses index 0
+      // walletIndex stays 0 (initialized above) — single-wallet fallback
 
       const wallet0Key = await this.getSponsorKeyForWallet(0);
       if (!wallet0Key) {

@@ -395,18 +395,6 @@ export class NonceDO {
     };
   }
 
-  // ---------------------------------------------------------------------------
-  // Legacy single-wallet helpers (kept for internal use by alarm/resync/reset)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * @deprecated Use getStoredSponsorAddressForWallet(0) instead.
-   * Kept for backward-compatible reads by alarm and resync handlers.
-   */
-  private async getStoredSponsorAddress(): Promise<string | null> {
-    return this.getStoredSponsorAddressForWallet(0);
-  }
-
   private async fetchNonceInfo(sponsorAddress: string): Promise<HiroNonceInfo> {
     const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/address/${sponsorAddress}/nonces`;
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
@@ -510,30 +498,27 @@ export class NonceDO {
 
       // Round-robin: start from stored nextWalletIndex, find a wallet under chaining limit
       let walletIndex = (await this.getNextWalletIndex()) % effectiveWalletCount;
+      let pool: PoolState | null = null;
 
       // Try each wallet in round-robin order; skip any at chaining limit
       let attempts = 0;
       while (attempts < effectiveWalletCount) {
-        // Pre-check: load pool to see if it has room
-        // We need to init here if needed to check reserved length
-        const pool = await this.loadPoolOrInit(walletIndex, sponsorAddress);
+        pool = await this.loadPoolOrInit(walletIndex, sponsorAddress);
         if (pool.reserved.length < CHAINING_LIMIT) {
           break;
         }
         // This wallet is at its chaining limit; try the next
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
+        pool = null;
         attempts++;
       }
 
-      if (attempts === effectiveWalletCount) {
+      if (attempts === effectiveWalletCount || pool === null) {
         throw new Error("CHAINING_LIMIT_EXCEEDED");
       }
 
       // Store the sponsor address for this wallet (used by alarm reconciliation)
       await this.setStoredSponsorAddressForWallet(walletIndex, sponsorAddress);
-
-      // Load pool for chosen wallet (already initialized above in the loop)
-      const pool = await this.loadPoolOrInit(walletIndex, sponsorAddress);
 
       // Extend pool if available is exhausted
       if (pool.available.length === 0) {
@@ -756,8 +741,8 @@ export class NonceDO {
 
       this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
       return {
-        previousNonce: previousNonce ?? null,
-        newNonce: previousNonce ?? null,
+        previousNonce,
+        newNonce: previousNonce,
         changed: false,
         reason: `gaps detected (${sortedGaps.join(",")}) but nonce will fill naturally`,
       };
@@ -815,8 +800,8 @@ export class NonceDO {
     }
 
     return {
-      previousNonce: effectivePreviousNonce ?? null,
-      newNonce: effectivePreviousNonce ?? null,
+      previousNonce: effectivePreviousNonce,
+      newNonce: effectivePreviousNonce,
       changed: false,
       reason: "nonce is consistent with chain state",
     };
@@ -925,7 +910,7 @@ export class NonceDO {
    */
   private async handleRecoveryAction(action: "resync" | "reset"): Promise<Response> {
     try {
-      const sponsorAddress = await this.getStoredSponsorAddress();
+      const sponsorAddress = await this.getStoredSponsorAddressForWallet(0);
       if (!sponsorAddress) {
         return this.badRequest("No sponsor address stored; call /assign first");
       }
