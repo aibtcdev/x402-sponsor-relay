@@ -621,6 +621,21 @@ export class NonceDO {
     };
   }
 
+  /**
+   * Collect all initialized wallets (those with a stored sponsor address).
+   * Returns an array of { walletIndex, address } in index order.
+   * Stops at the first uninitialized wallet index.
+   */
+  private async getInitializedWallets(): Promise<Array<{ walletIndex: number; address: string }>> {
+    const wallets: Array<{ walletIndex: number; address: string }> = [];
+    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+      const address = await this.getStoredSponsorAddressForWallet(wi);
+      if (!address) break;
+      wallets.push({ walletIndex: wi, address });
+    }
+    return wallets;
+  }
+
   private async fetchNonceInfo(sponsorAddress: string): Promise<HiroNonceInfo> {
     const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/address/${sponsorAddress}/nonces`;
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
@@ -899,17 +914,16 @@ export class NonceDO {
     const txidCount = txidRows.length > 0 ? txidRows[0].count : 0;
 
     // Load per-wallet pool state for reporting
+    const initializedWallets = await this.getInitializedWallets();
     const wallets: WalletPoolStats[] = [];
-    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
-      const addr = await this.getStoredSponsorAddressForWallet(wi);
-      if (!addr) break; // no more initialized wallets
-      const pool = await this.loadPoolForWallet(wi);
+    for (const { walletIndex, address } of initializedWallets) {
+      const pool = await this.loadPoolForWallet(walletIndex);
       wallets.push({
-        walletIndex: wi,
+        walletIndex,
         available: pool?.available.length ?? 0,
         reserved: pool?.reserved.length ?? 0,
         maxNonce: pool?.maxNonce ?? 0,
-        sponsorAddress: addr,
+        sponsorAddress: address,
       });
     }
 
@@ -936,7 +950,7 @@ export class NonceDO {
 
   /**
    * Core gap-aware nonce reconciliation against Hiro for a specific wallet.
-   * Shared by alarm() (all wallets), performResync() (wallet 0), and performReset() (wallet 0).
+   * Shared by alarm(), performResync(), and performReset() — all iterate every initialized wallet.
    */
   private async reconcileNonceForWallet(
     walletIndex: number,
@@ -1139,15 +1153,14 @@ export class NonceDO {
       reason: string;
     }>;
   }> {
+    const initializedWallets = await this.getInitializedWallets();
     const wallets = [];
-    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
-      const addr = await this.getStoredSponsorAddressForWallet(wi);
-      if (!addr) break;
-      const result = await this.reconcileNonceForWallet(wi, addr);
+    for (const { walletIndex, address } of initializedWallets) {
+      const result = await this.reconcileNonceForWallet(walletIndex, address);
       if (result === null) {
         throw new Error("Hiro API unavailable");
       }
-      wallets.push({ walletIndex: wi, ...result });
+      wallets.push({ walletIndex, ...result });
     }
     return { success: true, action: "resync", wallets };
   }
@@ -1165,14 +1178,12 @@ export class NonceDO {
       changed: boolean;
     }>;
   }> {
+    const initializedWallets = await this.getInitializedWallets();
     const wallets = [];
-    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
-      const addr = await this.getStoredSponsorAddressForWallet(wi);
-      if (!addr) break;
-
+    for (const { walletIndex, address } of initializedWallets) {
       let nonceInfo: HiroNonceInfo;
       try {
-        nonceInfo = await this.fetchNonceInfo(addr);
+        nonceInfo = await this.fetchNonceInfo(address);
       } catch (_e) {
         throw new Error("Hiro API unavailable");
       }
@@ -1183,23 +1194,27 @@ export class NonceDO {
         ? 0
         : nonceInfo.last_executed_tx_nonce + 1;
 
-      // For wallet 0, also update the stored scalar nonce used by legacy paths
-      const previousNonce = wi === 0 ? this.getStoredNonce() : null;
-      const changed = wi === 0 ? previousNonce !== safeFloor : true;
-      if (wi === 0) {
+      // Determine previous head: wallet 0 uses SQL counter, others use pool head
+      const pool = await this.loadPoolForWallet(walletIndex);
+      const previousNonce = walletIndex === 0
+        ? this.getStoredNonce()
+        : (pool?.available[0] ?? null);
+      const changed = previousNonce !== safeFloor;
+
+      // Wallet 0: also update the stored scalar nonce used by legacy paths
+      if (walletIndex === 0) {
         this.setStoredNonce(safeFloor);
-        if (changed) {
-          this.incrementConflictsDetected();
-        }
+      }
+      if (changed) {
+        this.incrementConflictsDetected();
       }
 
-      const pool = await this.loadPoolForWallet(wi);
       if (pool !== null) {
-        await this.resetPoolAvailableForWallet(wi, pool, safeFloor);
+        await this.resetPoolAvailableForWallet(walletIndex, pool, safeFloor);
       }
 
       wallets.push({
-        walletIndex: wi,
+        walletIndex,
         previousNonce,
         newNonce: safeFloor,
         changed,
@@ -1211,23 +1226,21 @@ export class NonceDO {
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
-        // Reconcile all wallets that have been initialized (up to MAX_WALLET_COUNT)
-        for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
-          const addr = await this.getStoredSponsorAddressForWallet(wi);
-          if (!addr) break; // no more initialized wallets
+        const initializedWallets = await this.getInitializedWallets();
+        for (const { walletIndex, address } of initializedWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
-          await this.reconcileNonceForWallet(wi, addr);
+          await this.reconcileNonceForWallet(walletIndex, address);
 
           // Clean stale reservations: release nonces reserved > 10 min ago with no broadcast
-          const pool = await this.loadPoolForWallet(wi);
+          const pool = await this.loadPoolForWallet(walletIndex);
           if (pool !== null) {
             const released = this.cleanStaleReservations(pool);
             if (released > 0) {
-              await this.savePoolForWallet(wi, pool);
+              await this.savePoolForWallet(walletIndex, pool);
               console.log(
                 JSON.stringify({
                   action: "stale_reservations_cleaned",
-                  walletIndex: wi,
+                  walletIndex,
                   released,
                 })
               );
@@ -1269,39 +1282,28 @@ export class NonceDO {
    */
   private async handleClearPools(): Promise<Response> {
     return this.state.blockConcurrencyWhile(async () => {
-      let cleared = 0;
-      for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
-        const addr = await this.getStoredSponsorAddressForWallet(wi);
-        if (!addr) break;
-        await this.state.storage.delete(this.poolKey(wi));
-        await this.state.storage.delete(this.sponsorAddressKey(wi));
-        cleared++;
+      const initializedWallets = await this.getInitializedWallets();
+      for (const { walletIndex } of initializedWallets) {
+        await this.state.storage.delete(this.poolKey(walletIndex));
+        await this.state.storage.delete(this.sponsorAddressKey(walletIndex));
       }
       // Reset round-robin index
-      await this.state.storage.put("next_wallet_index", 0);
-      console.log(
-        JSON.stringify({
-          action: "clear_pools",
-          previousNonce: null,
-          newNonce: null,
-          changed: cleared > 0,
-          reason:
-            cleared > 0
-              ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
-              : "No wallets to clear",
-        })
-      );
-      return this.jsonResponse({
+      await this.state.storage.put(NEXT_WALLET_INDEX_KEY, 0);
+
+      const cleared = initializedWallets.length;
+      const reason = cleared > 0
+        ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
+        : "No wallets to clear";
+      const result = {
         success: true,
         action: "clear_pools",
         previousNonce: null,
         newNonce: null,
         changed: cleared > 0,
-        reason:
-          cleared > 0
-            ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
-            : "No wallets to clear",
-      });
+        reason,
+      };
+      console.log(JSON.stringify(result));
+      return this.jsonResponse(result);
     });
   }
 

@@ -353,12 +353,16 @@ export class SponsorService {
       const data = (await response.json()) as {
         success?: boolean;
         action?: string;
-        changed?: boolean;
-        reason?: string;
+        wallets?: Array<{
+          walletIndex: number;
+          changed: boolean;
+          reason: string;
+        }>;
       };
+      const walletsChanged = data.wallets?.filter((w) => w.changed).length ?? 0;
       this.logger.info("Nonce DO resync completed", {
-        changed: data.changed,
-        reason: data.reason,
+        walletsChanged,
+        walletCount: data.wallets?.length ?? 0,
       });
     } catch (e) {
       this.logger.warn("Failed to resync NonceDO", {
