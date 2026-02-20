@@ -180,6 +180,7 @@ class ChainingLimitError extends Error {
 
 /** Insert a nonce into a sorted ascending array at the correct position. */
 function insertSorted(arr: number[], nonce: number): void {
+  if (arr.includes(nonce)) return;
   const idx = arr.findIndex((n) => n > nonce);
   if (idx === -1) {
     arr.push(nonce);
