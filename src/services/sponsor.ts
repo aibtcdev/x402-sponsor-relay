@@ -57,6 +57,8 @@ export interface SponsorFailure {
   success: false;
   error: string;
   details: string;
+  /** Optional machine-readable error code for callers */
+  code?: string;
 }
 
 /**
@@ -332,6 +334,17 @@ export class SponsorService {
   }
 
   /**
+   * Delayed resync: waits delayMs before calling resyncNonceDO so Hiro's mempool
+   * index has time to catch up after a conflicting transaction is broadcast.
+   * Call via executionCtx.waitUntil() after a nonce conflict broadcast failure.
+   * Never throws — all errors are logged as warnings.
+   */
+  async resyncNonceDODelayed(delayMs = 2000): Promise<void> {
+    await new Promise((r) => setTimeout(r, delayMs));
+    await this.resyncNonceDO();
+  }
+
+  /**
    * Fetch the sponsor account nonce from NonceDO when available.
    */
   private async fetchNonceFromDO(
@@ -455,12 +468,19 @@ export class SponsorService {
       fee = undefined;
     }
 
-    // Pre-fetch the sponsor nonce with retry-with-backoff to avoid hitting Hiro
-    // API rate limits from the internal fetchNonce() call inside sponsorTransaction().
-    // Passing sponsorNonce explicitly skips the internal nonce fetch entirely.
+    // Pre-fetch the sponsor nonce to avoid hitting Hiro API rate limits from the
+    // internal fetchNonce() call inside sponsorTransaction(). Passing sponsorNonce
+    // explicitly skips the internal nonce fetch entirely.
+    //
+    // When NONCE_DO is configured, it is the authoritative nonce source.
+    // If the DO is unreachable we fail fast (503) rather than silently falling back
+    // to the uncoordinated Hiro path which causes nonce races.
+    // When NONCE_DO is NOT configured (e.g. local dev), we fall back to Hiro with a warning.
     let sponsorNonce: bigint | undefined;
-    try {
-      const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
+    const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
+
+    if (this.env.NONCE_DO) {
+      // NONCE_DO is configured — it is the authoritative source; fail fast if unavailable
       const doNonce = await this.fetchNonceFromDO(sponsorAddress);
       if (doNonce !== null) {
         sponsorNonce = doNonce;
@@ -468,26 +488,33 @@ export class SponsorService {
           sponsorNonce: sponsorNonce.toString(),
         });
       } else {
-        const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
-        if (fetchedNonce !== null) {
-          sponsorNonce = fetchedNonce;
-          this.logger.debug("Using fallback sponsor nonce", {
-            sponsorNonce: sponsorNonce.toString(),
-          });
-        } else {
-          // Fall back to letting @stacks/transactions fetch the nonce internally
-          this.logger.warn(
-            "Nonce pre-fetch failed, falling back to internal nonce fetch"
-          );
-        }
+        this.logger.error(
+          "NonceDO is configured but unavailable; refusing to fall back to uncoordinated nonce"
+        );
+        return {
+          success: false,
+          error: "Nonce coordination service unavailable",
+          details: "NonceDO did not return a nonce; retry in a few seconds",
+          code: "NONCE_DO_UNAVAILABLE",
+        };
       }
-    } catch (e) {
+    } else {
+      // NONCE_DO not configured — fall back to Hiro with a warning (local dev / unconfigured)
       this.logger.warn(
-        "Error during nonce pre-fetch, falling back to internal nonce fetch",
-        {
-          error: e instanceof Error ? e.message : String(e),
-        }
+        "NONCE_DO not configured; falling back to uncoordinated Hiro nonce fetch"
       );
+      const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
+      if (fetchedNonce !== null) {
+        sponsorNonce = fetchedNonce;
+        this.logger.debug("Using Hiro fallback sponsor nonce", {
+          sponsorNonce: sponsorNonce.toString(),
+        });
+      } else {
+        // Let @stacks/transactions fetch internally as last resort
+        this.logger.warn(
+          "Hiro nonce fetch failed; falling back to internal nonce fetch"
+        );
+      }
     }
 
     try {
