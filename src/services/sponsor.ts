@@ -694,6 +694,7 @@ export async function recordNonceTxid(
  *
  * When txid is provided (broadcast succeeded): marks the nonce as consumed —
  * it is removed from reserved and NOT returned to available for reuse.
+ * If fee is also provided, it is recorded in NonceDO's cumulative wallet stats.
  *
  * When txid is absent (broadcast failed): returns the nonce to available[]
  * in sorted order so it can be reused for the next request.
@@ -709,7 +710,8 @@ export async function releaseNonceDO(
   logger: Logger,
   nonce: number,
   txid?: string,
-  walletIndex: number = 0
+  walletIndex: number = 0,
+  fee?: string
 ): Promise<void> {
   if (!env.NONCE_DO) {
     return;
@@ -724,6 +726,7 @@ export async function releaseNonceDO(
         nonce,
         walletIndex,
         ...(txid ? { txid } : {}),
+        ...(fee ? { fee } : {}),
       }),
     });
 
@@ -735,6 +738,7 @@ export async function releaseNonceDO(
         nonce,
         walletIndex,
         ...(txid ? { txid } : {}),
+        ...(fee ? { fee } : {}),
       });
     }
   } catch (e) {
@@ -743,6 +747,7 @@ export async function releaseNonceDO(
       nonce,
       walletIndex,
       ...(txid ? { txid } : {}),
+      ...(fee ? { fee } : {}),
     });
   }
 }

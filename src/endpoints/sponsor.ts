@@ -365,8 +365,9 @@ export class Sponsor extends BaseEndpoint {
 
       if (sponsorNonce !== null) {
         // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
+        // Also records the fee in NonceDO's cumulative per-wallet fee stats
         c.executionCtx.waitUntil(
-          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex).catch((e) => {
+          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex, sponsorResult.fee).catch((e) => {
             logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
           })
         );

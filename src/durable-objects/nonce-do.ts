@@ -34,6 +34,18 @@ interface ReleaseNonceRequest {
   txid?: string;
   /** Which wallet pool to release to (default: 0) */
   walletIndex?: number;
+  /** Fee paid for this transaction in microSTX (optional, used for cumulative tracking) */
+  fee?: string;
+}
+
+/**
+ * Per-wallet fee statistics (daily + cumulative)
+ */
+interface WalletFeeStats {
+  totalFeesSpent: string;
+  txCount: number;
+  txCountToday: number;
+  feesToday: string;
 }
 
 /**
@@ -72,6 +84,7 @@ interface WalletPoolStats {
   walletIndex: number;
   available: number;
   reserved: number;
+  maxNonce: number;
   sponsorAddress: string | null;
 }
 
@@ -124,6 +137,15 @@ const STATE_KEYS = {
 
 /** Round-robin wallet index storage key */
 const NEXT_WALLET_INDEX_KEY = "next_wallet_index";
+
+/** Safely add two microSTX string amounts using BigInt to avoid overflow */
+function addMicroSTX(a: string, b: string): string {
+  try {
+    return (BigInt(a || "0") + BigInt(b || "0")).toString();
+  } catch {
+    return a || "0";
+  }
+}
 
 export class NonceDO {
   private readonly sql: DurableObjectStorage["sql"];
@@ -311,6 +333,69 @@ export class NonceDO {
   }
 
   // ---------------------------------------------------------------------------
+  // Per-wallet fee tracking helpers
+  // ---------------------------------------------------------------------------
+
+  /** KV key for cumulative fee total for a specific wallet */
+  private walletFeesKey(walletIndex: number): string {
+    return `wallet_fees:${walletIndex}`;
+  }
+
+  /** KV key for cumulative tx count for a specific wallet */
+  private walletTxCountKey(walletIndex: number): string {
+    return `wallet_tx_count:${walletIndex}`;
+  }
+
+  /**
+   * KV key for today's fee stats for a specific wallet.
+   * Uses UTC date (YYYY-MM-DD) so stats roll over at midnight UTC.
+   */
+  private walletTxTodayKey(walletIndex: number): string {
+    const today = new Date().toISOString().slice(0, 10);
+    return `wallet_tx_today:${walletIndex}:${today}`;
+  }
+
+  /**
+   * Record a successful transaction fee for a specific wallet.
+   * Increments cumulative total fees, total tx count, and today's counters.
+   */
+  private async recordWalletFee(walletIndex: number, fee: string): Promise<void> {
+    // Update cumulative total fees
+    const prevTotal = (await this.state.storage.get<string>(this.walletFeesKey(walletIndex))) ?? "0";
+    await this.state.storage.put(this.walletFeesKey(walletIndex), addMicroSTX(prevTotal, fee));
+
+    // Update cumulative tx count
+    const prevCount = (await this.state.storage.get<number>(this.walletTxCountKey(walletIndex))) ?? 0;
+    await this.state.storage.put(this.walletTxCountKey(walletIndex), prevCount + 1);
+
+    // Update today's stats
+    const todayKey = this.walletTxTodayKey(walletIndex);
+    const today = (await this.state.storage.get<{ txCount: number; fees: string }>(todayKey)) ?? { txCount: 0, fees: "0" };
+    await this.state.storage.put(todayKey, {
+      txCount: today.txCount + 1,
+      fees: addMicroSTX(today.fees, fee),
+    });
+  }
+
+  /**
+   * Get fee statistics for a specific wallet.
+   * Returns cumulative totals and today's stats.
+   */
+  async getWalletFeeStats(walletIndex: number): Promise<WalletFeeStats> {
+    const totalFeesSpent = (await this.state.storage.get<string>(this.walletFeesKey(walletIndex))) ?? "0";
+    const txCount = (await this.state.storage.get<number>(this.walletTxCountKey(walletIndex))) ?? 0;
+    const todayKey = this.walletTxTodayKey(walletIndex);
+    const today = (await this.state.storage.get<{ txCount: number; fees: string }>(todayKey)) ?? { txCount: 0, fees: "0" };
+
+    return {
+      totalFeesSpent,
+      txCount,
+      txCountToday: today.txCount,
+      feesToday: today.fees,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
   // Legacy single-wallet helpers (kept for internal use by alarm/resync/reset)
   // ---------------------------------------------------------------------------
 
@@ -482,8 +567,9 @@ export class NonceDO {
    * txid absent   → nonce was NOT broadcast (e.g. broadcast failure); return to available
    *                 in sorted order so it can be reused.
    * walletIndex   → which wallet pool to release to (default: 0)
+   * fee           → when provided with txid (broadcast succeeded), recorded in cumulative wallet stats
    */
-  async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0): Promise<void> {
+  async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0, fee?: string): Promise<void> {
     return this.state.blockConcurrencyWhile(async () => {
       const pool = await this.loadPoolForWallet(walletIndex);
       if (pool === null) {
@@ -508,8 +594,13 @@ export class NonceDO {
         } else {
           pool.available.splice(insertIdx, 0, nonce);
         }
+      } else if (fee && fee !== "0") {
+        // Broadcast succeeded and fee provided — record in wallet stats
+        // (done outside blockConcurrencyWhile to avoid nested blocking, but we call it here
+        //  as part of the same serialized operation)
+        await this.recordWalletFee(walletIndex, fee);
       }
-      // If txid is provided, the nonce is consumed — do not return to available
+      // If txid is provided but no fee, the nonce is consumed — do not return to available
 
       await this.savePoolForWallet(walletIndex, pool);
     });
@@ -580,6 +671,7 @@ export class NonceDO {
         walletIndex: wi,
         available: pool?.available.length ?? 0,
         reserved: pool?.reserved.length ?? 0,
+        maxNonce: pool?.maxNonce ?? 0,
         sponsorAddress: addr,
       });
     }
@@ -902,8 +994,11 @@ export class NonceDO {
         ? Math.max(0, Math.min(body.walletIndex, MAX_WALLET_COUNT - 1))
         : 0;
 
+      // fee is optional; only recorded when present and txid is also present
+      const fee = typeof body.fee === "string" && body.fee.length > 0 ? body.fee : undefined;
+
       try {
-        await this.releaseNonce(body.nonce, body.txid, walletIndex);
+        await this.releaseNonce(body.nonce, body.txid, walletIndex, fee);
         return this.jsonResponse({ success: true });
       } catch (error) {
         return this.internalError(error);
@@ -954,6 +1049,21 @@ export class NonceDO {
       try {
         const stats = await this.getStats();
         return this.jsonResponse(stats);
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    // GET /wallet-fees/:walletIndex — returns fee stats for a specific wallet
+    const walletFeesMatch = url.pathname.match(/^\/wallet-fees\/(\d+)$/);
+    if (request.method === "GET" && walletFeesMatch) {
+      const wi = parseInt(walletFeesMatch[1], 10);
+      if (!Number.isInteger(wi) || wi < 0 || wi >= MAX_WALLET_COUNT) {
+        return this.badRequest("Invalid wallet index");
+      }
+      try {
+        const feeStats = await this.getWalletFeeStats(wi);
+        return this.jsonResponse(feeStats);
       } catch (error) {
         return this.internalError(error);
       }
