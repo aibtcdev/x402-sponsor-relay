@@ -523,7 +523,8 @@ export type RelayErrorCode =
   | "INVALID_STX_SIGNATURE"
   | "MISSING_STX_ADDRESS"
   | "INVALID_AUTH_SIGNATURE"
-  | "AUTH_EXPIRED";
+  | "AUTH_EXPIRED"
+  | "NONCE_RESET_FAILED";
 
 /**
  * Structured error response with retry guidance
