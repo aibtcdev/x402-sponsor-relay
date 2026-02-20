@@ -805,10 +805,14 @@ export class SponsorService {
       }
       const data = (await response.json()) as Partial<typeof empty>;
       return {
-        totalFeesSpent: typeof data.totalFeesSpent === "string" ? data.totalFeesSpent : "0",
-        txCount: typeof data.txCount === "number" ? data.txCount : 0,
-        txCountToday: typeof data.txCountToday === "number" ? data.txCountToday : 0,
-        feesToday: typeof data.feesToday === "string" ? data.feesToday : "0",
+        totalFeesSpent: typeof data.totalFeesSpent === "string" && data.totalFeesSpent !== null
+          ? data.totalFeesSpent : "0",
+        txCount: typeof data.txCount === "number" && data.txCount !== null
+          ? data.txCount : 0,
+        txCountToday: typeof data.txCountToday === "number" && data.txCountToday !== null
+          ? data.txCountToday : 0,
+        feesToday: typeof data.feesToday === "string" && data.feesToday !== null
+          ? data.feesToday : "0",
       };
     } catch (e) {
       this.logger.warn("Failed to fetch wallet fee stats from NonceDO", {
@@ -892,13 +896,13 @@ export class SponsorService {
         const status = this.classifyWalletStatus(balance);
 
         return {
-          index: walletIndex,
+          index: walletIndex,  // integer loop counter, never null
           address,
           balance,
-          totalFeesSpent: feeStats.totalFeesSpent,
-          txCount: feeStats.txCount,
-          txCountToday: feeStats.txCountToday,
-          feesToday: feeStats.feesToday,
+          totalFeesSpent: feeStats.totalFeesSpent ?? "0",
+          txCount: feeStats.txCount ?? 0,
+          txCountToday: feeStats.txCountToday ?? 0,
+          feesToday: feeStats.feesToday ?? "0",
           pool,
           status,
         };

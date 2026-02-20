@@ -919,11 +919,11 @@ export class NonceDO {
     for (const { walletIndex, address } of initializedWallets) {
       const pool = await this.loadPoolForWallet(walletIndex);
       wallets.push({
-        walletIndex,
+        walletIndex: Number(walletIndex),  // explicit integer coercion
         available: pool?.available.length ?? 0,
         reserved: pool?.reserved.length ?? 0,
         maxNonce: pool?.maxNonce ?? 0,
-        sponsorAddress: address,
+        sponsorAddress: address ?? null,
       });
     }
 
