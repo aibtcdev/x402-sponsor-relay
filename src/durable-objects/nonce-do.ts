@@ -621,6 +621,21 @@ export class NonceDO {
     };
   }
 
+  /**
+   * Collect all initialized wallets (those with a stored sponsor address).
+   * Returns an array of { walletIndex, address } in index order.
+   * Stops at the first uninitialized wallet index.
+   */
+  private async getInitializedWallets(): Promise<Array<{ walletIndex: number; address: string }>> {
+    const wallets: Array<{ walletIndex: number; address: string }> = [];
+    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+      const address = await this.getStoredSponsorAddressForWallet(wi);
+      if (!address) break;
+      wallets.push({ walletIndex: wi, address });
+    }
+    return wallets;
+  }
+
   private async fetchNonceInfo(sponsorAddress: string): Promise<HiroNonceInfo> {
     const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/address/${sponsorAddress}/nonces`;
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
@@ -899,17 +914,16 @@ export class NonceDO {
     const txidCount = txidRows.length > 0 ? txidRows[0].count : 0;
 
     // Load per-wallet pool state for reporting
+    const initializedWallets = await this.getInitializedWallets();
     const wallets: WalletPoolStats[] = [];
-    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
-      const addr = await this.getStoredSponsorAddressForWallet(wi);
-      if (!addr) break; // no more initialized wallets
-      const pool = await this.loadPoolForWallet(wi);
+    for (const { walletIndex, address } of initializedWallets) {
+      const pool = await this.loadPoolForWallet(walletIndex);
       wallets.push({
-        walletIndex: wi,
+        walletIndex,
         available: pool?.available.length ?? 0,
         reserved: pool?.reserved.length ?? 0,
         maxNonce: pool?.maxNonce ?? 0,
-        sponsorAddress: addr,
+        sponsorAddress: address,
       });
     }
 
@@ -936,7 +950,7 @@ export class NonceDO {
 
   /**
    * Core gap-aware nonce reconciliation against Hiro for a specific wallet.
-   * Shared by alarm() (all wallets), performResync() (wallet 0), and performReset() (wallet 0).
+   * Shared by alarm(), performResync(), and performReset() — all iterate every initialized wallet.
    */
   private async reconcileNonceForWallet(
     walletIndex: number,
@@ -1079,6 +1093,26 @@ export class NonceDO {
       };
     }
 
+    // POOL REFILL: pool is aligned with chain but below target size — refill without bumping head
+    if (
+      poolHead !== null &&
+      poolHead.available.length < POOL_SEED_SIZE &&
+      poolHead.reserved.length === 0 &&
+      (effectivePreviousNonce === null || possible_next_nonce === effectivePreviousNonce)
+    ) {
+      await this.resetPoolAvailableForWallet(
+        walletIndex,
+        poolHead,
+        effectivePreviousNonce ?? possible_next_nonce
+      );
+      return {
+        previousNonce: effectivePreviousNonce,
+        newNonce: effectivePreviousNonce ?? possible_next_nonce,
+        changed: true,
+        reason: `POOL REFILL: available ${poolHead.available.length} < ${POOL_SEED_SIZE}, re-seeded from nonce ${effectivePreviousNonce ?? possible_next_nonce}`,
+      };
+    }
+
     return {
       previousNonce: effectivePreviousNonce,
       newNonce: effectivePreviousNonce,
@@ -1107,88 +1141,118 @@ export class NonceDO {
   }
 
   /**
-   * Gap-aware nonce reconciliation for wallet 0, returning a structured response.
+   * Gap-aware nonce reconciliation for all initialized wallets, returning a structured response.
    */
-  private async performResync(sponsorAddress: string): Promise<{
+  private async performResync(): Promise<{
     success: true;
     action: "resync";
-    previousNonce: number | null;
-    newNonce: number | null;
-    changed: boolean;
-    reason: string;
+    wallets: Array<{
+      walletIndex: number;
+      previousNonce: number | null;
+      newNonce: number | null;
+      changed: boolean;
+      reason: string;
+    }>;
   }> {
-    const result = await this.reconcileNonceForWallet(0, sponsorAddress);
-    if (result === null) {
-      throw new Error("Hiro API unavailable");
+    const initializedWallets = await this.getInitializedWallets();
+    const wallets: Array<{
+      walletIndex: number;
+      previousNonce: number | null;
+      newNonce: number | null;
+      changed: boolean;
+      reason: string;
+    }> = [];
+    for (const { walletIndex, address } of initializedWallets) {
+      const result = await this.reconcileNonceForWallet(walletIndex, address);
+      if (result === null) {
+        throw new Error("Hiro API unavailable");
+      }
+      wallets.push({ walletIndex, ...result });
     }
-    return { success: true, action: "resync", ...result };
+    return { success: true, action: "resync", wallets };
   }
 
   /**
-   * Perform a hard nonce reset for wallet 0 to the safe floor: last_executed_tx_nonce + 1.
+   * Perform a hard nonce reset for all initialized wallets to safe floor: last_executed_tx_nonce + 1.
    */
-  private async performReset(sponsorAddress: string): Promise<{
+  private async performReset(): Promise<{
     success: true;
     action: "reset";
-    previousNonce: number | null;
-    newNonce: number;
-    changed: boolean;
+    wallets: Array<{
+      walletIndex: number;
+      previousNonce: number | null;
+      newNonce: number;
+      changed: boolean;
+    }>;
   }> {
-    let nonceInfo: HiroNonceInfo;
-    try {
-      nonceInfo = await this.fetchNonceInfo(sponsorAddress);
-    } catch (_e) {
-      throw new Error("Hiro API unavailable");
+    const initializedWallets = await this.getInitializedWallets();
+    const wallets: Array<{
+      walletIndex: number;
+      previousNonce: number | null;
+      newNonce: number;
+      changed: boolean;
+    }> = [];
+    for (const { walletIndex, address } of initializedWallets) {
+      let nonceInfo: HiroNonceInfo;
+      try {
+        nonceInfo = await this.fetchNonceInfo(address);
+      } catch (_e) {
+        throw new Error("Hiro API unavailable");
+      }
+
+      this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
+
+      const safeFloor = nonceInfo.last_executed_tx_nonce === null
+        ? 0
+        : nonceInfo.last_executed_tx_nonce + 1;
+
+      // Determine previous head: wallet 0 uses SQL counter, others use pool head
+      const pool = await this.loadPoolForWallet(walletIndex);
+      const previousNonce = walletIndex === 0
+        ? this.getStoredNonce()
+        : (pool?.available[0] ?? null);
+      const changed = previousNonce !== safeFloor;
+
+      // Wallet 0: also update the stored scalar nonce used by legacy paths
+      if (walletIndex === 0) {
+        this.setStoredNonce(safeFloor);
+      }
+      if (changed) {
+        this.incrementConflictsDetected();
+      }
+
+      if (pool !== null) {
+        await this.resetPoolAvailableForWallet(walletIndex, pool, safeFloor);
+      }
+
+      wallets.push({
+        walletIndex,
+        previousNonce,
+        newNonce: safeFloor,
+        changed,
+      });
     }
-
-    this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
-
-    const currentNonce = this.getStoredNonce();
-    const safeFloor = nonceInfo.last_executed_tx_nonce === null
-      ? 0
-      : nonceInfo.last_executed_tx_nonce + 1;
-
-    const changed = currentNonce !== safeFloor;
-    this.setStoredNonce(safeFloor);
-    if (changed) {
-      this.incrementConflictsDetected();
-    }
-
-    // Reset pool for wallet 0
-    const pool = await this.loadPoolForWallet(0);
-    if (pool !== null) {
-      await this.resetPoolAvailableForWallet(0, pool, safeFloor);
-    }
-
-    return {
-      success: true,
-      action: "reset",
-      previousNonce: currentNonce,
-      newNonce: safeFloor,
-      changed,
-    };
+    return { success: true, action: "reset", wallets };
   }
 
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
-        // Reconcile all wallets that have been initialized (up to MAX_WALLET_COUNT)
-        for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
-          const addr = await this.getStoredSponsorAddressForWallet(wi);
-          if (!addr) break; // no more initialized wallets
+        const initializedWallets = await this.getInitializedWallets();
+        for (const { walletIndex, address } of initializedWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
-          await this.reconcileNonceForWallet(wi, addr);
+          await this.reconcileNonceForWallet(walletIndex, address);
 
           // Clean stale reservations: release nonces reserved > 10 min ago with no broadcast
-          const pool = await this.loadPoolForWallet(wi);
+          const pool = await this.loadPoolForWallet(walletIndex);
           if (pool !== null) {
             const released = this.cleanStaleReservations(pool);
             if (released > 0) {
-              await this.savePoolForWallet(wi, pool);
+              await this.savePoolForWallet(walletIndex, pool);
               console.log(
                 JSON.stringify({
                   action: "stale_reservations_cleaned",
-                  walletIndex: wi,
+                  walletIndex,
                   released,
                 })
               );
@@ -1202,17 +1266,18 @@ export class NonceDO {
   }
 
   /**
-   * Shared handler for /resync and /reset RPC routes (operates on wallet 0).
+   * Shared handler for /resync and /reset RPC routes (operates on all initialized wallets).
    */
   private async handleRecoveryAction(action: "resync" | "reset"): Promise<Response> {
     try {
-      const sponsorAddress = await this.getStoredSponsorAddressForWallet(0);
-      if (!sponsorAddress) {
+      // Verify at least wallet 0 is initialized before attempting recovery
+      const wallet0Address = await this.getStoredSponsorAddressForWallet(0);
+      if (!wallet0Address) {
         return this.badRequest("No sponsor address stored; call /assign first");
       }
       const result = action === "reset"
-        ? await this.state.blockConcurrencyWhile(() => this.performReset(sponsorAddress))
-        : await this.state.blockConcurrencyWhile(() => this.performResync(sponsorAddress));
+        ? await this.state.blockConcurrencyWhile(() => this.performReset())
+        : await this.state.blockConcurrencyWhile(() => this.performResync());
       return this.jsonResponse(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
@@ -1229,39 +1294,28 @@ export class NonceDO {
    */
   private async handleClearPools(): Promise<Response> {
     return this.state.blockConcurrencyWhile(async () => {
-      let cleared = 0;
-      for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
-        const addr = await this.getStoredSponsorAddressForWallet(wi);
-        if (!addr) break;
-        await this.state.storage.delete(this.poolKey(wi));
-        await this.state.storage.delete(this.sponsorAddressKey(wi));
-        cleared++;
+      const initializedWallets = await this.getInitializedWallets();
+      for (const { walletIndex } of initializedWallets) {
+        await this.state.storage.delete(this.poolKey(walletIndex));
+        await this.state.storage.delete(this.sponsorAddressKey(walletIndex));
       }
       // Reset round-robin index
-      await this.state.storage.put("next_wallet_index", 0);
-      console.log(
-        JSON.stringify({
-          action: "clear_pools",
-          previousNonce: null,
-          newNonce: null,
-          changed: cleared > 0,
-          reason:
-            cleared > 0
-              ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
-              : "No wallets to clear",
-        })
-      );
-      return this.jsonResponse({
+      await this.state.storage.put(NEXT_WALLET_INDEX_KEY, 0);
+
+      const cleared = initializedWallets.length;
+      const reason = cleared > 0
+        ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
+        : "No wallets to clear";
+      const result = {
         success: true,
         action: "clear_pools",
         previousNonce: null,
         newNonce: null,
         changed: cleared > 0,
-        reason:
-          cleared > 0
-            ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
-            : "No wallets to clear",
-      });
+        reason,
+      };
+      console.log(JSON.stringify(result));
+      return this.jsonResponse(result);
     });
   }
 
