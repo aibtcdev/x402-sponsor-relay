@@ -168,6 +168,7 @@ export class SettlementService {
    * - "SBTC" or "sBTC" (case-insensitive) → "sBTC"
    * - "USDCX" or "USDCx" (case-insensitive) → "USDCx"
    * - CAIP-19 Stacks FT identifiers whose contract address is known → mapped token
+   * - Bare Stacks contract principals (e.g., "SM3...Q4.sbtc-token") → mapped token
    * - Unknown → null (caller should return unsupported_scheme error)
    */
   mapAssetToTokenType(asset: string): TokenType | null {
@@ -185,6 +186,39 @@ export class SettlementService {
       return "USDCx";
     }
 
+    // Try bare contract principal format: "address.contract-name"
+    const bareMatch = this.matchBareContractPrincipal(asset);
+    if (bareMatch !== null) {
+      return bareMatch;
+    }
+
+    return null;
+  }
+
+  /**
+   * Match a bare Stacks contract principal (address.contract-name) against
+   * known token contracts. Returns the mapped TokenType or null if unrecognized.
+   *
+   * Handles:
+   * - "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token" → "sBTC" (mainnet)
+   * - "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4.sbtc-token"  → "sBTC" (testnet)
+   * - "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9.token-aeusdc" → "USDCx"
+   */
+  private matchBareContractPrincipal(asset: string): TokenType | null {
+    const dotIndex = asset.indexOf(".");
+    if (dotIndex === -1) return null;
+    const address = asset.substring(0, dotIndex).toUpperCase();
+    const contractName = asset.substring(dotIndex + 1);
+
+    if (
+      (address === SBTC_CONTRACT_MAINNET || address === SBTC_CONTRACT_TESTNET) &&
+      contractName === SBTC_CONTRACT_NAME
+    ) {
+      return "sBTC";
+    }
+    if (address === USDCX_CONTRACT_MAINNET && contractName === USDCX_CONTRACT_NAME) {
+      return "USDCx";
+    }
     return null;
   }
 
