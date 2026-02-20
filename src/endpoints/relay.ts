@@ -7,6 +7,7 @@ import {
   StxVerifyService,
   extractSponsorNonce,
   recordNonceTxid,
+  releaseNonceDO,
 } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import type { AppContext, RelayRequest, SettlementResult } from "../types";
@@ -332,7 +333,20 @@ export class Relay extends BaseEndpoint {
       const broadcastResult = await settlementService.broadcastAndConfirm(
         verifyResult.data.transaction
       );
+
+      // Extract sponsor nonce once — used in both the failure and success paths below
+      const sponsorNonce = extractSponsorNonce(verifyResult.data.transaction);
+
       if ("error" in broadcastResult) {
+        // Release the nonce back to the pool so it can be reused (broadcast failed)
+        if (sponsorNonce !== null) {
+          c.executionCtx.waitUntil(
+            releaseNonceDO(c.env, logger, sponsorNonce).catch((e) => {
+              logger.warn("Failed to release nonce after broadcast failure", { error: String(e) });
+            })
+          );
+        }
+
         // Record fee even for failed broadcasts — sponsor already paid
         // Both calls are fire-and-forget (waitUntil) — never block the error response.
         const tokenTypeFailed = body.settle.tokenType || "STX";
@@ -374,8 +388,14 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      const sponsorNonce = extractSponsorNonce(verifyResult.data.transaction);
       if (sponsorNonce !== null) {
+        // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
+        c.executionCtx.waitUntil(
+          releaseNonceDO(c.env, logger, sponsorNonce, broadcastResult.txid).catch((e) => {
+            logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
+          })
+        );
+        // Also record nonce→txid mapping in NonceDO SQL table for gap detection
         c.executionCtx.waitUntil(
           recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce).catch((e) => {
             logger.warn("Failed to record nonce txid", { error: String(e) });
