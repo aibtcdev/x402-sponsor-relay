@@ -32,8 +32,8 @@
   ],
   "vars": {
     "STACKS_NETWORK": "testnet",
-    "SPONSOR_WALLET_COUNT": "1",
-    "FLUSH_RECIPIENT": "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC"
+    "SPONSOR_WALLET_COUNT": "5",
+    "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB"
   },
   // Cron trigger: run health check every 5 minutes
   "triggers": {
@@ -57,8 +57,8 @@
       "observability": { "enabled": false },
       "vars": {
         "STACKS_NETWORK": "testnet",
-        "SPONSOR_WALLET_COUNT": "1",
-        "FLUSH_RECIPIENT": "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC"
+        "SPONSOR_WALLET_COUNT": "5",
+        "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB"
       },
       // Bindings must be duplicated per environment
       "services": [
@@ -91,7 +91,7 @@
       "observability": { "enabled": false },
       "vars": {
         "STACKS_NETWORK": "mainnet",
-        "SPONSOR_WALLET_COUNT": "1",
+        "SPONSOR_WALLET_COUNT": "5",
         "FLUSH_RECIPIENT": "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC"
       },
       // Bindings must be duplicated per environment
