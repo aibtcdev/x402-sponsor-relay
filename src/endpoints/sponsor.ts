@@ -282,6 +282,8 @@ export class Sponsor extends BaseEndpoint {
 
       // Extract nonce before broadcast so it's available in all failure and success paths
       const sponsorNonce = extractSponsorNonce(sponsoredTx);
+      // walletIndex from NonceDO assignment — routes release to the correct per-wallet pool
+      const sponsorWalletIndex = sponsorResult.walletIndex;
 
       let txid: string;
       try {
@@ -303,7 +305,7 @@ export class Sponsor extends BaseEndpoint {
           // Return nonce to pool — broadcast was rejected, nonce can be reused
           if (sponsorNonce !== null) {
             c.executionCtx.waitUntil(
-              releaseNonceDO(c.env, logger, sponsorNonce).catch((e) => {
+              releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
                 logger.warn("Failed to release nonce after broadcast rejection", { error: String(e) });
               })
             );
@@ -345,7 +347,7 @@ export class Sponsor extends BaseEndpoint {
         // Return nonce to pool — broadcast threw an exception, nonce can be reused
         if (sponsorNonce !== null) {
           c.executionCtx.waitUntil(
-            releaseNonceDO(c.env, logger, sponsorNonce).catch((e2) => {
+            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e2) => {
               logger.warn("Failed to release nonce after broadcast exception", { error: String(e2) });
             })
           );
@@ -364,7 +366,7 @@ export class Sponsor extends BaseEndpoint {
       if (sponsorNonce !== null) {
         // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
         c.executionCtx.waitUntil(
-          releaseNonceDO(c.env, logger, sponsorNonce, txid).catch((e) => {
+          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex).catch((e) => {
             logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
           })
         );

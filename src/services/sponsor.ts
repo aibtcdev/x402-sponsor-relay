@@ -48,6 +48,8 @@ export interface SponsorSuccess {
   sponsoredTxHex: string;
   /** Fee in microSTX paid by sponsor */
   fee: string;
+  /** Index of the wallet that signed this transaction (for nonce release routing) */
+  walletIndex: number;
 }
 
 /**
@@ -66,14 +68,14 @@ export interface SponsorFailure {
  */
 export type SponsorResult = SponsorSuccess | SponsorFailure;
 
-// Module-level cache for derived sponsor key.
-// Env vars cannot change during a worker instance's lifetime - when secrets are
+// Module-level cache for derived sponsor keys (accountIndex → privateKey).
+// Env vars cannot change during a worker instance's lifetime — when secrets are
 // updated via `wrangler secret put`, workers restart with fresh instances.
-let cachedSponsorKey: string | null = null;
-let cachedAccountIndex: number | null = null;
+const cachedSponsorKeys: Map<number, string> = new Map();
 
 // Validation constants
 const MAX_ACCOUNT_INDEX = 1000;
+const MAX_WALLET_COUNT = 10;
 const VALID_MNEMONIC_LENGTHS = [12, 24];
 
 // Nonce fetch retry configuration
@@ -95,10 +97,25 @@ export class SponsorService {
   }
 
   /**
-   * Derive private key from mnemonic phrase
-   * Results are cached at module level to avoid re-derivation per request
+   * Parse and validate SPONSOR_WALLET_COUNT from env.
+   * Returns a number in [1, MAX_WALLET_COUNT], defaulting to 1.
    */
-  private async deriveSponsorKey(): Promise<string | null> {
+  private getWalletCount(): number {
+    const raw = this.env.SPONSOR_WALLET_COUNT;
+    if (!raw) return 1;
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_WALLET_COUNT) {
+      this.logger.warn("Invalid SPONSOR_WALLET_COUNT; using 1", { raw });
+      return 1;
+    }
+    return n;
+  }
+
+  /**
+   * Derive private key for a specific account index from the mnemonic phrase.
+   * Results are cached at module level to avoid re-derivation per request.
+   */
+  private async deriveSponsorKeyForIndex(accountIndex: number): Promise<string | null> {
     if (!this.env.SPONSOR_MNEMONIC) {
       return null;
     }
@@ -110,24 +127,23 @@ export class SponsorService {
       return null;
     }
 
-    // Parse and validate account index
-    const accountIndex = parseInt(this.env.SPONSOR_ACCOUNT_INDEX || "0", 10);
-
+    // Validate account index range
     if (
       !Number.isInteger(accountIndex) ||
       accountIndex < 0 ||
       accountIndex > MAX_ACCOUNT_INDEX
     ) {
-      this.logger.error("Invalid SPONSOR_ACCOUNT_INDEX; must be 0-1000");
+      this.logger.error("Invalid account index; must be 0-1000", { accountIndex });
       return null;
     }
 
-    // Return cached key if available (env can't change during worker lifetime)
-    if (cachedSponsorKey !== null && cachedAccountIndex === accountIndex) {
-      return cachedSponsorKey;
+    // Return cached key if available
+    const cached = cachedSponsorKeys.get(accountIndex);
+    if (cached !== undefined) {
+      return cached;
     }
 
-    this.logger.info("Deriving sponsor key from mnemonic");
+    this.logger.info("Deriving sponsor key from mnemonic", { accountIndex });
 
     try {
       const wallet = await generateWallet({
@@ -149,13 +165,13 @@ export class SponsorService {
       }
 
       // Cache the derived key
-      cachedSponsorKey = account.stxPrivateKey;
-      cachedAccountIndex = accountIndex;
+      cachedSponsorKeys.set(accountIndex, account.stxPrivateKey);
 
-      this.logger.info("Sponsor key derived successfully");
-      return cachedSponsorKey;
+      this.logger.info("Sponsor key derived successfully", { accountIndex });
+      return account.stxPrivateKey;
     } catch (e) {
       this.logger.error("Failed to derive sponsor key from mnemonic", {
+        accountIndex,
         error: e instanceof Error ? e.message : "Unknown error",
       });
       return null;
@@ -163,17 +179,25 @@ export class SponsorService {
   }
 
   /**
-   * Get the sponsor private key (from mnemonic or direct config)
+   * Get the sponsor private key for a specific wallet index.
+   * walletIndex maps directly to the BIP-44 account index derived from the mnemonic.
+   * Falls back to SPONSOR_PRIVATE_KEY only for walletIndex=0.
    */
-  private async getSponsorKey(): Promise<string | null> {
-    // Prefer mnemonic derivation
+  private async getSponsorKeyForWallet(walletIndex: number): Promise<string | null> {
     if (this.env.SPONSOR_MNEMONIC) {
-      return this.deriveSponsorKey();
+      return this.deriveSponsorKeyForIndex(walletIndex);
     }
 
-    // Fall back to direct private key
-    if (this.env.SPONSOR_PRIVATE_KEY) {
+    // SPONSOR_PRIVATE_KEY fallback is only valid for wallet 0
+    if (this.env.SPONSOR_PRIVATE_KEY && walletIndex === 0) {
       return this.env.SPONSOR_PRIVATE_KEY;
+    }
+
+    if (walletIndex !== 0) {
+      this.logger.error(
+        "Multi-wallet rotation requires SPONSOR_MNEMONIC; SPONSOR_PRIVATE_KEY only supports wallet 0",
+        { walletIndex }
+      );
     }
 
     return null;
@@ -350,21 +374,25 @@ export class SponsorService {
 
   /**
    * Fetch the sponsor account nonce from NonceDO when available.
+   * Passes walletCount so NonceDO can do round-robin across N wallets.
+   * Returns both nonce and walletIndex so SponsorService can pick the right key.
    */
   private async fetchNonceFromDO(
     sponsorAddress: string
-  ): Promise<bigint | null> {
+  ): Promise<{ nonce: bigint; walletIndex: number } | null> {
     if (!this.env.NONCE_DO) {
       this.logger.debug("Nonce DO not configured; skipping DO nonce fetch");
       return null;
     }
+
+    const walletCount = this.getWalletCount();
 
     try {
       const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
       const response = await stub.fetch("https://nonce-do/assign", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sponsorAddress }),
+        body: JSON.stringify({ sponsorAddress, walletCount }),
       });
 
       if (!response.ok) {
@@ -374,13 +402,14 @@ export class SponsorService {
         return null;
       }
 
-      const data = (await response.json()) as { nonce?: number };
+      const data = (await response.json()) as { nonce?: number; walletIndex?: number };
       if (typeof data?.nonce !== "number") {
         this.logger.warn("Nonce DO response missing nonce field");
         return null;
       }
 
-      return BigInt(data.nonce);
+      const walletIndex = typeof data.walletIndex === "number" ? data.walletIndex : 0;
+      return { nonce: BigInt(data.nonce), walletIndex };
     } catch (e) {
       this.logger.warn("Failed to fetch nonce from NonceDO", {
         error: e instanceof Error ? e.message : String(e),
@@ -436,22 +465,15 @@ export class SponsorService {
   }
 
   /**
-   * Sponsor a validated transaction
+   * Sponsor a validated transaction using round-robin wallet selection.
+   *
+   * When NONCE_DO is configured, fetchNonceFromDO returns both nonce and walletIndex.
+   * The walletIndex determines which BIP-44 account key is used for signing.
+   * The walletIndex is included in SponsorSuccess so callers can route release calls.
    */
   async sponsorTransaction(
     transaction: StacksTransactionWire
   ): Promise<SponsorResult> {
-    const sponsorKey = await this.getSponsorKey();
-
-    if (!sponsorKey) {
-      this.logger.error("Sponsor key not configured");
-      return {
-        success: false,
-        error: "Service not configured",
-        details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
-      };
-    }
-
     const network = this.getNetwork();
 
     // Determine fee from FeeService to prevent overpayment
@@ -472,24 +494,36 @@ export class SponsorService {
       fee = undefined;
     }
 
-    // Pre-fetch the sponsor nonce to avoid hitting Hiro API rate limits from the
-    // internal fetchNonce() call inside sponsorTransaction(). Passing sponsorNonce
-    // explicitly skips the internal nonce fetch entirely.
-    //
-    // When NONCE_DO is configured, it is the authoritative nonce source.
+    // Pre-fetch the sponsor nonce from NonceDO (authoritative coordinator).
+    // When NONCE_DO is configured, it also returns walletIndex for key selection.
     // If the DO is unreachable we fail fast (503) rather than silently falling back
     // to the uncoordinated Hiro path which causes nonce races.
     // When NONCE_DO is NOT configured (e.g. local dev), we fall back to Hiro with a warning.
     let sponsorNonce: bigint | undefined;
-    const sponsorAddress = getAddressFromPrivateKey(sponsorKey, network);
+    let walletIndex = 0;
 
     if (this.env.NONCE_DO) {
+      // Derive wallet 0 address first for nonce fetch request.
+      // The DO will do round-robin internally and return the actual walletIndex used.
+      const wallet0Key = await this.getSponsorKeyForWallet(0);
+      if (!wallet0Key) {
+        this.logger.error("Sponsor key not configured");
+        return {
+          success: false,
+          error: "Service not configured",
+          details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
+        };
+      }
+      const wallet0Address = getAddressFromPrivateKey(wallet0Key, network);
+
       // NONCE_DO is configured — it is the authoritative source; fail fast if unavailable
-      const doNonce = await this.fetchNonceFromDO(sponsorAddress);
-      if (doNonce !== null) {
-        sponsorNonce = doNonce;
+      const doResult = await this.fetchNonceFromDO(wallet0Address);
+      if (doResult !== null) {
+        sponsorNonce = doResult.nonce;
+        walletIndex = doResult.walletIndex;
         this.logger.debug("Using NonceDO sponsor nonce", {
           sponsorNonce: sponsorNonce.toString(),
+          walletIndex,
         });
       } else {
         this.logger.error(
@@ -507,6 +541,18 @@ export class SponsorService {
       this.logger.warn(
         "NONCE_DO not configured; falling back to uncoordinated Hiro nonce fetch"
       );
+      walletIndex = 0; // single-wallet fallback always uses index 0
+
+      const wallet0Key = await this.getSponsorKeyForWallet(0);
+      if (!wallet0Key) {
+        this.logger.error("Sponsor key not configured");
+        return {
+          success: false,
+          error: "Service not configured",
+          details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
+        };
+      }
+      const sponsorAddress = getAddressFromPrivateKey(wallet0Key, network);
       const fetchedNonce = await this.fetchNonceWithRetry(sponsorAddress);
       if (fetchedNonce !== null) {
         sponsorNonce = fetchedNonce;
@@ -519,6 +565,17 @@ export class SponsorService {
           "Hiro nonce fetch failed; falling back to internal nonce fetch"
         );
       }
+    }
+
+    // Get the sponsor key for the wallet index selected by NonceDO
+    const sponsorKey = await this.getSponsorKeyForWallet(walletIndex);
+    if (!sponsorKey) {
+      this.logger.error("Sponsor key not configured for wallet", { walletIndex });
+      return {
+        success: false,
+        error: "Service not configured",
+        details: `Could not derive key for wallet index ${walletIndex}. Set SPONSOR_MNEMONIC.`,
+      };
     }
 
     try {
@@ -554,16 +611,18 @@ export class SponsorService {
         }
       }
 
-      this.logger.info("Transaction sponsored", { fee: actualFee });
+      this.logger.info("Transaction sponsored", { fee: actualFee, walletIndex });
 
       return {
         success: true,
         sponsoredTxHex,
         fee: actualFee,
+        walletIndex,
       };
     } catch (e) {
       this.logger.error("Failed to sponsor transaction", {
         error: e instanceof Error ? e.message : "Unknown error",
+        walletIndex,
       });
       return {
         success: false,
@@ -639,6 +698,9 @@ export async function recordNonceTxid(
  * When txid is absent (broadcast failed): returns the nonce to available[]
  * in sorted order so it can be reused for the next request.
  *
+ * walletIndex specifies which wallet pool to release to (default: 0).
+ * Must match the walletIndex returned by the NonceDO /assign response.
+ *
  * Call via executionCtx.waitUntil() as fire-and-forget — never blocks the response.
  * Never throws — all errors are logged as warnings.
  */
@@ -646,7 +708,8 @@ export async function releaseNonceDO(
   env: Env,
   logger: Logger,
   nonce: number,
-  txid?: string
+  txid?: string,
+  walletIndex: number = 0
 ): Promise<void> {
   if (!env.NONCE_DO) {
     return;
@@ -657,7 +720,11 @@ export async function releaseNonceDO(
     const response = await stub.fetch("https://nonce-do/release", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ nonce, ...(txid ? { txid } : {}) }),
+      body: JSON.stringify({
+        nonce,
+        walletIndex,
+        ...(txid ? { txid } : {}),
+      }),
     });
 
     if (!response.ok) {
@@ -666,6 +733,7 @@ export async function releaseNonceDO(
         status: response.status,
         body,
         nonce,
+        walletIndex,
         ...(txid ? { txid } : {}),
       });
     }
@@ -673,6 +741,7 @@ export async function releaseNonceDO(
     logger.warn("Failed to release nonce to NonceDO", {
       error: e instanceof Error ? e.message : String(e),
       nonce,
+      walletIndex,
       ...(txid ? { txid } : {}),
     });
   }

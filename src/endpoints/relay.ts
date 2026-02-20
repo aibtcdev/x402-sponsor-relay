@@ -336,12 +336,14 @@ export class Relay extends BaseEndpoint {
 
       // Extract sponsor nonce once — used in both the failure and success paths below
       const sponsorNonce = extractSponsorNonce(verifyResult.data.transaction);
+      // walletIndex from NonceDO assignment — routes release to the correct per-wallet pool
+      const sponsorWalletIndex = sponsorResult.walletIndex;
 
       if ("error" in broadcastResult) {
         // Release the nonce back to the pool so it can be reused (broadcast failed)
         if (sponsorNonce !== null) {
           c.executionCtx.waitUntil(
-            releaseNonceDO(c.env, logger, sponsorNonce).catch((e) => {
+            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
               logger.warn("Failed to release nonce after broadcast failure", { error: String(e) });
             })
           );
@@ -391,7 +393,7 @@ export class Relay extends BaseEndpoint {
       if (sponsorNonce !== null) {
         // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
         c.executionCtx.waitUntil(
-          releaseNonceDO(c.env, logger, sponsorNonce, broadcastResult.txid).catch((e) => {
+          releaseNonceDO(c.env, logger, sponsorNonce, broadcastResult.txid, sponsorWalletIndex).catch((e) => {
             logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
           })
         );
