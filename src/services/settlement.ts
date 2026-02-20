@@ -717,8 +717,64 @@ export class SettlementService {
   }
 
   /**
+   * Check whether a txid is still alive in the mempool or confirmed on-chain.
+   * Used to validate "pending" dedup entries before returning them to callers.
+   *
+   * Returns true  if the tx is pending, success, or the API is unreachable (fail-open).
+   * Returns false if the tx is 404 (never indexed / evicted) or abort_xx / dropped_xx.
+   */
+  private async verifyTxidAlive(txid: string): Promise<boolean> {
+    try {
+      const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
+      const hiroHeaders = getHiroHeaders(this.env.HIRO_API_KEY);
+      const url = `${hiroBaseUrl}/extended/v1/tx/${txid}`;
+
+      const response = await fetch(url, {
+        headers: hiroHeaders,
+        signal: AbortSignal.timeout(5_000),
+      });
+
+      if (response.status === 404) {
+        this.logger.debug("verifyTxidAlive: txid not found (404)", { txid });
+        return false;
+      }
+
+      if (!response.ok) {
+        // Non-404 error — assume alive to avoid false invalidation
+        this.logger.debug("verifyTxidAlive: non-OK response, assuming alive", {
+          txid,
+          status: response.status,
+        });
+        return true;
+      }
+
+      const data = (await response.json()) as HiroTxResponse;
+      const txStatus = data.tx_status;
+
+      if (txStatus?.startsWith("abort_") || txStatus?.startsWith("dropped_")) {
+        this.logger.debug("verifyTxidAlive: txid is dead", { txid, txStatus });
+        return false;
+      }
+
+      this.logger.debug("verifyTxidAlive: txid is alive", { txid, txStatus });
+      return true;
+    } catch (e) {
+      // Network error or timeout — assume alive to avoid false invalidation
+      this.logger.debug("verifyTxidAlive: fetch error, assuming alive", {
+        txid,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return true;
+    }
+  }
+
+  /**
    * Check KV for a cached deduplication result for the given transaction hex.
    * Returns the cached result if found, or null if not found or KV unavailable.
+   *
+   * For "pending" entries, performs a liveness check against the Hiro API.
+   * If the txid is dead (dropped or never indexed), the stale entry is deleted
+   * and null is returned so the caller can retry with a fresh broadcast.
    */
   async checkDedup(sponsoredTxHex: string): Promise<DedupResult | null> {
     if (!this.env.RELAY_KV) {
@@ -726,10 +782,10 @@ export class SettlementService {
     }
 
     try {
-      // Note: dedup keys are SHA-256 of the fully-sponsored tx hex.
-      // A resubmitted transaction after a NONCE_CONFLICT will have a new sponsor
-      // nonce and therefore a different hex — it will not match this cache entry.
-      // This is intentional: each sponsoring attempt is treated as a distinct event.
+      // Note: dedup keys are SHA-256 of the original unsigned agent tx hex
+      // (body.transaction in /relay, txHex in /settle). This means the same
+      // agent payload will match even across different sponsoring attempts,
+      // enabling true idempotency for retried submissions.
       const txHash = await this.computeTxHash(sponsoredTxHex);
       const key = `${DEDUP_KEY_PREFIX}${txHash}`;
       const cached = await this.env.RELAY_KV.get(key);
@@ -739,6 +795,22 @@ export class SettlementService {
       }
 
       const result = JSON.parse(cached) as DedupResult;
+
+      // For "pending" entries, verify the txid is still alive before returning.
+      // If the transaction was dropped or replaced, the cached entry is stale and
+      // must be invalidated so the caller can submit a fresh broadcast.
+      if (result.status === "pending") {
+        const alive = await this.verifyTxidAlive(result.txid);
+        if (!alive) {
+          this.logger.warn("Dedup stale: pending txid is dead, invalidating cache entry", {
+            txHash: txHash.slice(0, 16) + "...",
+            txid: result.txid,
+          });
+          await this.env.RELAY_KV.delete(key);
+          return null;
+        }
+      }
+
       this.logger.info("Dedup hit: returning cached result", {
         txHash: txHash.slice(0, 16) + "...",
         txid: result.txid,
