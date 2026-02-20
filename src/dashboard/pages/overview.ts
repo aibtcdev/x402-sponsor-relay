@@ -339,12 +339,21 @@ ${footer(utcTimestamp())}
       init: function() {
         var self = this;
         fetch('/wallets')
-          .then(function(r) { return r.json(); })
-          .then(function(data) {
-            self.wallets = data.wallets || [];
-            self.totals = data.totals || null;
+          .then(function(r) {
+            if (!r.ok) throw new Error('Failed to load wallets: ' + r.status);
+            return r.json();
           })
-          .catch(function() { self.error = 'Wallet status unavailable (sponsor not configured or error)'; })
+          .then(function(data) {
+            if (data && data.success === false) {
+              self.error = data.error || 'Wallet status unavailable (sponsor not configured or error)';
+              self.wallets = [];
+              self.totals = null;
+              return;
+            }
+            self.wallets = (data && data.wallets) || [];
+            self.totals = (data && data.totals) || null;
+          })
+          .catch(function(e) { self.error = e.message || 'Wallet status unavailable (sponsor not configured or error)'; })
           .finally(function() { self.loading = false; });
       },
       formatSTX: function(microSTX) {

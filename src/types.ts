@@ -43,9 +43,8 @@ export interface Logger {
 export interface Env {
   /** 24-word mnemonic phrase for sponsor wallet (preferred) */
   SPONSOR_MNEMONIC?: string;
-  /** Account index to derive from mnemonic (default: 0) */
-  SPONSOR_ACCOUNT_INDEX?: string;
-  /** Number of sponsor wallets to rotate through (default: "1", max: 10) */
+  /** Number of sponsor wallets to rotate through (default: "1", max: 10).
+   *  Derives BIP-44 accounts 0..N-1 from the mnemonic for round-robin sponsoring. */
   SPONSOR_WALLET_COUNT?: string;
   /** Hex-encoded private key (fallback if no mnemonic) */
   SPONSOR_PRIVATE_KEY?: string;

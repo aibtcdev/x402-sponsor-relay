@@ -373,48 +373,87 @@ export class SponsorService {
   }
 
   /**
+   * Derive Stacks addresses for all configured wallets.
+   * Returns a map of walletIndex (as string) → Stacks address.
+   */
+  private async deriveWalletAddresses(): Promise<Record<string, string>> {
+    const network = this.getNetwork();
+    const walletCount = this.getWalletCount();
+    const addresses: Record<string, string> = {};
+    for (let i = 0; i < walletCount; i++) {
+      const key = await this.getSponsorKeyForWallet(i);
+      if (key) {
+        addresses[String(i)] = getAddressFromPrivateKey(key, network);
+      }
+    }
+    return addresses;
+  }
+
+  /**
    * Fetch the sponsor account nonce from NonceDO when available.
-   * Passes walletCount so NonceDO can do round-robin across N wallets.
+   * Passes walletCount and per-wallet addresses so NonceDO can do round-robin
+   * and seed each wallet's pool from the correct on-chain nonce.
    * Returns both nonce and walletIndex so SponsorService can pick the right key.
+   *
+   * On NonceDO error: returns a structured error with code instead of null,
+   * so callers can propagate the correct HTTP status (e.g. 429 for chaining limit).
    */
   private async fetchNonceFromDO(
     sponsorAddress: string
-  ): Promise<{ nonce: bigint; walletIndex: number } | null> {
+  ): Promise<
+    | { ok: true; nonce: bigint; walletIndex: number }
+    | { ok: false; code?: string; error: string; status: number }
+  > {
     if (!this.env.NONCE_DO) {
       this.logger.debug("Nonce DO not configured; skipping DO nonce fetch");
-      return null;
+      return { ok: false, error: "NONCE_DO not configured", status: 503 };
     }
 
     const walletCount = this.getWalletCount();
+    const addresses = walletCount > 1 ? await this.deriveWalletAddresses() : undefined;
 
     try {
       const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
       const response = await stub.fetch("https://nonce-do/assign", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sponsorAddress, walletCount }),
+        body: JSON.stringify({ sponsorAddress, walletCount, addresses }),
       });
 
       if (!response.ok) {
+        // Parse the error body so callers can propagate specific codes (e.g. 429)
+        let errorBody: { error?: string; code?: string } = {};
+        try {
+          errorBody = (await response.json()) as { error?: string; code?: string };
+        } catch {
+          // response may not be JSON
+        }
         this.logger.warn("Nonce DO responded with error", {
           status: response.status,
+          code: errorBody.code,
+          error: errorBody.error,
         });
-        return null;
+        return {
+          ok: false,
+          code: errorBody.code,
+          error: errorBody.error ?? `NonceDO error ${response.status}`,
+          status: response.status,
+        };
       }
 
       const data = (await response.json()) as { nonce?: number; walletIndex?: number };
       if (typeof data?.nonce !== "number") {
         this.logger.warn("Nonce DO response missing nonce field");
-        return null;
+        return { ok: false, error: "NonceDO response missing nonce field", status: 500 };
       }
 
       const walletIndex = typeof data.walletIndex === "number" ? data.walletIndex : 0;
-      return { nonce: BigInt(data.nonce), walletIndex };
+      return { ok: true, nonce: BigInt(data.nonce), walletIndex };
     } catch (e) {
       this.logger.warn("Failed to fetch nonce from NonceDO", {
         error: e instanceof Error ? e.message : String(e),
       });
-      return null;
+      return { ok: false, error: e instanceof Error ? e.message : String(e), status: 503 };
     }
   }
 
@@ -500,9 +539,12 @@ export class SponsorService {
     // When NONCE_DO is NOT configured (e.g. local dev), we fall back to Hiro with a warning.
     let sponsorNonce: bigint | undefined;
     let walletIndex = 0;
+    // Track whether NonceDO assigned a nonce so we can release it on any failure path
+    let nonceFromDO = false;
+    let assignedNonceValue: number | undefined;
 
     if (this.env.NONCE_DO) {
-      // Derive wallet 0 address first for nonce fetch request.
+      // Derive wallet 0 address for the NonceDO request.
       // The DO will do round-robin internally and return the actual walletIndex used.
       const wallet0Key = await this.getSponsorKeyForWallet(0);
       if (!wallet0Key) {
@@ -517,22 +559,31 @@ export class SponsorService {
 
       // NONCE_DO is configured — it is the authoritative source; fail fast if unavailable
       const doResult = await this.fetchNonceFromDO(wallet0Address);
-      if (doResult !== null) {
+      if (doResult.ok) {
         sponsorNonce = doResult.nonce;
         walletIndex = doResult.walletIndex;
+        nonceFromDO = true;
+        assignedNonceValue = Number(doResult.nonce);
         this.logger.debug("Using NonceDO sponsor nonce", {
           sponsorNonce: sponsorNonce.toString(),
           walletIndex,
         });
       } else {
+        // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED)
+        const code = doResult.code === "CHAINING_LIMIT_EXCEEDED"
+          ? "RATE_LIMIT_EXCEEDED"
+          : "NONCE_DO_UNAVAILABLE";
         this.logger.error(
-          "NonceDO is configured but unavailable; refusing to fall back to uncoordinated nonce"
+          "NonceDO nonce assignment failed",
+          { code: doResult.code, error: doResult.error, status: doResult.status }
         );
         return {
           success: false,
-          error: "Nonce coordination service unavailable",
-          details: "NonceDO did not return a nonce; retry in a few seconds",
-          code: "NONCE_DO_UNAVAILABLE",
+          error: doResult.error,
+          details: doResult.code === "CHAINING_LIMIT_EXCEEDED"
+            ? "All sponsor wallets at chaining limit; retry in a few seconds"
+            : "NonceDO did not return a nonce; retry in a few seconds",
+          code,
         };
       }
     } else {
@@ -570,6 +621,10 @@ export class SponsorService {
     const sponsorKey = await this.getSponsorKeyForWallet(walletIndex);
     if (!sponsorKey) {
       this.logger.error("Sponsor key not configured for wallet", { walletIndex });
+      // Release the reserved nonce back to pool since we can't sign
+      if (nonceFromDO && assignedNonceValue !== undefined) {
+        await releaseNonceDO(this.env, this.logger, assignedNonceValue, undefined, walletIndex);
+      }
       return {
         success: false,
         error: "Service not configured",
@@ -623,6 +678,10 @@ export class SponsorService {
         error: e instanceof Error ? e.message : "Unknown error",
         walletIndex,
       });
+      // Release the reserved nonce back to pool since broadcast never happened
+      if (nonceFromDO && assignedNonceValue !== undefined) {
+        await releaseNonceDO(this.env, this.logger, assignedNonceValue, undefined, walletIndex);
+      }
       return {
         success: false,
         error: "Failed to sponsor transaction",

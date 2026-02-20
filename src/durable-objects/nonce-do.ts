@@ -5,6 +5,10 @@ interface AssignNonceRequest {
   sponsorAddress: string;
   /** Number of wallets in rotation (default: 1). Controls round-robin range. */
   walletCount?: number;
+  /** Per-wallet sponsor addresses for multi-wallet mode.
+   *  Map of walletIndex (as string key) → Stacks address.
+   *  Required when walletCount > 1 so each wallet pool seeds from its own on-chain nonce. */
+  addresses?: Record<string, string>;
 }
 
 interface AssignNonceResponse {
@@ -310,11 +314,24 @@ export class NonceDO {
     await this.state.storage.put(this.poolKey(walletIndex), pool);
   }
 
-  /** Get the stored sponsor address for a specific wallet. */
+  /** Get the stored sponsor address for a specific wallet.
+   *  For wallet 0, also checks the legacy "sponsor_address" key and migrates it. */
   private async getStoredSponsorAddressForWallet(walletIndex: number): Promise<string | null> {
     const key = this.sponsorAddressKey(walletIndex);
     const stored = await this.state.storage.get<string>(key);
-    return typeof stored === "string" && stored.length > 0 ? stored : null;
+    if (typeof stored === "string" && stored.length > 0) return stored;
+
+    // Migration: wallet 0 may have address under legacy key
+    if (walletIndex === 0) {
+      const legacy = await this.state.storage.get<string>("sponsor_address");
+      if (typeof legacy === "string" && legacy.length > 0) {
+        await this.state.storage.put(key, legacy);
+        await this.state.storage.delete("sponsor_address");
+        return legacy;
+      }
+    }
+
+    return null;
   }
 
   /** Store the sponsor address for a specific wallet. */
@@ -482,7 +499,8 @@ export class NonceDO {
    */
   async assignNonce(
     sponsorAddress: string,
-    walletCount: number = 1
+    walletCount: number = 1,
+    addresses?: Record<string, string>
   ): Promise<{ nonce: number; walletIndex: number }> {
     if (!sponsorAddress) {
       throw new Error("Missing sponsor address");
@@ -500,10 +518,15 @@ export class NonceDO {
       let walletIndex = (await this.getNextWalletIndex()) % effectiveWalletCount;
       let pool: PoolState | null = null;
 
+      // Resolve the correct sponsor address for a given wallet index.
+      // In multi-wallet mode, each wallet has its own Stacks address for nonce seeding.
+      const resolveAddress = (wi: number): string =>
+        addresses?.[String(wi)] ?? sponsorAddress;
+
       // Try each wallet in round-robin order; skip any at chaining limit
       let attempts = 0;
       while (attempts < effectiveWalletCount) {
-        pool = await this.loadPoolOrInit(walletIndex, sponsorAddress);
+        pool = await this.loadPoolOrInit(walletIndex, resolveAddress(walletIndex));
         if (pool.reserved.length < CHAINING_LIMIT) {
           break;
         }
@@ -517,8 +540,8 @@ export class NonceDO {
         throw new Error("CHAINING_LIMIT_EXCEEDED");
       }
 
-      // Store the sponsor address for this wallet (used by alarm reconciliation)
-      await this.setStoredSponsorAddressForWallet(walletIndex, sponsorAddress);
+      // Store the per-wallet sponsor address (used by alarm reconciliation)
+      await this.setStoredSponsorAddressForWallet(walletIndex, resolveAddress(walletIndex));
 
       // Extend pool if available is exhausted
       if (pool.available.length === 0) {
@@ -946,7 +969,7 @@ export class NonceDO {
         : 1;
 
       try {
-        const result = await this.assignNonce(body.sponsorAddress, walletCount);
+        const result = await this.assignNonce(body.sponsorAddress, walletCount, body.addresses);
         const response: AssignNonceResponse = {
           nonce: result.nonce,
           walletIndex: result.walletIndex,
