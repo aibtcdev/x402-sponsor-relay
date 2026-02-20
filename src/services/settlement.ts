@@ -85,6 +85,19 @@ export class SettlementService {
   }
 
   /**
+   * Returns true if a Hiro tx_status string indicates a terminal (dead) transaction.
+   * Terminal statuses start with "abort_" or "dropped_".
+   */
+  private isTxStatusTerminal(txStatus: string | undefined): boolean {
+    return txStatus?.startsWith("abort_") === true || txStatus?.startsWith("dropped_") === true;
+  }
+
+  /** Truncate a hex hash to a short prefix for log context. */
+  private truncateHash(hash: string): string {
+    return hash.slice(0, 16) + "...";
+  }
+
+  /**
    * Extract a Stacks address string from a principal ClarityValue.
    * Handles both standard principal (type: "address") and
    * contract principal (type: "contract", value: "addr.contract-name").
@@ -670,7 +683,7 @@ export class SettlementService {
             }
           }
 
-          if (txStatus?.startsWith("abort_") || txStatus?.startsWith("dropped_")) {
+          if (this.isTxStatusTerminal(txStatus)) {
             this.logger.warn("Transaction aborted or dropped", {
               txid,
               txStatus,
@@ -726,22 +739,20 @@ export class SettlementService {
   private async verifyTxidAlive(txid: string): Promise<boolean> {
     try {
       const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
-      const hiroHeaders = getHiroHeaders(this.env.HIRO_API_KEY);
       const url = `${hiroBaseUrl}/extended/v1/tx/${txid}`;
 
       const response = await fetch(url, {
-        headers: hiroHeaders,
+        headers: getHiroHeaders(this.env.HIRO_API_KEY),
         signal: AbortSignal.timeout(5_000),
       });
 
       if (response.status === 404) {
-        this.logger.debug("verifyTxidAlive: txid not found (404)", { txid });
+        this.logger.debug("Txid not found, treating as dead", { txid });
         return false;
       }
 
       if (!response.ok) {
-        // Non-404 error — assume alive to avoid false invalidation
-        this.logger.debug("verifyTxidAlive: non-OK response, assuming alive", {
+        this.logger.debug("Hiro API error during liveness check, assuming alive", {
           txid,
           status: response.status,
         });
@@ -749,18 +760,15 @@ export class SettlementService {
       }
 
       const data = (await response.json()) as HiroTxResponse;
-      const txStatus = data.tx_status;
-
-      if (txStatus?.startsWith("abort_") || txStatus?.startsWith("dropped_")) {
-        this.logger.debug("verifyTxidAlive: txid is dead", { txid, txStatus });
+      if (this.isTxStatusTerminal(data.tx_status)) {
+        this.logger.debug("Txid has terminal status", { txid, txStatus: data.tx_status });
         return false;
       }
 
-      this.logger.debug("verifyTxidAlive: txid is alive", { txid, txStatus });
+      this.logger.debug("Txid is alive", { txid, txStatus: data.tx_status });
       return true;
     } catch (e) {
-      // Network error or timeout — assume alive to avoid false invalidation
-      this.logger.debug("verifyTxidAlive: fetch error, assuming alive", {
+      this.logger.debug("Liveness check failed, assuming alive", {
         txid,
         error: e instanceof Error ? e.message : String(e),
       });
@@ -803,7 +811,7 @@ export class SettlementService {
         const alive = await this.verifyTxidAlive(result.txid);
         if (!alive) {
           this.logger.warn("Dedup stale: pending txid is dead, invalidating cache entry", {
-            txHash: txHash.slice(0, 16) + "...",
+            txHash: this.truncateHash(txHash),
             txid: result.txid,
           });
           await this.env.RELAY_KV.delete(key);
@@ -812,7 +820,7 @@ export class SettlementService {
       }
 
       this.logger.info("Dedup hit: returning cached result", {
-        txHash: txHash.slice(0, 16) + "...",
+        txHash: this.truncateHash(txHash),
         txid: result.txid,
         status: result.status,
       });
@@ -845,7 +853,7 @@ export class SettlementService {
       });
 
       this.logger.debug("Dedup result recorded in KV", {
-        txHash: txHash.slice(0, 16) + "...",
+        txHash: this.truncateHash(txHash),
         txid: result.txid,
         status: result.status,
         ttlSeconds: DEDUP_TTL_SECONDS,

@@ -138,6 +138,14 @@ const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 /** Maximum number of sponsor wallets supported */
 const MAX_WALLET_COUNT = 10;
+/** Valid BIP-39 mnemonic word counts */
+const VALID_MNEMONIC_LENGTHS = [12, 24];
+/** Gap-fill transfer: 1 uSTX (minimal amount to fill a nonce gap) */
+const GAP_FILL_AMOUNT = 1n;
+/** Gap-fill fee: 30,000 uSTX (high enough for RBF priority) */
+const GAP_FILL_FEE = 30_000n;
+/** Default recipient for gap-fill self-transfers */
+const DEFAULT_FLUSH_RECIPIENT = "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC";
 
 // Legacy single-wallet pool key (migrated to pool:0 on first access)
 const POOL_KEY = "pool";
@@ -167,6 +175,16 @@ class ChainingLimitError extends Error {
     super("CHAINING_LIMIT_EXCEEDED");
     this.name = "ChainingLimitError";
     this.mempoolDepth = mempoolDepth;
+  }
+}
+
+/** Insert a nonce into a sorted ascending array at the correct position. */
+function insertSorted(arr: number[], nonce: number): void {
+  const idx = arr.findIndex((n) => n > nonce);
+  if (idx === -1) {
+    arr.push(nonce);
+  } else {
+    arr.splice(idx, 0, nonce);
   }
 }
 
@@ -309,11 +327,11 @@ export class NonceDO {
   private hasTxidForNonce(nonce: number): boolean {
     const rows = this.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ? LIMIT 1",
+        "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
         nonce
       )
       .toArray();
-    return rows.length > 0 && rows[0].count > 0;
+    return rows[0].count > 0;
   }
 
   /**
@@ -327,46 +345,32 @@ export class NonceDO {
    */
   private cleanStaleReservations(pool: PoolState): number {
     const now = Date.now();
-    const staleNonces: number[] = [];
+    const staleNonces = new Set<number>();
 
     for (const nonce of pool.reserved) {
       const reservedAt = pool.reservedAt[nonce];
-      if (reservedAt === undefined) {
-        // No timestamp — treat as potentially stale only if STALE_THRESHOLD_MS has passed
-        // since we can't know when it was reserved; conservatively skip.
-        continue;
-      }
-      const ageMs = now - reservedAt;
-      if (ageMs < STALE_THRESHOLD_MS) {
-        continue; // Still within the grace window
-      }
-      if (this.hasTxidForNonce(nonce)) {
-        continue; // Was broadcast — consumed legitimately, do not reclaim
-      }
-      staleNonces.push(nonce);
+      // No timestamp means we can't determine age -- conservatively skip
+      if (reservedAt === undefined) continue;
+      // Still within the grace window
+      if (now - reservedAt < STALE_THRESHOLD_MS) continue;
+      // Was broadcast -- consumed legitimately, do not reclaim
+      if (this.hasTxidForNonce(nonce)) continue;
+
+      staleNonces.add(nonce);
     }
 
-    if (staleNonces.length === 0) {
+    if (staleNonces.size === 0) {
       return 0;
     }
 
-    // Remove stale nonces from reserved and return to available in sorted order
+    // Filter out stale nonces from reserved and return them to available
+    pool.reserved = pool.reserved.filter((n) => !staleNonces.has(n));
     for (const nonce of staleNonces) {
-      const idx = pool.reserved.indexOf(nonce);
-      if (idx !== -1) {
-        pool.reserved.splice(idx, 1);
-      }
       delete pool.reservedAt[nonce];
-
-      const insertIdx = pool.available.findIndex((n) => n > nonce);
-      if (insertIdx === -1) {
-        pool.available.push(nonce);
-      } else {
-        pool.available.splice(insertIdx, 0, nonce);
-      }
+      insertSorted(pool.available, nonce);
     }
 
-    return staleNonces.length;
+    return staleNonces.size;
   }
 
   /**
@@ -377,7 +381,7 @@ export class NonceDO {
   private async derivePrivateKeyForWallet(walletIndex: number): Promise<string | null> {
     if (this.env.SPONSOR_MNEMONIC) {
       const words = this.env.SPONSOR_MNEMONIC.trim().split(/\s+/);
-      if (![12, 24].includes(words.length)) return null;
+      if (!VALID_MNEMONIC_LENGTHS.includes(words.length)) return null;
       try {
         const wallet = await generateWallet({
           secretKey: this.env.SPONSOR_MNEMONIC,
@@ -410,15 +414,15 @@ export class NonceDO {
     privateKey: string
   ): Promise<string | null> {
     const network = this.env.STACKS_NETWORK ?? "testnet";
-    const flushRecipient = this.env.FLUSH_RECIPIENT ?? "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC";
+    const recipient = this.env.FLUSH_RECIPIENT ?? DEFAULT_FLUSH_RECIPIENT;
     try {
       const tx = await makeSTXTokenTransfer({
-        recipient: flushRecipient,
-        amount: 1n,
+        recipient,
+        amount: GAP_FILL_AMOUNT,
         senderKey: privateKey,
         network,
         nonce: BigInt(gapNonce),
-        fee: 30000n,
+        fee: GAP_FILL_FEE,
         memo: `gap-fill-${gapNonce}`,
       });
       const result = await broadcastTransaction({ transaction: tx, network });
@@ -798,12 +802,7 @@ export class NonceDO {
 
       if (!txid) {
         // Unused nonce: return to available in sorted order
-        const insertIdx = pool.available.findIndex((n) => n > nonce);
-        if (insertIdx === -1) {
-          pool.available.push(nonce);
-        } else {
-          pool.available.splice(insertIdx, 0, nonce);
-        }
+        insertSorted(pool.available, nonce);
       } else if (fee && fee !== "0") {
         // Broadcast succeeded and fee provided — record in wallet stats
         // (done outside blockConcurrencyWhile to avoid nested blocking, but we call it here

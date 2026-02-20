@@ -85,6 +85,17 @@ const NONCE_FETCH_BASE_DELAY_MS = 500;
 const NONCE_FETCH_MAX_DELAY_MS = 5000;
 
 /**
+ * Error body returned by NonceDO on assignment failure.
+ * Shared between fetchNonceFromDO return type and JSON parsing.
+ */
+interface NonceDOErrorBody {
+  error?: string;
+  code?: string;
+  mempoolDepth?: number;
+  estimatedDrainSeconds?: number;
+}
+
+/**
  * Service for validating and sponsoring Stacks transactions
  */
 export class SponsorService {
@@ -402,14 +413,7 @@ export class SponsorService {
     sponsorAddress: string
   ): Promise<
     | { ok: true; nonce: bigint; walletIndex: number }
-    | {
-        ok: false;
-        code?: string;
-        error: string;
-        status: number;
-        mempoolDepth?: number;
-        estimatedDrainSeconds?: number;
-      }
+    | ({ ok: false; error: string; status: number } & NonceDOErrorBody)
   > {
     if (!this.env.NONCE_DO) {
       this.logger.debug("Nonce DO not configured; skipping DO nonce fetch");
@@ -429,14 +433,9 @@ export class SponsorService {
 
       if (!response.ok) {
         // Parse the error body so callers can propagate specific codes (e.g. 429)
-        let errorBody: {
-          error?: string;
-          code?: string;
-          mempoolDepth?: number;
-          estimatedDrainSeconds?: number;
-        } = {};
+        let errorBody: NonceDOErrorBody = {};
         try {
-          errorBody = (await response.json()) as typeof errorBody;
+          errorBody = (await response.json()) as NonceDOErrorBody;
         } catch {
           // response may not be JSON
         }
@@ -444,8 +443,8 @@ export class SponsorService {
           status: response.status,
           code: errorBody.code,
           error: errorBody.error,
-          ...(errorBody.mempoolDepth !== undefined ? { mempoolDepth: errorBody.mempoolDepth } : {}),
-          ...(errorBody.estimatedDrainSeconds !== undefined ? { estimatedDrainSeconds: errorBody.estimatedDrainSeconds } : {}),
+          mempoolDepth: errorBody.mempoolDepth,
+          estimatedDrainSeconds: errorBody.estimatedDrainSeconds,
         });
         return {
           ok: false,
@@ -588,26 +587,19 @@ export class SponsorService {
         // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED)
         const isChainingLimit = doResult.code === "CHAINING_LIMIT_EXCEEDED";
         const code = isChainingLimit ? "RATE_LIMIT_EXCEEDED" : "NONCE_DO_UNAVAILABLE";
-        this.logger.error(
-          "NonceDO nonce assignment failed",
-          {
-            code: doResult.code,
-            error: doResult.error,
-            status: doResult.status,
-            ...(doResult.mempoolDepth !== undefined ? { mempoolDepth: doResult.mempoolDepth } : {}),
-            ...(doResult.estimatedDrainSeconds !== undefined ? { estimatedDrainSeconds: doResult.estimatedDrainSeconds } : {}),
-          }
-        );
+        this.logger.error("NonceDO nonce assignment failed", {
+          code: doResult.code,
+          error: doResult.error,
+          status: doResult.status,
+          mempoolDepth: doResult.mempoolDepth,
+          estimatedDrainSeconds: doResult.estimatedDrainSeconds,
+        });
 
         let details: string;
-        if (isChainingLimit) {
-          const depth = doResult.mempoolDepth;
-          const drain = doResult.estimatedDrainSeconds;
-          if (depth !== undefined && drain !== undefined) {
-            details = `All sponsor wallets at chaining limit (mempool depth: ${depth}); retry in ~${drain}s`;
-          } else {
-            details = "All sponsor wallets at chaining limit; retry in a few seconds";
-          }
+        if (isChainingLimit && doResult.mempoolDepth !== undefined && doResult.estimatedDrainSeconds !== undefined) {
+          details = `All sponsor wallets at chaining limit (mempool depth: ${doResult.mempoolDepth}); retry in ~${doResult.estimatedDrainSeconds}s`;
+        } else if (isChainingLimit) {
+          details = "All sponsor wallets at chaining limit; retry in a few seconds";
         } else {
           details = "NonceDO did not return a nonce; retry in a few seconds";
         }
