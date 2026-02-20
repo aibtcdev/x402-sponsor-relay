@@ -577,6 +577,104 @@ export class StatsDO {
   }
 
   // ===========================================================================
+  // Backfill — one-time bulk import from old KV data
+  // ===========================================================================
+
+  /**
+   * Bulk import historical data from KV migration.
+   * Uses INSERT OR REPLACE so it's safe to run multiple times.
+   */
+  private async handleBackfill(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      daily?: Array<{
+        date: string;
+        total: number; success: number; failed: number;
+        stx_count: number; stx_volume: string;
+        sbtc_count: number; sbtc_volume: string;
+        usdcx_count: number; usdcx_volume: string;
+        fee_total: string; fee_count: number;
+        fee_min: string | null; fee_max: string | null;
+        err_validation: number; err_rate_limit: number;
+        err_sponsoring: number; err_settlement: number; err_internal: number;
+      }>;
+      hourly?: Array<{
+        hour: string;
+        total: number; success: number; failed: number;
+        stx_count: number; sbtc_count: number; usdcx_count: number;
+        fee_total: string;
+      }>;
+      txLog?: Array<{
+        endpoint: string;
+        timestamp: number;
+        success: number;
+        token: string;
+        amount: string;
+        fee?: string | null;
+        txid?: string | null;
+        sender?: string | null;
+        recipient?: string | null;
+        status?: string | null;
+        block_height?: number | null;
+      }>;
+    };
+
+    let dailyCount = 0;
+    let hourlyCount = 0;
+    let txLogCount = 0;
+
+    if (body.daily) {
+      for (const d of body.daily) {
+        this.sql.exec(
+          `INSERT OR REPLACE INTO daily_stats
+             (date, total, success, failed,
+              stx_count, stx_volume, sbtc_count, sbtc_volume, usdcx_count, usdcx_volume,
+              fee_total, fee_count, fee_min, fee_max,
+              err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          d.date, d.total, d.success, d.failed,
+          d.stx_count, d.stx_volume, d.sbtc_count, d.sbtc_volume, d.usdcx_count, d.usdcx_volume,
+          d.fee_total, d.fee_count, d.fee_min, d.fee_max,
+          d.err_validation, d.err_rate_limit, d.err_sponsoring, d.err_settlement, d.err_internal
+        );
+        dailyCount++;
+      }
+    }
+
+    if (body.hourly) {
+      for (const h of body.hourly) {
+        this.sql.exec(
+          `INSERT OR REPLACE INTO hourly_stats
+             (hour, total, success, failed, stx_count, sbtc_count, usdcx_count, fee_total)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          h.hour, h.total, h.success, h.failed,
+          h.stx_count, h.sbtc_count, h.usdcx_count, h.fee_total
+        );
+        hourlyCount++;
+      }
+    }
+
+    if (body.txLog) {
+      for (const t of body.txLog) {
+        const id = crypto.randomUUID();
+        this.sql.exec(
+          `INSERT OR IGNORE INTO tx_log
+             (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id, t.endpoint, t.timestamp, t.success, t.token, t.amount,
+          t.fee ?? null, t.txid ?? null, t.sender ?? null, t.recipient ?? null,
+          t.status ?? null, t.block_height ?? null
+        );
+        txLogCount++;
+      }
+    }
+
+    return this.jsonResponse({
+      success: true,
+      imported: { daily: dailyCount, hourly: hourlyCount, txLog: txLogCount },
+    });
+  }
+
+  // ===========================================================================
   // Fetch handler (routes for Worker-to-DO calls)
   // ===========================================================================
 
@@ -644,6 +742,11 @@ export class StatsDO {
       if (method === "GET" && url.pathname === "/overview") {
         const overview = this.buildOverview();
         return this.jsonResponse(overview);
+      }
+
+      // POST /backfill — one-time bulk import of historical KV data
+      if (method === "POST" && url.pathname === "/backfill") {
+        return this.handleBackfill(request);
       }
 
       return new Response("Not found", { status: 404 });

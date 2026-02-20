@@ -98,6 +98,185 @@ openapi.post("/settle", Settle as unknown as typeof Settle);
 openapi.post("/verify", VerifyV2 as unknown as typeof VerifyV2);
 openapi.get("/supported", Supported as unknown as typeof Supported);
 
+// --------------------------------------------------------------------------
+// Admin: one-time KV → StatsDO backfill (remove after migration)
+// --------------------------------------------------------------------------
+app.use("/admin/backfill", authMiddleware);
+app.use("/admin/backfill", requireAuthMiddleware);
+
+/**
+ * Old KV shapes (removed from types.ts during StatsDO migration)
+ */
+interface OldHourlyStats {
+  hour: string;
+  transactions: number;
+  success: number;
+  failed: number;
+  tokens: { STX: number; sBTC: number; USDCx: number };
+  fees?: string;
+}
+
+interface OldDailyStats {
+  date: string;
+  transactions: { total: number; success: number; failed: number };
+  tokens: {
+    STX: { count: number; volume: string };
+    sBTC: { count: number; volume: string };
+    USDCx: { count: number; volume: string };
+  };
+  errors: {
+    validation: number;
+    rateLimit: number;
+    sponsoring: number;
+    settlement: number;
+    internal: number;
+  };
+  fees?: { total: string; count: number; min: string; max: string };
+}
+
+interface OldTxLogEntry {
+  timestamp: string;
+  endpoint: string;
+  success: boolean;
+  tokenType: string;
+  amount: string;
+  fee?: string;
+  txid?: string;
+  sender?: string;
+  recipient?: string;
+  status?: string;
+  blockHeight?: number;
+}
+
+/** List all KV keys with a given prefix (handles pagination) */
+async function listAllKvKeys(kv: KVNamespace, prefix: string) {
+  const keys: string[] = [];
+  let cursor: string | undefined;
+  let done = false;
+  while (!done) {
+    const result = await kv.list({ prefix, cursor });
+    keys.push(...result.keys.map((k) => k.name));
+    if (result.list_complete) {
+      done = true;
+    } else {
+      cursor = result.cursor;
+    }
+  }
+  return keys;
+}
+
+app.post("/admin/backfill", async (c) => {
+  const logger = c.get("logger");
+  const kv = c.env.RELAY_KV;
+  const statsDo = c.env.STATS_DO;
+
+  if (!kv) return c.json({ error: "RELAY_KV not available" }, 500);
+  if (!statsDo) return c.json({ error: "STATS_DO not available" }, 500);
+
+  logger.info("Starting KV → StatsDO backfill");
+
+  // 1. Read daily stats from KV
+  const dailyKeys = await listAllKvKeys(kv, "stats:daily:");
+  const daily: Array<Record<string, unknown>> = [];
+  for (const key of dailyKeys) {
+    const data = await kv.get<OldDailyStats>(key, "json");
+    if (!data) continue;
+    daily.push({
+      date: data.date,
+      total: data.transactions.total,
+      success: data.transactions.success,
+      failed: data.transactions.failed,
+      stx_count: data.tokens.STX.count,
+      stx_volume: data.tokens.STX.volume,
+      sbtc_count: data.tokens.sBTC.count,
+      sbtc_volume: data.tokens.sBTC.volume,
+      usdcx_count: data.tokens.USDCx.count,
+      usdcx_volume: data.tokens.USDCx.volume,
+      fee_total: data.fees?.total ?? "0",
+      fee_count: data.fees?.count ?? 0,
+      fee_min: data.fees?.min ?? null,
+      fee_max: data.fees?.max ?? null,
+      err_validation: data.errors.validation,
+      err_rate_limit: data.errors.rateLimit,
+      err_sponsoring: data.errors.sponsoring,
+      err_settlement: data.errors.settlement,
+      err_internal: data.errors.internal,
+    });
+  }
+
+  // 2. Read hourly stats from KV
+  const hourlyKeys = await listAllKvKeys(kv, "stats:hourly:");
+  const hourly: Array<Record<string, unknown>> = [];
+  for (const key of hourlyKeys) {
+    const data = await kv.get<OldHourlyStats>(key, "json");
+    if (!data) continue;
+    hourly.push({
+      hour: data.hour,
+      total: data.transactions,
+      success: data.success,
+      failed: data.failed,
+      stx_count: data.tokens.STX,
+      sbtc_count: data.tokens.sBTC,
+      usdcx_count: data.tokens.USDCx,
+      fee_total: data.fees ?? "0",
+    });
+  }
+
+  // 3. Read transaction log entries from KV
+  const txLogKeys = await listAllKvKeys(kv, "tx:log:");
+  const txLog: Array<Record<string, unknown>> = [];
+  for (const key of txLogKeys) {
+    const entries = await kv.get<OldTxLogEntry[]>(key, "json");
+    if (!entries) continue;
+    for (const e of entries) {
+      txLog.push({
+        endpoint: e.endpoint,
+        timestamp: new Date(e.timestamp).getTime(),
+        success: e.success ? 1 : 0,
+        token: e.tokenType,
+        amount: e.amount || "0",
+        fee: e.fee ?? null,
+        txid: e.txid ?? null,
+        sender: e.sender ?? null,
+        recipient: e.recipient ?? null,
+        status: e.status ?? null,
+        block_height: e.blockHeight ?? null,
+      });
+    }
+  }
+
+  logger.info("KV data read complete", {
+    dailyKeys: dailyKeys.length,
+    hourlyKeys: hourlyKeys.length,
+    txLogKeys: txLogKeys.length,
+    txLogEntries: txLog.length,
+  });
+
+  // 4. Send to StatsDO /backfill
+  const stub = statsDo.get(statsDo.idFromName("global"));
+  const resp = await stub.fetch(
+    new Request("http://do/backfill", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ daily, hourly, txLog }),
+    })
+  );
+
+  const result = await resp.json();
+  logger.info("Backfill complete", result as Record<string, unknown>);
+
+  return c.json({
+    success: true,
+    kvKeysRead: {
+      daily: dailyKeys.length,
+      hourly: hourlyKeys.length,
+      txLog: txLogKeys.length,
+      txLogEntries: txLog.length,
+    },
+    imported: result,
+  });
+});
+
 // Mount dashboard routes (HTML pages, not OpenAPI)
 app.route("/dashboard", dashboard);
 
