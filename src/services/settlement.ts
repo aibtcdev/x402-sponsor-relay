@@ -40,6 +40,8 @@ const MAX_POLL_DELAY_MS = 8_000;
 // KV dedup configuration
 const DEDUP_TTL_SECONDS = 300;
 const DEDUP_KEY_PREFIX = "dedup:";
+/** Only verify liveness of pending dedup entries older than this (ms) */
+const DEDUP_LIVENESS_AGE_MS = 60_000;
 
 /** Shape of Hiro GET /extended/v1/tx/{txid} response (subset) */
 interface HiroTxResponse {
@@ -82,6 +84,19 @@ export class SettlementService {
     const hashBuffer = await crypto.subtle.digest("SHA-256", data);
     const bytes = new Uint8Array(hashBuffer);
     return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  /**
+   * Returns true if a Hiro tx_status string indicates a terminal (dead) transaction.
+   * Terminal statuses start with "abort_" or "dropped_".
+   */
+  private isTxStatusTerminal(txStatus: string | undefined): boolean {
+    return txStatus?.startsWith("abort_") === true || txStatus?.startsWith("dropped_") === true;
+  }
+
+  /** Truncate a hex hash to a short prefix for log context. */
+  private truncateHash(hash: string): string {
+    return hash.slice(0, 16) + "...";
   }
 
   /**
@@ -670,7 +685,7 @@ export class SettlementService {
             }
           }
 
-          if (txStatus?.startsWith("abort_") || txStatus?.startsWith("dropped_")) {
+          if (this.isTxStatusTerminal(txStatus)) {
             this.logger.warn("Transaction aborted or dropped", {
               txid,
               txStatus,
@@ -717,8 +732,59 @@ export class SettlementService {
   }
 
   /**
+   * Check whether a txid is still alive in the mempool or confirmed on-chain.
+   * Used to validate "pending" dedup entries before returning them to callers.
+   *
+   * Returns true  if the tx is pending, success, or the API is unreachable (fail-open).
+   * Returns false if the tx is 404 (never indexed / evicted) or abort_xx / dropped_xx.
+   */
+  private async verifyTxidAlive(txid: string): Promise<boolean> {
+    try {
+      const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
+      const url = `${hiroBaseUrl}/extended/v1/tx/${txid}`;
+
+      const response = await fetch(url, {
+        headers: getHiroHeaders(this.env.HIRO_API_KEY),
+        signal: AbortSignal.timeout(5_000),
+      });
+
+      if (response.status === 404) {
+        this.logger.debug("Txid not found, treating as dead", { txid });
+        return false;
+      }
+
+      if (!response.ok) {
+        this.logger.debug("Hiro API error during liveness check, assuming alive", {
+          txid,
+          status: response.status,
+        });
+        return true;
+      }
+
+      const data = (await response.json()) as HiroTxResponse;
+      if (this.isTxStatusTerminal(data.tx_status)) {
+        this.logger.debug("Txid has terminal status", { txid, txStatus: data.tx_status });
+        return false;
+      }
+
+      this.logger.debug("Txid is alive", { txid, txStatus: data.tx_status });
+      return true;
+    } catch (e) {
+      this.logger.debug("Liveness check failed, assuming alive", {
+        txid,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return true;
+    }
+  }
+
+  /**
    * Check KV for a cached deduplication result for the given transaction hex.
    * Returns the cached result if found, or null if not found or KV unavailable.
+   *
+   * For "pending" entries, performs a liveness check against the Hiro API.
+   * If the txid is dead (dropped or never indexed), the stale entry is deleted
+   * and null is returned so the caller can retry with a fresh broadcast.
    */
   async checkDedup(sponsoredTxHex: string): Promise<DedupResult | null> {
     if (!this.env.RELAY_KV) {
@@ -726,10 +792,10 @@ export class SettlementService {
     }
 
     try {
-      // Note: dedup keys are SHA-256 of the fully-sponsored tx hex.
-      // A resubmitted transaction after a NONCE_CONFLICT will have a new sponsor
-      // nonce and therefore a different hex — it will not match this cache entry.
-      // This is intentional: each sponsoring attempt is treated as a distinct event.
+      // Note: dedup keys are SHA-256 of the original unsigned agent tx hex
+      // (body.transaction in /relay, txHex in /settle). This means the same
+      // agent payload will match even across different sponsoring attempts,
+      // enabling true idempotency for retried submissions.
       const txHash = await this.computeTxHash(sponsoredTxHex);
       const key = `${DEDUP_KEY_PREFIX}${txHash}`;
       const cached = await this.env.RELAY_KV.get(key);
@@ -739,8 +805,25 @@ export class SettlementService {
       }
 
       const result = JSON.parse(cached) as DedupResult;
+
+      // For "pending" entries older than DEDUP_LIVENESS_AGE_MS, verify the txid is
+      // still alive. Fresh entries are trusted to avoid adding Hiro API latency to
+      // the hot path on every dedup hit.
+      const entryAge = result.recordedAt ? Date.now() - result.recordedAt : Infinity;
+      if (result.status === "pending" && entryAge > DEDUP_LIVENESS_AGE_MS) {
+        const alive = await this.verifyTxidAlive(result.txid);
+        if (!alive) {
+          this.logger.warn("Dedup stale: pending txid is dead, invalidating cache entry", {
+            txHash: this.truncateHash(txHash),
+            txid: result.txid,
+          });
+          await this.env.RELAY_KV.delete(key);
+          return null;
+        }
+      }
+
       this.logger.info("Dedup hit: returning cached result", {
-        txHash: txHash.slice(0, 16) + "...",
+        txHash: this.truncateHash(txHash),
         txid: result.txid,
         status: result.status,
       });
@@ -768,12 +851,14 @@ export class SettlementService {
     try {
       const txHash = await this.computeTxHash(sponsoredTxHex);
       const key = `${DEDUP_KEY_PREFIX}${txHash}`;
-      await this.env.RELAY_KV.put(key, JSON.stringify(result), {
-        expirationTtl: DEDUP_TTL_SECONDS,
-      });
+      await this.env.RELAY_KV.put(
+        key,
+        JSON.stringify({ ...result, recordedAt: Date.now() }),
+        { expirationTtl: DEDUP_TTL_SECONDS }
+      );
 
       this.logger.debug("Dedup result recorded in KV", {
-        txHash: txHash.slice(0, 16) + "...",
+        txHash: this.truncateHash(txHash),
         txid: result.txid,
         status: result.status,
         ttlSeconds: DEDUP_TTL_SECONDS,

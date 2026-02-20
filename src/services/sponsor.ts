@@ -85,6 +85,17 @@ const NONCE_FETCH_BASE_DELAY_MS = 500;
 const NONCE_FETCH_MAX_DELAY_MS = 5000;
 
 /**
+ * Error body returned by NonceDO on assignment failure.
+ * Shared between fetchNonceFromDO return type and JSON parsing.
+ */
+interface NonceDOErrorBody {
+  error?: string;
+  code?: string;
+  mempoolDepth?: number;
+  estimatedDrainSeconds?: number;
+}
+
+/**
  * Service for validating and sponsoring Stacks transactions
  */
 export class SponsorService {
@@ -402,7 +413,7 @@ export class SponsorService {
     sponsorAddress: string
   ): Promise<
     | { ok: true; nonce: bigint; walletIndex: number }
-    | { ok: false; code?: string; error: string; status: number }
+    | ({ ok: false; error: string; status: number } & NonceDOErrorBody)
   > {
     if (!this.env.NONCE_DO) {
       this.logger.debug("Nonce DO not configured; skipping DO nonce fetch");
@@ -422,9 +433,9 @@ export class SponsorService {
 
       if (!response.ok) {
         // Parse the error body so callers can propagate specific codes (e.g. 429)
-        let errorBody: { error?: string; code?: string } = {};
+        let errorBody: NonceDOErrorBody = {};
         try {
-          errorBody = (await response.json()) as { error?: string; code?: string };
+          errorBody = (await response.json()) as NonceDOErrorBody;
         } catch {
           // response may not be JSON
         }
@@ -432,12 +443,16 @@ export class SponsorService {
           status: response.status,
           code: errorBody.code,
           error: errorBody.error,
+          mempoolDepth: errorBody.mempoolDepth,
+          estimatedDrainSeconds: errorBody.estimatedDrainSeconds,
         });
         return {
           ok: false,
           code: errorBody.code,
           error: errorBody.error ?? `NonceDO error ${response.status}`,
           status: response.status,
+          mempoolDepth: errorBody.mempoolDepth,
+          estimatedDrainSeconds: errorBody.estimatedDrainSeconds,
         };
       }
 
@@ -570,19 +585,29 @@ export class SponsorService {
         });
       } else {
         // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED)
-        const code = doResult.code === "CHAINING_LIMIT_EXCEEDED"
-          ? "RATE_LIMIT_EXCEEDED"
-          : "NONCE_DO_UNAVAILABLE";
-        this.logger.error(
-          "NonceDO nonce assignment failed",
-          { code: doResult.code, error: doResult.error, status: doResult.status }
-        );
+        const isChainingLimit = doResult.code === "CHAINING_LIMIT_EXCEEDED";
+        const code = isChainingLimit ? "RATE_LIMIT_EXCEEDED" : "NONCE_DO_UNAVAILABLE";
+        this.logger.error("NonceDO nonce assignment failed", {
+          code: doResult.code,
+          error: doResult.error,
+          status: doResult.status,
+          mempoolDepth: doResult.mempoolDepth,
+          estimatedDrainSeconds: doResult.estimatedDrainSeconds,
+        });
+
+        let details: string;
+        if (isChainingLimit && doResult.mempoolDepth !== undefined && doResult.estimatedDrainSeconds !== undefined) {
+          details = `All sponsor wallets at chaining limit (mempool depth: ${doResult.mempoolDepth}); retry in ~${doResult.estimatedDrainSeconds}s`;
+        } else if (isChainingLimit) {
+          details = "All sponsor wallets at chaining limit; retry in a few seconds";
+        } else {
+          details = "NonceDO did not return a nonce; retry in a few seconds";
+        }
+
         return {
           success: false,
           error: doResult.error,
-          details: doResult.code === "CHAINING_LIMIT_EXCEEDED"
-            ? "All sponsor wallets at chaining limit; retry in a few seconds"
-            : "NonceDO did not return a nonce; retry in a few seconds",
+          details,
           code,
         };
       }

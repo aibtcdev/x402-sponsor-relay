@@ -51,6 +51,8 @@ export interface Env {
   STACKS_NETWORK: "mainnet" | "testnet";
   /** Optional Hiro API key for higher rate limits */
   HIRO_API_KEY?: string;
+  /** Recipient address for nonce gap-fill transactions (default: SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC) */
+  FLUSH_RECIPIENT?: string;
   // LOGS is a service binding to worker-logs, typed loosely to avoid complex Service<> generics
   LOGS?: unknown;
   // KV namespace for receipts, dedup, fee cache, and health checks
@@ -1036,6 +1038,8 @@ export interface DedupResult {
   blockHeight?: number;
   /** Hex-encoded fully-sponsored transaction for consistent dedup responses */
   sponsoredTx?: string;
+  /** Unix timestamp (ms) when this dedup entry was recorded */
+  recordedAt?: number;
 }
 
 /**

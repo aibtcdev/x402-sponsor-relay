@@ -1,3 +1,8 @@
+import {
+  makeSTXTokenTransfer,
+  broadcastTransaction,
+} from "@stacks/transactions";
+import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
 import type { Env } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 
@@ -77,11 +82,13 @@ interface ReconcileResult {
  * available: nonces ready to be assigned (pre-seeded, sorted ascending)
  * reserved: nonces currently in-flight (assigned but not yet confirmed or released)
  * maxNonce: highest nonce ever placed in the pool (used to extend when available runs low)
+ * reservedAt: unix ms timestamp of when each nonce was reserved (keyed by nonce as string)
  */
 interface PoolState {
   available: number[];
   reserved: number[];
   maxNonce: number;
+  reservedAt: Record<number, number>;
 }
 
 interface WalletPoolStats {
@@ -105,6 +112,8 @@ interface NonceStatsResponse {
   lastHiroSync: string | null;
   /** ISO timestamp of last gap detection (null if no gaps detected) */
   lastGapDetected: string | null;
+  /** Number of gap-fill transactions broadcast by the alarm */
+  gapsFilled: number;
   /** Number of nonces currently available in the pool (wallet 0, backward compat) */
   poolAvailable: number;
   /** Number of nonces currently in-flight (wallet 0, backward compat) */
@@ -115,8 +124,12 @@ interface NonceStatsResponse {
   wallets: WalletPoolStats[];
 }
 
-/** Maximum number of in-flight nonces allowed concurrently per sponsor wallet */
-const CHAINING_LIMIT = 25;
+/**
+ * Maximum number of in-flight nonces allowed concurrently per sponsor wallet.
+ * The Stacks node hard-rejects at 25 (TooMuchChaining). We cap at 20 to leave
+ * a buffer of 5 for concurrent in-flight requests and gap-fill transactions.
+ */
+const CHAINING_LIMIT = 20;
 /** Initial pool pre-seeds this many nonces ahead of the current head */
 const POOL_SEED_SIZE = CHAINING_LIMIT;
 
@@ -125,6 +138,17 @@ const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 /** Maximum number of sponsor wallets supported */
 const MAX_WALLET_COUNT = 10;
+/** Valid BIP-39 mnemonic word counts */
+const VALID_MNEMONIC_LENGTHS = [12, 24];
+/** Gap-fill transfer: 1 uSTX (minimal amount to fill a nonce gap) */
+const GAP_FILL_AMOUNT = 1n;
+/** Gap-fill fee: 30,000 uSTX (high enough for RBF priority) */
+const GAP_FILL_FEE = 30_000n;
+/** Default recipient for gap-fill self-transfers, per network */
+const DEFAULT_FLUSH_RECIPIENT_MAINNET = "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC";
+const DEFAULT_FLUSH_RECIPIENT_TESTNET = "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB";
+/** Maximum number of gap-fill broadcasts per alarm cycle per wallet */
+const MAX_GAP_FILLS_PER_ALARM = 5;
 
 // Legacy single-wallet pool key (migrated to pool:0 on first access)
 const POOL_KEY = "pool";
@@ -135,12 +159,38 @@ const STATE_KEYS = {
   lastAssignedNonce: "last_assigned_nonce",
   lastAssignedAt: "last_assigned_at",
   gapsRecovered: "gaps_recovered",
+  gapsFilled: "gaps_filled",
   lastHiroSync: "last_hiro_sync",
   lastGapDetected: "last_gap_detected",
 } as const;
 
 /** Round-robin wallet index storage key */
 const NEXT_WALLET_INDEX_KEY = "next_wallet_index";
+
+/**
+ * Structured error thrown when all sponsor wallets are at the chaining limit.
+ * Carries mempoolDepth so the /assign handler can build an actionable 429 response.
+ */
+class ChainingLimitError extends Error {
+  readonly mempoolDepth: number;
+
+  constructor(mempoolDepth: number) {
+    super("CHAINING_LIMIT_EXCEEDED");
+    this.name = "ChainingLimitError";
+    this.mempoolDepth = mempoolDepth;
+  }
+}
+
+/** Insert a nonce into a sorted ascending array at the correct position. */
+function insertSorted(arr: number[], nonce: number): void {
+  if (arr.includes(nonce)) return;
+  const idx = arr.findIndex((n) => n > nonce);
+  if (idx === -1) {
+    arr.push(nonce);
+  } else {
+    arr.splice(idx, 0, nonce);
+  }
+}
 
 /** Safely add two microSTX string amounts using BigInt to avoid overflow */
 function addMicroSTX(a: string, b: string): string {
@@ -268,6 +318,155 @@ export class NonceDO {
     this.setStateValue(STATE_KEYS.gapsRecovered, gapsRecovered);
   }
 
+  private incrementGapsFilled(): void {
+    const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled) + 1;
+    this.setStateValue(STATE_KEYS.gapsFilled, gapsFilled);
+  }
+
+  /**
+   * Return true if any txid has been recorded for this nonce in nonce_txids.
+   * Used by cleanStaleReservations to distinguish reserved-but-broadcast nonces
+   * from reserved-but-never-broadcast (orphaned) nonces.
+   */
+  private hasTxidForNonce(nonce: number): boolean {
+    const rows = this.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
+        nonce
+      )
+      .toArray();
+    return rows[0].count > 0;
+  }
+
+  /**
+   * Release stale reservations for a wallet pool back to available.
+   * A reservation is "stale" when:
+   *   - It has been reserved longer than STALE_THRESHOLD_MS (10 minutes), AND
+   *   - No txid has been recorded for it in nonce_txids (never broadcast).
+   *
+   * This recovers pool capacity lost to fire-and-forget releaseNonceDO failures.
+   * Returns the number of nonces returned to available.
+   */
+  private cleanStaleReservations(pool: PoolState): number {
+    const now = Date.now();
+    const staleNonces = new Set<number>();
+
+    for (const nonce of pool.reserved) {
+      const reservedAt = pool.reservedAt[nonce];
+      // No timestamp means we can't determine age -- conservatively skip
+      if (reservedAt === undefined) continue;
+      // Still within the grace window
+      if (now - reservedAt < STALE_THRESHOLD_MS) continue;
+      // Was broadcast -- consumed legitimately, do not reclaim
+      if (this.hasTxidForNonce(nonce)) continue;
+
+      staleNonces.add(nonce);
+    }
+
+    if (staleNonces.size === 0) {
+      return 0;
+    }
+
+    // Filter out stale nonces from reserved and return them to available
+    pool.reserved = pool.reserved.filter((n) => !staleNonces.has(n));
+    for (const nonce of staleNonces) {
+      delete pool.reservedAt[nonce];
+      insertSorted(pool.available, nonce);
+    }
+
+    return staleNonces.size;
+  }
+
+  /**
+   * Derive the private key for a specific wallet index from the mnemonic.
+   * Falls back to SPONSOR_PRIVATE_KEY for wallet 0 if no mnemonic is set.
+   * Uses the same derivation pattern as SponsorService.deriveSponsorKeyForIndex.
+   */
+  private async derivePrivateKeyForWallet(walletIndex: number): Promise<string | null> {
+    if (this.env.SPONSOR_MNEMONIC) {
+      const words = this.env.SPONSOR_MNEMONIC.trim().split(/\s+/);
+      if (!VALID_MNEMONIC_LENGTHS.includes(words.length)) return null;
+      try {
+        const wallet = await generateWallet({
+          secretKey: this.env.SPONSOR_MNEMONIC,
+          password: "",
+        });
+        for (let i = wallet.accounts.length; i <= walletIndex; i++) {
+          generateNewAccount(wallet);
+        }
+        const account = wallet.accounts[walletIndex];
+        return account?.stxPrivateKey ?? null;
+      } catch {
+        return null;
+      }
+    }
+    // Fallback: SPONSOR_PRIVATE_KEY is only valid for wallet 0
+    if (walletIndex === 0 && this.env.SPONSOR_PRIVATE_KEY) {
+      return this.env.SPONSOR_PRIVATE_KEY;
+    }
+    return null;
+  }
+
+  /**
+   * Broadcast a gap-fill STX transfer for a specific nonce.
+   * Returns the txid on success, null if the nonce is already occupied or on error.
+   * Amount: 1 uSTX. Fee: 30,000 uSTX (RBF-capable). Memo: gap-fill-{nonce}.
+   */
+  private async fillGapNonce(
+    walletIndex: number,
+    gapNonce: number,
+    privateKey: string
+  ): Promise<string | null> {
+    const network = this.env.STACKS_NETWORK ?? "testnet";
+    const defaultRecipient = network === "mainnet"
+      ? DEFAULT_FLUSH_RECIPIENT_MAINNET
+      : DEFAULT_FLUSH_RECIPIENT_TESTNET;
+    const recipient = this.env.FLUSH_RECIPIENT ?? defaultRecipient;
+    try {
+      const tx = await makeSTXTokenTransfer({
+        recipient,
+        amount: GAP_FILL_AMOUNT,
+        senderKey: privateKey,
+        network,
+        nonce: BigInt(gapNonce),
+        fee: GAP_FILL_FEE,
+        memo: `gap-fill-${gapNonce}`,
+      });
+      const result = await broadcastTransaction({ transaction: tx, network });
+      if ("txid" in result) {
+        return result.txid;
+      }
+      // Cast to access raw reason string — Hiro may return values not in the typed union
+      // (e.g. "ConflictingNonceInMempool" when a tx with same nonce is already in mempool)
+      const rejection = result as unknown as { reason?: string; error?: string };
+      if (rejection.reason === "ConflictingNonceInMempool") {
+        // Nonce already occupied — not an error, just skip
+        return null;
+      }
+      // Other rejection — log and continue
+      console.warn(
+        JSON.stringify({
+          action: "gap_fill_rejected",
+          walletIndex,
+          nonce: gapNonce,
+          reason: rejection.reason ?? "unknown",
+          error: rejection.error ?? "",
+        })
+      );
+      return null;
+    } catch (e) {
+      console.warn(
+        JSON.stringify({
+          action: "gap_fill_error",
+          walletIndex,
+          nonce: gapNonce,
+          error: e instanceof Error ? e.message : String(e),
+        })
+      );
+      return null;
+    }
+  }
+
   private async scheduleAlarm(): Promise<void> {
     await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
   }
@@ -293,13 +492,22 @@ export class NonceDO {
   private async loadPoolForWallet(walletIndex: number): Promise<PoolState | null> {
     // Try per-wallet key first
     const pool = await this.state.storage.get<PoolState>(this.poolKey(walletIndex));
-    if (pool != null) return pool;
+    if (pool != null) {
+      // Backward compat: pools persisted before reservedAt was added won't have the field
+      if (!pool.reservedAt) {
+        pool.reservedAt = {};
+      }
+      return pool;
+    }
 
     // Migration: wallet 0 may have state under legacy "pool" key
     if (walletIndex === 0) {
       const legacy = await this.state.storage.get<PoolState>(POOL_KEY);
       if (legacy != null) {
         // Migrate to per-wallet key, remove legacy
+        if (!legacy.reservedAt) {
+          legacy.reservedAt = {};
+        }
         await this.state.storage.put(this.poolKey(0), legacy);
         await this.state.storage.delete(POOL_KEY);
         return legacy;
@@ -482,6 +690,7 @@ export class NonceDO {
       available,
       reserved: [],
       maxNonce: seedNonce + POOL_SEED_SIZE - 1,
+      reservedAt: {},
     };
     await this.savePoolForWallet(walletIndex, pool);
     return pool;
@@ -525,19 +734,21 @@ export class NonceDO {
 
       // Try each wallet in round-robin order; skip any at chaining limit
       let attempts = 0;
+      let totalMempoolDepth = 0;
       while (attempts < effectiveWalletCount) {
         pool = await this.loadPoolOrInit(walletIndex, resolveAddress(walletIndex));
         if (pool.reserved.length < CHAINING_LIMIT) {
           break;
         }
-        // This wallet is at its chaining limit; try the next
+        // This wallet is at its chaining limit; accumulate depth and try the next
+        totalMempoolDepth += pool.reserved.length;
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
         pool = null;
         attempts++;
       }
 
       if (attempts === effectiveWalletCount || pool === null) {
-        throw new Error("CHAINING_LIMIT_EXCEEDED");
+        throw new ChainingLimitError(totalMempoolDepth);
       }
 
       // Store the per-wallet sponsor address (used by alarm reconciliation)
@@ -553,6 +764,7 @@ export class NonceDO {
       // Assign the next available nonce
       const assignedNonce = pool.available.shift()!;
       pool.reserved.push(assignedNonce);
+      pool.reservedAt[assignedNonce] = Date.now();
 
       await this.savePoolForWallet(walletIndex, pool);
       this.updateAssignedStats(assignedNonce);
@@ -591,17 +803,13 @@ export class NonceDO {
         return;
       }
 
-      // Remove from reserved
+      // Remove from reserved and clear the reservation timestamp
       pool.reserved.splice(reservedIdx, 1);
+      delete pool.reservedAt[nonce];
 
       if (!txid) {
         // Unused nonce: return to available in sorted order
-        const insertIdx = pool.available.findIndex((n) => n > nonce);
-        if (insertIdx === -1) {
-          pool.available.push(nonce);
-        } else {
-          pool.available.splice(insertIdx, 0, nonce);
-        }
+        insertSorted(pool.available, nonce);
       } else if (fee && fee !== "0") {
         // Broadcast succeeded and fee provided — record in wallet stats
         // (done outside blockConcurrencyWhile to avoid nested blocking, but we call it here
@@ -661,6 +869,7 @@ export class NonceDO {
     const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
     const nextNonce = this.getStoredNonce();
     const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered);
+    const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled);
     const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
     const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
 
@@ -695,6 +904,7 @@ export class NonceDO {
       nextNonce,
       txidCount,
       gapsRecovered,
+      gapsFilled,
       lastHiroSync: lastHiroSyncMs ? new Date(lastHiroSyncMs).toISOString() : null,
       lastGapDetected: lastGapDetectedMs ? new Date(lastGapDetectedMs).toISOString() : null,
       poolAvailable: wallet0?.available ?? 0,
@@ -763,11 +973,38 @@ export class NonceDO {
       }
 
       this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+
+      // Actively fill gaps: derive key and broadcast 1 uSTX transfers for each gap nonce.
+      // Cap per-alarm fills to avoid exceeding Cloudflare alarm execution time limits.
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      const filled: number[] = [];
+      const gapsToFill = sortedGaps.slice(0, MAX_GAP_FILLS_PER_ALARM);
+      if (privateKey) {
+        for (const gapNonce of gapsToFill) {
+          const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
+          if (txid) {
+            console.log(
+              JSON.stringify({
+                action: "gap_filled",
+                walletIndex,
+                nonce: gapNonce,
+                txid,
+              })
+            );
+            this.incrementGapsFilled();
+            filled.push(gapNonce);
+          }
+        }
+      }
+
       return {
         previousNonce,
         newNonce: previousNonce,
-        changed: false,
-        reason: `gaps detected (${sortedGaps.join(",")}) but nonce will fill naturally`,
+        changed: filled.length > 0,
+        reason:
+          filled.length > 0
+            ? `gap_filled: broadcast ${filled.length} fill tx(s) for nonces [${filled.join(",")}]`
+            : `gaps detected (${sortedGaps.join(",")}) but could not fill (no key or already occupied)`,
       };
     }
 
@@ -921,6 +1158,22 @@ export class NonceDO {
           if (!addr) break; // no more initialized wallets
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
           await this.reconcileNonceForWallet(wi, addr);
+
+          // Clean stale reservations: release nonces reserved > 10 min ago with no broadcast
+          const pool = await this.loadPoolForWallet(wi);
+          if (pool !== null) {
+            const released = this.cleanStaleReservations(pool);
+            if (released > 0) {
+              await this.savePoolForWallet(wi, pool);
+              console.log(
+                JSON.stringify({
+                  action: "stale_reservations_cleaned",
+                  walletIndex: wi,
+                  released,
+                })
+              );
+            }
+          }
         }
       } finally {
         await this.scheduleAlarm();
@@ -977,9 +1230,17 @@ export class NonceDO {
         };
         return this.jsonResponse(response);
       } catch (error) {
-        if (error instanceof Error && error.message === "CHAINING_LIMIT_EXCEEDED") {
+        if (error instanceof ChainingLimitError) {
+          const mempoolDepth = error.mempoolDepth;
+          // Assume ~2 txs/s drain rate (conservative estimate for Stacks testnet/mainnet)
+          const estimatedDrainSeconds = Math.ceil(mempoolDepth / 2);
           return this.jsonResponse(
-            { error: "Chaining limit exceeded; too many in-flight nonces", code: "CHAINING_LIMIT_EXCEEDED" },
+            {
+              error: "Chaining limit exceeded; too many in-flight nonces",
+              code: "CHAINING_LIMIT_EXCEEDED",
+              mempoolDepth,
+              estimatedDrainSeconds,
+            },
             429
           );
         }
