@@ -166,6 +166,80 @@ ${header(network)}
   <div class="mb-6">
     ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
   </div>
+
+  <!-- Sponsor Wallets Section (client-side fetch from /wallets) -->
+  <div class="mb-6" x-data="walletApp()" x-init="init()">
+    <div class="brand-section p-6">
+      <h3 class="text-lg font-semibold text-white mb-4">Sponsor Wallets</h3>
+      <div x-show="loading" class="text-gray-400 text-sm py-4">Loading wallet status...</div>
+      <div x-show="!loading && error" class="text-gray-500 text-sm py-4" x-text="error"></div>
+      <div x-show="!loading && !error && totals">
+        <!-- Summary row -->
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400">Total Balance</p>
+            <p class="text-xl font-bold text-white mt-2" x-text="formatSTX(totals && totals.totalBalance)"></p>
+          </div>
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400">Total Fees Spent</p>
+            <p class="text-xl font-bold text-white mt-2" x-text="formatSTX(totals && totals.totalFeesSpent)"></p>
+          </div>
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400">Total Tx Count</p>
+            <p class="text-xl font-bold text-white mt-2" x-text="totals && totals.totalTxCount"></p>
+          </div>
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400">Wallet Count</p>
+            <p class="text-xl font-bold text-white mt-2" x-text="totals && totals.walletCount"></p>
+          </div>
+        </div>
+        <!-- Per-wallet table -->
+        <div class="overflow-x-auto">
+          <table class="w-full">
+            <thead>
+              <tr class="text-left text-gray-400 text-sm">
+                <th class="py-2 px-4 font-medium">#</th>
+                <th class="py-2 px-4 font-medium">Address</th>
+                <th class="py-2 px-4 font-medium text-right">Balance</th>
+                <th class="py-2 px-4 font-medium text-right">Fees Spent</th>
+                <th class="py-2 px-4 font-medium text-right">Txs Today</th>
+                <th class="py-2 px-4 font-medium text-right">Pool</th>
+                <th class="py-2 px-4 font-medium text-right">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="wallet in wallets" :key="wallet.index">
+                <tr class="border-t" style="border-color: #1a1a1a">
+                  <td class="py-3 px-4 text-gray-400 text-sm" x-text="wallet.index"></td>
+                  <td class="py-3 px-4">
+                    <code class="text-sm font-mono text-purple-400" x-text="truncateAddr(wallet.address)"></code>
+                  </td>
+                  <td class="py-3 px-4 text-right">
+                    <span class="text-white font-medium" x-text="formatSTX(wallet.balance)"></span>
+                  </td>
+                  <td class="py-3 px-4 text-right">
+                    <span class="text-gray-400 text-sm" x-text="formatSTX(wallet.totalFeesSpent)"></span>
+                  </td>
+                  <td class="py-3 px-4 text-right">
+                    <span class="text-white" x-text="wallet.txCountToday"></span>
+                    <span class="text-gray-500 text-xs ml-1" x-text="'(' + wallet.txCount + ' total)'"></span>
+                  </td>
+                  <td class="py-3 px-4 text-right text-sm text-gray-400">
+                    <span x-text="wallet.pool.available + ' avail / ' + wallet.pool.reserved + ' rsv'"></span>
+                  </td>
+                  <td class="py-3 px-4 text-right">
+                    <span class="px-2 py-0.5 text-xs rounded-full font-medium"
+                          :style="'background-color: ' + statusColor(wallet.status) + '20; color: ' + statusColor(wallet.status) + '; border: 1px solid ' + statusColor(wallet.status) + '40'"
+                          x-text="statusLabel(wallet.status)"></span>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
 </main>
 
 ${footer(utcTimestamp())}
@@ -254,6 +328,52 @@ ${footer(utcTimestamp())}
       })
       .catch(function() {});
   }, 60000);
+
+  // Wallet status Alpine.js component — fetches /wallets on init
+  function walletApp() {
+    return {
+      loading: true,
+      error: null,
+      wallets: [],
+      totals: null,
+      init: function() {
+        var self = this;
+        fetch('/wallets')
+          .then(function(r) { return r.json(); })
+          .then(function(data) {
+            self.wallets = data.wallets || [];
+            self.totals = data.totals || null;
+          })
+          .catch(function() { self.error = 'Wallet status unavailable (sponsor not configured or error)'; })
+          .finally(function() { self.loading = false; });
+      },
+      formatSTX: function(microSTX) {
+        if (!microSTX) return '0 STX';
+        try {
+          var n = BigInt(microSTX);
+          var whole = n / BigInt(1000000);
+          var frac = n % BigInt(1000000);
+          return whole.toLocaleString() + '.' + frac.toString().padStart(6, '0') + ' STX';
+        } catch(e) {
+          return microSTX + ' uSTX';
+        }
+      },
+      truncateAddr: function(addr) {
+        if (!addr || addr.length < 12) return addr || '';
+        return addr.slice(0, 8) + '...' + addr.slice(-6);
+      },
+      statusColor: function(status) {
+        if (status === 'healthy') return '#10B981';
+        if (status === 'low_balance') return '#FBBF24';
+        return '#F87171';
+      },
+      statusLabel: function(status) {
+        if (status === 'healthy') return 'Healthy';
+        if (status === 'low_balance') return 'Low Balance';
+        return 'Depleted';
+      }
+    };
+  }
 </script>
 `;
 
