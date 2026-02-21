@@ -157,6 +157,14 @@ interface NonceStatsResponse {
 const CHAINING_LIMIT = 20;
 /** Initial pool pre-seeds this many nonces ahead of the current head */
 const POOL_SEED_SIZE = CHAINING_LIMIT;
+/**
+ * Maximum allowed lookahead distance beyond Hiro's possible_next_nonce.
+ * If pool.maxNonce would exceed hiroNextNonce + LOOKAHEAD_GUARD_BUFFER, we refuse
+ * to extend the pool further. This prevents the pool from running so far ahead of
+ * confirmed chain state that a resync would discard a large batch of pre-assigned nonces.
+ * Set equal to CHAINING_LIMIT (20) — same as the in-flight cap for symmetry.
+ */
+const LOOKAHEAD_GUARD_BUFFER = CHAINING_LIMIT;
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 /** Reset to possible_next_nonce if no assignment in this window and we are ahead */
@@ -792,6 +800,27 @@ export class NonceDO {
   }
 
   /**
+   * Fetch possible_next_nonce from Hiro for a specific wallet address.
+   * Returns the nonce on success, null on any failure (network error, timeout, bad response).
+   * Used exclusively by the lookahead cap guard in assignNonce() — must be fail-open.
+   */
+  private async fetchNextNonceForWallet(
+    walletIndex: number,
+    address: string
+  ): Promise<number | null> {
+    try {
+      const info = await this.fetchNonceInfo(address);
+      return info.possible_next_nonce;
+    } catch (_e) {
+      this.log("debug", "nonce_lookahead_check_skipped", {
+        walletIndex,
+        reason: "hiro_unreachable",
+      });
+      return null;
+    }
+  }
+
+  /**
    * Load or initialize a pool for a specific wallet.
    * On first init, fetches nonce from Hiro for that wallet's address.
    */
@@ -917,6 +946,24 @@ export class NonceDO {
       // Extend pool if available is exhausted
       if (pool.available.length === 0) {
         const nextNonce = pool.maxNonce + 1;
+        // Lookahead cap guard: refuse to extend the pool past hiroNextNonce + LOOKAHEAD_GUARD_BUFFER.
+        // This prevents the pool from running so far ahead of confirmed chain state that a
+        // resync would discard a large batch of pre-assigned nonces, causing a sudden gap.
+        // Fail-open when Hiro is unreachable: if we can't check, allow the extension.
+        const walletAddr = resolveAddress(walletIndex);
+        const hiroNextNonce = await this.fetchNextNonceForWallet(walletIndex, walletAddr);
+        if (hiroNextNonce !== null && nextNonce > hiroNextNonce + LOOKAHEAD_GUARD_BUFFER) {
+          this.log("warn", "nonce_lookahead_capped", {
+            walletIndex,
+            poolMaxNonce: pool.maxNonce,
+            nextNonce,
+            hiroNextNonce,
+            limit: hiroNextNonce + LOOKAHEAD_GUARD_BUFFER,
+            poolReserved: pool.reserved.length,
+          });
+          // Treat this the same as chaining limit — caller returns 429 so agent can retry
+          throw new ChainingLimitError(pool.reserved.length);
+        }
         pool.available.push(nextNonce);
         pool.maxNonce = nextNonce;
       }
