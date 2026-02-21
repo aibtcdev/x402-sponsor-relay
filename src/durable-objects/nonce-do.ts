@@ -3,8 +3,25 @@ import {
   broadcastTransaction,
 } from "@stacks/transactions";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
-import type { Env } from "../types";
+import type { Env, LogsRPC } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
+
+const APP_ID = "x402-relay";
+
+/**
+ * Type guard to check if LOGS binding has the required RPC methods.
+ * Mirrors the same guard in src/middleware/logger.ts for use in Durable Objects.
+ */
+function isLogsRPC(logs: unknown): logs is LogsRPC {
+  return (
+    typeof logs === "object" &&
+    logs !== null &&
+    typeof (logs as LogsRPC).info === "function" &&
+    typeof (logs as LogsRPC).warn === "function" &&
+    typeof (logs as LogsRPC).error === "function" &&
+    typeof (logs as LogsRPC).debug === "function"
+  );
+}
 
 interface AssignNonceRequest {
   sponsorAddress: string;
@@ -270,6 +287,30 @@ export class NonceDO {
     return this.jsonResponse({ error: message }, 500);
   }
 
+  /**
+   * Structured logger for NonceDO events.
+   * Sends to worker-logs RPC binding (env.LOGS) when available; falls back to console.
+   * Uses this.state.waitUntil() to fire-and-forget async RPC calls without blocking.
+   */
+  private log(
+    level: "info" | "warn" | "error" | "debug",
+    message: string,
+    context?: Record<string, unknown>
+  ): void {
+    if (isLogsRPC(this.env.LOGS)) {
+      this.state.waitUntil(this.env.LOGS[level](APP_ID, message, context));
+    } else {
+      const line = context
+        ? `${message} ${JSON.stringify(context)}`
+        : message;
+      if (level === "warn" || level === "error") {
+        console[level](`[${level.toUpperCase()}] ${line}`);
+      } else {
+        console.log(`[${level.toUpperCase()}] ${line}`);
+      }
+    }
+  }
+
   private getStateValue(key: string): number | null {
     const rows = this.sql
       .exec<{ value: number }>(
@@ -449,25 +490,19 @@ export class NonceDO {
         return null;
       }
       // Other rejection — log and continue
-      console.warn(
-        JSON.stringify({
-          action: "gap_fill_rejected",
-          walletIndex,
-          nonce: gapNonce,
-          reason: rejection.reason ?? "unknown",
-          error: rejection.error ?? "",
-        })
-      );
+      this.log("warn", "gap_fill_rejected", {
+        walletIndex,
+        nonce: gapNonce,
+        reason: rejection.reason ?? "unknown",
+        error: rejection.error ?? "",
+      });
       return null;
     } catch (e) {
-      console.warn(
-        JSON.stringify({
-          action: "gap_fill_error",
-          walletIndex,
-          nonce: gapNonce,
-          error: e instanceof Error ? e.message : String(e),
-        })
-      );
+      this.log("warn", "gap_fill_error", {
+        walletIndex,
+        nonce: gapNonce,
+        error: e instanceof Error ? e.message : String(e),
+      });
       return null;
     }
   }
@@ -710,14 +745,11 @@ export class NonceDO {
     if (pool !== null) {
       const storedAddr = await this.getStoredSponsorAddressForWallet(walletIndex);
       if (storedAddr && storedAddr !== sponsorAddress) {
-        console.log(
-          JSON.stringify({
-            action: "pool_address_changed",
-            walletIndex,
-            oldAddress: storedAddr,
-            newAddress: sponsorAddress,
-          })
-        );
+        this.log("info", "pool_address_changed", {
+          walletIndex,
+          oldAddress: storedAddr,
+          newAddress: sponsorAddress,
+        });
         pool = null;
       }
     }
@@ -1050,14 +1082,7 @@ export class NonceDO {
         for (const gapNonce of gapsToFill) {
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
           if (txid) {
-            console.log(
-              JSON.stringify({
-                action: "gap_filled",
-                walletIndex,
-                nonce: gapNonce,
-                txid,
-              })
-            );
+            this.log("info", "gap_filled", { walletIndex, nonce: gapNonce, txid });
             this.incrementGapsFilled();
             filled.push(gapNonce);
             // Record gap-fill fee in per-wallet stats (separate counter for observability)
@@ -1284,13 +1309,7 @@ export class NonceDO {
             const released = this.cleanStaleReservations(pool);
             if (released > 0) {
               await this.savePoolForWallet(walletIndex, pool);
-              console.log(
-                JSON.stringify({
-                  action: "stale_reservations_cleaned",
-                  walletIndex,
-                  released,
-                })
-              );
+              this.log("info", "stale_reservations_cleaned", { walletIndex, released });
             }
           }
         }
@@ -1349,7 +1368,7 @@ export class NonceDO {
         changed: cleared > 0,
         reason,
       };
-      console.log(JSON.stringify(result));
+      this.log("info", "clear_pools", { action: result.action, changed: result.changed, reason: result.reason });
       return this.jsonResponse(result);
     });
   }
