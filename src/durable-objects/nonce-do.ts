@@ -102,12 +102,15 @@ interface ReconcileResult {
  * Reservation pool state — persisted as a single JSON object per wallet.
  * available: nonces ready to be assigned (pre-seeded, sorted ascending)
  * reserved: nonces currently in-flight (assigned but not yet confirmed or released)
+ * spent: nonces that were broadcast (txid recorded) and must never be reused.
+ *        Once a nonce appears in spent[], it is permanently quarantined from available[].
  * maxNonce: highest nonce ever placed in the pool (used to extend when available runs low)
  * reservedAt: unix ms timestamp of when each nonce was reserved (keyed by nonce as string)
  */
 interface PoolState {
   available: number[];
   reserved: number[];
+  spent: number[];
   maxNonce: number;
   reservedAt: Record<number, number>;
 }
@@ -116,6 +119,7 @@ interface WalletPoolStats {
   walletIndex: number;
   available: number;
   reserved: number;
+  spent: number;
   maxNonce: number;
   sponsorAddress: string | null;
 }
@@ -390,11 +394,12 @@ export class NonceDO {
    *   - No txid has been recorded for it in nonce_txids (never broadcast).
    *
    * This recovers pool capacity lost to fire-and-forget releaseNonceDO failures.
-   * Returns the number of nonces returned to available.
+   * Returns the number of nonces reclaimed (returned to available or quarantined to spent).
    */
   private cleanStaleReservations(pool: PoolState): number {
     const now = Date.now();
     const staleNonces = new Set<number>();
+    const staleWithTxid = new Set<number>();
 
     for (const nonce of pool.reserved) {
       const reservedAt = pool.reservedAt[nonce];
@@ -402,24 +407,43 @@ export class NonceDO {
       if (reservedAt === undefined) continue;
       // Still within the grace window
       if (now - reservedAt < STALE_THRESHOLD_MS) continue;
-      // Was broadcast -- consumed legitimately, do not reclaim
-      if (this.hasTxidForNonce(nonce)) continue;
-
-      staleNonces.add(nonce);
+      // Was broadcast -- quarantine to spent[] instead of returning to available
+      if (this.hasTxidForNonce(nonce)) {
+        staleWithTxid.add(nonce);
+      } else {
+        staleNonces.add(nonce);
+      }
     }
 
-    if (staleNonces.size === 0) {
+    const totalReclaimed = staleNonces.size + staleWithTxid.size;
+    if (totalReclaimed === 0) {
       return 0;
     }
 
-    // Filter out stale nonces from reserved and return them to available
-    pool.reserved = pool.reserved.filter((n) => !staleNonces.has(n));
+    // Filter all stale nonces from reserved
+    const allStale = new Set([...staleNonces, ...staleWithTxid]);
+    pool.reserved = pool.reserved.filter((n) => !allStale.has(n));
+
+    // Nonces without txid: safe to return to available
     for (const nonce of staleNonces) {
       delete pool.reservedAt[nonce];
       insertSorted(pool.available, nonce);
     }
 
-    return staleNonces.size;
+    // Nonces with txid: quarantine to spent[] — they were broadcast
+    for (const nonce of staleWithTxid) {
+      delete pool.reservedAt[nonce];
+      if (!pool.spent.includes(nonce)) {
+        pool.spent.push(nonce);
+      }
+      this.log("warn", "nonce_quarantined_stale", {
+        nonce,
+        reason: "stale_reservation_with_txid",
+        poolSpent: pool.spent.length,
+      });
+    }
+
+    return totalReclaimed;
   }
 
   /**
@@ -565,6 +589,10 @@ export class NonceDO {
       if (!pool.reservedAt) {
         pool.reservedAt = {};
       }
+      // Backward compat: pools persisted before spent[] was added won't have the field
+      if (!pool.spent) {
+        pool.spent = [];
+      }
       return pool;
     }
 
@@ -575,6 +603,9 @@ export class NonceDO {
         // Migrate to per-wallet key, remove legacy
         if (!legacy.reservedAt) {
           legacy.reservedAt = {};
+        }
+        if (!legacy.spent) {
+          legacy.spent = [];
         }
         await this.state.storage.put(this.poolKey(0), legacy);
         await this.state.storage.delete(POOL_KEY);
@@ -817,6 +848,7 @@ export class NonceDO {
     const pool: PoolState = {
       available,
       reserved: [],
+      spent: [],
       maxNonce: seedNonce + POOL_SEED_SIZE - 1,
       reservedAt: {},
     };
@@ -944,15 +976,34 @@ export class NonceDO {
       delete pool.reservedAt[nonce];
 
       if (!txid) {
-        // Unused nonce: return to available in sorted order
-        insertSorted(pool.available, nonce);
-      } else if (fee && fee !== "0") {
-        // Broadcast succeeded and fee provided — record in wallet stats
-        // (done outside blockConcurrencyWhile to avoid nested blocking, but we call it here
-        //  as part of the same serialized operation)
-        await this.recordWalletFee(walletIndex, fee);
+        // No txid provided: broadcast may have failed. Check if we previously recorded
+        // a txid for this nonce (e.g. a retry scenario). If a txid was ever recorded,
+        // the nonce was broadcast and must go to spent[] — never back to available[].
+        if (this.hasTxidForNonce(nonce)) {
+          // Nonce was broadcast at some point — quarantine it permanently
+          if (!pool.spent.includes(nonce)) {
+            pool.spent.push(nonce);
+          }
+          this.log("warn", "nonce_quarantined", {
+            walletIndex,
+            nonce,
+            reason: "txid_recorded_on_failed_release",
+            poolSpent: pool.spent.length,
+          });
+        } else {
+          // Truly unused nonce (never broadcast): safe to return to available
+          insertSorted(pool.available, nonce);
+        }
+      } else {
+        // txid provided: nonce was broadcast successfully — consumed, not reusable
+        if (!pool.spent.includes(nonce)) {
+          pool.spent.push(nonce);
+        }
+        if (fee && fee !== "0") {
+          // Broadcast succeeded and fee provided — record in wallet stats
+          await this.recordWalletFee(walletIndex, fee);
+        }
       }
-      // If txid is provided but no fee, the nonce is consumed — do not return to available
 
       await this.savePoolForWallet(walletIndex, pool);
 
@@ -963,6 +1014,7 @@ export class NonceDO {
         txid: txid ?? null,
         poolAvailable: pool.available.length,
         poolReserved: pool.reserved.length,
+        poolSpent: pool.spent.length,
       });
     });
   }
@@ -1032,6 +1084,7 @@ export class NonceDO {
         walletIndex: Number(walletIndex),  // explicit integer coercion
         available: pool?.available.length ?? 0,
         reserved: pool?.reserved.length ?? 0,
+        spent: pool?.spent.length ?? 0,
         maxNonce: pool?.maxNonce ?? 0,
         sponsorAddress: address ?? null,
       });
@@ -1277,9 +1330,9 @@ export class NonceDO {
 
   /**
    * Reset pool.available for a specific wallet to a fresh range starting at newHead.
-   * NEVER touches pool.reserved.
-   * Skips any nonce already in pool.reserved[] to prevent available/reserved overlap.
-   * Enforces the invariant: available ∩ reserved = ∅.
+   * NEVER touches pool.reserved or pool.spent.
+   * Skips any nonce already in pool.reserved[] or pool.spent[] to prevent overlap.
+   * Enforces the invariant: available ∩ reserved = ∅ and available ∩ spent = ∅.
    */
   private async resetPoolAvailableForWallet(
     walletIndex: number,
@@ -1287,21 +1340,22 @@ export class NonceDO {
     newHead: number
   ): Promise<void> {
     const availableSlots = Math.max(1, POOL_SEED_SIZE - pool.reserved.length);
-    const reservedSet = new Set(pool.reserved);
+    // Exclude both reserved and spent nonces from the new available range
+    const excludedSet = new Set([...pool.reserved, ...pool.spent]);
     const newAvailable: number[] = [];
     const prevAvailableCount = pool.available.length;
-    // Search up to 2x the seed size beyond newHead to find enough non-reserved slots
+    // Search up to 2x the seed size beyond newHead to find enough non-excluded slots
     const searchLimit = newHead + POOL_SEED_SIZE * 2;
     for (
       let candidate = newHead;
       candidate < searchLimit && newAvailable.length < availableSlots;
       candidate++
     ) {
-      if (!reservedSet.has(candidate)) {
+      if (!excludedSet.has(candidate)) {
         newAvailable.push(candidate);
       }
     }
-    // skipped > 0 means we had to skip reserved nonces to fill available[]
+    // skipped > 0 means we had to skip reserved/spent nonces to fill available[]
     const skipped = availableSlots - newAvailable.length;
     pool.available = newAvailable;
     pool.maxNonce =
@@ -1317,6 +1371,7 @@ export class NonceDO {
       newAvailableCount: newAvailable.length,
       prevAvailableCount,
       reservedCount: pool.reserved.length,
+      spentCount: pool.spent.length,
       skipped,
       maxNonce: pool.maxNonce,
     });
