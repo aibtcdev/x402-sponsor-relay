@@ -1,3 +1,4 @@
+import { deserializeTransaction } from "@stacks/transactions";
 import { BaseEndpoint } from "./BaseEndpoint";
 import {
   SponsorService,
@@ -10,6 +11,7 @@ import {
   releaseNonceDO,
 } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
+import { stripHexPrefix } from "../utils";
 import type { AppContext, RelayRequest, SettlementResult } from "../types";
 import {
   Error400Response,
@@ -318,7 +320,23 @@ export class Relay extends BaseEndpoint {
         sponsorResult.sponsoredTxHex,
         body.settle
       );
+
+      // Deserialize early so we can extract the nonce before broadcast —
+      // needed to release on verify failure (nonce leak fix, see #95)
+      const sponsoredTx = deserializeTransaction(stripHexPrefix(sponsorResult.sponsoredTxHex));
+      const sponsorNonce = extractSponsorNonce(sponsoredTx);
+      // walletIndex from NonceDO assignment — routes release to the correct per-wallet pool
+      const sponsorWalletIndex = sponsorResult.walletIndex;
+
       if (!verifyResult.valid) {
+        // Release the nonce back to the pool — verify failed before broadcast
+        if (sponsorNonce !== null) {
+          c.executionCtx.waitUntil(
+            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
+              logger.warn("Failed to release nonce after verify failure", { error: String(e) });
+            })
+          );
+        }
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         return this.err(c, {
           error: verifyResult.error,
@@ -333,11 +351,6 @@ export class Relay extends BaseEndpoint {
       const broadcastResult = await settlementService.broadcastAndConfirm(
         verifyResult.data.transaction
       );
-
-      // Extract sponsor nonce once — used in both the failure and success paths below
-      const sponsorNonce = extractSponsorNonce(verifyResult.data.transaction);
-      // walletIndex from NonceDO assignment — routes release to the correct per-wallet pool
-      const sponsorWalletIndex = sponsorResult.walletIndex;
 
       if ("error" in broadcastResult) {
         // Release the nonce back to the pool so it can be reused (broadcast failed)
