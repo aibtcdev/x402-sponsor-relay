@@ -504,7 +504,7 @@ export class StatsDO {
     const previous = twoDays[0] ?? null;
     const current = twoDays[1];
 
-    // Token percentages
+    // Token percentages (from today's daily_stats — calendar-day token breakdown)
     const totalTokenTx =
       current.tokens.STX.count +
       current.tokens.sBTC.count +
@@ -512,7 +512,7 @@ export class StatsDO {
     const pct = (count: number) =>
       totalTokenTx > 0 ? Math.round((count / totalTokenTx) * 100) : 0;
 
-    // Fee aggregates
+    // Fee aggregates (from today's daily_stats)
     const currentFees = current.fees ?? { total: "0", count: 0, min: "0", max: "0" };
     const previousFees = previous?.fees ?? { total: "0", count: 0, min: "0", max: "0" };
 
@@ -533,16 +533,26 @@ export class StatsDO {
       else if (pctChange < -5n) feeTrend = "down";
     }
 
+    // Hourly data covers the rolling 24h window (crossing midnight).
+    // Sum it to produce headline totals that match the hourly chart exactly.
     const hourlyData = this.readHourlyData();
+    const rolling = hourlyData.reduce(
+      (acc, h) => ({
+        total: acc.total + h.transactions,
+        success: acc.success + h.success,
+      }),
+      { total: 0, success: 0 }
+    );
+    const rollingFailed = rolling.total - rolling.success;
 
     return {
       period: "24h",
       transactions: {
-        total: current.transactions.total,
-        success: current.transactions.success,
-        failed: current.transactions.failed,
+        total: rolling.total,
+        success: rolling.success,
+        failed: rollingFailed,
         trend: calculateTrend(
-          current.transactions.total,
+          rolling.total,
           previous?.transactions.total ?? 0
         ),
         previousTotal: previous?.transactions.total ?? 0,
