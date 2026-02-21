@@ -20,9 +20,9 @@ Pool vs chain state divergence shows pools 18-19 nonces ahead of confirmed state
 
 ## Status
 
-- [ ] Phase 1 -- Add nonce lifecycle observability (pending)
-- [ ] Phase 2 -- Fix resync to account for mempool state (pending)
-- [ ] Phase 3 -- Guard against pool/chain divergence (pending)
+- [x] Phase 1 -- Add nonce lifecycle observability (implemented)
+- [x] Phase 2 -- Fix resync to account for mempool state (implemented)
+- [x] Phase 3 -- Guard against pool/chain divergence (implemented)
 - [ ] Phase 4 -- Validate and harden under load (pending)
 
 ## Key Files

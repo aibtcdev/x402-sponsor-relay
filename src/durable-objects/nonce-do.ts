@@ -244,10 +244,15 @@ function addMicroSTX(a: string, b: string): string {
   }
 }
 
+/** TTL for cached Hiro next_nonce values used by the lookahead cap guard (ms) */
+const HIRO_NONCE_CACHE_TTL_MS = 30 * 1000;
+
 export class NonceDO {
   private readonly sql: DurableObjectStorage["sql"];
   private readonly state: DurableObjectState;
   private readonly env: Env;
+  /** Per-wallet cache of Hiro possible_next_nonce to avoid redundant API calls */
+  private readonly hiroNonceCache = new Map<number, { value: number; expiresAt: number }>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.state = ctx;
@@ -406,6 +411,23 @@ export class NonceDO {
   }
 
   /**
+   * Batch version of hasTxidForNonce: returns the set of nonces (from the input)
+   * that have at least one txid recorded in nonce_txids.
+   * Uses a single SQL query with WHERE nonce IN (...) for efficiency.
+   */
+  private getNoncesWithTxids(nonces: number[]): Set<number> {
+    if (nonces.length === 0) return new Set();
+    const placeholders = nonces.map(() => "?").join(",");
+    const rows = this.sql
+      .exec<{ nonce: number }>(
+        `SELECT DISTINCT nonce FROM nonce_txids WHERE nonce IN (${placeholders})`,
+        ...nonces
+      )
+      .toArray();
+    return new Set(rows.map((r) => r.nonce));
+  }
+
+  /**
    * Release stale reservations for a wallet pool back to available.
    * A reservation is "stale" when:
    *   - It has been reserved longer than STALE_THRESHOLD_MS (10 minutes), AND
@@ -414,10 +436,9 @@ export class NonceDO {
    * This recovers pool capacity lost to fire-and-forget releaseNonceDO failures.
    * Returns the number of nonces reclaimed (returned to available or quarantined to spent).
    */
-  private cleanStaleReservations(pool: PoolState): number {
+  private cleanStaleReservations(pool: PoolState, walletIndex: number): number {
     const now = Date.now();
-    const staleNonces = new Set<number>();
-    const staleWithTxid = new Set<number>();
+    const staleCandidates: number[] = [];
 
     for (const nonce of pool.reserved) {
       const reservedAt = pool.reservedAt[nonce];
@@ -425,8 +446,17 @@ export class NonceDO {
       if (reservedAt === undefined) continue;
       // Still within the grace window
       if (now - reservedAt < STALE_THRESHOLD_MS) continue;
-      // Was broadcast -- quarantine to spent[] instead of returning to available
-      if (this.hasTxidForNonce(nonce)) {
+      staleCandidates.push(nonce);
+    }
+
+    if (staleCandidates.length === 0) return 0;
+
+    // Batch check which stale nonces have txids recorded
+    const noncesWithTxids = this.getNoncesWithTxids(staleCandidates);
+    const staleNonces = new Set<number>();
+    const staleWithTxid = new Set<number>();
+    for (const nonce of staleCandidates) {
+      if (noncesWithTxids.has(nonce)) {
         staleWithTxid.add(nonce);
       } else {
         staleNonces.add(nonce);
@@ -455,6 +485,7 @@ export class NonceDO {
         pool.spent.push(nonce);
       }
       this.log("warn", "nonce_quarantined_stale", {
+        walletIndex,
         nonce,
         reason: "stale_reservation_with_txid",
         poolSpent: pool.spent.length,
@@ -490,6 +521,26 @@ export class NonceDO {
       }
     }
     return before - pool.reserved.length;
+  }
+
+  /**
+   * Remove confirmed nonces from pool.spent[] for a specific wallet.
+   * Nonces far below last_executed_tx_nonce can never conflict again and are safe to discard.
+   * This prevents spent[] from growing unbounded over the lifetime of the DO.
+   * Returns the count of nonces removed.
+   *
+   * pool is mutated in place but NOT saved here — callers must save if count > 0.
+   */
+  private pruneConfirmedSpent(
+    pool: PoolState,
+    lastExecutedTxNonce: number | null
+  ): number {
+    if (lastExecutedTxNonce === null || pool.spent.length === 0) {
+      return 0;
+    }
+    const before = pool.spent.length;
+    pool.spent = pool.spent.filter((n) => n > lastExecutedTxNonce);
+    return before - pool.spent.length;
   }
 
   /**
@@ -824,8 +875,17 @@ export class NonceDO {
     walletIndex: number,
     address: string
   ): Promise<number | null> {
+    // Check cache first to avoid redundant Hiro API calls during high traffic
+    const cached = this.hiroNonceCache.get(walletIndex);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.value;
+    }
     try {
       const info = await this.fetchNonceInfo(address);
+      this.hiroNonceCache.set(walletIndex, {
+        value: info.possible_next_nonce,
+        expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
+      });
       return info.possible_next_nonce;
     } catch (_e) {
       this.log("debug", "nonce_lookahead_check_skipped", {
@@ -1043,7 +1103,7 @@ export class NonceDO {
         // No txid provided: broadcast may have failed. Check if we previously recorded
         // a txid for this nonce (e.g. a retry scenario). If a txid was ever recorded,
         // the nonce was broadcast and must go to spent[] — never back to available[].
-        if (this.hasTxidForNonce(nonce)) {
+        if (this.getNoncesWithTxids([nonce]).has(nonce)) {
           // Nonce was broadcast at some point — quarantine it permanently
           if (!pool.spent.includes(nonce)) {
             pool.spent.push(nonce);
@@ -1198,15 +1258,18 @@ export class NonceDO {
     // reserved set is accurate when computing available slots.
     const poolForPrune = await this.loadPoolForWallet(walletIndex);
     if (poolForPrune !== null) {
-      const pruned = this.pruneConfirmedReservations(poolForPrune, nonceInfo.last_executed_tx_nonce);
-      if (pruned > 0) {
+      const prunedReserved = this.pruneConfirmedReservations(poolForPrune, nonceInfo.last_executed_tx_nonce);
+      const prunedSpent = this.pruneConfirmedSpent(poolForPrune, nonceInfo.last_executed_tx_nonce);
+      if (prunedReserved > 0 || prunedSpent > 0) {
         await this.savePoolForWallet(walletIndex, poolForPrune);
         this.log("info", "reserved_pruned", {
           walletIndex,
-          pruned,
+          prunedReserved,
+          prunedSpent,
           lastExecutedTxNonce: nonceInfo.last_executed_tx_nonce,
           poolReserved: poolForPrune.reserved.length,
           poolAvailable: poolForPrune.available.length,
+          poolSpent: poolForPrune.spent.length,
         });
       }
     }
@@ -1419,8 +1482,18 @@ export class NonceDO {
         newAvailable.push(candidate);
       }
     }
-    // skipped > 0 means we had to skip reserved/spent nonces to fill available[]
-    const skipped = availableSlots - newAvailable.length;
+    // unfilled > 0 means we couldn't find enough non-excluded candidates within the search limit
+    const unfilled = availableSlots - newAvailable.length;
+    if (unfilled > 0) {
+      this.log("warn", "pool_reset_unfilled", {
+        walletIndex,
+        unfilled,
+        availableSlots,
+        filled: newAvailable.length,
+        excludedCount: excludedSet.size,
+        searchLimit,
+      });
+    }
     pool.available = newAvailable;
     pool.maxNonce =
       newAvailable.length > 0
@@ -1436,7 +1509,7 @@ export class NonceDO {
       prevAvailableCount,
       reservedCount: pool.reserved.length,
       spentCount: pool.spent.length,
-      skipped,
+      unfilled,
       maxNonce: pool.maxNonce,
     });
   }
@@ -1549,7 +1622,7 @@ export class NonceDO {
           // Clean stale reservations: release nonces reserved > 10 min ago with no broadcast
           const pool = await this.loadPoolForWallet(walletIndex);
           if (pool !== null) {
-            const released = this.cleanStaleReservations(pool);
+            const released = this.cleanStaleReservations(pool, walletIndex);
             if (released > 0) {
               await this.savePoolForWallet(walletIndex, pool);
               this.log("info", "stale_reservations_cleaned", { walletIndex, released });
@@ -1570,7 +1643,10 @@ export class NonceDO {
           isActive,
         });
         await this.scheduleAlarm(isActive);
-      } catch (_e) {
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        const stack = error instanceof Error ? error.stack : undefined;
+        this.log("error", "nonce_alarm_failed", { message, stack });
         // Ensure we always reschedule even if the cycle threw an unexpected error
         await this.scheduleAlarm(false);
       }
