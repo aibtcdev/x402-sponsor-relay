@@ -22,6 +22,7 @@ import type {
   BroadcastAndConfirmResult,
 } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import { extractSponsorNonce } from "./sponsor";
 
 // Known SIP-010 token contract addresses
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
@@ -494,6 +495,9 @@ export class SettlementService {
   async broadcastAndConfirm(
     transaction: StacksTransactionWire
   ): Promise<BroadcastAndConfirmResult> {
+    // Extract sponsor nonce once for structured logging in all failure paths
+    const sponsorNonceForLog = extractSponsorNonce(transaction);
+
     // Broadcast to Stacks node via direct fetch to /v2/transactions.
     // Using direct fetch instead of broadcastTransaction() from @stacks/transactions
     // to avoid unhandled throws on non-JSON node responses and gain structured
@@ -598,6 +602,7 @@ export class SettlementService {
           this.logger.warn("Broadcast rejected due to nonce conflict", {
             status: broadcastResponse.status,
             details: conflictDetails,
+            sponsorNonce: sponsorNonceForLog,
           });
           return {
             error: "Nonce conflict",
