@@ -310,6 +310,11 @@ export class Sponsor extends BaseEndpoint {
           );
 
           if (isNonceConflict) {
+            logger.warn("Nonce conflict returned to agent", {
+              sponsorNonce,
+              walletIndex: sponsorWalletIndex,
+              broadcastDetails: errorReason,
+            });
             this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
             return this.err(c, {
               error: "Nonce conflict — resubmit with a new transaction",

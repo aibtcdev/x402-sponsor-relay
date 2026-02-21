@@ -873,6 +873,14 @@ export class NonceDO {
         this.setStoredNonce(pool.available[0] ?? assignedNonce + 1);
       }
 
+      this.log("info", "nonce_assigned", {
+        walletIndex,
+        nonce: assignedNonce,
+        poolAvailable: pool.available.length,
+        poolReserved: pool.reserved.length,
+        maxNonce: pool.maxNonce,
+      });
+
       // Advance round-robin to next wallet
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
@@ -919,6 +927,15 @@ export class NonceDO {
       // If txid is provided but no fee, the nonce is consumed — do not return to available
 
       await this.savePoolForWallet(walletIndex, pool);
+
+      this.log("info", "nonce_released", {
+        walletIndex,
+        nonce,
+        consumed: !!txid,
+        txid: txid ?? null,
+        poolAvailable: pool.available.length,
+        poolReserved: pool.reserved.length,
+      });
     });
   }
 
@@ -1063,6 +1080,17 @@ export class NonceDO {
           await this.resetPoolAvailableForWallet(walletIndex, pool, lowestGap);
         }
 
+        this.log("warn", "nonce_reconcile_gap_recovery", {
+          walletIndex,
+          previousNonce,
+          newNonce: lowestGap,
+          gaps: sortedGaps,
+          hiroNextNonce: possible_next_nonce,
+          hiroMissingNonces: detected_missing_nonces,
+          poolReserved: pool?.reserved.length ?? 0,
+          poolAvailable: pool?.available.length ?? 0,
+        });
+
         return {
           previousNonce,
           newNonce: lowestGap,
@@ -1118,6 +1146,15 @@ export class NonceDO {
         await this.resetPoolAvailableForWallet(walletIndex, poolHead, possible_next_nonce);
       }
 
+      this.log("warn", "nonce_reconcile_forward_bump", {
+        walletIndex,
+        previousNonce: effectivePreviousNonce,
+        newNonce: possible_next_nonce,
+        hiroNextNonce: possible_next_nonce,
+        poolReserved: poolHead?.reserved.length ?? 0,
+        poolAvailable: poolHead?.available.length ?? 0,
+      });
+
       return {
         previousNonce: effectivePreviousNonce,
         newNonce: possible_next_nonce,
@@ -1144,6 +1181,16 @@ export class NonceDO {
       if (poolHead !== null) {
         await this.resetPoolAvailableForWallet(walletIndex, poolHead, possible_next_nonce);
       }
+
+      this.log("warn", "nonce_reconcile_stale", {
+        walletIndex,
+        previousNonce: effectivePreviousNonce,
+        newNonce: possible_next_nonce,
+        idleSeconds: Math.round(idleMs / 1000),
+        hiroNextNonce: possible_next_nonce,
+        poolReserved: poolHead?.reserved.length ?? 0,
+        poolAvailable: poolHead?.available.length ?? 0,
+      });
 
       return {
         previousNonce: effectivePreviousNonce,
