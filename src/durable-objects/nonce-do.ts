@@ -55,6 +55,10 @@ interface WalletFeeStats {
   txCount: number;
   txCountToday: number;
   feesToday: string;
+  /** Cumulative fees paid for gap-fill transactions (microSTX string) */
+  gapFillFeesTotal: string;
+  /** Number of gap-fill transactions broadcast by the alarm for this wallet */
+  gapFillCount: number;
 }
 
 /**
@@ -581,6 +585,31 @@ export class NonceDO {
     return `wallet_tx_today:${walletIndex}:${today}`;
   }
 
+  /** KV key for cumulative gap-fill fee total for a specific wallet */
+  private walletGapFillFeesKey(walletIndex: number): string {
+    return `wallet_gap_fill_fees:${walletIndex}`;
+  }
+
+  /** KV key for cumulative gap-fill tx count for a specific wallet */
+  private walletGapFillCountKey(walletIndex: number): string {
+    return `wallet_gap_fill_count:${walletIndex}`;
+  }
+
+  /**
+   * Record a successful gap-fill transaction fee for a specific wallet.
+   * Increments gap-fill-specific counters separately from sponsored tx fees
+   * so gap-fill costs are distinguishable in per-wallet stats.
+   */
+  private async recordGapFillFee(walletIndex: number, fee: string): Promise<void> {
+    // Update cumulative gap-fill total fees
+    const prevTotal = (await this.state.storage.get<string>(this.walletGapFillFeesKey(walletIndex))) ?? "0";
+    await this.state.storage.put(this.walletGapFillFeesKey(walletIndex), addMicroSTX(prevTotal, fee));
+
+    // Update cumulative gap-fill tx count
+    const prevCount = (await this.state.storage.get<number>(this.walletGapFillCountKey(walletIndex))) ?? 0;
+    await this.state.storage.put(this.walletGapFillCountKey(walletIndex), prevCount + 1);
+  }
+
   /**
    * Record a successful transaction fee for a specific wallet.
    * Increments cumulative total fees, total tx count, and today's counters.
@@ -605,19 +634,23 @@ export class NonceDO {
 
   /**
    * Get fee statistics for a specific wallet.
-   * Returns cumulative totals and today's stats.
+   * Returns cumulative totals, today's stats, and gap-fill breakdown.
    */
   async getWalletFeeStats(walletIndex: number): Promise<WalletFeeStats> {
     const totalFeesSpent = (await this.state.storage.get<string>(this.walletFeesKey(walletIndex))) ?? "0";
     const txCount = (await this.state.storage.get<number>(this.walletTxCountKey(walletIndex))) ?? 0;
     const todayKey = this.walletTxTodayKey(walletIndex);
     const today = (await this.state.storage.get<{ txCount: number; fees: string }>(todayKey)) ?? { txCount: 0, fees: "0" };
+    const gapFillFeesTotal = (await this.state.storage.get<string>(this.walletGapFillFeesKey(walletIndex))) ?? "0";
+    const gapFillCount = (await this.state.storage.get<number>(this.walletGapFillCountKey(walletIndex))) ?? 0;
 
     return {
       totalFeesSpent,
       txCount,
       txCountToday: today.txCount,
       feesToday: today.fees,
+      gapFillFeesTotal,
+      gapFillCount,
     };
   }
 
@@ -1027,6 +1060,8 @@ export class NonceDO {
             );
             this.incrementGapsFilled();
             filled.push(gapNonce);
+            // Record gap-fill fee in per-wallet stats (separate counter for observability)
+            await this.recordGapFillFee(walletIndex, GAP_FILL_FEE.toString());
           }
         }
       }
