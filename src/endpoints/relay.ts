@@ -381,6 +381,11 @@ export class Relay extends BaseEndpoint {
         );
 
         if (broadcastResult.nonceConflict) {
+          logger.warn("Nonce conflict returned to agent", {
+            sponsorNonce,
+            walletIndex: sponsorWalletIndex,
+            broadcastDetails: broadcastResult.details,
+          });
           this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
           return this.err(c, {
             error: "Nonce conflict — resubmit with a new transaction",
