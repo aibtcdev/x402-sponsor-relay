@@ -167,6 +167,16 @@ const POOL_SEED_SIZE = CHAINING_LIMIT;
 const LOOKAHEAD_GUARD_BUFFER = CHAINING_LIMIT;
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
+/**
+ * Alarm interval used when there are in-flight nonces (reserved.length > 0).
+ * Fires at 60s so reconciliation catches conflicts during traffic bursts.
+ */
+const ALARM_INTERVAL_ACTIVE_MS = 60 * 1000;
+/**
+ * Alarm interval used when all wallets are idle (reserved.length === 0).
+ * Reverts to the standard 5-minute cadence to avoid unnecessary Hiro API calls.
+ */
+const ALARM_INTERVAL_IDLE_MS = ALARM_INTERVAL_MS;
 /** Reset to possible_next_nonce if no assignment in this window and we are ahead */
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 /** Maximum number of sponsor wallets supported */
@@ -567,8 +577,14 @@ export class NonceDO {
     }
   }
 
-  private async scheduleAlarm(): Promise<void> {
-    await this.state.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+  /**
+   * Schedule the next alarm.
+   * active=true  → 60s interval (in-flight nonces present, frequent reconciliation needed)
+   * active=false → 5min interval (all wallets idle, normal cadence)
+   */
+  private async scheduleAlarm(active = false): Promise<void> {
+    const intervalMs = active ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
+    await this.state.storage.setAlarm(Date.now() + intervalMs);
   }
 
   // ---------------------------------------------------------------------------
@@ -907,7 +923,8 @@ export class NonceDO {
     return this.state.blockConcurrencyWhile(async () => {
       const currentAlarm = await this.state.storage.getAlarm();
       if (currentAlarm === null) {
-        await this.scheduleAlarm();
+        // Assigning a nonce means we have active traffic — schedule at active interval
+        await this.scheduleAlarm(true);
       }
 
       const effectiveWalletCount = Math.max(1, Math.min(walletCount, MAX_WALLET_COUNT));
@@ -1523,6 +1540,8 @@ export class NonceDO {
     await this.state.blockConcurrencyWhile(async () => {
       try {
         const initializedWallets = await this.getInitializedWallets();
+        let totalReservedAfterCycle = 0;
+
         for (const { walletIndex, address } of initializedWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
           await this.reconcileNonceForWallet(walletIndex, address);
@@ -1535,10 +1554,25 @@ export class NonceDO {
               await this.savePoolForWallet(walletIndex, pool);
               this.log("info", "stale_reservations_cleaned", { walletIndex, released });
             }
+            totalReservedAfterCycle += pool.reserved.length;
           }
         }
-      } finally {
-        await this.scheduleAlarm();
+
+        // Dynamic alarm interval: use active (60s) when any wallet has in-flight nonces,
+        // idle (5min) when all wallets are drained. This ensures rapid reconciliation
+        // during traffic bursts and doesn't hammer Hiro unnecessarily when idle.
+        const isActive = totalReservedAfterCycle > 0;
+        const intervalMs = isActive ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
+        this.log("info", "nonce_alarm_scheduled", {
+          intervalMs,
+          activeWallets: initializedWallets.length,
+          totalReserved: totalReservedAfterCycle,
+          isActive,
+        });
+        await this.scheduleAlarm(isActive);
+      } catch (_e) {
+        // Ensure we always reschedule even if the cycle threw an unexpected error
+        await this.scheduleAlarm(false);
       }
     });
   }
