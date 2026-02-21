@@ -423,6 +423,34 @@ export class NonceDO {
   }
 
   /**
+   * Remove confirmed nonces from pool.reserved[] for a specific wallet.
+   * A nonce is "confirmed" when it is <= Hiro's last_executed_tx_nonce for that wallet,
+   * meaning the transaction was included in a block and can never conflict again.
+   * Returns the count of nonces removed.
+   *
+   * pool is mutated in place but NOT saved here — callers must save if count > 0.
+   * This prevents reserved[] from accumulating indefinitely across alarm cycles.
+   */
+  private pruneConfirmedReservations(
+    pool: PoolState,
+    lastExecutedTxNonce: number | null
+  ): number {
+    if (lastExecutedTxNonce === null || pool.reserved.length === 0) {
+      return 0;
+    }
+    const before = pool.reserved.length;
+    pool.reserved = pool.reserved.filter((n) => n > lastExecutedTxNonce);
+    // Clean up reservedAt entries for pruned nonces
+    for (const key of Object.keys(pool.reservedAt)) {
+      const n = Number(key);
+      if (n <= lastExecutedTxNonce) {
+        delete pool.reservedAt[n];
+      }
+    }
+    return before - pool.reserved.length;
+  }
+
+  /**
    * Derive the private key for a specific wallet index from the mnemonic.
    * Falls back to SPONSOR_PRIVATE_KEY for wallet 0 if no mnemonic is set.
    * Uses the same derivation pattern as SponsorService.deriveSponsorKeyForIndex.
@@ -1047,6 +1075,25 @@ export class NonceDO {
 
     this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
 
+    // Prune confirmed nonces from reserved[] before any pool manipulation.
+    // This keeps reserved[] lean and prevents phantom reservations from accumulating
+    // across alarm cycles. Must happen before resetPoolAvailableForWallet() so the
+    // reserved set is accurate when computing available slots.
+    const poolForPrune = await this.loadPoolForWallet(walletIndex);
+    if (poolForPrune !== null) {
+      const pruned = this.pruneConfirmedReservations(poolForPrune, nonceInfo.last_executed_tx_nonce);
+      if (pruned > 0) {
+        await this.savePoolForWallet(walletIndex, poolForPrune);
+        this.log("info", "reserved_pruned", {
+          walletIndex,
+          pruned,
+          lastExecutedTxNonce: nonceInfo.last_executed_tx_nonce,
+          poolReserved: poolForPrune.reserved.length,
+          poolAvailable: poolForPrune.available.length,
+        });
+      }
+    }
+
     const previousNonce = walletIndex === 0 ? this.getStoredNonce() : null;
 
     if (walletIndex === 0 && previousNonce === null) {
@@ -1231,6 +1278,8 @@ export class NonceDO {
   /**
    * Reset pool.available for a specific wallet to a fresh range starting at newHead.
    * NEVER touches pool.reserved.
+   * Skips any nonce already in pool.reserved[] to prevent available/reserved overlap.
+   * Enforces the invariant: available ∩ reserved = ∅.
    */
   private async resetPoolAvailableForWallet(
     walletIndex: number,
@@ -1238,13 +1287,39 @@ export class NonceDO {
     newHead: number
   ): Promise<void> {
     const availableSlots = Math.max(1, POOL_SEED_SIZE - pool.reserved.length);
+    const reservedSet = new Set(pool.reserved);
     const newAvailable: number[] = [];
-    for (let i = 0; i < availableSlots; i++) {
-      newAvailable.push(newHead + i);
+    const prevAvailableCount = pool.available.length;
+    // Search up to 2x the seed size beyond newHead to find enough non-reserved slots
+    const searchLimit = newHead + POOL_SEED_SIZE * 2;
+    for (
+      let candidate = newHead;
+      candidate < searchLimit && newAvailable.length < availableSlots;
+      candidate++
+    ) {
+      if (!reservedSet.has(candidate)) {
+        newAvailable.push(candidate);
+      }
     }
+    // skipped > 0 means we had to skip reserved nonces to fill available[]
+    const skipped = availableSlots - newAvailable.length;
     pool.available = newAvailable;
-    pool.maxNonce = newHead + availableSlots - 1;
+    pool.maxNonce =
+      newAvailable.length > 0
+        ? newAvailable[newAvailable.length - 1]
+        : newHead + availableSlots - 1;
     await this.savePoolForWallet(walletIndex, pool);
+
+    this.log("info", "pool_available_reset", {
+      walletIndex,
+      newHead,
+      availableSlots,
+      newAvailableCount: newAvailable.length,
+      prevAvailableCount,
+      reservedCount: pool.reserved.length,
+      skipped,
+      maxNonce: pool.maxNonce,
+    });
   }
 
   /**
