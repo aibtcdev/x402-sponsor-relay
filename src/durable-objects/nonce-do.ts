@@ -3,8 +3,25 @@ import {
   broadcastTransaction,
 } from "@stacks/transactions";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
-import type { Env } from "../types";
+import type { Env, LogsRPC } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
+
+const APP_ID = "x402-relay";
+
+/**
+ * Type guard to check if LOGS binding has the required RPC methods.
+ * Mirrors the same guard in src/middleware/logger.ts for use in Durable Objects.
+ */
+function isLogsRPC(logs: unknown): logs is LogsRPC {
+  return (
+    typeof logs === "object" &&
+    logs !== null &&
+    typeof (logs as LogsRPC).info === "function" &&
+    typeof (logs as LogsRPC).warn === "function" &&
+    typeof (logs as LogsRPC).error === "function" &&
+    typeof (logs as LogsRPC).debug === "function"
+  );
+}
 
 interface AssignNonceRequest {
   sponsorAddress: string;
@@ -55,6 +72,10 @@ interface WalletFeeStats {
   txCount: number;
   txCountToday: number;
   feesToday: string;
+  /** Cumulative fees paid for gap-fill transactions (microSTX string) */
+  gapFillFeesTotal: string;
+  /** Number of gap-fill transactions broadcast by the alarm for this wallet */
+  gapFillCount: number;
 }
 
 /**
@@ -266,6 +287,30 @@ export class NonceDO {
     return this.jsonResponse({ error: message }, 500);
   }
 
+  /**
+   * Structured logger for NonceDO events.
+   * Sends to worker-logs RPC binding (env.LOGS) when available; falls back to console.
+   * Uses this.state.waitUntil() to fire-and-forget async RPC calls without blocking.
+   */
+  private log(
+    level: "info" | "warn" | "error" | "debug",
+    message: string,
+    context?: Record<string, unknown>
+  ): void {
+    if (isLogsRPC(this.env.LOGS)) {
+      this.state.waitUntil(this.env.LOGS[level](APP_ID, message, context));
+    } else {
+      const line = context
+        ? `${message} ${JSON.stringify(context)}`
+        : message;
+      if (level === "warn" || level === "error") {
+        console[level](`[${level.toUpperCase()}] ${line}`);
+      } else {
+        console.log(`[${level.toUpperCase()}] ${line}`);
+      }
+    }
+  }
+
   private getStateValue(key: string): number | null {
     const rows = this.sql
       .exec<{ value: number }>(
@@ -445,25 +490,19 @@ export class NonceDO {
         return null;
       }
       // Other rejection — log and continue
-      console.warn(
-        JSON.stringify({
-          action: "gap_fill_rejected",
-          walletIndex,
-          nonce: gapNonce,
-          reason: rejection.reason ?? "unknown",
-          error: rejection.error ?? "",
-        })
-      );
+      this.log("warn", "gap_fill_rejected", {
+        walletIndex,
+        nonce: gapNonce,
+        reason: rejection.reason ?? "unknown",
+        error: rejection.error ?? "",
+      });
       return null;
     } catch (e) {
-      console.warn(
-        JSON.stringify({
-          action: "gap_fill_error",
-          walletIndex,
-          nonce: gapNonce,
-          error: e instanceof Error ? e.message : String(e),
-        })
-      );
+      this.log("warn", "gap_fill_error", {
+        walletIndex,
+        nonce: gapNonce,
+        error: e instanceof Error ? e.message : String(e),
+      });
       return null;
     }
   }
@@ -581,6 +620,31 @@ export class NonceDO {
     return `wallet_tx_today:${walletIndex}:${today}`;
   }
 
+  /** KV key for cumulative gap-fill fee total for a specific wallet */
+  private walletGapFillFeesKey(walletIndex: number): string {
+    return `wallet_gap_fill_fees:${walletIndex}`;
+  }
+
+  /** KV key for cumulative gap-fill tx count for a specific wallet */
+  private walletGapFillCountKey(walletIndex: number): string {
+    return `wallet_gap_fill_count:${walletIndex}`;
+  }
+
+  /**
+   * Record a successful gap-fill transaction fee for a specific wallet.
+   * Increments gap-fill-specific counters separately from sponsored tx fees
+   * so gap-fill costs are distinguishable in per-wallet stats.
+   */
+  private async recordGapFillFee(walletIndex: number, fee: string): Promise<void> {
+    // Update cumulative gap-fill total fees
+    const prevTotal = (await this.state.storage.get<string>(this.walletGapFillFeesKey(walletIndex))) ?? "0";
+    await this.state.storage.put(this.walletGapFillFeesKey(walletIndex), addMicroSTX(prevTotal, fee));
+
+    // Update cumulative gap-fill tx count
+    const prevCount = (await this.state.storage.get<number>(this.walletGapFillCountKey(walletIndex))) ?? 0;
+    await this.state.storage.put(this.walletGapFillCountKey(walletIndex), prevCount + 1);
+  }
+
   /**
    * Record a successful transaction fee for a specific wallet.
    * Increments cumulative total fees, total tx count, and today's counters.
@@ -605,19 +669,23 @@ export class NonceDO {
 
   /**
    * Get fee statistics for a specific wallet.
-   * Returns cumulative totals and today's stats.
+   * Returns cumulative totals, today's stats, and gap-fill breakdown.
    */
   async getWalletFeeStats(walletIndex: number): Promise<WalletFeeStats> {
     const totalFeesSpent = (await this.state.storage.get<string>(this.walletFeesKey(walletIndex))) ?? "0";
     const txCount = (await this.state.storage.get<number>(this.walletTxCountKey(walletIndex))) ?? 0;
     const todayKey = this.walletTxTodayKey(walletIndex);
     const today = (await this.state.storage.get<{ txCount: number; fees: string }>(todayKey)) ?? { txCount: 0, fees: "0" };
+    const gapFillFeesTotal = (await this.state.storage.get<string>(this.walletGapFillFeesKey(walletIndex))) ?? "0";
+    const gapFillCount = (await this.state.storage.get<number>(this.walletGapFillCountKey(walletIndex))) ?? 0;
 
     return {
       totalFeesSpent,
       txCount,
       txCountToday: today.txCount,
       feesToday: today.fees,
+      gapFillFeesTotal,
+      gapFillCount,
     };
   }
 
@@ -677,14 +745,11 @@ export class NonceDO {
     if (pool !== null) {
       const storedAddr = await this.getStoredSponsorAddressForWallet(walletIndex);
       if (storedAddr && storedAddr !== sponsorAddress) {
-        console.log(
-          JSON.stringify({
-            action: "pool_address_changed",
-            walletIndex,
-            oldAddress: storedAddr,
-            newAddress: sponsorAddress,
-          })
-        );
+        this.log("info", "pool_address_changed", {
+          walletIndex,
+          oldAddress: storedAddr,
+          newAddress: sponsorAddress,
+        });
         pool = null;
       }
     }
@@ -919,11 +984,11 @@ export class NonceDO {
     for (const { walletIndex, address } of initializedWallets) {
       const pool = await this.loadPoolForWallet(walletIndex);
       wallets.push({
-        walletIndex,
+        walletIndex: Number(walletIndex),  // explicit integer coercion
         available: pool?.available.length ?? 0,
         reserved: pool?.reserved.length ?? 0,
         maxNonce: pool?.maxNonce ?? 0,
-        sponsorAddress: address,
+        sponsorAddress: address ?? null,
       });
     }
 
@@ -1017,16 +1082,11 @@ export class NonceDO {
         for (const gapNonce of gapsToFill) {
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
           if (txid) {
-            console.log(
-              JSON.stringify({
-                action: "gap_filled",
-                walletIndex,
-                nonce: gapNonce,
-                txid,
-              })
-            );
+            this.log("info", "gap_filled", { walletIndex, nonce: gapNonce, txid });
             this.incrementGapsFilled();
             filled.push(gapNonce);
+            // Record gap-fill fee in per-wallet stats (separate counter for observability)
+            await this.recordGapFillFee(walletIndex, GAP_FILL_FEE.toString());
           }
         }
       }
@@ -1249,13 +1309,7 @@ export class NonceDO {
             const released = this.cleanStaleReservations(pool);
             if (released > 0) {
               await this.savePoolForWallet(walletIndex, pool);
-              console.log(
-                JSON.stringify({
-                  action: "stale_reservations_cleaned",
-                  walletIndex,
-                  released,
-                })
-              );
+              this.log("info", "stale_reservations_cleaned", { walletIndex, released });
             }
           }
         }
@@ -1314,7 +1368,7 @@ export class NonceDO {
         changed: cleared > 0,
         reason,
       };
-      console.log(JSON.stringify(result));
+      this.log("info", "clear_pools", { action: result.action, changed: result.changed, reason: result.reason });
       return this.jsonResponse(result);
     });
   }

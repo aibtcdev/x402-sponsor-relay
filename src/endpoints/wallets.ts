@@ -43,6 +43,8 @@ export class Wallets extends BaseEndpoint {
                       txCount: { type: "number" as const, description: "Total transactions sponsored by this wallet" },
                       txCountToday: { type: "number" as const, description: "Transactions sponsored today (UTC)" },
                       feesToday: { type: "string" as const, description: "Fees paid today in microSTX" },
+                      gapFillFeesTotal: { type: "string" as const, description: "Cumulative fees paid for gap-fill txs in microSTX" },
+                      gapFillCount: { type: "number" as const, description: "Number of gap-fill transactions broadcast for this wallet" },
                       pool: {
                         type: "object" as const,
                         description: "Live nonce pool state",

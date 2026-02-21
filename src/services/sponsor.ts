@@ -790,8 +790,10 @@ export class SponsorService {
     txCount: number;
     txCountToday: number;
     feesToday: string;
+    gapFillFeesTotal: string;
+    gapFillCount: number;
   }> {
-    const empty = { totalFeesSpent: "0", txCount: 0, txCountToday: 0, feesToday: "0" };
+    const empty = { totalFeesSpent: "0", txCount: 0, txCountToday: 0, feesToday: "0", gapFillFeesTotal: "0", gapFillCount: 0 };
     if (!this.env.NONCE_DO) {
       return empty;
     }
@@ -805,10 +807,18 @@ export class SponsorService {
       }
       const data = (await response.json()) as Partial<typeof empty>;
       return {
-        totalFeesSpent: typeof data.totalFeesSpent === "string" ? data.totalFeesSpent : "0",
-        txCount: typeof data.txCount === "number" ? data.txCount : 0,
-        txCountToday: typeof data.txCountToday === "number" ? data.txCountToday : 0,
-        feesToday: typeof data.feesToday === "string" ? data.feesToday : "0",
+        totalFeesSpent: typeof data.totalFeesSpent === "string" && data.totalFeesSpent !== null
+          ? data.totalFeesSpent : "0",
+        txCount: typeof data.txCount === "number" && data.txCount !== null
+          ? data.txCount : 0,
+        txCountToday: typeof data.txCountToday === "number" && data.txCountToday !== null
+          ? data.txCountToday : 0,
+        feesToday: typeof data.feesToday === "string" && data.feesToday !== null
+          ? data.feesToday : "0",
+        gapFillFeesTotal: typeof data.gapFillFeesTotal === "string" && data.gapFillFeesTotal !== null
+          ? data.gapFillFeesTotal : "0",
+        gapFillCount: typeof data.gapFillCount === "number" && data.gapFillCount !== null
+          ? data.gapFillCount : 0,
       };
     } catch (e) {
       this.logger.warn("Failed to fetch wallet fee stats from NonceDO", {
@@ -892,13 +902,15 @@ export class SponsorService {
         const status = this.classifyWalletStatus(balance);
 
         return {
-          index: walletIndex,
+          index: walletIndex,  // integer loop counter, never null
           address,
           balance,
-          totalFeesSpent: feeStats.totalFeesSpent,
-          txCount: feeStats.txCount,
-          txCountToday: feeStats.txCountToday,
-          feesToday: feeStats.feesToday,
+          totalFeesSpent: feeStats.totalFeesSpent ?? "0",
+          txCount: feeStats.txCount ?? 0,
+          txCountToday: feeStats.txCountToday ?? 0,
+          feesToday: feeStats.feesToday ?? "0",
+          gapFillFeesTotal: feeStats.gapFillFeesTotal ?? "0",
+          gapFillCount: feeStats.gapFillCount ?? 0,
           pool,
           status,
         };

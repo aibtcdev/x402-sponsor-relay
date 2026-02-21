@@ -881,6 +881,10 @@ export interface WalletStatus {
   txCountToday: number;
   /** Total fees paid today in microSTX (as string) */
   feesToday: string;
+  /** Cumulative fees paid for gap-fill transactions (microSTX string) */
+  gapFillFeesTotal: string;
+  /** Number of gap-fill transactions broadcast by the alarm for this wallet */
+  gapFillCount: number;
   /** Live nonce pool state */
   pool: {
     available: number;
