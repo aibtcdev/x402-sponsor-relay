@@ -1020,15 +1020,36 @@ export class NonceDO {
       // Store the per-wallet sponsor address (used by alarm reconciliation)
       await this.setStoredSponsorAddressForWallet(walletIndex, resolveAddress(walletIndex));
 
+      // Fetch current Hiro possible_next_nonce (with 30s cache) for stale-head guard.
+      // Also used by lookahead cap guard below. Fail-open: null means Hiro unreachable.
+      const walletAddr = resolveAddress(walletIndex);
+      const hiroNextNonce = await this.fetchNextNonceForWallet(walletIndex, walletAddr);
+
+      // Guard: evict stale nonces from pool head.
+      // Between alarm cycles, confirmed txs advance possible_next_nonce past the
+      // pool head, leaving already-confirmed nonces in available[]. Evict them.
+      if (hiroNextNonce !== null) {
+        while (pool.available.length > 0 && pool.available[0] < hiroNextNonce) {
+          const staleNonce = pool.available.shift()!;
+          this.log("warn", "nonce_stale_evicted_on_assign", {
+            walletIndex,
+            nonce: staleNonce,
+            hiroNextNonce,
+          });
+        }
+      }
+
       // Extend pool if available is exhausted
       if (pool.available.length === 0) {
-        const nextNonce = pool.maxNonce + 1;
+        // Start from the higher of maxNonce+1 and hiroNextNonce to avoid stale extensions
+        let nextNonce = pool.maxNonce + 1;
+        if (hiroNextNonce !== null && nextNonce < hiroNextNonce) {
+          nextNonce = hiroNextNonce;
+        }
         // Lookahead cap guard: refuse to extend the pool past hiroNextNonce + LOOKAHEAD_GUARD_BUFFER.
         // This prevents the pool from running so far ahead of confirmed chain state that a
         // resync would discard a large batch of pre-assigned nonces, causing a sudden gap.
         // Fail-open when Hiro is unreachable: if we can't check, allow the extension.
-        const walletAddr = resolveAddress(walletIndex);
-        const hiroNextNonce = await this.fetchNextNonceForWallet(walletIndex, walletAddr);
         if (hiroNextNonce !== null && nextNonce > hiroNextNonce + LOOKAHEAD_GUARD_BUFFER) {
           this.log("warn", "nonce_lookahead_capped", {
             walletIndex,
@@ -1251,6 +1272,12 @@ export class NonceDO {
     }
 
     this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
+
+    // Populate Hiro nonce cache (used by assignNonce stale-head guard and alarm invariant check)
+    this.hiroNonceCache.set(walletIndex, {
+      value: nonceInfo.possible_next_nonce,
+      expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
+    });
 
     // Prune confirmed nonces from reserved[] before any pool manipulation.
     // This keeps reserved[] lean and prevents phantom reservations from accumulating
@@ -1618,6 +1645,26 @@ export class NonceDO {
         for (const { walletIndex, address } of initializedWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
           await this.reconcileNonceForWallet(walletIndex, address);
+
+          // Pool invariant self-check: evict any available nonce below Hiro's possible_next_nonce.
+          // Catches nonces that became confirmed between alarm cycles (time-window stale heads).
+          const cached = this.hiroNonceCache.get(walletIndex);
+          if (cached) {
+            const invariantPool = await this.loadPoolForWallet(walletIndex);
+            if (invariantPool !== null) {
+              const staleCount = invariantPool.available.filter(n => n < cached.value).length;
+              if (staleCount > 0) {
+                invariantPool.available = invariantPool.available.filter(n => n >= cached.value);
+                await this.savePoolForWallet(walletIndex, invariantPool);
+                this.log("warn", "pool_invariant_violation", {
+                  walletIndex,
+                  staleEvicted: staleCount,
+                  possibleNextNonce: cached.value,
+                  poolAvailable: invariantPool.available.length,
+                });
+              }
+            }
+          }
 
           // Clean stale reservations: release nonces reserved > 10 min ago with no broadcast
           const pool = await this.loadPoolForWallet(walletIndex);
