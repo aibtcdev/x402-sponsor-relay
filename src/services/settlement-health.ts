@@ -3,7 +3,7 @@ import { HealthMonitor } from "./health-monitor";
 import type { HealthStatus } from "./health-monitor";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 
-const HIRO_CHECK_TIMEOUT_MS = 5000;
+const HIRO_CHECK_TIMEOUT_MS = 10000;
 
 /**
  * Service for monitoring native settlement health.

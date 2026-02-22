@@ -247,7 +247,7 @@ function addMicroSTX(a: string, b: string): string {
 /** TTL for cached Hiro next_nonce values used by the lookahead cap guard (ms) */
 const HIRO_NONCE_CACHE_TTL_MS = 30 * 1000;
 /** Timeout for Hiro nonce info fetch requests (ms) */
-const HIRO_NONCE_FETCH_TIMEOUT_MS = 5000;
+const HIRO_NONCE_FETCH_TIMEOUT_MS = 10000;
 
 export class NonceDO {
   private readonly sql: DurableObjectStorage["sql"];

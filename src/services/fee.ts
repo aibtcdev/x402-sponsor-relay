@@ -34,7 +34,7 @@ const CACHE_TTL_SECONDS = 60;
 /**
  * Timeout for Hiro API fee fetch requests (ms)
  */
-const HIRO_FEE_TIMEOUT_MS = 5000;
+const HIRO_FEE_TIMEOUT_MS = 15000;
 
 /**
  * Service for fetching and clamping fee estimates from Hiro API

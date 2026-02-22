@@ -40,11 +40,11 @@ const MAX_POLL_DELAY_MS = 8_000;
 
 // Hiro API timeout configuration
 /** Timeout for broadcast POST to Hiro /v2/transactions (ms) */
-const HIRO_BROADCAST_TIMEOUT_MS = 15_000;
+const HIRO_BROADCAST_TIMEOUT_MS = 20_000;
 /** Timeout for each Hiro poll request during confirmation polling (ms) */
 const HIRO_POLL_TIMEOUT_MS = 10_000;
 /** Timeout for liveness check against Hiro /extended/v1/tx/:txid (ms) */
-const HIRO_LIVENESS_TIMEOUT_MS = 5_000;
+const HIRO_LIVENESS_TIMEOUT_MS = 10_000;
 
 // KV dedup configuration
 const DEDUP_TTL_SECONDS = 300;
