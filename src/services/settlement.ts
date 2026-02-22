@@ -38,6 +38,14 @@ const INITIAL_POLL_DELAY_MS = 2_000;
 const POLL_BACKOFF_FACTOR = 1.5;
 const MAX_POLL_DELAY_MS = 8_000;
 
+// Hiro API timeout configuration
+/** Timeout for broadcast POST to Hiro /v2/transactions (ms) */
+const HIRO_BROADCAST_TIMEOUT_MS = 15_000;
+/** Timeout for each Hiro poll request during confirmation polling (ms) */
+const HIRO_POLL_TIMEOUT_MS = 10_000;
+/** Timeout for liveness check against Hiro /extended/v1/tx/:txid (ms) */
+const HIRO_LIVENESS_TIMEOUT_MS = 5_000;
+
 // KV dedup configuration
 const DEDUP_TTL_SECONDS = 300;
 const DEDUP_KEY_PREFIX = "dedup:";
@@ -546,7 +554,7 @@ export class SettlementService {
         method: "POST",
         headers: broadcastHeaders,
         body: txBytes,
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.timeout(HIRO_BROADCAST_TIMEOUT_MS),
       });
 
       const responseText = await broadcastResponse.text();
@@ -662,7 +670,7 @@ export class SettlementService {
       try {
         const response = await fetch(pollUrl, {
           headers: hiroHeaders,
-          signal: AbortSignal.timeout(10_000),
+          signal: AbortSignal.timeout(HIRO_POLL_TIMEOUT_MS),
         });
 
         if (response.ok) {
@@ -750,7 +758,7 @@ export class SettlementService {
 
       const response = await fetch(url, {
         headers: getHiroHeaders(this.env.HIRO_API_KEY),
-        signal: AbortSignal.timeout(5_000),
+        signal: AbortSignal.timeout(HIRO_LIVENESS_TIMEOUT_MS),
       });
 
       if (response.status === 404) {

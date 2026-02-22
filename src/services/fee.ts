@@ -8,7 +8,7 @@ import type {
   FeePriority,
   FeePriorityTiers,
 } from "../types";
-import { getHiroBaseUrl } from "../utils";
+import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 
 /**
  * Default clamp configuration (code defaults)
@@ -30,6 +30,11 @@ const KV_KEY_RATE_LIMITED = "fee:rate_limited_until";
  * Cache TTL in seconds
  */
 const CACHE_TTL_SECONDS = 60;
+
+/**
+ * Timeout for Hiro API fee fetch requests (ms)
+ */
+const HIRO_FEE_TIMEOUT_MS = 5000;
 
 /**
  * Service for fetching and clamping fee estimates from Hiro API
@@ -175,15 +180,12 @@ export class FeeService {
     const url = `${baseUrl}/extended/v2/mempool/fees`;
 
     try {
-      const headers: Record<string, string> = {};
-      if (this.hiroApiKey) {
-        headers["X-Hiro-API-Key"] = this.hiroApiKey;
-      }
+      const headers = getHiroHeaders(this.hiroApiKey);
 
       this.logger.debug("Fetching fees from Hiro API", { url });
       const response = await fetch(url, {
         headers,
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(HIRO_FEE_TIMEOUT_MS),
       });
 
       if (response.status === 429) {
