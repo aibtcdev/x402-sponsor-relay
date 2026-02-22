@@ -28,8 +28,13 @@ import { extractSponsorNonce } from "./sponsor";
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
 const SBTC_CONTRACT_TESTNET = "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4";
 const SBTC_CONTRACT_NAME = "sbtc-token";
-const USDCX_CONTRACT_MAINNET = "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9";
-const USDCX_CONTRACT_NAME = "token-aeusdc";
+
+// USDCx — two known mainnet contracts that both represent USDC on Stacks
+const USDCX_CIRCLE_CONTRACT_MAINNET = "SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE";
+const USDCX_CIRCLE_CONTRACT_NAME = "usdcx";
+const USDCX_AEUSDC_CONTRACT_MAINNET = "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9";
+const USDCX_AEUSDC_CONTRACT_NAME = "token-aeusdc";
+
 const SIP010_TRANSFER_FUNCTION = "transfer";
 
 // Polling configuration
@@ -200,7 +205,7 @@ export class SettlementService {
     if (contractAddr === SBTC_CONTRACT_MAINNET || contractAddr === SBTC_CONTRACT_TESTNET) {
       return "sBTC";
     }
-    if (contractAddr === USDCX_CONTRACT_MAINNET) {
+    if (contractAddr === USDCX_CIRCLE_CONTRACT_MAINNET || contractAddr === USDCX_AEUSDC_CONTRACT_MAINNET) {
       return "USDCx";
     }
 
@@ -220,7 +225,8 @@ export class SettlementService {
    * Handles:
    * - "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token" → "sBTC" (mainnet)
    * - "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4.sbtc-token"  → "sBTC" (testnet)
-   * - "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9.token-aeusdc" → "USDCx"
+   * - "SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE.usdcx" → "USDCx" (Circle)
+   * - "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9.token-aeusdc" → "USDCx" (Aave aeUSDC)
    */
   private matchBareContractPrincipal(asset: string): TokenType | null {
     const dotIndex = asset.indexOf(".");
@@ -234,7 +240,10 @@ export class SettlementService {
     ) {
       return "sBTC";
     }
-    if (address === USDCX_CONTRACT_MAINNET && contractName === USDCX_CONTRACT_NAME) {
+    if (
+      (address === USDCX_CIRCLE_CONTRACT_MAINNET && contractName === USDCX_CIRCLE_CONTRACT_NAME) ||
+      (address === USDCX_AEUSDC_CONTRACT_MAINNET && contractName === USDCX_AEUSDC_CONTRACT_NAME)
+    ) {
       return "USDCx";
     }
     return null;
@@ -353,14 +362,10 @@ export class SettlementService {
           };
         }
         tokenType = "sBTC";
-      } else if (contractAddressStr === USDCX_CONTRACT_MAINNET) {
-        if (contractNameStr !== USDCX_CONTRACT_NAME) {
-          return {
-            valid: false,
-            error: "Unsupported contract",
-            details: `Expected contract name '${USDCX_CONTRACT_NAME}', got '${contractNameStr}'`,
-          };
-        }
+      } else if (
+        (contractAddressStr === USDCX_CIRCLE_CONTRACT_MAINNET && contractNameStr === USDCX_CIRCLE_CONTRACT_NAME) ||
+        (contractAddressStr === USDCX_AEUSDC_CONTRACT_MAINNET && contractNameStr === USDCX_AEUSDC_CONTRACT_NAME)
+      ) {
         tokenType = "USDCx";
       } else {
         // Reject unknown SIP-010 contracts — only known tokens are supported
