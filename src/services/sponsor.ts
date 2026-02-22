@@ -544,10 +544,13 @@ export class SponsorService {
     try {
       const feeService = new FeeService(this.env, this.logger);
       const feeType = this.payloadToFeeType(transaction.payload.payloadType);
-      fee = await feeService.getFeeForType(feeType, "medium_priority");
+      const { fees, source: feeSource } = await feeService.getEstimates();
+      const feeTiers = fees[feeType] ?? fees.contract_call;
+      fee = feeTiers["medium_priority"];
       this.logger.info("Using clamped fee from FeeService", {
         feeType,
         fee,
+        feeSource,
       });
     } catch (e) {
       // On failure, let @stacks/transactions estimate the fee (fallback)

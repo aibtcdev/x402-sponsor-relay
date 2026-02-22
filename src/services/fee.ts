@@ -252,8 +252,10 @@ export class FeeService {
       this.logger.debug("Fetched fees from Hiro API", { data: resolved });
       return resolved;
     } catch (e) {
+      const isTimeout = e instanceof Error && e.name === "TimeoutError";
       this.logger.error("Error fetching fees from Hiro API", {
         error: e instanceof Error ? e.message : String(e),
+        isTimeout,
       });
       return null;
     }
@@ -350,7 +352,7 @@ export class FeeService {
     }
 
     // Fallback: use floor values from clamp config
-    this.logger.warn("Using default floor-based fees");
+    this.logger.info("Using default floor-based fees", { source: "default" });
     const config = await this.getClampConfig();
     const defaults: FeeEstimates = {
       token_transfer: this.uniformTiers(config.token_transfer.floor),
