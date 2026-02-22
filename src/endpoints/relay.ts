@@ -356,9 +356,11 @@ export class Relay extends BaseEndpoint {
       // Step D — Broadcast and poll for confirmation.
       // Cap poll time to caller's maxTimeoutSeconds so the relay responds
       // before the caller's own timeout fires (avoids 500 empty-body errors).
+      // Reserve 5s for broadcast overhead, sponsoring, and response serialization.
+      const RELAY_OVERHEAD_MS = 5_000;
       const maxPollTimeMs =
         body.settle.maxTimeoutSeconds != null && body.settle.maxTimeoutSeconds > 0
-          ? body.settle.maxTimeoutSeconds * 1000
+          ? Math.max(body.settle.maxTimeoutSeconds * 1000 - RELAY_OVERHEAD_MS, 1_000)
           : undefined;
       const broadcastResult = await settlementService.broadcastAndConfirm(
         verifyResult.data.transaction,
