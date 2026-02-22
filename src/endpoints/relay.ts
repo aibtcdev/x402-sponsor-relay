@@ -79,6 +79,12 @@ export class Relay extends BaseEndpoint {
                       type: "string" as const,
                       description: "HTTP method being used (optional)",
                     },
+                    maxTimeoutSeconds: {
+                      type: "number" as const,
+                      description:
+                        "Maximum timeout in seconds for settlement polling (optional, caps broadcastAndConfirm; default 60s)",
+                      example: 30,
+                    },
                   },
                 },
                 auth: {
@@ -347,9 +353,16 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Step D — Broadcast and poll for confirmation (up to 60s)
+      // Step D — Broadcast and poll for confirmation.
+      // Cap poll time to caller's maxTimeoutSeconds so the relay responds
+      // before the caller's own timeout fires (avoids 500 empty-body errors).
+      const maxPollTimeMs =
+        body.settle.maxTimeoutSeconds != null && body.settle.maxTimeoutSeconds > 0
+          ? body.settle.maxTimeoutSeconds * 1000
+          : undefined;
       const broadcastResult = await settlementService.broadcastAndConfirm(
-        verifyResult.data.transaction
+        verifyResult.data.transaction,
+        maxPollTimeMs
       );
 
       if ("error" in broadcastResult) {

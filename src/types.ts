@@ -375,6 +375,8 @@ export interface SettleOptions {
   resource?: string;
   /** HTTP method being used (optional, for tracking) */
   method?: string;
+  /** Maximum timeout in seconds for settlement (optional, caps broadcastAndConfirm polling) */
+  maxTimeoutSeconds?: number;
 }
 
 // =============================================================================
