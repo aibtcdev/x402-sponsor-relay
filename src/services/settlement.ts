@@ -498,16 +498,28 @@ export class SettlementService {
    * Broadcast a pre-deserialized transaction and poll for confirmation.
    *
    * Polls Hiro API GET /extended/v1/tx/{txid} with exponential backoff:
-   * - Initial delay: 2s, backoff factor: 1.5x, max delay: 8s, max time: 60s
+   * - Initial delay: 2s, backoff factor: 1.5x, max delay: 8s
+   * - Default max time: 60s (configurable via maxPollTimeMs)
    *
    * Returns:
    * - { txid, status: "confirmed", blockHeight } on confirmation
-   * - { txid, status: "pending" } on timeout (60s elapsed)
+   * - { txid, status: "pending" } on timeout
    * - { error, details } on broadcast failure or transaction abort/drop
+   *
+   * @param transaction - Pre-deserialized Stacks transaction
+   * @param maxPollTimeMs - Optional max poll time in ms (default: MAX_POLL_TIME_MS = 60s).
+   *   Callers with shorter upstream timeouts can pass a lower value to get a
+   *   "pending" response before their own timeout fires, avoiding 500 empty-body errors.
    */
   async broadcastAndConfirm(
-    transaction: StacksTransactionWire
+    transaction: StacksTransactionWire,
+    maxPollTimeMs?: number
   ): Promise<BroadcastAndConfirmResult> {
+    // Resolve effective poll time: caller override or default constant
+    const effectivePollTimeMs = maxPollTimeMs != null && maxPollTimeMs > 0
+      ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
+      : MAX_POLL_TIME_MS;
+
     // Extract sponsor nonce once for structured logging in all failure paths
     const sponsorNonceForLog = extractSponsorNonce(transaction);
 
@@ -658,24 +670,31 @@ export class SettlementService {
     while (true) {
       // Check for timeout before sleeping
       const elapsed = Date.now() - startTime;
-      if (elapsed >= MAX_POLL_TIME_MS) {
+      if (elapsed >= effectivePollTimeMs) {
         this.logger.info("Transaction confirmation timeout, returning pending", {
           txid,
           elapsedMs: elapsed,
+          maxPollTimeMs: effectivePollTimeMs,
         });
         return { txid, status: "pending" };
       }
 
-      // Wait before polling (immediate on first iteration)
+      // Wait before polling (immediate on first iteration).
+      // Cap sleep by remaining time so we don't overshoot the budget.
       if (delay > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        const remainingMs = effectivePollTimeMs - (Date.now() - startTime);
+        if (remainingMs <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(delay, remainingMs)));
       }
 
-      // Poll Hiro API
+      // Poll Hiro API. Cap per-request timeout by remaining budget.
       try {
+        const remainingForPoll = effectivePollTimeMs - (Date.now() - startTime);
+        if (remainingForPoll <= 0) break;
+        const pollTimeout = Math.min(HIRO_POLL_TIMEOUT_MS, remainingForPoll);
         const response = await fetch(pollUrl, {
           headers: hiroHeaders,
-          signal: AbortSignal.timeout(HIRO_POLL_TIMEOUT_MS),
+          signal: AbortSignal.timeout(pollTimeout),
         });
 
         if (response.ok) {
@@ -747,6 +766,14 @@ export class SettlementService {
       // Set delay: first iteration starts the backoff series, then exponential growth
       delay = delay === 0 ? INITIAL_POLL_DELAY_MS : Math.min(delay * POLL_BACKOFF_FACTOR, MAX_POLL_DELAY_MS);
     }
+
+    // Reached here via break (remaining time exhausted mid-loop)
+    this.logger.info("Transaction confirmation timeout, returning pending", {
+      txid,
+      elapsedMs: Date.now() - startTime,
+      maxPollTimeMs: effectivePollTimeMs,
+    });
+    return { txid, status: "pending" };
   }
 
   /**

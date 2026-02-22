@@ -218,8 +218,8 @@ export interface X402PaymentRequirementsV2 {
   asset: string;
   /** Recipient Stacks address */
   payTo: string;
-  /** Maximum timeout in seconds for settlement */
-  maxTimeoutSeconds: number;
+  /** Maximum timeout in seconds for settlement (optional) */
+  maxTimeoutSeconds?: number;
   /** Optional extra fields for scheme-specific data */
   extra?: Record<string, unknown>;
 }
@@ -375,6 +375,8 @@ export interface SettleOptions {
   resource?: string;
   /** HTTP method being used (optional, for tracking) */
   method?: string;
+  /** Maximum timeout in seconds for settlement (optional, caps broadcastAndConfirm polling) */
+  maxTimeoutSeconds?: number;
 }
 
 // =============================================================================

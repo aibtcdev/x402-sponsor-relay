@@ -87,6 +87,8 @@ export interface V2ValidatedRequest {
   network: string;
   /** SettlementService instance (reuse for verify/broadcast/dedup) */
   settlementService: SettlementService;
+  /** Max settlement timeout in seconds from paymentRequirements (optional) */
+  maxTimeoutSeconds?: number;
 }
 
 /**
@@ -180,6 +182,12 @@ export function validateV2Request(
     };
   }
 
+  // Extract maxTimeoutSeconds from payment requirements (positive numbers only)
+  const maxTimeoutSeconds =
+    typeof req.maxTimeoutSeconds === "number" && req.maxTimeoutSeconds > 0
+      ? req.maxTimeoutSeconds
+      : undefined;
+
   return {
     valid: true,
     data: {
@@ -191,6 +199,7 @@ export function validateV2Request(
       txHex,
       network,
       settlementService,
+      maxTimeoutSeconds,
     },
   };
 }

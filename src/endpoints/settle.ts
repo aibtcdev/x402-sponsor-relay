@@ -159,9 +159,17 @@ export class Settle extends BaseEndpoint {
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
       }
 
-      // Broadcast and poll for confirmation
+      // Broadcast and poll for confirmation.
+      // Cap poll time to caller's maxTimeoutSeconds (from paymentRequirements)
+      // so the relay responds before the caller's own timeout fires.
+      // Reserve 5s for broadcast overhead and response serialization.
+      const SETTLE_OVERHEAD_MS = 5_000;
+      const maxPollTimeMs = validation.data.maxTimeoutSeconds != null
+        ? Math.max(validation.data.maxTimeoutSeconds * 1000 - SETTLE_OVERHEAD_MS, 1_000)
+        : undefined;
       const broadcastResult = await settlementService.broadcastAndConfirm(
-        verifyResult.data.transaction
+        verifyResult.data.transaction,
+        maxPollTimeMs
       );
 
       if ("error" in broadcastResult) {
