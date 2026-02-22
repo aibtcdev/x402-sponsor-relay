@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.14.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.13.1...x402-sponsor-relay-v1.14.0) (2026-02-22)
+
+
+### Features
+
+* **settlement:** support Circle USDCx contract alongside Aave aeUSDC ([60b0788](https://github.com/aibtcdev/x402-sponsor-relay/commit/60b0788115d9147ab74177712094a876a730eb67))
+* **settlement:** support Circle USDCx contract alongside Aave aeUSDC ([#102](https://github.com/aibtcdev/x402-sponsor-relay/issues/102)) ([60b0788](https://github.com/aibtcdev/x402-sponsor-relay/commit/60b0788115d9147ab74177712094a876a730eb67))
+
 ## [1.13.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.13.0...x402-sponsor-relay-v1.13.1) (2026-02-22)
 
 
