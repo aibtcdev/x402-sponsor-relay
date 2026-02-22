@@ -1029,13 +1029,18 @@ export class NonceDO {
       // Between alarm cycles, confirmed txs advance possible_next_nonce past the
       // pool head, leaving already-confirmed nonces in available[]. Evict them.
       if (hiroNextNonce !== null) {
+        let evicted = false;
         while (pool.available.length > 0 && pool.available[0] < hiroNextNonce) {
           const staleNonce = pool.available.shift()!;
+          evicted = true;
           this.log("warn", "nonce_stale_evicted_on_assign", {
             walletIndex,
             nonce: staleNonce,
             hiroNextNonce,
           });
+        }
+        if (evicted) {
+          await this.savePoolForWallet(walletIndex, pool);
         }
       }
 
@@ -1649,25 +1654,22 @@ export class NonceDO {
           // Pool invariant self-check: evict any available nonce below Hiro's possible_next_nonce.
           // Catches nonces that became confirmed between alarm cycles (time-window stale heads).
           const cached = this.hiroNonceCache.get(walletIndex);
-          if (cached) {
-            const invariantPool = await this.loadPoolForWallet(walletIndex);
-            if (invariantPool !== null) {
-              const staleCount = invariantPool.available.filter(n => n < cached.value).length;
-              if (staleCount > 0) {
-                invariantPool.available = invariantPool.available.filter(n => n >= cached.value);
-                await this.savePoolForWallet(walletIndex, invariantPool);
-                this.log("warn", "pool_invariant_violation", {
-                  walletIndex,
-                  staleEvicted: staleCount,
-                  possibleNextNonce: cached.value,
-                  poolAvailable: invariantPool.available.length,
-                });
-              }
+          let pool = await this.loadPoolForWallet(walletIndex);
+          if (cached && pool !== null) {
+            const staleCount = pool.available.filter(n => n < cached.value).length;
+            if (staleCount > 0) {
+              pool.available = pool.available.filter(n => n >= cached.value);
+              await this.savePoolForWallet(walletIndex, pool);
+              this.log("warn", "pool_invariant_violation", {
+                walletIndex,
+                staleEvicted: staleCount,
+                possibleNextNonce: cached.value,
+                poolAvailable: pool.available.length,
+              });
             }
           }
 
           // Clean stale reservations: release nonces reserved > 10 min ago with no broadcast
-          const pool = await this.loadPoolForWallet(walletIndex);
           if (pool !== null) {
             const released = this.cleanStaleReservations(pool, walletIndex);
             if (released > 0) {
