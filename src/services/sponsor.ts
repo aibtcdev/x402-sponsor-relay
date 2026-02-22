@@ -84,6 +84,11 @@ const NONCE_FETCH_BASE_DELAY_MS = 500;
 /** Cap retry delay at 5s to stay well within Worker request time limits */
 const NONCE_FETCH_MAX_DELAY_MS = 5000;
 
+/** Timeout for Hiro API nonce fetch requests (ms) */
+const HIRO_NONCE_TIMEOUT_MS = 10000;
+/** Timeout for Hiro API wallet balance fetch requests (ms) */
+const HIRO_BALANCE_TIMEOUT_MS = 10000;
+
 /**
  * Error body returned by NonceDO on assignment failure.
  * Shared between fetchNonceFromDO return type and JSON parsing.
@@ -278,7 +283,7 @@ export class SponsorService {
       try {
         const response = await fetch(url, {
           headers,
-          signal: AbortSignal.timeout(5000),
+          signal: AbortSignal.timeout(HIRO_NONCE_TIMEOUT_MS),
         });
 
         if (response.status === 429) {
@@ -539,10 +544,13 @@ export class SponsorService {
     try {
       const feeService = new FeeService(this.env, this.logger);
       const feeType = this.payloadToFeeType(transaction.payload.payloadType);
-      fee = await feeService.getFeeForType(feeType, "medium_priority");
+      const { fees, source: feeSource } = await feeService.getEstimates();
+      const feeTiers = fees[feeType] ?? fees.contract_call;
+      fee = feeTiers["medium_priority"];
       this.logger.info("Using clamped fee from FeeService", {
         feeType,
         fee,
+        feeSource,
       });
     } catch (e) {
       // On failure, let @stacks/transactions estimate the fee (fallback)
@@ -754,7 +762,7 @@ export class SponsorService {
     try {
       const response = await fetch(url, {
         headers,
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(HIRO_BALANCE_TIMEOUT_MS),
       });
       if (!response.ok) {
         this.logger.warn("Hiro account endpoint error for wallet balance", {

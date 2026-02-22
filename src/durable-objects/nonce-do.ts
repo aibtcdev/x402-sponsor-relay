@@ -246,6 +246,8 @@ function addMicroSTX(a: string, b: string): string {
 
 /** TTL for cached Hiro next_nonce values used by the lookahead cap guard (ms) */
 const HIRO_NONCE_CACHE_TTL_MS = 30 * 1000;
+/** Timeout for Hiro nonce info fetch requests (ms) */
+const HIRO_NONCE_FETCH_TIMEOUT_MS = 10000;
 
 export class NonceDO {
   private readonly sql: DurableObjectStorage["sql"];
@@ -843,7 +845,7 @@ export class NonceDO {
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
     const response = await fetch(url, {
       headers,
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
