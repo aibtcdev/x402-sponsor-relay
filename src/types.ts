@@ -357,6 +357,7 @@ export const X402_V2_ERROR_CODES = {
   TRANSACTION_PENDING: "transaction_pending",
   TRANSACTION_FAILED: "transaction_failed",
   BROADCAST_FAILED: "broadcast_failed",
+  CONFLICTING_NONCE: "conflicting_nonce",
 } as const;
 
 /**

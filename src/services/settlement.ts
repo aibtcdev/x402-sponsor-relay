@@ -289,13 +289,19 @@ export class SettlementService {
     try {
       transaction = this.deserializeTx(sponsoredTxHex);
     } catch (e) {
+      // Include relay network in the error details to help callers detect
+      // testnet-vs-mainnet mismatches (#110). A common root cause is building
+      // a transaction for one network and submitting it to the other.
+      const deserializeError = e instanceof Error ? e.message : "Unknown deserialization error";
       this.logger.warn("Failed to deserialize transaction for payment verification", {
-        error: e instanceof Error ? e.message : String(e),
+        error: deserializeError,
+        relayNetwork: this.env.STACKS_NETWORK,
       });
       return {
         valid: false,
         error: "Cannot deserialize transaction",
-        details: e instanceof Error ? e.message : "Unknown deserialization error",
+        details: `${deserializeError} — relay is configured for ${this.env.STACKS_NETWORK}. ` +
+          `Ensure your transaction was built for the correct network.`,
       };
     }
 
@@ -624,11 +630,31 @@ export class SettlementService {
         );
 
         if (isNonceConflict) {
-          this.logger.warn("Broadcast rejected due to nonce conflict", {
-            status: broadcastResponse.status,
-            details: conflictDetails,
-            sponsorNonce: sponsorNonceForLog,
-          });
+          // Include sender identity for attribution (#114).
+          // The signer field is the hash160 of the sender's public key (not a
+          // human-readable address, but sufficient for log correlation).
+          const senderSigner = transaction.auth.spendingCondition.signer;
+          const senderNonce = Number(transaction.auth.spendingCondition.nonce);
+
+          if (sponsorNonceForLog === null) {
+            // No relay-assigned sponsor nonce: this is a client pre-signed tx.
+            // Log at INFO — the nonce conflict is the client's problem, not the relay's.
+            this.logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
+              status: broadcastResponse.status,
+              details: conflictDetails,
+              senderSigner,
+              senderNonce,
+            });
+          } else {
+            // Relay assigned a sponsor nonce: unexpected conflict on relay side.
+            this.logger.warn("Broadcast rejected due to nonce conflict", {
+              status: broadcastResponse.status,
+              details: conflictDetails,
+              sponsorNonce: sponsorNonceForLog,
+              senderSigner,
+              senderNonce,
+            });
+          }
           return {
             error: "Nonce conflict",
             details: conflictDetails,

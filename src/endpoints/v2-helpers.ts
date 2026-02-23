@@ -147,6 +147,20 @@ export function validateV2Request(
     };
   }
 
+  // Validate scheme — this relay only supports "exact" (#109)
+  // Check early so unsupported schemes get INVALID_SCHEME, not a confusing
+  // UNSUPPORTED_SCHEME that looks like an asset mapping failure.
+  if (req.scheme && req.scheme !== "exact") {
+    logger.warn("Unsupported payment scheme", {
+      scheme: req.scheme,
+      supportedSchemes: ["exact"],
+    });
+    return {
+      valid: false,
+      error: { errorReason: X402_V2_ERROR_CODES.INVALID_SCHEME, status: 400 },
+    };
+  }
+
   // Validate network matches relay's configured network
   if (req.network !== network) {
     logger.warn("Network mismatch", {

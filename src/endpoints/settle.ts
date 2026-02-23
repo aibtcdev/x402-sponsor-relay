@@ -5,7 +5,7 @@ import {
   V2_REQUEST_BODY_SCHEMA,
   V2_ERROR_RESPONSE_SCHEMA,
 } from "./v2-helpers";
-import { StatsService, SponsorService } from "../services";
+import { StatsService } from "../services";
 import type { AppContext, X402SettlementResponseV2 } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
@@ -173,29 +173,37 @@ export class Settle extends BaseEndpoint {
       );
 
       if ("error" in broadcastResult) {
-        logger.warn("Broadcast/confirm failed", {
-          error: broadcastResult.error,
-          retryable: broadcastResult.retryable,
-        });
-        // Fire-and-forget — never block the error response
-        c.executionCtx.waitUntil(
-          statsService.logTransaction({
-            timestamp: new Date().toISOString(),
-            endpoint: "settle",
-            success: false,
-            tokenType: settleOptions.tokenType ?? "STX",
-            amount: settleOptions.minAmount,
-            status: "failed",
-          }).catch(() => {})
-        );
         if (broadcastResult.nonceConflict) {
-          const sponsorService = new SponsorService(c.env, logger);
-          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
+          // Client-side nonce conflict: the pre-signed tx had a stale sender nonce.
+          // This is NOT a relay failure — do not record as a failed transaction in
+          // StatsDO (fixes #113). The relay's NonceDO was never involved, so do not
+          // trigger a resync (fixes #116). Log at INFO for attribution (fixes #114).
+          logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
+            error: broadcastResult.error,
+            senderSigner: verifyResult.data.sender,
+          });
+        } else {
+          // Relay-side or network broadcast failure: record as a failed transaction.
+          logger.warn("Broadcast/confirm failed", {
+            error: broadcastResult.error,
+            retryable: broadcastResult.retryable,
+          });
+          // Fire-and-forget — never block the error response
+          c.executionCtx.waitUntil(
+            statsService.logTransaction({
+              timestamp: new Date().toISOString(),
+              endpoint: "settle",
+              success: false,
+              tokenType: settleOptions.tokenType ?? "STX",
+              amount: settleOptions.minAmount,
+              status: "failed",
+            }).catch(() => {})
+          );
         }
 
         let errorReason: string;
         if (broadcastResult.nonceConflict) {
-          errorReason = "conflicting_nonce";
+          errorReason = X402_V2_ERROR_CODES.CONFLICTING_NONCE;
         } else if (broadcastResult.retryable) {
           errorReason = X402_V2_ERROR_CODES.BROADCAST_FAILED;
         } else {
