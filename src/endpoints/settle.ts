@@ -203,7 +203,7 @@ export class Settle extends BaseEndpoint {
 
         let errorReason: string;
         if (broadcastResult.nonceConflict) {
-          errorReason = "conflicting_nonce";
+          errorReason = X402_V2_ERROR_CODES.CONFLICTING_NONCE;
         } else if (broadcastResult.retryable) {
           errorReason = X402_V2_ERROR_CODES.BROADCAST_FAILED;
         } else {
