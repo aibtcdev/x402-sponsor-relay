@@ -630,11 +630,31 @@ export class SettlementService {
         );
 
         if (isNonceConflict) {
-          this.logger.warn("Broadcast rejected due to nonce conflict", {
-            status: broadcastResponse.status,
-            details: conflictDetails,
-            sponsorNonce: sponsorNonceForLog,
-          });
+          // Include sender identity for attribution (#114).
+          // The signer field is the hash160 of the sender's public key (not a
+          // human-readable address, but sufficient for log correlation).
+          const senderSigner = transaction.auth.spendingCondition.signer;
+          const senderNonce = Number(transaction.auth.spendingCondition.nonce);
+
+          if (sponsorNonceForLog === null) {
+            // No relay-assigned sponsor nonce: this is a client pre-signed tx.
+            // Log at INFO — the nonce conflict is the client's problem, not the relay's.
+            this.logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
+              status: broadcastResponse.status,
+              details: conflictDetails,
+              senderSigner,
+              senderNonce,
+            });
+          } else {
+            // Relay assigned a sponsor nonce: unexpected conflict on relay side.
+            this.logger.warn("Broadcast rejected due to nonce conflict", {
+              status: broadcastResponse.status,
+              details: conflictDetails,
+              sponsorNonce: sponsorNonceForLog,
+              senderSigner,
+              senderNonce,
+            });
+          }
           return {
             error: "Nonce conflict",
             details: conflictDetails,
