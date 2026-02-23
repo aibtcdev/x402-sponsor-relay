@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.14.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.14.0...x402-sponsor-relay-v1.14.1) (2026-02-23)
+
+
+### Bug Fixes
+
+* **settlement:** pass maxTimeoutSeconds through to broadcastAndConfirm ([88354d7](https://github.com/aibtcdev/x402-sponsor-relay/commit/88354d7b0ea78e8f8ee13ddf6b9e7ea48a9462a7)), closes [#105](https://github.com/aibtcdev/x402-sponsor-relay/issues/105)
+* **settlement:** pass maxTimeoutSeconds through to broadcastAndConfirm ([#106](https://github.com/aibtcdev/x402-sponsor-relay/issues/106)) ([88354d7](https://github.com/aibtcdev/x402-sponsor-relay/commit/88354d7b0ea78e8f8ee13ddf6b9e7ea48a9462a7))
+* **settle:** silence BadNonce burst noise and relay error audit ([#117](https://github.com/aibtcdev/x402-sponsor-relay/issues/117)) ([a508266](https://github.com/aibtcdev/x402-sponsor-relay/commit/a508266ecd0b2164a897dd70578881da7591472c))
+
 ## [1.14.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.13.1...x402-sponsor-relay-v1.14.0) (2026-02-22)
 
 
