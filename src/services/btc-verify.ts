@@ -219,7 +219,11 @@ export class BtcVerifyService {
       return { verified };
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Unknown error";
-      this.logger.error("Low-level signature verification error", { error: reason, address });
+      // Log at WARN, not ERROR: exceptions here are expected for unsupported formats
+      // (e.g. native SegWit / P2WPKH addresses with BIP-322 signatures, which most
+      // wallets produce). These are not internal errors; they are recoverable user
+      // errors with a clear error message surfaced to the caller (#112).
+      this.logger.warn("Low-level signature verification error", { error: reason, address });
       return { verified: false, reason };
     }
   }
