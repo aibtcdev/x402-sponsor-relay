@@ -289,13 +289,19 @@ export class SettlementService {
     try {
       transaction = this.deserializeTx(sponsoredTxHex);
     } catch (e) {
+      // Include relay network in the error details to help callers detect
+      // testnet-vs-mainnet mismatches (#110). A common root cause is building
+      // a transaction for one network and submitting it to the other.
+      const deserializeError = e instanceof Error ? e.message : "Unknown deserialization error";
       this.logger.warn("Failed to deserialize transaction for payment verification", {
-        error: e instanceof Error ? e.message : String(e),
+        error: deserializeError,
+        relayNetwork: this.env.STACKS_NETWORK,
       });
       return {
         valid: false,
         error: "Cannot deserialize transaction",
-        details: e instanceof Error ? e.message : "Unknown deserialization error",
+        details: `${deserializeError} — relay is configured for ${this.env.STACKS_NETWORK}. ` +
+          `Ensure your transaction was built for the correct network.`,
       };
     }
 
