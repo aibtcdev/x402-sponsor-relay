@@ -70,11 +70,11 @@ Use this relay when your agent needs to:
 API keys are required for POST /sponsor. Provision one for free by proving
 ownership of a Bitcoin or Stacks address — no sBTC or STX required.
 
-### Via Bitcoin signature (BIP-137):
+### Via Bitcoin signature (BIP-137 / BIP-322):
 POST https://x402-relay.aibtc.com/keys/provision
 {
   "btcAddress": "bc1q...",
-  "signature": "<base64 BIP-137 sig>",
+  "signature": "<base64 BIP-322 sig>",  // BIP-322 for bc1q/bc1p, BIP-137 for 1.../3...
   "message": "Bitcoin will be the currency of AIs | <ISO-8601 timestamp>"
 }
 
@@ -328,7 +328,13 @@ Content-Type: application/json
 ## POST /keys/provision — Provision API Key via Bitcoin Signature
 
 Provision a free-tier API key by proving ownership of a Bitcoin address
-using BIP-137 signature verification. No prior authentication required.
+using BIP-137 or BIP-322 signature verification. No prior authentication required.
+
+All Bitcoin address formats are supported:
+- P2PKH (1...): BIP-137 signature (most wallets, legacy)
+- P2SH (3...): BIP-137 signature (wrapped SegWit wallets)
+- P2WPKH (bc1q...): BIP-322 "simple" ECDSA signature (native SegWit wallets)
+- P2TR (bc1p...): BIP-322 "simple" Schnorr signature (Taproot wallets)
 
 ### Two Signing Paths
 
@@ -345,12 +351,9 @@ Content-Type: application/json
 
 {
   "btcAddress": "bc1q...",
-  "signature": "<base64 BIP-137 sig>",
+  "signature": "<base64 BIP-322 sig>",  // BIP-322 for bc1q/bc1p, BIP-137 for 1.../3...
   "message": "Bitcoin will be the currency of AIs | 2026-02-16T12:00:00.000Z"
 }
-
-Accepts any Bitcoin address format: P2PKH (1...), P2SH (3...), Bech32 (bc1q...),
-Taproot (bc1p...).
 
 ### Success Response (200)
 
@@ -375,7 +378,7 @@ Taproot (bc1p...).
 - 400 MISSING_BTC_ADDRESS — invalid or absent btcAddress
 - 400 MISSING_SIGNATURE — signature absent
 - 400 INVALID_MESSAGE_FORMAT — message absent or malformed
-- 400 INVALID_SIGNATURE — BIP-137 verification failed
+- 400 INVALID_SIGNATURE — BIP-137/BIP-322 signature verification failed
 - 400 STALE_TIMESTAMP — timestamp older than 5 minutes
 - 409 ALREADY_PROVISIONED — this BTC address already has a key
 - 500 INTERNAL_ERROR — storage error, retryable: true
@@ -827,7 +830,7 @@ discovery.get("/topics", (c) => {
     {
       topic: "api-keys",
       description:
-        "API key provisioning via BTC signature (BIP-137) or STX signature (RSV hex). Key tiers, expiry, and management.",
+        "API key provisioning via BTC signature (BIP-137/BIP-322 for all address types) or STX signature (RSV hex). Key tiers, expiry, and management.",
       url: `${baseUrl}/topics/api-keys`,
     },
     {
@@ -1032,7 +1035,8 @@ Key format: x402_sk_<env>_<32-char-hex>
 
 ## Provisioning via Bitcoin Signature
 
-POST /keys/provision accepts a BIP-137 signature over a known message.
+POST /keys/provision accepts a BIP-137 or BIP-322 signature over a known message.
+Signature format is auto-detected based on address type.
 
 ### Message formats
 
@@ -1051,15 +1055,15 @@ Content-Type: application/json
 
 {
   "btcAddress": "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
-  "signature": "H9L5yLFjti0QTHhPyFrZCT1V...",   // base64 BIP-137
+  "signature": "H9L5yLFjti0QTHhPyFrZCT1V...",   // base64 BIP-322 (bc1q/bc1p) or BIP-137 (1.../3...)
   "message": "Bitcoin will be the currency of AIs | 2026-02-16T12:00:00.000Z"
 }
 
-Accepted address formats:
-- P2PKH: 1...  (legacy)
-- P2SH:  3...  (wrapped segwit)
-- Bech32: bc1q...  (native segwit)
-- Bech32m: bc1p...  (taproot)
+Accepted address formats and signature types:
+- P2PKH: 1...  (legacy, BIP-137)
+- P2SH:  3...  (wrapped segwit, BIP-137)
+- P2WPKH: bc1q...  (native segwit, BIP-322 ECDSA)
+- P2TR: bc1p...  (taproot, BIP-322 Schnorr)
 
 ### Response
 
@@ -1314,7 +1318,7 @@ All errors return JSON with this shape:
 | MISSING_STX_ADDRESS   | 400  | false     | stxAddress absent |
 | MISSING_SIGNATURE     | 400  | false     | signature absent |
 | INVALID_MESSAGE_FORMAT| 400  | false     | message absent or wrong format |
-| INVALID_SIGNATURE     | 400  | false     | BIP-137 signature verification failed |
+| INVALID_SIGNATURE     | 400  | false     | BIP-137/BIP-322 signature verification failed |
 | INVALID_STX_SIGNATURE | 400  | false     | Stacks RSV sig verification failed |
 | STALE_TIMESTAMP       | 400  | false     | timestamp > 5 minutes from server time |
 | ALREADY_PROVISIONED   | 409  | false     | this address already has a key |
@@ -1716,7 +1720,9 @@ discovery.get("/.well-known/agent.json", (c) => {
         id: "provision-api-key",
         name: "Provision API Key",
         description:
-          "Get a free-tier API key for POST /sponsor by signing a known message with your Bitcoin key (BIP-137). " +
+          "Get a free-tier API key for POST /sponsor by signing a known message with your Bitcoin key. " +
+          "Supports all address types: P2PKH (1...) and P2SH (3...) use BIP-137; " +
+          "native SegWit (bc1q...) and Taproot (bc1p...) use BIP-322. " +
           "POST /keys/provision with { btcAddress, signature, message }. " +
           "Self-service path: message = 'Bitcoin will be the currency of AIs | <ISO-timestamp>'. " +
           "Also available via Stacks signature: POST /keys/provision-stx. " +

@@ -80,7 +80,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /openapi.json` - OpenAPI specification
 - `POST /relay` - Submit sponsored transaction for native settlement (verify locally + broadcast + poll, optional SIP-018 auth)
 - `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key, optional SIP-018 auth)
-- `POST /keys/provision` - Provision API key via Bitcoin signature (BIP-137)
+- `POST /keys/provision` - Provision API key via Bitcoin signature (BIP-137/BIP-322)
 - `POST /keys/provision-stx` - Provision API key via Stacks signature
 - `GET /verify/:receiptId` - Verify a payment receipt
 - `POST /access` - Access protected resource with receipt token
@@ -217,7 +217,7 @@ Response (success): {
 // POST /keys/provision (no authentication required)
 Request: {
   btcAddress: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
-  signature: "H9L5yLFj...",  // Base64-encoded BIP-137 signature
+  signature: "H9L5yLFj...",  // Base64-encoded BIP-137 or BIP-322 signature
   message: "Bitcoin will be the currency of AIs"  // or with timestamp for self-service
 }
 
@@ -418,12 +418,12 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
 - `src/endpoints/supported.ts` - x402 V2 supported payment kinds (spec section 7.3)
 - `src/endpoints/verify-receipt.ts` - Receipt verification endpoint (GET /verify/:receiptId)
 - `src/endpoints/access.ts` - Protected resource access endpoint
-- `src/endpoints/provision.ts` - API key provisioning via BTC signature (BIP-137)
+- `src/endpoints/provision.ts` - API key provisioning via BTC signature (BIP-137/BIP-322)
 - `src/endpoints/provision-stx.ts` - API key provisioning via Stacks signature
 - `src/endpoints/fees.ts` - Fee estimation endpoint (public, no auth)
 - `src/endpoints/fees-config.ts` - Fee clamp configuration endpoint (admin, API key auth)
 - `src/services/receipt.ts` - ReceiptService (store/retrieve/consume receipts in KV)
-- `src/services/btc-verify.ts` - BtcVerifyService (BIP-137 signature verification)
+- `src/services/btc-verify.ts` - BtcVerifyService (BIP-137/BIP-322 signature verification)
 - `src/services/stx-verify.ts` - StxVerifyService (plain message + SIP-018 signature verification)
 - `src/services/auth.ts` - AuthService (API key management and provisioning)
 - `src/services/fee.ts` - FeeService (fetch/clamp/cache fee estimates from Hiro API)
