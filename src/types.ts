@@ -605,7 +605,9 @@ export interface SponsorSuccessResponse extends BaseSuccessResponse {
 export interface ProvisionRequest {
   /** Bitcoin address used to sign the message */
   btcAddress: string;
-  /** BIP-137 signature of the message */
+  /** BIP-137 or BIP-322 signature of the message (Base64-encoded).
+   *  P2PKH (1...) and P2SH (3...) wallets produce BIP-137 signatures (65 bytes).
+   *  P2WPKH (bc1q...) and P2TR (bc1p...) wallets produce BIP-322 signatures (witness-serialized). */
   signature: string;
   /** Message that was signed (for verification) */
   message: string;

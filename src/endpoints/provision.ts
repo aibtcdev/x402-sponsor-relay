@@ -15,12 +15,16 @@ const BTC_ADDRESS_REGEX =
  * Provision endpoint - programmatic API key provisioning via BTC signature
  * POST /keys/provision
  *
- * Accepts btcAddress + signature + message, verifies BIP-137 signature,
+ * Accepts btcAddress + signature + message, verifies BIP-137 or BIP-322 signature,
  * and provisions a free-tier API key with 30-day expiration.
  *
  * Two paths:
  * 1. Registration: message = "Bitcoin will be the currency of AIs" (no timestamp)
  * 2. Self-service: message = "Bitcoin will be the currency of AIs | {ISO-timestamp}" (must be within 5 min)
+ *
+ * Signature format is auto-detected by address type:
+ * - P2PKH (1...) and P2SH (3...): BIP-137 (65-byte, Base64-encoded)
+ * - P2WPKH (bc1q...) and P2TR (bc1p...): BIP-322 "simple" (witness-serialized, Base64-encoded)
  *
  * Returns HTTP 409 if BTC address already has a key.
  */
@@ -29,7 +33,9 @@ export class Provision extends BaseEndpoint {
     tags: ["Provision"],
     summary: "Provision an API key via Bitcoin signature",
     description:
-      "Self-provision a free-tier API key by proving Bitcoin address ownership via BIP-137 signature verification. " +
+      "Self-provision a free-tier API key by proving Bitcoin address ownership via BIP-137 or BIP-322 signature verification. " +
+      "All Bitcoin address formats are supported: P2PKH (1...) and P2SH (3...) use BIP-137; " +
+      "native SegWit (bc1q...) and Taproot (bc1p...) use BIP-322 'simple' format. " +
       "Supports two paths: Registration (bare message 'Bitcoin will be the currency of AIs') and Self-service " +
       "(message with timestamp within 5 minutes). Returns HTTP 409 if BTC address already has a provisioned key.",
     request: {
@@ -43,15 +49,19 @@ export class Provision extends BaseEndpoint {
                 btcAddress: {
                   type: "string" as const,
                   description:
-                    "Bitcoin address used to sign the message. Best support: P2PKH (1...) and " +
-                    "P2SH-P2WPKH (3...). Native SegWit (bc1q...) may work with wallets that implement " +
-                    "BIP-137 SegWit extensions (e.g. Electrum, Sparrow). Taproot (bc1p...) is not " +
-                    "supported. For Stacks addresses, use POST /keys/provision-stx instead.",
+                    "Bitcoin address used to sign the message. All formats supported: " +
+                    "P2PKH (1...) and P2SH (3...) use BIP-137 signatures; " +
+                    "native SegWit (bc1q...) uses BIP-322 ECDSA signatures; " +
+                    "Taproot (bc1p...) uses BIP-322 Schnorr signatures. " +
+                    "For Stacks addresses, use POST /keys/provision-stx instead.",
                   example: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
                 },
                 signature: {
                   type: "string" as const,
-                  description: "Base64-encoded BIP-137 signature of the message",
+                  description:
+                    "Base64-encoded BIP-137 or BIP-322 signature of the message. " +
+                    "P2PKH/P2SH wallets produce BIP-137 (65 bytes). " +
+                    "P2WPKH/P2TR wallets produce BIP-322 'simple' witness-serialized format.",
                   example: "H9L5yLFjti0QTHhPyFrZCT1V/MMnBtXKmoiKDZ78NDBjERki6ZTQZdSMCtkgoNmp17By9ItJr8o7ChX0XxY91nk=",
                 },
                 message: {
@@ -149,7 +159,7 @@ export class Provision extends BaseEndpoint {
       // Validate BTC address format (P2PKH, P2SH, Bech32, Bech32m)
       if (!BTC_ADDRESS_REGEX.test(body.btcAddress)) {
         return this.err(c, {
-          error: "Invalid Bitcoin address format. Supported: P2PKH (1...), P2SH (3...), native SegWit (bc1q.../tb1q...). Taproot (bc1p...) is not supported — use POST /keys/provision-stx instead.",
+          error: "Invalid Bitcoin address format. Supported: P2PKH (1...), P2SH (3...), native SegWit (bc1q.../tb1q...), Taproot (bc1p.../tb1p...). For Stacks addresses, use POST /keys/provision-stx instead.",
           code: "INVALID_BTC_ADDRESS",
           status: 400,
           retryable: false,
