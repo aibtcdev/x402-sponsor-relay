@@ -26,6 +26,8 @@
     "wrangler": "^4.58.0"
   },
   "dependencies": {
+    "@noble/curves": "^2.0.1",
+    "@scure/btc-signer": "^2.0.1",
     "@stacks/common": "^7.3.1",
     "@stacks/encryption": "^7.3.1",
     "@stacks/transactions": "^7.3.1",
