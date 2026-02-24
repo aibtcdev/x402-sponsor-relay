@@ -98,18 +98,20 @@ function signBip137(message: string, privateKey: Uint8Array): string {
   const formattedMessage = formatBitcoinMessage(message);
   const messageHash = doubleSha256(formattedMessage);
 
-  // Sign and get recovery info
-  const sig = secp256k1.sign(messageHash, privateKey, { lowS: true });
-  const recoveryId = sig.recovery;
+  // Sign with { format: 'recovered' } to get 65-byte output: [recoveryId, r(32), s(32)]
+  // @noble/curves v2 sign() returns compact bytes by default (no recovery).
+  // prehash: false because messageHash is already the double-SHA256 of the formatted message.
+  // The 'recovered' format prepends the recovery bit as the first byte.
+  const sigRecovered = secp256k1.sign(messageHash, privateKey, { lowS: true, prehash: false, format: 'recovered' });
+  const recoveryId = sigRecovered[0]; // first byte is recovery ID (0 or 1)
 
   // BIP-137 header byte for P2PKH compressed = 31 + recoveryId
   const header = 31 + recoveryId;
 
   const sigBytes = new Uint8Array(65);
   sigBytes[0] = header;
-  const rawSig = sig.toCompactRawBytes();
-  sigBytes.set(rawSig.slice(0, 32), 1);  // r
-  sigBytes.set(rawSig.slice(32, 64), 33); // s
+  sigBytes.set(sigRecovered.slice(1, 33), 1);  // r (bytes 1-32 of recovered sig)
+  sigBytes.set(sigRecovered.slice(33, 65), 33); // s (bytes 33-64 of recovered sig)
 
   return Buffer.from(sigBytes).toString("base64");
 }
@@ -152,12 +154,20 @@ function bip322BuildToSpendTxId(message: string, scriptPubKey: Uint8Array): Uint
 function signBip322(message: string, privateKey: Uint8Array, scriptPubKey: Uint8Array): string {
   const toSpendTxid = bip322BuildToSpendTxId(message, scriptPubKey);
 
-  const toSignTx = new Transaction({ version: 0, lockTime: 0 });
+  // allowUnknownOutputs: true required for OP_RETURN output in BIP-322 virtual transactions.
+  const toSignTx = new Transaction({ version: 0, lockTime: 0, allowUnknownOutputs: true });
+
+  // For P2TR (OP_1 <32-byte x-only pubkey>), signIdx requires tapInternalKey on the input.
+  // Detect P2TR by script format: [0x51, 0x20, ...32 bytes] = OP_1 OP_PUSH32 <x-only-pubkey>
+  const isP2TR = scriptPubKey[0] === 0x51 && scriptPubKey[1] === 0x20 && scriptPubKey.length === 34;
+  const tapInternalKey = isP2TR ? scriptPubKey.slice(2) : undefined;
+
   toSignTx.addInput({
     txid: toSpendTxid,
     index: 0,
     sequence: 0,
     witnessUtxo: { amount: 0n, script: scriptPubKey },
+    ...(tapInternalKey && { tapInternalKey }),
   });
   toSignTx.addOutput({ script: Script.encode(["RETURN"]), amount: 0n });
 
