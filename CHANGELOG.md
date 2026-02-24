@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.15.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.14.1...x402-sponsor-relay-v1.15.0) (2026-02-24)
+
+
+### Features
+
+* **btc-verify:** add BIP-322 support and migrate to pure JS crypto ([#118](https://github.com/aibtcdev/x402-sponsor-relay/issues/118)) ([dfe252b](https://github.com/aibtcdev/x402-sponsor-relay/commit/dfe252b4d63cb27a86ea455bb0f8afeafc799d92))
+
 ## [1.14.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.14.0...x402-sponsor-relay-v1.14.1) (2026-02-23)
 
 
