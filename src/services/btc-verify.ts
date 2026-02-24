@@ -11,7 +11,9 @@ import {
   RawTx,
   Address,
   NETWORK as BTC_MAINNET,
+  TEST_NETWORK as BTC_TESTNET,
 } from "@scure/btc-signer";
+import type { BTC_NETWORK } from "@scure/btc-signer/utils.js";
 import { hashSha256Sync } from "@stacks/encryption";
 import type { Logger } from "../types";
 
@@ -55,6 +57,24 @@ export function detectAddressType(address: string): BtcAddressType {
   if (address.startsWith("bc1q") || address.startsWith("tb1q")) return "P2WPKH";
   if (address.startsWith("bc1p") || address.startsWith("tb1p")) return "P2TR";
   return "unknown";
+}
+
+/**
+ * Detect the Bitcoin network from an address prefix.
+ * - bc1q, bc1p, 1, 3 → mainnet
+ * - tb1q, tb1p, m, n, 2 → testnet
+ */
+function detectBtcNetwork(address: string): BTC_NETWORK {
+  if (
+    address.startsWith("tb1q") ||
+    address.startsWith("tb1p") ||
+    address.startsWith("m") ||
+    address.startsWith("n") ||
+    address.startsWith("2")
+  ) {
+    return BTC_TESTNET;
+  }
+  return BTC_MAINNET;
 }
 
 /**
@@ -157,17 +177,19 @@ function parseDERSignature(der: Uint8Array): Uint8Array {
   if (der[pos] !== 0x02) throw new Error("parseDERSignature: expected 0x02 for r");
   pos++;
   const rLen = der[pos++];
+  if (pos + rLen > der.length) throw new Error("parseDERSignature: r extends beyond signature");
   // Strip optional leading 0x00 padding byte (added when high bit is set)
   const rBytes = der.slice(rLen === 33 ? pos + 1 : pos, pos + rLen);
   pos += rLen;
   if (der[pos] !== 0x02) throw new Error("parseDERSignature: expected 0x02 for s");
   pos++;
   const sLen = der[pos++];
+  if (pos + sLen > der.length) throw new Error("parseDERSignature: s extends beyond signature");
   const sBytes = der.slice(sLen === 33 ? pos + 1 : pos, pos + sLen);
 
   const compact = new Uint8Array(64);
-  compact.set(rBytes.slice(-32), 0);  // r (last 32 bytes, in case rLen < 32)
-  compact.set(sBytes.slice(-32), 32); // s (last 32 bytes)
+  compact.set(rBytes, 32 - rBytes.length);  // left-pad r
+  compact.set(sBytes, 64 - sBytes.length);  // left-pad s
   return compact;
 }
 
@@ -259,17 +281,18 @@ function verifyBip137(address: string, message: string, signatureBase64: string)
   // 35-38: P2SH-P2WPKH (wrapped SegWit) → p2sh(p2wpkh(...))
   // 39-42: P2WPKH native SegWit
   try {
+    const network = detectBtcNetwork(address);
     let derivedAddress: string | undefined;
     if (header >= 27 && header <= 34) {
       // P2PKH
-      derivedAddress = p2pkh(recoveredPubKey, BTC_MAINNET).address;
+      derivedAddress = p2pkh(recoveredPubKey, network).address;
     } else if (header >= 35 && header <= 38) {
       // P2SH-P2WPKH (wrapped SegWit)
-      const inner = p2wpkh(recoveredPubKey, BTC_MAINNET);
-      derivedAddress = p2sh(inner, BTC_MAINNET).address;
+      const inner = p2wpkh(recoveredPubKey, network);
+      derivedAddress = p2sh(inner, network).address;
     } else if (header >= 39 && header <= 42) {
       // P2WPKH (native SegWit)
-      derivedAddress = p2wpkh(recoveredPubKey, BTC_MAINNET).address;
+      derivedAddress = p2wpkh(recoveredPubKey, network).address;
     }
     return derivedAddress === address;
   } catch {
@@ -348,7 +371,8 @@ function bip322VerifyP2WPKH(
   }
 
   // Derive scriptPubKey from witness pubkey
-  const scriptPubKey = p2wpkh(pubkeyBytes, BTC_MAINNET).script;
+  const network = detectBtcNetwork(address);
+  const scriptPubKey = p2wpkh(pubkeyBytes, network).script;
 
   // Build to_spend txid
   const toSpendTxid = bip322BuildToSpendTxId(message, scriptPubKey);
@@ -379,7 +403,7 @@ function bip322VerifyP2WPKH(
   if (!sigValid) return false;
 
   // Confirm derived address matches claimed address
-  const derivedAddress = p2wpkh(pubkeyBytes, BTC_MAINNET).address;
+  const derivedAddress = p2wpkh(pubkeyBytes, network).address;
   return derivedAddress === address;
 }
 
@@ -410,7 +434,8 @@ function bip322VerifyP2TR(
   // Address().decode() returns decoded.pubkey = the TWEAKED key embedded in the bech32 data.
   // We must NOT call p2tr(decoded.pubkey, ...) — that would apply another TapTweak.
   // Instead, build the scriptPubKey directly: OP_1 (0x51) OP_PUSH32 (0x20) <tweakedKey>
-  const decoded = Address(BTC_MAINNET).decode(address);
+  const network = detectBtcNetwork(address);
+  const decoded = Address(network).decode(address);
   if (decoded.type !== "tr") {
     throw new Error(`P2TR BIP-322: address does not decode to P2TR type`);
   }
