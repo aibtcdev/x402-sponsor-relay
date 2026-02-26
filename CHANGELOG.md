@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.15.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.15.0...x402-sponsor-relay-v1.15.1) (2026-02-26)
+
+
+### Bug Fixes
+
+* **settlement:** relax testnet sBTC matching and DRY token dispatch ([#123](https://github.com/aibtcdev/x402-sponsor-relay/issues/123)) ([488ffd1](https://github.com/aibtcdev/x402-sponsor-relay/commit/488ffd1208c5dbd5b888ac6e6b6220141aab8302))
+
 ## [1.15.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.14.1...x402-sponsor-relay-v1.15.0) (2026-02-24)
 
 
