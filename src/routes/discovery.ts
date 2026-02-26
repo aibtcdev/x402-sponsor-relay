@@ -634,7 +634,7 @@ Content-Type: application/json
 - invalid_payload — missing required fields in request
 - invalid_payment_requirements — paymentRequirements missing network/payTo/amount
 - invalid_network — network does not match relay's configured network
-- unsupported_scheme — asset identifier not recognized
+- unrecognized_asset — asset identifier not recognized
 - invalid_transaction_state — tx deserialization or verification failed
 - recipient_mismatch — tx recipient does not match payTo
 - amount_insufficient — tx amount is below the required minimum
@@ -1411,7 +1411,7 @@ Assets are identified by type:
   "sBTC"  — wrapped Bitcoin (amounts in satoshis)
   CAIP-19 contract address — e.g., full principal for USDCx or other SIP-010 tokens
 
-If the asset is unrecognized, the relay returns errorReason: "unsupported_scheme".
+If the asset is unrecognized, the relay returns errorReason: "unrecognized_asset".
 
 ## POST /verify — Local Validation (Spec Section 7.1)
 
@@ -1461,7 +1461,7 @@ Content-Type: application/json
   invalid_payload               — missing required request fields
   invalid_payment_requirements  — paymentRequirements missing network/payTo/amount
   invalid_network               — network does not match relay's chain
-  unsupported_scheme            — asset not recognized
+  unrecognized_asset            — asset not recognized
   invalid_transaction_state     — tx cannot be deserialized or verified
   recipient_mismatch            — tx recipient != paymentRequirements.payTo
   amount_insufficient           — tx amount < paymentRequirements.amount

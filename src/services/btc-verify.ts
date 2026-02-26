@@ -558,7 +558,7 @@ export class BtcVerifyService {
 
       return this.verifyAndReturn(btcAddress, message, signature, "self-service", timestamp, addressType);
     } catch (error) {
-      this.logger.warn("BTC verification error", {
+      this.logger.error("BTC verification error", {
         error: error instanceof Error ? error.message : "Unknown error",
         btcAddress,
         addressType,
