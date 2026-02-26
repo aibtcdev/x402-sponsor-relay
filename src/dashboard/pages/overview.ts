@@ -1,4 +1,4 @@
-import type { DashboardOverview } from "../../types";
+import type { DashboardOverview, AggregateKeyStats } from "../../types";
 import { htmlDocument, header, footer } from "../components/layout";
 import {
   statsCard,
@@ -78,6 +78,38 @@ function settlementCard(
   </div>
   <p class="text-xs text-gray-500 mt-2">Uptime 24h: ${uptime24h}%</p>
 </div>`;
+}
+
+/**
+ * Render the API Keys statistics section for the dashboard.
+ * Shows total active, 7-day registrations, expired, and revoked counts.
+ */
+function apiKeysSection(apiKeys: AggregateKeyStats): string {
+  return `
+  <!-- API Keys Section -->
+  <div class="mb-6">
+    <div class="brand-section p-6">
+      <h3 class="text-lg font-semibold text-white mb-4">API Keys</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="brand-card p-4">
+          <p class="text-sm text-gray-400">Total Active</p>
+          <p class="text-2xl font-bold text-white mt-2">${escapeHtml(String(apiKeys.totalActiveKeys))}</p>
+        </div>
+        <div class="brand-card p-4">
+          <p class="text-sm text-gray-400">Registered (7d)</p>
+          <p class="text-2xl font-bold text-green-400 mt-2">${escapeHtml(String(apiKeys.newKeysLast7Days))}</p>
+        </div>
+        <div class="brand-card p-4">
+          <p class="text-sm text-gray-400">Expired</p>
+          <p class="text-2xl font-bold text-yellow-400 mt-2">${escapeHtml(String(apiKeys.expiredKeys))}</p>
+        </div>
+        <div class="brand-card p-4">
+          <p class="text-sm text-gray-400">Revoked</p>
+          <p class="text-2xl font-bold text-red-400 mt-2">${escapeHtml(String(apiKeys.revokedKeys))}</p>
+        </div>
+      </div>
+    </div>
+  </div>`;
 }
 
 /**
@@ -166,6 +198,8 @@ ${header(network)}
   <div class="mb-6">
     ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
   </div>
+
+  ${data.apiKeys ? apiKeysSection(data.apiKeys) : ""}
 
   <!-- Sponsor Wallets Section (client-side fetch from /wallets) -->
   <div class="mb-6" x-data="walletApp()" x-init="init()">
