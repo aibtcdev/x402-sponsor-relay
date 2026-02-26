@@ -4,6 +4,7 @@ import type {
   ErrorCategory,
   DailyStats,
   DashboardOverview,
+  EndpointBreakdown,
   TransactionLogEntry,
 } from "../types";
 import { calculateTrend } from "../services/stats";
@@ -122,6 +123,59 @@ export class StatsDO {
         fee_total TEXT DEFAULT '0'
       );
     `);
+
+    // Schema migrations — ALTER TABLE ADD COLUMN is idempotent (catch ignores
+    // "duplicate column name" errors on repeated DO restarts).
+
+    // tx_log: client error flag (1 = client caused this failure, 0 = relay/network)
+    try {
+      this.sql.exec(`ALTER TABLE tx_log ADD COLUMN client_error INTEGER DEFAULT 0`);
+    } catch {}
+
+    // daily_stats: client errors counter
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN client_errors INTEGER DEFAULT 0`);
+    } catch {}
+
+    // daily_stats: per-endpoint counters
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN relay_total INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN relay_success INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN relay_failed INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN sponsor_total INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN sponsor_success INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN sponsor_failed INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN settle_total INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN settle_success INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN settle_failed INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN settle_client_errors INTEGER DEFAULT 0`);
+    } catch {}
+    try {
+      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN verify_total INTEGER DEFAULT 0`);
+    } catch {}
+
+    // hourly_stats: client errors counter
+    try {
+      this.sql.exec(`ALTER TABLE hourly_stats ADD COLUMN client_errors INTEGER DEFAULT 0`);
+    } catch {}
   }
 
   // ===========================================================================
@@ -155,17 +209,18 @@ export class StatsDO {
 
     const successInt = entry.success ? 1 : 0;
     const failedInt = entry.success ? 0 : 1;
+    const clientErrorInt = entry.clientError ? 1 : 0;
     const token = entry.tokenType as string;
     const amount = entry.amount || "0";
     const fee = entry.fee || null;
 
-    // Insert into tx_log
+    // Insert into tx_log (includes new client_error column)
     const id = crypto.randomUUID();
     const timestamp = new Date(entry.timestamp).getTime() || now;
     this.sql.exec(
       `INSERT OR IGNORE INTO tx_log
-         (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height, client_error)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       entry.endpoint,
       timestamp,
@@ -177,7 +232,8 @@ export class StatsDO {
       entry.sender || null,
       entry.recipient || null,
       entry.status || null,
-      entry.blockHeight || null
+      entry.blockHeight || null,
+      clientErrorInt
     );
 
     // Prune tx_log older than 7 days
@@ -189,24 +245,64 @@ export class StatsDO {
     const sbtcInt = token === "sBTC" ? 1 : 0;
     const usdcxInt = token === "USDCx" ? 1 : 0;
 
-    // Atomic daily upsert — counts
+    // Atomic daily upsert — core counts + client errors
     this.sql.exec(
-      `INSERT INTO daily_stats (date, total, success, failed, stx_count, sbtc_count, usdcx_count)
-       VALUES (?, 1, ?, ?, ?, ?, ?)
+      `INSERT INTO daily_stats (date, total, success, failed, stx_count, sbtc_count, usdcx_count, client_errors)
+       VALUES (?, 1, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(date) DO UPDATE SET
          total = total + 1,
          success = success + excluded.success,
          failed = failed + excluded.failed,
          stx_count = stx_count + excluded.stx_count,
          sbtc_count = sbtc_count + excluded.sbtc_count,
-         usdcx_count = usdcx_count + excluded.usdcx_count`,
+         usdcx_count = usdcx_count + excluded.usdcx_count,
+         client_errors = client_errors + excluded.client_errors`,
       today,
       successInt,
       failedInt,
       stxInt,
       sbtcInt,
-      usdcxInt
+      usdcxInt,
+      clientErrorInt
     );
+
+    // Atomic daily upsert — per-endpoint counters
+    // Each endpoint has its own total/success/failed columns (verify only has total)
+    const ep = entry.endpoint;
+    if (ep === "relay") {
+      this.sql.exec(
+        `UPDATE daily_stats SET
+           relay_total = relay_total + 1,
+           relay_success = relay_success + ?,
+           relay_failed = relay_failed + ?
+         WHERE date = ?`,
+        successInt, failedInt, today
+      );
+    } else if (ep === "sponsor") {
+      this.sql.exec(
+        `UPDATE daily_stats SET
+           sponsor_total = sponsor_total + 1,
+           sponsor_success = sponsor_success + ?,
+           sponsor_failed = sponsor_failed + ?
+         WHERE date = ?`,
+        successInt, failedInt, today
+      );
+    } else if (ep === "settle") {
+      this.sql.exec(
+        `UPDATE daily_stats SET
+           settle_total = settle_total + 1,
+           settle_success = settle_success + ?,
+           settle_failed = settle_failed + ?,
+           settle_client_errors = settle_client_errors + ?
+         WHERE date = ?`,
+        successInt, failedInt, clientErrorInt, today
+      );
+    } else if (ep === "verify") {
+      this.sql.exec(
+        `UPDATE daily_stats SET verify_total = verify_total + 1 WHERE date = ?`,
+        today
+      );
+    }
 
     // Atomic daily upsert — volumes (must be separate to use BigInt arithmetic safely)
     if (stxInt) {
@@ -253,23 +349,25 @@ export class StatsDO {
       );
     }
 
-    // Atomic hourly upsert
+    // Atomic hourly upsert — core counts + client errors
     this.sql.exec(
-      `INSERT INTO hourly_stats (hour, total, success, failed, stx_count, sbtc_count, usdcx_count)
-       VALUES (?, 1, ?, ?, ?, ?, ?)
+      `INSERT INTO hourly_stats (hour, total, success, failed, stx_count, sbtc_count, usdcx_count, client_errors)
+       VALUES (?, 1, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(hour) DO UPDATE SET
          total = total + 1,
          success = success + excluded.success,
          failed = failed + excluded.failed,
          stx_count = stx_count + excluded.stx_count,
          sbtc_count = sbtc_count + excluded.sbtc_count,
-         usdcx_count = usdcx_count + excluded.usdcx_count`,
+         usdcx_count = usdcx_count + excluded.usdcx_count,
+         client_errors = client_errors + excluded.client_errors`,
       hourKey,
       successInt,
       failedInt,
       stxInt,
       sbtcInt,
-      usdcxInt
+      usdcxInt,
+      clientErrorInt
     );
 
     // Hourly fee total
@@ -326,6 +424,7 @@ export class StatsDO {
           total: number;
           success: number;
           failed: number;
+          client_errors: number;
           stx_count: number;
           stx_volume: string;
           sbtc_count: number;
@@ -342,7 +441,7 @@ export class StatsDO {
           err_settlement: number;
           err_internal: number;
         }>(
-          `SELECT total, success, failed,
+          `SELECT total, success, failed, client_errors,
                   stx_count, stx_volume,
                   sbtc_count, sbtc_volume,
                   usdcx_count, usdcx_volume,
@@ -356,7 +455,7 @@ export class StatsDO {
       if (rows.length === 0) {
         result.push({
           date,
-          transactions: { total: 0, success: 0, failed: 0 },
+          transactions: { total: 0, success: 0, failed: 0, clientErrors: 0 },
           tokens: {
             STX: { count: 0, volume: "0" },
             sBTC: { count: 0, volume: "0" },
@@ -378,6 +477,7 @@ export class StatsDO {
             total: r.total,
             success: r.success,
             failed: r.failed,
+            clientErrors: r.client_errors ?? 0,
           },
           tokens: {
             STX: { count: r.stx_count, volume: r.stx_volume || "0" },
@@ -407,9 +507,9 @@ export class StatsDO {
     return result;
   }
 
-  private readHourlyData(): Array<{ hour: string; transactions: number; success: number; fees?: string }> {
+  private readHourlyData(): Array<{ hour: string; transactions: number; success: number; fees?: string; clientErrors?: number }> {
     const now = Date.now();
-    const result: Array<{ hour: string; transactions: number; success: number; fees?: string }> = [];
+    const result: Array<{ hour: string; transactions: number; success: number; fees?: string; clientErrors?: number }> = [];
 
     for (let i = 23; i >= 0; i--) {
       const ts = now - i * HOUR_MS;
@@ -418,8 +518,8 @@ export class StatsDO {
       const key = getHourKey(ts);
 
       const rows = this.sql
-        .exec<{ total: number; success: number; fee_total: string }>(
-          `SELECT total, success, fee_total FROM hourly_stats WHERE hour = ? LIMIT 1`,
+        .exec<{ total: number; success: number; fee_total: string; client_errors: number }>(
+          `SELECT total, success, fee_total, client_errors FROM hourly_stats WHERE hour = ? LIMIT 1`,
           key
         )
         .toArray();
@@ -428,13 +528,16 @@ export class StatsDO {
         result.push({ hour: hourLabel, transactions: 0, success: 0 });
       } else {
         const r = rows[0];
-        const entry: { hour: string; transactions: number; success: number; fees?: string } = {
+        const entry: { hour: string; transactions: number; success: number; fees?: string; clientErrors?: number } = {
           hour: hourLabel,
           transactions: r.total,
           success: r.success,
         };
         if (r.fee_total && r.fee_total !== "0") {
           entry.fees = r.fee_total;
+        }
+        if (r.client_errors > 0) {
+          entry.clientErrors = r.client_errors;
         }
         result.push(entry);
       }
@@ -540,10 +643,14 @@ export class StatsDO {
       (acc, h) => ({
         total: acc.total + h.transactions,
         success: acc.success + h.success,
+        clientErrors: acc.clientErrors + (h.clientErrors ?? 0),
       }),
-      { total: 0, success: 0 }
+      { total: 0, success: 0, clientErrors: 0 }
     );
     const rollingFailed = rolling.total - rolling.success;
+
+    // Per-endpoint breakdown from today's daily_stats
+    const endpointBreakdown = this.readEndpointBreakdown(current.date);
 
     return {
       period: "24h",
@@ -551,6 +658,7 @@ export class StatsDO {
         total: rolling.total,
         success: rolling.success,
         failed: rollingFailed,
+        clientErrors: rolling.clientErrors,
         trend: calculateTrend(
           rolling.total,
           previous?.transactions.total ?? 0
@@ -583,6 +691,64 @@ export class StatsDO {
         previousTotal: previousFees.total,
       },
       hourlyData,
+      endpointBreakdown,
+    };
+  }
+
+  private readEndpointBreakdown(date: string): EndpointBreakdown {
+    const rows = this.sql
+      .exec<{
+        relay_total: number;
+        relay_success: number;
+        relay_failed: number;
+        sponsor_total: number;
+        sponsor_success: number;
+        sponsor_failed: number;
+        settle_total: number;
+        settle_success: number;
+        settle_failed: number;
+        settle_client_errors: number;
+        verify_total: number;
+      }>(
+        `SELECT relay_total, relay_success, relay_failed,
+                sponsor_total, sponsor_success, sponsor_failed,
+                settle_total, settle_success, settle_failed, settle_client_errors,
+                verify_total
+         FROM daily_stats WHERE date = ? LIMIT 1`,
+        date
+      )
+      .toArray();
+
+    if (rows.length === 0) {
+      return {
+        relay: { total: 0, success: 0, failed: 0 },
+        sponsor: { total: 0, success: 0, failed: 0 },
+        settle: { total: 0, success: 0, failed: 0, clientErrors: 0 },
+        verify: { total: 0 },
+      };
+    }
+
+    const r = rows[0];
+    return {
+      relay: {
+        total: r.relay_total ?? 0,
+        success: r.relay_success ?? 0,
+        failed: r.relay_failed ?? 0,
+      },
+      sponsor: {
+        total: r.sponsor_total ?? 0,
+        success: r.sponsor_success ?? 0,
+        failed: r.sponsor_failed ?? 0,
+      },
+      settle: {
+        total: r.settle_total ?? 0,
+        success: r.settle_success ?? 0,
+        failed: r.settle_failed ?? 0,
+        clientErrors: r.settle_client_errors ?? 0,
+      },
+      verify: {
+        total: r.verify_total ?? 0,
+      },
     };
   }
 
@@ -606,12 +772,20 @@ export class StatsDO {
         fee_min: string | null; fee_max: string | null;
         err_validation: number; err_rate_limit: number;
         err_sponsoring: number; err_settlement: number; err_internal: number;
+        // New optional columns (default to 0 when absent in historical data)
+        client_errors?: number;
+        relay_total?: number; relay_success?: number; relay_failed?: number;
+        sponsor_total?: number; sponsor_success?: number; sponsor_failed?: number;
+        settle_total?: number; settle_success?: number; settle_failed?: number;
+        settle_client_errors?: number;
+        verify_total?: number;
       }>;
       hourly?: Array<{
         hour: string;
         total: number; success: number; failed: number;
         stx_count: number; sbtc_count: number; usdcx_count: number;
         fee_total: string;
+        client_errors?: number;
       }>;
       txLog?: Array<{
         endpoint: string;
@@ -625,6 +799,7 @@ export class StatsDO {
         recipient?: string | null;
         status?: string | null;
         block_height?: number | null;
+        client_error?: number;
       }>;
     };
 
@@ -639,12 +814,22 @@ export class StatsDO {
              (date, total, success, failed,
               stx_count, stx_volume, sbtc_count, sbtc_volume, usdcx_count, usdcx_volume,
               fee_total, fee_count, fee_min, fee_max,
-              err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal,
+              client_errors,
+              relay_total, relay_success, relay_failed,
+              sponsor_total, sponsor_success, sponsor_failed,
+              settle_total, settle_success, settle_failed, settle_client_errors,
+              verify_total)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           d.date, d.total, d.success, d.failed,
           d.stx_count, d.stx_volume, d.sbtc_count, d.sbtc_volume, d.usdcx_count, d.usdcx_volume,
           d.fee_total, d.fee_count, d.fee_min, d.fee_max,
-          d.err_validation, d.err_rate_limit, d.err_sponsoring, d.err_settlement, d.err_internal
+          d.err_validation, d.err_rate_limit, d.err_sponsoring, d.err_settlement, d.err_internal,
+          d.client_errors ?? 0,
+          d.relay_total ?? 0, d.relay_success ?? 0, d.relay_failed ?? 0,
+          d.sponsor_total ?? 0, d.sponsor_success ?? 0, d.sponsor_failed ?? 0,
+          d.settle_total ?? 0, d.settle_success ?? 0, d.settle_failed ?? 0, d.settle_client_errors ?? 0,
+          d.verify_total ?? 0
         );
         dailyCount++;
       }
@@ -654,10 +839,11 @@ export class StatsDO {
       for (const h of body.hourly) {
         this.sql.exec(
           `INSERT OR REPLACE INTO hourly_stats
-             (hour, total, success, failed, stx_count, sbtc_count, usdcx_count, fee_total)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+             (hour, total, success, failed, stx_count, sbtc_count, usdcx_count, fee_total, client_errors)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           h.hour, h.total, h.success, h.failed,
-          h.stx_count, h.sbtc_count, h.usdcx_count, h.fee_total
+          h.stx_count, h.sbtc_count, h.usdcx_count, h.fee_total,
+          h.client_errors ?? 0
         );
         hourlyCount++;
       }
@@ -668,11 +854,11 @@ export class StatsDO {
         const id = crypto.randomUUID();
         this.sql.exec(
           `INSERT OR IGNORE INTO tx_log
-             (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height, client_error)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           id, t.endpoint, t.timestamp, t.success, t.token, t.amount,
           t.fee ?? null, t.txid ?? null, t.sender ?? null, t.recipient ?? null,
-          t.status ?? null, t.block_height ?? null
+          t.status ?? null, t.block_height ?? null, t.client_error ?? 0
         );
         txLogCount++;
       }
@@ -711,6 +897,7 @@ export class StatsDO {
           recipient: body.recipient,
           status: body.status,
           blockHeight: body.blockHeight,
+          clientError: body.clientError,
         };
         this.recordTx(entry);
         return this.jsonResponse({ success: true });

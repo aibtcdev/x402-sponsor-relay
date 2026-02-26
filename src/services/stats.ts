@@ -153,6 +153,7 @@ export class StatsService {
         total: 0,
         success: 0,
         failed: 0,
+        clientErrors: 0,
         trend: "stable",
         previousTotal: 0,
       },
