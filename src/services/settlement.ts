@@ -666,32 +666,52 @@ export class SettlementService {
           });
           return {
             error: "Broadcast failed",
-            details: conflictDetails,
+            details: errorDetails,
             retryable: false,
           };
         }
 
-        // HTTP 5xx or 522 (Cloudflare timeout): log and retry
-        const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
-        this.logger.warn(`Broadcast attempt ${attempt}/${BROADCAST_MAX_ATTEMPTS} failed: ${conflictDetails}, retrying in ${retryDelay}ms`, {
-          status: broadcastResponse.status,
-          attempt,
-          maxAttempts: BROADCAST_MAX_ATTEMPTS,
-          retryDelayMs: retryDelay,
-        });
-        lastBroadcastError = {
-          error: "Broadcast failed",
-          details: conflictDetails,
-          retryable: true,
-        };
-        if (attempt < BROADCAST_MAX_ATTEMPTS) {
-          await new Promise((r) => setTimeout(r, retryDelay));
+        // Only retry on HTTP 5xx (includes 522 Cloudflare timeout)
+        if (broadcastResponse.status >= 500) {
+          const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
+          const retryMsg = attempt < BROADCAST_MAX_ATTEMPTS
+            ? `retrying in ${retryDelay}ms`
+            : "no retries remaining";
+          this.logger.warn(`Broadcast attempt ${attempt}/${BROADCAST_MAX_ATTEMPTS} failed: ${conflictDetails}, ${retryMsg}`, {
+            status: broadcastResponse.status,
+            attempt,
+            maxAttempts: BROADCAST_MAX_ATTEMPTS,
+            retryDelayMs: retryDelay,
+          });
+          lastBroadcastError = {
+            error: "Broadcast failed",
+            details: conflictDetails,
+            retryable: true,
+          };
+          if (attempt < BROADCAST_MAX_ATTEMPTS) {
+            await new Promise((r) => setTimeout(r, retryDelay));
+          }
+        } else {
+          // Unexpected status code (1xx, 3xx) — don't retry, return error
+          this.logger.error("Broadcast failed with unexpected status", {
+            status: broadcastResponse.status,
+            error: errorMessage,
+            details: errorDetails,
+          });
+          return {
+            error: "Broadcast failed",
+            details: errorDetails,
+            retryable: false,
+          };
         }
       } catch (e) {
         // Network error, AbortError (timeout), or TypeError — retry on transient failures
         const errMsg = e instanceof Error ? e.message : String(e);
         const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
-        this.logger.warn(`Broadcast attempt ${attempt}/${BROADCAST_MAX_ATTEMPTS} failed: ${errMsg}, retrying in ${retryDelay}ms`, {
+        const retryMsg = attempt < BROADCAST_MAX_ATTEMPTS
+          ? `retrying in ${retryDelay}ms`
+          : "no retries remaining";
+        this.logger.warn(`Broadcast attempt ${attempt}/${BROADCAST_MAX_ATTEMPTS} failed: ${errMsg}, ${retryMsg}`, {
           error: errMsg,
           attempt,
           maxAttempts: BROADCAST_MAX_ATTEMPTS,
