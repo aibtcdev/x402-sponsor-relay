@@ -43,12 +43,21 @@ const POLL_BACKOFF_FACTOR = 1.5;
 const MAX_POLL_DELAY_MS = 8_000;
 
 // Hiro API timeout configuration
-/** Timeout for broadcast POST to Hiro /v2/transactions (ms) */
-const HIRO_BROADCAST_TIMEOUT_MS = 20_000;
+/** Timeout for each broadcast attempt POST to Hiro /v2/transactions (ms).
+ *  Reduced from 20s to 12s to leave budget for up to 3 attempts (worst case: 39s total). */
+const HIRO_BROADCAST_TIMEOUT_MS = 12_000;
 /** Timeout for each Hiro poll request during confirmation polling (ms) */
 const HIRO_POLL_TIMEOUT_MS = 10_000;
 /** Timeout for liveness check against Hiro /extended/v1/tx/:txid (ms) */
 const HIRO_LIVENESS_TIMEOUT_MS = 10_000;
+
+// Broadcast retry configuration
+/** Maximum number of broadcast attempts (1 initial + 2 retries) */
+const BROADCAST_MAX_ATTEMPTS = 3;
+/** Delay in ms after the first failed broadcast attempt */
+const BROADCAST_RETRY_BASE_DELAY_MS = 1_000;
+/** Delay in ms after the second failed broadcast attempt (cap) */
+const BROADCAST_RETRY_MAX_DELAY_MS = 2_000;
 
 // KV dedup configuration
 const DEDUP_TTL_SECONDS = 300;
@@ -508,80 +517,89 @@ export class SettlementService {
     // Using direct fetch instead of broadcastTransaction() from @stacks/transactions
     // to avoid unhandled throws on non-JSON node responses and gain structured
     // Ok/Err handling regardless of the node's response content type.
-    let txid: string;
-    try {
-      const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
-      const broadcastUrl = `${hiroBaseUrl}/v2/transactions`;
+    //
+    // Retry logic: up to BROADCAST_MAX_ATTEMPTS attempts with exponential backoff.
+    // Retries on HTTP 5xx/522 and network/timeout errors.
+    // Immediate return on nonce conflicts (4xx) — do not retry.
 
-      // Serialize transaction to bytes (serialize() returns hex in @stacks/transactions v7)
-      const txHex = transaction.serialize();
-      if (
-        typeof txHex !== "string" ||
-        txHex.length === 0 ||
-        txHex.length % 2 !== 0 ||
-        !/^[0-9a-fA-F]+$/.test(txHex)
-      ) {
-        this.logger.error("Failed to serialize transaction to valid hex", {
-          txHexSample: String(txHex).slice(0, 64),
-        });
-        return {
-          error: "Broadcast failed",
-          details: "Serialized transaction is not a valid hex string",
-          retryable: false,
-        };
-      }
-      const bytePairs = txHex.match(/.{2}/g);
-      if (!bytePairs) {
-        this.logger.error("Hex serialization produced no byte pairs", {
-          txHexSample: txHex.slice(0, 64),
-        });
-        return {
-          error: "Broadcast failed",
-          details: "Serialized transaction hex could not be converted to bytes",
-          retryable: false,
-        };
-      }
-      const txBytes = new Uint8Array(bytePairs.map((b) => parseInt(b, 16)));
-
-      const broadcastHeaders: Record<string, string> = {
-        "Content-Type": "application/octet-stream",
-        ...getHiroHeaders(this.env.HIRO_API_KEY),
-      };
-
-      const broadcastResponse = await fetch(broadcastUrl, {
-        method: "POST",
-        headers: broadcastHeaders,
-        body: txBytes,
-        signal: AbortSignal.timeout(HIRO_BROADCAST_TIMEOUT_MS),
+    // Serialize transaction bytes once, outside the retry loop
+    const txHex = transaction.serialize();
+    if (
+      typeof txHex !== "string" ||
+      txHex.length === 0 ||
+      txHex.length % 2 !== 0 ||
+      !/^[0-9a-fA-F]+$/.test(txHex)
+    ) {
+      this.logger.error("Failed to serialize transaction to valid hex", {
+        txHexSample: String(txHex).slice(0, 64),
       });
+      return {
+        error: "Broadcast failed",
+        details: "Serialized transaction is not a valid hex string",
+        retryable: false,
+      };
+    }
+    const bytePairs = txHex.match(/.{2}/g);
+    if (!bytePairs) {
+      this.logger.error("Hex serialization produced no byte pairs", {
+        txHexSample: txHex.slice(0, 64),
+      });
+      return {
+        error: "Broadcast failed",
+        details: "Serialized transaction hex could not be converted to bytes",
+        retryable: false,
+      };
+    }
+    const txBytes = new Uint8Array(bytePairs.map((b) => parseInt(b, 16)));
 
-      const responseText = await broadcastResponse.text();
+    const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
+    const broadcastUrl = `${hiroBaseUrl}/v2/transactions`;
+    const broadcastHeaders: Record<string, string> = {
+      "Content-Type": "application/octet-stream",
+      ...getHiroHeaders(this.env.HIRO_API_KEY),
+    };
 
-      if (broadcastResponse.ok) {
-        // Success: body is a JSON-quoted txid string, e.g. "\"0x1234...\""
-        let parsedTxid: string;
-        try {
-          parsedTxid = JSON.parse(responseText) as string;
-        } catch {
-          // Some nodes return the txid without JSON quoting
-          parsedTxid = responseText.trim().replace(/^"|"$/g, "");
+    let txid = "";
+    let lastBroadcastError: BroadcastAndConfirmResult | undefined;
+
+    for (let attempt = 1; attempt <= BROADCAST_MAX_ATTEMPTS; attempt++) {
+      try {
+        const broadcastResponse = await fetch(broadcastUrl, {
+          method: "POST",
+          headers: broadcastHeaders,
+          body: txBytes,
+          signal: AbortSignal.timeout(HIRO_BROADCAST_TIMEOUT_MS),
+        });
+
+        const responseText = await broadcastResponse.text();
+
+        if (broadcastResponse.ok) {
+          // Success: body is a JSON-quoted txid string, e.g. "\"0x1234...\""
+          let parsedTxid: string;
+          try {
+            parsedTxid = JSON.parse(responseText) as string;
+          } catch {
+            // Some nodes return the txid without JSON quoting
+            parsedTxid = responseText.trim().replace(/^"|"$/g, "");
+          }
+
+          if (!parsedTxid || typeof parsedTxid !== "string") {
+            this.logger.error("Broadcast returned OK but unparseable txid", {
+              responseText: responseText.slice(0, 200),
+            });
+            return {
+              error: "Broadcast failed",
+              details: "Node returned OK but txid could not be parsed",
+              retryable: true,
+            };
+          }
+
+          txid = parsedTxid;
+          this.logger.info("Transaction broadcast successful", { txid, attempt });
+          break; // Success — exit retry loop and fall through to polling
         }
 
-        if (!parsedTxid || typeof parsedTxid !== "string") {
-          this.logger.error("Broadcast returned OK but unparseable txid", {
-            responseText: responseText.slice(0, 200),
-          });
-          return {
-            error: "Broadcast failed",
-            details: "Node returned OK but txid could not be parsed",
-            retryable: true,
-          };
-        }
-
-        txid = parsedTxid;
-        this.logger.info("Transaction broadcast successful", { txid });
-      } else {
-        // Error: try to parse JSON error body; fall back to raw text
+        // Non-OK response: parse error body and decide whether to retry
         let errorMessage = `HTTP ${broadcastResponse.status}`;
         let errorDetails = responseText.slice(0, 500);
 
@@ -630,6 +648,7 @@ export class SettlementService {
               senderNonce,
             });
           }
+          // Nonce conflicts are not retriable at the broadcast level
           return {
             error: "Nonce conflict",
             details: conflictDetails,
@@ -638,30 +657,67 @@ export class SettlementService {
           };
         }
 
-        this.logger.error("Broadcast failed", {
+        // HTTP 4xx (non-nonce): reject immediately, no retry
+        if (broadcastResponse.status >= 400 && broadcastResponse.status < 500) {
+          this.logger.error("Broadcast failed with 4xx, not retrying", {
+            status: broadcastResponse.status,
+            error: errorMessage,
+            details: errorDetails,
+          });
+          return {
+            error: "Broadcast failed",
+            details: conflictDetails,
+            retryable: false,
+          };
+        }
+
+        // HTTP 5xx or 522 (Cloudflare timeout): log and retry
+        const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
+        this.logger.warn(`Broadcast attempt ${attempt}/${BROADCAST_MAX_ATTEMPTS} failed: ${conflictDetails}, retrying in ${retryDelay}ms`, {
           status: broadcastResponse.status,
-          error: errorMessage,
-          details: errorDetails,
+          attempt,
+          maxAttempts: BROADCAST_MAX_ATTEMPTS,
+          retryDelayMs: retryDelay,
         });
-        return {
+        lastBroadcastError = {
           error: "Broadcast failed",
           details: conflictDetails,
           retryable: true,
         };
+        if (attempt < BROADCAST_MAX_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, retryDelay));
+        }
+      } catch (e) {
+        // Network error, AbortError (timeout), or TypeError — retry on transient failures
+        const errMsg = e instanceof Error ? e.message : String(e);
+        const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
+        this.logger.warn(`Broadcast attempt ${attempt}/${BROADCAST_MAX_ATTEMPTS} failed: ${errMsg}, retrying in ${retryDelay}ms`, {
+          error: errMsg,
+          attempt,
+          maxAttempts: BROADCAST_MAX_ATTEMPTS,
+          retryDelayMs: retryDelay,
+        });
+        lastBroadcastError = {
+          error: "Broadcast failed",
+          details: errMsg,
+          retryable: true,
+        };
+        if (attempt < BROADCAST_MAX_ATTEMPTS) {
+          await new Promise((r) => setTimeout(r, retryDelay));
+        }
       }
-    } catch (e) {
-      this.logger.error("Broadcast threw exception", {
-        error: e instanceof Error ? e.message : String(e),
+    }
+
+    // All attempts exhausted — return the last error
+    if (lastBroadcastError) {
+      this.logger.error("Broadcast failed after all attempts", {
+        maxAttempts: BROADCAST_MAX_ATTEMPTS,
+        lastError: "error" in lastBroadcastError ? lastBroadcastError.details : "unknown",
       });
-      return {
-        error: "Broadcast failed",
-        details: e instanceof Error ? e.message : "Unknown broadcast error",
-        retryable: true,
-      };
+      return lastBroadcastError;
     }
 
     // Poll for confirmation with exponential backoff
-    const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
     const hiroHeaders = getHiroHeaders(this.env.HIRO_API_KEY);
     const pollUrl = `${hiroBaseUrl}/extended/v1/tx/${txid}`;
 
