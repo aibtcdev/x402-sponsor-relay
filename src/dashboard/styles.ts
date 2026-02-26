@@ -133,6 +133,7 @@ export const dashboardCss = `
   .py-4 { padding-top: 1rem; padding-bottom: 1rem; }
   .py-8 { padding-top: 2rem; padding-bottom: 2rem; }
   .pt-2 { padding-top: 0.5rem; }
+  .mt-0\\.5 { margin-top: 0.125rem; }
   .mt-1 { margin-top: 0.25rem; }
   .mt-2 { margin-top: 0.5rem; }
   .mt-3 { margin-top: 0.75rem; }
