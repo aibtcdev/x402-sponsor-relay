@@ -129,6 +129,10 @@ export function validateV2Request(
   // Validate top-level fields exist
   const parsed = body as X402SettleRequestV2 | null;
   if (!parsed?.paymentPayload || !parsed?.paymentRequirements) {
+    logger.warn("Missing required V2 fields", {
+      hasPaymentPayload: !!parsed?.paymentPayload,
+      hasPaymentRequirements: !!parsed?.paymentRequirements,
+    });
     return {
       valid: false,
       error: { errorReason: X402_V2_ERROR_CODES.INVALID_PAYLOAD, status: 400 },
@@ -190,6 +194,9 @@ export function validateV2Request(
   // Extract transaction hex from payload
   const txHex = parsed.paymentPayload?.payload?.transaction;
   if (!txHex) {
+    logger.warn("Empty or missing transaction in paymentPayload", {
+      hasPayload: !!parsed.paymentPayload?.payload,
+    });
     return {
       valid: false,
       error: { errorReason: X402_V2_ERROR_CODES.INVALID_PAYLOAD, status: 400 },
