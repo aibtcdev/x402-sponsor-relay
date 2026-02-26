@@ -529,8 +529,9 @@ export class BtcVerifyService {
     message: string,
     signature: string
   ): BtcVerifyResult {
+    let addressType: BtcAddressType = "unknown";
     try {
-      const addressType = detectAddressType(btcAddress);
+      addressType = detectAddressType(btcAddress);
 
       // Determine path: registration (bare message) or self-service (with timestamp)
       if (message === BTC_MESSAGES.BASE) {
@@ -560,6 +561,7 @@ export class BtcVerifyService {
       this.logger.error("BTC verification error", {
         error: error instanceof Error ? error.message : "Unknown error",
         btcAddress,
+        addressType,
       });
       return {
         valid: false,

@@ -346,6 +346,7 @@ export const X402_V2_ERROR_CODES = {
   INVALID_PAYMENT_REQUIREMENTS: "invalid_payment_requirements",
   INVALID_SCHEME: "invalid_scheme",
   UNSUPPORTED_SCHEME: "unsupported_scheme",
+  UNRECOGNIZED_ASSET: "unrecognized_asset",
   INVALID_X402_VERSION: "invalid_x402_version",
   INVALID_TRANSACTION_STATE: "invalid_transaction_state",
   UNEXPECTED_VERIFY_ERROR: "unexpected_verify_error",
