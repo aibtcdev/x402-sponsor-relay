@@ -99,6 +99,17 @@ interface ReconcileResult {
 }
 
 /**
+ * Tracks how many consecutive alarm cycles a specific gap nonce has been stuck.
+ * Persisted in DO storage (key: gap_persist:N) so state survives alarm restarts.
+ */
+interface GapPersistState {
+  stuckNonce: number;  // The lowest missing nonce that keeps reappearing
+  cycleCount: number;  // Consecutive alarm cycles the gap has been stuck
+  firstSeen: string;   // ISO timestamp of first detection
+  lastSeen: string;    // ISO timestamp of most recent detection
+}
+
+/**
  * Reservation pool state — persisted as a single JSON object per wallet.
  * available: nonces ready to be assigned (pre-seeded, sorted ascending)
  * reserved: nonces currently in-flight (assigned but not yet confirmed or released)
@@ -766,6 +777,11 @@ export class NonceDO {
     return `wallet_gap_fill_count:${walletIndex}`;
   }
 
+  /** KV key for per-wallet gap persistence tracking state */
+  private walletGapPersistKey(walletIndex: number): string {
+    return `gap_persist:${walletIndex}`;
+  }
+
   /**
    * Record a successful gap-fill transaction fee for a specific wallet.
    * Increments gap-fill-specific counters separately from sponsored tx fees
@@ -1000,11 +1016,31 @@ export class NonceDO {
       const resolveAddress = (wi: number): string =>
         addresses?.[String(wi)] ?? sponsorAddress;
 
-      // Try each wallet in round-robin order; skip any at chaining limit
+      // Try each wallet in round-robin order; skip any at chaining limit or degraded (stuck nonce)
       let attempts = 0;
       let totalMempoolDepth = 0;
+      // Track degraded wallets for fallback: { walletIndex, cycleCount, pool }
+      const degradedWallets: Array<{ walletIndex: number; cycleCount: number; pool: PoolState }> = [];
       while (attempts < effectiveWalletCount) {
         pool = await this.loadPoolOrInit(walletIndex, resolveAddress(walletIndex));
+
+        // Check if this wallet is degraded (stuck gap nonce for >= 2 cycles)
+        const gapState = await this.state.storage.get<GapPersistState>(
+          this.walletGapPersistKey(walletIndex)
+        );
+        if (gapState && gapState.cycleCount >= 2) {
+          this.log("warn", "skipping_degraded_wallet", {
+            walletIndex,
+            stuckNonce: gapState.stuckNonce,
+            cycleCount: gapState.cycleCount,
+          });
+          degradedWallets.push({ walletIndex, cycleCount: gapState.cycleCount, pool });
+          walletIndex = (walletIndex + 1) % effectiveWalletCount;
+          pool = null;
+          attempts++;
+          continue;
+        }
+
         if (pool.reserved.length < CHAINING_LIMIT) {
           break;
         }
@@ -1016,7 +1052,26 @@ export class NonceDO {
       }
 
       if (attempts === effectiveWalletCount || pool === null) {
-        throw new ChainingLimitError(totalMempoolDepth);
+        // All wallets are either at chaining limit or degraded.
+        // If there are degraded-but-not-full wallets, use the least-degraded one as fallback
+        // rather than failing with a misleading CHAINING_LIMIT_EXCEEDED error.
+        const degradedNotFull = degradedWallets.filter(
+          (d) => d.pool.reserved.length < CHAINING_LIMIT
+        );
+        if (degradedNotFull.length > 0) {
+          // Sort ascending by cycleCount, pick least-degraded wallet
+          degradedNotFull.sort((a, b) => a.cycleCount - b.cycleCount);
+          const fallback = degradedNotFull[0];
+          walletIndex = fallback.walletIndex;
+          pool = fallback.pool;
+          this.log("warn", "all_wallets_degraded_using_least_degraded", {
+            walletIndex,
+            cycleCount: fallback.cycleCount,
+            degradedCount: degradedWallets.length,
+          });
+        } else {
+          throw new ChainingLimitError(totalMempoolDepth);
+        }
       }
 
       // Store the per-wallet sponsor address (used by alarm reconciliation)
@@ -1362,6 +1417,65 @@ export class NonceDO {
 
       this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
 
+      // Gap persistence tracking: detect stuck gap nonces across consecutive alarm cycles.
+      // If the same lowestGap nonce reappears for 3+ cycles, the gap-fill tx is itself stuck
+      // (e.g. confirmed but Hiro hasn't caught up, or tx dropped). Reset the pool instead of
+      // filling indefinitely.
+      const gapPersistKey = this.walletGapPersistKey(walletIndex);
+      const existingGapState = await this.state.storage.get<GapPersistState>(gapPersistKey);
+      const now = new Date().toISOString();
+
+      let gapPersistState: GapPersistState;
+      if (existingGapState && existingGapState.stuckNonce === lowestGap) {
+        // Same gap nonce seen again — increment cycle counter
+        gapPersistState = {
+          stuckNonce: lowestGap,
+          cycleCount: existingGapState.cycleCount + 1,
+          firstSeen: existingGapState.firstSeen,
+          lastSeen: now,
+        };
+      } else {
+        // New gap or different nonce — start fresh tracking
+        gapPersistState = {
+          stuckNonce: lowestGap,
+          cycleCount: 1,
+          firstSeen: now,
+          lastSeen: now,
+        };
+      }
+      await this.state.storage.put(gapPersistKey, gapPersistState);
+
+      // After 3 consecutive cycles with the same stuck nonce, reset the pool instead of
+      // retrying gap-fill. The gap-fill tx may be stuck in mempool and will never clear.
+      if (gapPersistState.cycleCount >= 3) {
+        this.log("warn", "stuck_nonce_pool_reset", {
+          walletIndex,
+          stuckNonce: lowestGap,
+          cycleCount: gapPersistState.cycleCount,
+          firstSeen: gapPersistState.firstSeen,
+          possibleNextNonce: possible_next_nonce,
+        });
+        const poolToReset = await this.loadPoolForWallet(walletIndex);
+        if (poolToReset !== null) {
+          await this.resetPoolAvailableForWallet(walletIndex, poolToReset, possible_next_nonce);
+        }
+        if (walletIndex === 0) {
+          this.setStoredNonce(possible_next_nonce);
+        }
+        await this.state.storage.delete(gapPersistKey);
+        this.log("info", "stuck_nonce_pool_reset_complete", {
+          walletIndex,
+          newHead: possible_next_nonce,
+          stuckNonce: lowestGap,
+        });
+        return {
+          previousNonce,
+          newNonce: possible_next_nonce,
+          changed: true,
+          reason: `STUCK NONCE RESET: nonce ${lowestGap} stuck for ${gapPersistState.cycleCount} alarm cycles, reset pool to ${possible_next_nonce}`,
+        };
+      }
+
       // Actively fill gaps: derive key and broadcast 1 uSTX transfers for each gap nonce.
       // Cap per-alarm fills to avoid exceeding Cloudflare alarm execution time limits.
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
@@ -1389,6 +1503,21 @@ export class NonceDO {
             ? `gap_filled: broadcast ${filled.length} fill tx(s) for nonces [${filled.join(",")}]`
             : `gaps detected (${sortedGaps.join(",")}) but could not fill (no key or already occupied)`,
       };
+    }
+
+    // Auto-recovery: clear gap persist state when no gaps are detected.
+    // This ensures wallets return to healthy status once the stuck nonce resolves.
+    const existingGapStateForRecovery = await this.state.storage.get<GapPersistState>(
+      this.walletGapPersistKey(walletIndex)
+    );
+    if (existingGapStateForRecovery) {
+      await this.state.storage.delete(this.walletGapPersistKey(walletIndex));
+      this.log("info", "stuck_nonce_gap_cleared", {
+        walletIndex,
+        previousStuckNonce: existingGapStateForRecovery.stuckNonce,
+        previousCycleCount: existingGapStateForRecovery.cycleCount,
+        firstSeen: existingGapStateForRecovery.firstSeen,
+      });
     }
 
     // For wallets other than 0 we don't have a SQL counter, so compare pool head
