@@ -43,6 +43,11 @@ export class DashboardStats extends BaseEndpoint {
                     total: { type: "number" as const },
                     success: { type: "number" as const },
                     failed: { type: "number" as const },
+                    clientErrors: {
+                      type: "number" as const,
+                      description:
+                        "Number of failures caused by client errors (bad params, nonce conflicts, rate limits). Excluded from effective success rate calculation.",
+                    },
                     trend: {
                       type: "string" as const,
                       enum: ["up", "down", "stable"],
@@ -145,6 +150,53 @@ export class DashboardStats extends BaseEndpoint {
                             description: "Current status of the key",
                           },
                         },
+                      },
+                    },
+                  },
+                },
+                endpointBreakdown: {
+                  type: "object" as const,
+                  nullable: true,
+                  description:
+                    "Per-endpoint transaction breakdown (today's calendar-day counters from StatsDO). Only present when StatsDO is configured.",
+                  properties: {
+                    relay: {
+                      type: "object" as const,
+                      description: "Stats for POST /relay (sponsored transactions with settlement)",
+                      properties: {
+                        total: { type: "number" as const },
+                        success: { type: "number" as const },
+                        failed: { type: "number" as const },
+                      },
+                    },
+                    sponsor: {
+                      type: "object" as const,
+                      description: "Stats for POST /sponsor (direct sponsoring, API key required)",
+                      properties: {
+                        total: { type: "number" as const },
+                        success: { type: "number" as const },
+                        failed: { type: "number" as const },
+                      },
+                    },
+                    settle: {
+                      type: "object" as const,
+                      description: "Stats for POST /settle (x402 V2 facilitator — no sponsoring)",
+                      properties: {
+                        total: { type: "number" as const },
+                        success: { type: "number" as const },
+                        failed: { type: "number" as const },
+                        clientErrors: {
+                          type: "number" as const,
+                          description:
+                            "Settle failures caused by client errors (invalid payload, wrong recipient, etc.)",
+                        },
+                      },
+                    },
+                    verify: {
+                      type: "object" as const,
+                      description: "Stats for POST /verify (x402 V2 local validation only)",
+                      properties: {
+                        total: { type: "number" as const },
                       },
                     },
                   },
