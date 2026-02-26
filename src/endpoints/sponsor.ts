@@ -151,6 +151,15 @@ export class Sponsor extends BaseEndpoint {
       // Validate required fields
       if (!body.transaction) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "sponsor",
+          success: false,
+          clientError: true,
+          tokenType: "STX",
+          amount: "0",
+          status: "failed",
+        }).catch(() => {}));
         return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
@@ -165,6 +174,15 @@ export class Sponsor extends BaseEndpoint {
         const authError = stxVerifyService.verifySip018Auth(body.auth, "sponsor");
         if (authError) {
           c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logTransaction({
+            timestamp: new Date().toISOString(),
+            endpoint: "sponsor",
+            success: false,
+            clientError: true,
+            tokenType: "STX",
+            amount: "0",
+            status: "failed",
+          }).catch(() => {}));
           return this.err(c, {
             error: authError.error,
             code: authError.code,
@@ -181,6 +199,15 @@ export class Sponsor extends BaseEndpoint {
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "sponsor",
+          success: false,
+          clientError: true,
+          tokenType: "STX",
+          amount: "0",
+          status: "failed",
+        }).catch(() => {}));
         const code =
           validation.error === "Transaction must be sponsored"
             ? "NOT_SPONSORED"
@@ -207,6 +234,15 @@ export class Sponsor extends BaseEndpoint {
           tier: metadata.tier,
           code: rateLimitResult.code,
         });
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "sponsor",
+          success: false,
+          clientError: true,
+          tokenType: "STX",
+          amount: "0",
+          status: "failed",
+        }).catch(() => {}));
         const isDaily = rateLimitResult.code === "DAILY_LIMIT_EXCEEDED";
         return this.err(c, {
           error: isDaily ? "Daily request limit exceeded" : "Rate limit exceeded",
@@ -244,6 +280,15 @@ export class Sponsor extends BaseEndpoint {
           tier: metadata.tier,
           estimatedFee: estimatedFee.toString(),
         });
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "sponsor",
+          success: false,
+          clientError: true,
+          tokenType: "STX",
+          amount: "0",
+          status: "failed",
+        }).catch(() => {}));
         return this.err(c, {
           error: "Daily spending cap exceeded",
           code: "SPENDING_CAP_EXCEEDED",
@@ -295,6 +340,15 @@ export class Sponsor extends BaseEndpoint {
             reason: errorReason,
           });
           c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logTransaction({
+            timestamp: new Date().toISOString(),
+            endpoint: "sponsor",
+            success: false,
+            clientError: false,
+            tokenType: "STX",
+            amount: "0",
+            status: "failed",
+          }).catch(() => {}));
 
           // Return nonce to pool — broadcast was rejected, nonce can be reused
           if (sponsorNonce !== null) {
@@ -342,6 +396,15 @@ export class Sponsor extends BaseEndpoint {
           error: e instanceof Error ? e.message : "Unknown error",
         });
         c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "sponsor",
+          success: false,
+          clientError: false,
+          tokenType: "STX",
+          amount: "0",
+          status: "failed",
+        }).catch(() => {}));
 
         // Return nonce to pool — broadcast threw an exception, nonce can be reused
         if (sponsorNonce !== null) {
@@ -423,6 +486,15 @@ export class Sponsor extends BaseEndpoint {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logTransaction({
+        timestamp: new Date().toISOString(),
+        endpoint: "sponsor",
+        success: false,
+        clientError: false,
+        tokenType: "STX",
+        amount: "0",
+        status: "failed",
+      }).catch(() => {}));
       return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",

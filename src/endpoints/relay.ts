@@ -204,6 +204,15 @@ export class Relay extends BaseEndpoint {
       // Validate required fields
       if (!body.transaction) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "relay",
+          success: false,
+          clientError: true,
+          tokenType: "STX",
+          amount: "0",
+          status: "failed",
+        }).catch(() => {}));
         return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
@@ -214,6 +223,15 @@ export class Relay extends BaseEndpoint {
 
       if (!body.settle) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "relay",
+          success: false,
+          clientError: true,
+          tokenType: "STX",
+          amount: "0",
+          status: "failed",
+        }).catch(() => {}));
         return this.err(c, {
           error: "Missing settle options",
           code: "MISSING_SETTLE_OPTIONS",
@@ -228,6 +246,15 @@ export class Relay extends BaseEndpoint {
         const authError = stxVerifyService.verifySip018Auth(body.auth, "relay");
         if (authError) {
           c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logTransaction({
+            timestamp: new Date().toISOString(),
+            endpoint: "relay",
+            success: false,
+            clientError: true,
+            tokenType: "STX",
+            amount: "0",
+            status: "failed",
+          }).catch(() => {}));
           return this.err(c, {
             error: authError.error,
             code: authError.code,
@@ -247,6 +274,15 @@ export class Relay extends BaseEndpoint {
       );
       if (settleValidation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "relay",
+          success: false,
+          clientError: true,
+          tokenType: body.settle.tokenType ?? "STX",
+          amount: body.settle.minAmount ?? "0",
+          status: "failed",
+        }).catch(() => {}));
         return this.err(c, {
           error: settleValidation.error,
           code: "INVALID_SETTLE_OPTIONS",
@@ -260,6 +296,15 @@ export class Relay extends BaseEndpoint {
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "relay",
+          success: false,
+          clientError: true,
+          tokenType: body.settle.tokenType ?? "STX",
+          amount: body.settle.minAmount,
+          status: "failed",
+        }).catch(() => {}));
         // Determine error code based on validation failure
         const code = validation.error === "Transaction must be sponsored"
           ? "NOT_SPONSORED"
@@ -277,6 +322,15 @@ export class Relay extends BaseEndpoint {
       if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
         c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "relay",
+          success: false,
+          clientError: true,
+          tokenType: body.settle.tokenType ?? "STX",
+          amount: body.settle.minAmount,
+          status: "failed",
+        }).catch(() => {}));
         return this.err(c, {
           error: "Rate limit exceeded",
           code: "RATE_LIMIT_EXCEEDED",
@@ -344,6 +398,16 @@ export class Relay extends BaseEndpoint {
           );
         }
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        // Client error: the transaction doesn't match the declared settle options
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "relay",
+          success: false,
+          clientError: true,
+          tokenType: body.settle.tokenType ?? "STX",
+          amount: body.settle.minAmount,
+          status: "failed",
+        }).catch(() => {}));
         return this.err(c, {
           error: verifyResult.error,
           code: "SETTLEMENT_VERIFICATION_FAILED",
@@ -386,6 +450,7 @@ export class Relay extends BaseEndpoint {
             timestamp: new Date().toISOString(),
             endpoint: "relay",
             success: false,
+            clientError: false,
             tokenType: tokenTypeFailed,
             amount: body.settle.minAmount,
             fee: sponsorResult.fee,
@@ -520,6 +585,15 @@ export class Relay extends BaseEndpoint {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logTransaction({
+        timestamp: new Date().toISOString(),
+        endpoint: "relay",
+        success: false,
+        clientError: false,
+        tokenType: "STX",
+        amount: "0",
+        status: "failed",
+      }).catch(() => {}));
       return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",
