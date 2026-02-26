@@ -807,6 +807,9 @@ export class AuthService {
       totalActiveKeys: 0,
       totalFeesToday: "0",
       topKeys: [],
+      expiredKeys: 0,
+      revokedKeys: 0,
+      newKeysLast7Days: 0,
     };
 
     if (!this.kv) {
@@ -879,8 +882,11 @@ export class AuthService {
       return emptyStats;
     }
 
-    // Count active keys by listing key: prefix
+    // Count active/expired/revoked keys and 7-day registrations by listing key: prefix
     let totalActiveKeys = 0;
+    let expiredKeys = 0;
+    let revokedKeys = 0;
+    let newKeysLast7Days = 0;
 
     try {
       // Phase 1: collect key names from KV list
@@ -913,12 +919,32 @@ export class AuthService {
       );
 
       const now = new Date();
+      const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
       for (const metadata of metadataResults) {
-        if (metadata?.active) {
-          const expiresAt = new Date(metadata.expiresAt);
-          if (expiresAt > now) {
-            totalActiveKeys++;
-          }
+        if (!metadata) continue;
+
+        const expiresAt = new Date(metadata.expiresAt);
+        const createdAt = new Date(metadata.createdAt);
+
+        // Count revoked keys (active === false)
+        if (!metadata.active) {
+          revokedKeys++;
+        }
+
+        // Count expired keys (expiresAt in the past, regardless of active flag)
+        if (expiresAt <= now) {
+          expiredKeys++;
+        }
+
+        // Count active keys: must be active and not expired
+        if (metadata.active && expiresAt > now) {
+          totalActiveKeys++;
+        }
+
+        // Count keys registered in the last 7 days
+        if (createdAt >= sevenDaysAgo) {
+          newKeysLast7Days++;
         }
       }
     } catch (error) {
@@ -955,6 +981,9 @@ export class AuthService {
       totalActiveKeys,
       totalFeesToday: totalFeesToday.toString(),
       topKeys,
+      expiredKeys,
+      revokedKeys,
+      newKeysLast7Days,
     };
   }
 }

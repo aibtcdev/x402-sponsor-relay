@@ -843,6 +843,12 @@ export interface AggregateKeyStats {
   totalFeesToday: string;
   /** Top keys by request count (max 5) */
   topKeys: ApiKeyStatsEntry[];
+  /** Number of keys whose expiresAt is in the past (regardless of active flag) */
+  expiredKeys: number;
+  /** Number of keys with active === false (revoked) */
+  revokedKeys: number;
+  /** Number of keys created within the last 7 days */
+  newKeysLast7Days: number;
 }
 
 /**
