@@ -138,9 +138,10 @@ export class SettlementService {
   }
 
   private isUsdcxContract(address: string, contractName: string): boolean {
+    const upper = address.toUpperCase();
     return (
-      (address === USDCX_CIRCLE_CONTRACT_MAINNET && contractName === USDCX_CIRCLE_CONTRACT_NAME) ||
-      (address === USDCX_AEUSDC_CONTRACT_MAINNET && contractName === USDCX_AEUSDC_CONTRACT_NAME)
+      (upper === USDCX_CIRCLE_CONTRACT_MAINNET && contractName === USDCX_CIRCLE_CONTRACT_NAME) ||
+      (upper === USDCX_AEUSDC_CONTRACT_MAINNET && contractName === USDCX_AEUSDC_CONTRACT_NAME)
     );
   }
 
