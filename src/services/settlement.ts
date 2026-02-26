@@ -26,7 +26,6 @@ import { extractSponsorNonce } from "./sponsor";
 
 // Known SIP-010 token contract addresses
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
-const SBTC_CONTRACT_TESTNET = "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4";
 const SBTC_CONTRACT_NAME = "sbtc-token";
 
 // USDCx — two known mainnet contracts that both represent USDC on Stacks
@@ -131,6 +130,21 @@ export class SettlementService {
     return null;
   }
 
+  // Mainnet: exact address + name. Testnet: name-only (deployer drifts across SDKs).
+  private isSbtcContract(address: string, contractName: string): boolean {
+    if (contractName !== SBTC_CONTRACT_NAME) return false;
+    if (this.env.STACKS_NETWORK === "testnet") return true;
+    return address.toUpperCase() === SBTC_CONTRACT_MAINNET;
+  }
+
+  private isUsdcxContract(address: string, contractName: string): boolean {
+    const upper = address.toUpperCase();
+    return (
+      (upper === USDCX_CIRCLE_CONTRACT_MAINNET && contractName === USDCX_CIRCLE_CONTRACT_NAME) ||
+      (upper === USDCX_AEUSDC_CONTRACT_MAINNET && contractName === USDCX_AEUSDC_CONTRACT_NAME)
+    );
+  }
+
   /**
    * Validate settle options (expectedRecipient, minAmount, tokenType)
    */
@@ -200,62 +214,36 @@ export class SettlementService {
     if (upper === "SBTC") return "sBTC";
     if (upper === "USDCX") return "USDCx";
 
-    // Try to parse a Stacks FT CAIP-19 identifier and extract the contract address.
-    const contractAddr = this.extractStacksFtContractAddress(asset);
-    if (contractAddr === SBTC_CONTRACT_MAINNET || contractAddr === SBTC_CONTRACT_TESTNET) {
-      return "sBTC";
-    }
-    if (contractAddr === USDCX_CIRCLE_CONTRACT_MAINNET || contractAddr === USDCX_AEUSDC_CONTRACT_MAINNET) {
-      return "USDCx";
+    // Try CAIP-19 format: stacks:<chainId>/sip010:<addr>.<name>.<token>
+    const ftContract = this.extractStacksFtContract(asset);
+    if (ftContract) {
+      return this.matchTokenContract(ftContract.address, ftContract.contractName);
     }
 
-    // Try bare contract principal format: "address.contract-name"
-    const bareMatch = this.matchBareContractPrincipal(asset);
-    if (bareMatch !== null) {
-      return bareMatch;
-    }
+    // Try bare contract principal: "address.contract-name"
+    return this.matchBareContractPrincipal(asset);
+  }
 
+  // Map a known contract address + name to its TokenType, or null if unrecognized.
+  private matchTokenContract(address: string, contractName: string): TokenType | null {
+    if (this.isSbtcContract(address, contractName)) return "sBTC";
+    if (this.isUsdcxContract(address, contractName)) return "USDCx";
     return null;
   }
 
-  /**
-   * Match a bare Stacks contract principal (address.contract-name) against
-   * known token contracts. Returns the mapped TokenType or null if unrecognized.
-   *
-   * Handles:
-   * - "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token" → "sBTC" (mainnet)
-   * - "ST1F7QA2MDF17S807EPA36TSS8AMEQ4ASGQBP8WN4.sbtc-token"  → "sBTC" (testnet)
-   * - "SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE.usdcx" → "USDCx" (Circle)
-   * - "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9.token-aeusdc" → "USDCx" (Aave aeUSDC)
-   */
+  // Parse "address.contract-name" and match against known tokens.
   private matchBareContractPrincipal(asset: string): TokenType | null {
     const dotIndex = asset.indexOf(".");
     if (dotIndex === -1) return null;
-    const address = asset.substring(0, dotIndex).toUpperCase();
-    const contractName = asset.substring(dotIndex + 1);
-
-    if (
-      (address === SBTC_CONTRACT_MAINNET || address === SBTC_CONTRACT_TESTNET) &&
-      contractName === SBTC_CONTRACT_NAME
-    ) {
-      return "sBTC";
-    }
-    if (
-      (address === USDCX_CIRCLE_CONTRACT_MAINNET && contractName === USDCX_CIRCLE_CONTRACT_NAME) ||
-      (address === USDCX_AEUSDC_CONTRACT_MAINNET && contractName === USDCX_AEUSDC_CONTRACT_NAME)
-    ) {
-      return "USDCx";
-    }
-    return null;
+    return this.matchTokenContract(
+      asset.substring(0, dotIndex).toUpperCase(),
+      asset.substring(dotIndex + 1)
+    );
   }
 
-  /**
-   * Extract the Stacks FT contract principal from a CAIP-19 asset identifier.
-   *
-   * Expected format: stacks:<chainId>/sip010:<contractAddr>.<contractName>.<tokenName>
-   * Returns the uppercase contract address, or null if not a valid Stacks FT CAIP-19.
-   */
-  private extractStacksFtContractAddress(asset: string): string | null {
+  // Parse CAIP-19 format: stacks:<chainId>/sip010:<addr>.<name>.<token>
+  // Returns { address (uppercase), contractName } or null.
+  private extractStacksFtContract(asset: string): { address: string; contractName: string } | null {
     if (!asset.toLowerCase().startsWith("stacks:")) return null;
     const parts = asset.split("/");
     if (parts.length < 2) return null;
@@ -263,8 +251,11 @@ export class SettlementService {
     if (!assetSpec.toLowerCase().startsWith("sip010:")) return null;
     const afterType = assetSpec.substring(7); // strip "sip010:"
     if (!afterType) return null;
-    const [contractPrincipal] = afterType.split(".");
-    return contractPrincipal ? contractPrincipal.toUpperCase() : null;
+    const dotParts = afterType.split(".");
+    const contractPrincipal = dotParts[0];
+    const contractName = dotParts[1];
+    if (!contractPrincipal || !contractName) return null;
+    return { address: contractPrincipal.toUpperCase(), contractName };
   }
 
   /**
@@ -356,31 +347,15 @@ export class SettlementService {
       }
 
       // Determine token type from contract address
-      if (
-        contractAddressStr === SBTC_CONTRACT_MAINNET ||
-        contractAddressStr === SBTC_CONTRACT_TESTNET
-      ) {
-        if (contractNameStr !== SBTC_CONTRACT_NAME) {
-          return {
-            valid: false,
-            error: "Unsupported contract",
-            details: `Expected contract name '${SBTC_CONTRACT_NAME}', got '${contractNameStr}'`,
-          };
-        }
-        tokenType = "sBTC";
-      } else if (
-        (contractAddressStr === USDCX_CIRCLE_CONTRACT_MAINNET && contractNameStr === USDCX_CIRCLE_CONTRACT_NAME) ||
-        (contractAddressStr === USDCX_AEUSDC_CONTRACT_MAINNET && contractNameStr === USDCX_AEUSDC_CONTRACT_NAME)
-      ) {
-        tokenType = "USDCx";
-      } else {
-        // Reject unknown SIP-010 contracts — only known tokens are supported
+      const matchedToken = this.matchTokenContract(contractAddressStr, contractNameStr);
+      if (!matchedToken) {
         return {
           valid: false,
           error: "Unsupported token contract",
           details: `Unsupported SIP-010 token contract: ${contractAddressStr}.${contractNameStr}`,
         };
       }
+      tokenType = matchedToken;
 
       // SIP-010 transfer args: [amount (uint), from (principal), to (principal), memo (optional)]
       const args = transaction.payload.functionArgs as ClarityValue[];
