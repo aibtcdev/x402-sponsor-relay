@@ -181,11 +181,14 @@ export function validateV2Request(
   const settlementService = new SettlementService(env, logger);
   const tokenType = settlementService.mapAssetToTokenType(req.asset);
   if (tokenType === null) {
-    logger.warn("Unsupported asset", { asset: req.asset });
+    logger.warn("Unrecognized asset in paymentRequirements", {
+      asset: req.asset,
+      supportedAssets: ["STX", "sBTC", "USDCx"],
+    });
     return {
       valid: false,
       error: {
-        errorReason: X402_V2_ERROR_CODES.UNSUPPORTED_SCHEME,
+        errorReason: X402_V2_ERROR_CODES.UNRECOGNIZED_ASSET,
         status: 400,
       },
     };
