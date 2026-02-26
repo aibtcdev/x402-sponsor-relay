@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.15.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.15.1...x402-sponsor-relay-v1.15.2) (2026-02-26)
+
+
+### Bug Fixes
+
+* **diagnostics:** reduce error noise for expected failures ([#127](https://github.com/aibtcdev/x402-sponsor-relay/issues/127)) ([f7c84f4](https://github.com/aibtcdev/x402-sponsor-relay/commit/f7c84f4d72eed5dd351670878c5d428763f9fda7))
+* **resilience:** broadcast retry and stuck-nonce auto-recovery ([#125](https://github.com/aibtcdev/x402-sponsor-relay/issues/125)) ([72496c7](https://github.com/aibtcdev/x402-sponsor-relay/commit/72496c7a3359fb3a953aab9f2a625b05c94f53bf))
+
 ## [1.15.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.15.0...x402-sponsor-relay-v1.15.1) (2026-02-26)
 
 
