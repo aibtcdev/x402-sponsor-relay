@@ -587,7 +587,7 @@ Content-Type: application/json
       "transaction": "0x00000001..."         // hex-encoded signed sponsored tx
     },
     "extensions": {                          // optional — payment-identifier extension
-      "payment-identifier": "pay_<uuid>"    // stable id; survives tx rebuilds on retry
+      "payment-identifier": { "info": { "id": "pay_<uuid>" } }
     },
     "accepted": {                            // payment requirements that were accepted
       "scheme": "exact",
@@ -1634,7 +1634,7 @@ Content-Type: application/json
       "transaction": "<hex-encoded sponsored tx>"
     },
     "extensions": {
-      "payment-identifier": "pay_01J7QZXK5XRGBVMK3N9RTNF4WW"
+      "payment-identifier": { "info": { "id": "pay_01J7QZXK5XRGBVMK3N9RTNF4WW" } }
     }
   },
   "paymentRequirements": {
@@ -1670,7 +1670,7 @@ Skip it when:
 
 4b. (Optional) Client includes a "payment-identifier" in paymentPayload.extensions
     for stable idempotency across retries, even if the tx must be rebuilt.
-    Example: "extensions": { "payment-identifier": "pay_<uuid>" }
+    Example: "extensions": { "payment-identifier": { "info": { "id": "pay_<uuid>" } } }
 
 5. Client calls POST /settle with the signed tx and paymentRequirements.
    Relay verifies, broadcasts, and returns { success: true, transaction: "0x..." }.

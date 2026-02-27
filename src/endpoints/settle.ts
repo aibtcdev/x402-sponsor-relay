@@ -130,8 +130,7 @@ export class Settle extends BaseEndpoint {
         return v2Error(validation.error.errorReason, validation.error.status);
       }
 
-      const { settleOptions, txHex, settlementService } = validation.data;
-      const paymentIdentifier = validation.data.paymentIdentifier;
+      const { settleOptions, txHex, settlementService, paymentIdentifier } = validation.data;
 
       // Payment-identifier cache check (client-controlled idempotency, higher priority than dedup)
       let paymentIdPayloadHash: string | undefined;
@@ -146,7 +145,7 @@ export class Settle extends BaseEndpoint {
           logger.info("payment-identifier cache hit, returning cached settle response", {
             id: paymentIdentifier,
           });
-          return c.json(cacheResult.response, 200);
+          return c.json(cacheResult.response as X402SettlementResponseV2, 200);
         }
         if (cacheResult.status === "conflict") {
           logger.warn("payment-identifier conflict detected", { id: paymentIdentifier });

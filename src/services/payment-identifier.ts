@@ -1,4 +1,4 @@
-import type { Logger, X402SettlementResponseV2 } from "../types";
+import type { Logger } from "../types";
 
 const PAYMENT_ID_TTL_SECONDS = 300;
 const PAYMENT_ID_KEY_PREFIX = "payid:";
@@ -6,12 +6,16 @@ const PAYMENT_ID_KEY_PREFIX = "payid:";
 /**
  * Shape of a cached payment-identifier entry stored in KV.
  * Keyed by payid:<id> with a 300s TTL.
+ *
+ * The response field is typed as `unknown` so both /settle (X402SettlementResponseV2)
+ * and /verify (X402VerifyResponseV2) can cache their responses without unsafe casts.
+ * Callers are responsible for casting the response to the expected shape on cache hit.
  */
 export interface CachedPaymentIdEntry {
   /** SHA-256 hex hash of canonical { paymentPayload, paymentRequirements } JSON */
   payloadHash: string;
-  /** The settle response returned to the original caller */
-  response: X402SettlementResponseV2;
+  /** The response returned to the original caller (shape depends on endpoint) */
+  response: unknown;
   /** Unix timestamp (ms) when this entry was recorded */
   recordedAt: number;
 }
@@ -25,7 +29,7 @@ export interface CachedPaymentIdEntry {
  */
 export type PaymentIdCheckResult =
   | { status: "miss" }
-  | { status: "hit"; response: X402SettlementResponseV2 }
+  | { status: "hit"; response: unknown }
   | { status: "conflict" };
 
 /**
@@ -129,7 +133,7 @@ export class PaymentIdService {
   async recordPaymentId(
     id: string,
     payloadHash: string,
-    response: X402SettlementResponseV2
+    response: unknown
   ): Promise<void> {
     if (!this.kv) {
       return;

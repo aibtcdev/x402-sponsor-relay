@@ -319,7 +319,7 @@ Request: {
       transaction: "hex-encoded-signed-sponsored-tx"  // pre-sponsored tx
     },
     extensions?: {                 // optional — payment-identifier extension
-      "payment-identifier": "pay_<uuid>"  // stable id; 16-128 chars [a-zA-Z0-9_-]+
+      "payment-identifier": { info: { id: "pay_<uuid>" } }  // 16-128 chars [a-zA-Z0-9_-]+
       // same id + same payload = cached 200; same id + different payload = 409 Conflict
     },
     accepted?: { ... }  // paymentRequirements the client accepted

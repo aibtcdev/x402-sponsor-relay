@@ -5,7 +5,7 @@ import {
   V2_REQUEST_BODY_SCHEMA,
 } from "./v2-helpers";
 import { StatsService, PaymentIdService } from "../services";
-import type { AppContext, X402VerifyResponseV2, X402SettleRequestV2, X402SettlementResponseV2 } from "../types";
+import type { AppContext, X402VerifyResponseV2, X402SettleRequestV2 } from "../types";
 import { X402_V2_ERROR_CODES } from "../types";
 
 /**
@@ -95,8 +95,7 @@ export class VerifyV2 extends BaseEndpoint {
         return v2Invalid(validation.error.errorReason);
       }
 
-      const { settleOptions, txHex, settlementService } = validation.data;
-      const paymentIdentifier = validation.data.paymentIdentifier;
+      const { settleOptions, txHex, settlementService, paymentIdentifier } = validation.data;
 
       // Payment-identifier cache check (client-controlled idempotency)
       let paymentIdPayloadHash: string | undefined;
@@ -111,7 +110,7 @@ export class VerifyV2 extends BaseEndpoint {
           logger.info("payment-identifier cache hit, returning cached verify response", {
             id: paymentIdentifier,
           });
-          return c.json(cacheResult.response as unknown as X402VerifyResponseV2, 200);
+          return c.json(cacheResult.response as X402VerifyResponseV2, 200);
         }
         if (cacheResult.status === "conflict") {
           logger.warn("payment-identifier conflict detected", { id: paymentIdentifier });
@@ -161,13 +160,7 @@ export class VerifyV2 extends BaseEndpoint {
       // Cache the verify result under the payment-identifier key for idempotent retries
       if (paymentIdentifier && paymentIdPayloadHash) {
         c.executionCtx.waitUntil(
-          paymentIdService
-            .recordPaymentId(
-              paymentIdentifier,
-              paymentIdPayloadHash,
-              response as unknown as X402SettlementResponseV2
-            )
-            .catch(() => {})
+          paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, response).catch(() => {})
         );
       }
 

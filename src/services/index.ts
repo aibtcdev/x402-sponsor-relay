@@ -36,4 +36,3 @@ export { SettlementService } from "./settlement";
 export { SettlementHealthService } from "./settlement-health";
 
 export { PaymentIdService } from "./payment-identifier";
-export type { PaymentIdCheckResult, CachedPaymentIdEntry } from "./payment-identifier";
