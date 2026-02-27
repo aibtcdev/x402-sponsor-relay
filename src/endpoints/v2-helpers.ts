@@ -2,10 +2,16 @@ import { SettlementService } from "../services";
 import type {
   Env,
   Logger,
+  PaymentIdentifierExtension,
   SettleOptions,
   X402SettleRequestV2,
 } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
+
+/** Allowed characters for payment-identifier id: alphanumeric, underscore, hyphen */
+const PAYMENT_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const PAYMENT_ID_MIN_LENGTH = 16;
+const PAYMENT_ID_MAX_LENGTH = 128;
 
 // =============================================================================
 // Shared OpenAPI Schema Definitions for V2 Endpoints
@@ -40,6 +46,29 @@ export const V2_REQUEST_BODY_SCHEMA = {
               type: "string" as const,
               description: "Hex-encoded signed sponsored transaction",
               example: "0x00000001...",
+            },
+          },
+        },
+        extensions: {
+          type: "object" as const,
+          description: "Optional protocol extensions",
+          properties: {
+            "payment-identifier": {
+              type: "object" as const,
+              description: "Client-controlled idempotency key (payment-identifier extension)",
+              properties: {
+                info: {
+                  type: "object" as const,
+                  properties: {
+                    id: {
+                      type: "string" as const,
+                      description:
+                        "16-128 char idempotency key (pattern: [a-zA-Z0-9_-]+, pay_ prefix recommended)",
+                      example: "pay_01JMVP9QE8XA3BDGM5RN7KWTZ4",
+                    },
+                  },
+                },
+              },
             },
           },
         },
@@ -89,6 +118,12 @@ export interface V2ValidatedRequest {
   settlementService: SettlementService;
   /** Max settlement timeout in seconds from paymentRequirements (optional) */
   maxTimeoutSeconds?: number;
+  /**
+   * Extracted payment-identifier extension id, if provided by client.
+   * Undefined when the extension is absent (backward compatible).
+   * Used for client-controlled idempotency caching in /settle and /verify.
+   */
+  paymentIdentifier?: string;
 }
 
 /**
@@ -212,6 +247,16 @@ export function validateV2Request(
       ? req.maxTimeoutSeconds
       : undefined;
 
+  // Extract and validate payment-identifier extension (optional)
+  const paymentIdResult = validatePaymentIdentifier(
+    parsed.paymentPayload.extensions?.["payment-identifier"],
+    logger
+  );
+  if (paymentIdResult !== undefined && typeof paymentIdResult !== "string") {
+    return paymentIdResult;
+  }
+  const paymentIdentifier = paymentIdResult;
+
   return {
     valid: true,
     data: {
@@ -224,8 +269,54 @@ export function validateV2Request(
       network,
       settlementService,
       maxTimeoutSeconds,
+      paymentIdentifier,
     },
   };
+}
+
+/**
+ * Validate the payment-identifier extension if present.
+ *
+ * Returns:
+ * - `undefined` if the extension is absent (backward compatible, no id)
+ * - The validated id string if the extension is present and valid
+ * - A V2ValidationResult error if the extension is present but invalid
+ */
+function validatePaymentIdentifier(
+  ext: PaymentIdentifierExtension | undefined,
+  logger: Logger
+): string | undefined | { valid: false; error: V2ValidationError } {
+  if (ext === undefined) {
+    return undefined;
+  }
+
+  const id = ext?.info?.id;
+  const invalidPayload = {
+    valid: false as const,
+    error: { errorReason: X402_V2_ERROR_CODES.INVALID_PAYLOAD, status: 400 as const },
+  };
+
+  if (typeof id !== "string") {
+    logger.warn("payment-identifier extension present but id is not a string", { idType: typeof id });
+    return invalidPayload;
+  }
+
+  if (id.length < PAYMENT_ID_MIN_LENGTH || id.length > PAYMENT_ID_MAX_LENGTH) {
+    logger.warn("payment-identifier id length out of range", {
+      length: id.length,
+      min: PAYMENT_ID_MIN_LENGTH,
+      max: PAYMENT_ID_MAX_LENGTH,
+    });
+    return invalidPayload;
+  }
+
+  if (!PAYMENT_ID_PATTERN.test(id)) {
+    logger.warn("payment-identifier id contains invalid characters", { id });
+    return invalidPayload;
+  }
+
+  logger.debug("payment-identifier extracted", { id });
+  return id;
 }
 
 /**

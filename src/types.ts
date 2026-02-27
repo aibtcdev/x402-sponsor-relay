@@ -246,6 +246,30 @@ export interface X402PayloadV2 {
 }
 
 /**
+ * Payment-identifier extension payload (x402 V2 extension)
+ * Provides a client-controlled idempotency key that survives transaction rebuilds.
+ * Pattern: [a-zA-Z0-9_-]+, length 16-128, pay_ prefix recommended.
+ */
+export interface PaymentIdentifierExtension {
+  /** Extension info object containing the idempotency key */
+  info: {
+    /** Idempotency key (16-128 chars, pattern: [a-zA-Z0-9_-]+) */
+    id: string;
+  };
+}
+
+/**
+ * Typed extensions object for x402 V2 paymentPayload.
+ * Maps known extension keys to their typed payloads.
+ */
+export interface PaymentPayloadExtensions {
+  /** Client-controlled idempotency key extension */
+  "payment-identifier"?: PaymentIdentifierExtension;
+  /** Allow arbitrary future/unknown x402 extensions */
+  [key: string]: unknown;
+}
+
+/**
  * Client's payment authorization (x402 V2 paymentPayload)
  */
 export interface X402PaymentPayloadV2 {
@@ -258,7 +282,7 @@ export interface X402PaymentPayloadV2 {
   /** Scheme-specific payload containing the transaction */
   payload: X402PayloadV2;
   /** Optional protocol extensions */
-  extensions?: Record<string, unknown>;
+  extensions?: PaymentPayloadExtensions;
 }
 
 /**
@@ -308,6 +332,8 @@ export interface X402VerifyResponseV2 {
   invalidReason?: string;
   /** Payer Stacks address (if determinable) */
   payer?: string;
+  /** Optional protocol extensions echoed back to the client */
+  extensions?: Record<string, unknown>;
 }
 
 /**
@@ -359,6 +385,8 @@ export const X402_V2_ERROR_CODES = {
   TRANSACTION_FAILED: "transaction_failed",
   BROADCAST_FAILED: "broadcast_failed",
   CONFLICTING_NONCE: "conflicting_nonce",
+  PAYMENT_IDENTIFIER_CONFLICT: "payment_identifier_conflict",
+  PAYMENT_IDENTIFIER_REQUIRED: "payment_identifier_required",
 } as const;
 
 /**

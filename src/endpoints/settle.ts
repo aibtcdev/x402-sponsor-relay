@@ -5,8 +5,8 @@ import {
   V2_REQUEST_BODY_SCHEMA,
   V2_ERROR_RESPONSE_SCHEMA,
 } from "./v2-helpers";
-import { StatsService } from "../services";
-import type { AppContext, X402SettlementResponseV2 } from "../types";
+import { StatsService, PaymentIdService } from "../services";
+import type { AppContext, X402SettlementResponseV2, X402SettleRequestV2 } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
 /**
@@ -22,7 +22,7 @@ export class Settle extends BaseEndpoint {
     tags: ["x402 V2"],
     summary: "Settle an x402 V2 payment",
     description:
-      "x402 V2 facilitator settle endpoint (spec section 7.2). Verifies payment parameters locally and broadcasts the transaction to the Stacks network. Does not sponsor — expects a fully-sponsored transaction in paymentPayload.payload.transaction. Returns HTTP 200 for all settlement results (success or failure); HTTP 400 for invalid request schema.",
+      "x402 V2 facilitator settle endpoint (spec section 7.2). Verifies payment parameters locally and broadcasts the transaction to the Stacks network. Does not sponsor — expects a fully-sponsored transaction in paymentPayload.payload.transaction. Returns HTTP 200 for settlement results (success or failure); HTTP 400 for invalid request schema; HTTP 409 when a payment-identifier conflicts with a prior request.",
     request: {
       body: {
         content: {
@@ -62,8 +62,20 @@ export class Settle extends BaseEndpoint {
                   description: "CAIP-2 network identifier",
                   example: "stacks:2147483648",
                 },
+                extensions: {
+                  type: "object" as const,
+                  description: "Echoed protocol extensions (e.g. payment-identifier)",
+                },
               },
             },
+          },
+        },
+      },
+      "409": {
+        description: "Payment-identifier conflict — same id used with a different payload",
+        content: {
+          "application/json": {
+            schema: V2_ERROR_RESPONSE_SCHEMA,
           },
         },
       },
@@ -97,12 +109,13 @@ export class Settle extends BaseEndpoint {
     logger.info("x402 V2 settle request received");
 
     const statsService = new StatsService(c.env, logger);
+    const paymentIdService = new PaymentIdService(c.env.RELAY_KV, logger);
 
     const network = CAIP2_NETWORKS[c.env.STACKS_NETWORK];
 
     const v2Error = (
       errorReason: string,
-      status: 200 | 400 | 500,
+      status: 200 | 400 | 409 | 500,
       payer?: string
     ): Response => {
       const body: X402SettlementResponseV2 = {
@@ -129,7 +142,28 @@ export class Settle extends BaseEndpoint {
         return v2Error(validation.error.errorReason, validation.error.status);
       }
 
-      const { settleOptions, txHex, settlementService } = validation.data;
+      const { settleOptions, txHex, settlementService, paymentIdentifier } = validation.data;
+
+      // Payment-identifier cache check (client-controlled idempotency, higher priority than dedup)
+      let paymentIdPayloadHash: string | undefined;
+      if (paymentIdentifier) {
+        const rawBody = body as X402SettleRequestV2;
+        paymentIdPayloadHash = await paymentIdService.computePayloadHash(
+          rawBody.paymentPayload,
+          rawBody.paymentRequirements
+        );
+        const cacheResult = await paymentIdService.checkPaymentId(paymentIdentifier, paymentIdPayloadHash, "settle");
+        if (cacheResult.status === "hit") {
+          logger.info("payment-identifier cache hit, returning cached settle response", {
+            id: paymentIdentifier,
+          });
+          return c.json(cacheResult.response as X402SettlementResponseV2, 200);
+        }
+        if (cacheResult.status === "conflict") {
+          logger.warn("payment-identifier conflict detected", { id: paymentIdentifier });
+          return v2Error(X402_V2_ERROR_CODES.PAYMENT_IDENTIFIER_CONFLICT, 409);
+        }
+      }
 
       const dedupResult = await settlementService.checkDedup(txHex);
       if (dedupResult) {
@@ -240,7 +274,18 @@ export class Settle extends BaseEndpoint {
         payer,
         transaction: broadcastResult.txid,
         network,
+        ...(paymentIdentifier
+          ? { extensions: { "payment-identifier": { info: { id: paymentIdentifier } } } }
+          : {}),
       };
+
+      // Cache the result under the payment-identifier key for idempotent retries
+      if (paymentIdentifier && paymentIdPayloadHash) {
+        c.executionCtx.waitUntil(
+          paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, response, "settle").catch(() => {})
+        );
+      }
+
       return c.json(response, 200);
     } catch (e) {
       logger.error("Unexpected settle error", {

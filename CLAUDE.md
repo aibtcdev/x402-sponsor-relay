@@ -318,6 +318,10 @@ Request: {
     payload: {
       transaction: "hex-encoded-signed-sponsored-tx"  // pre-sponsored tx
     },
+    extensions?: {                 // optional — payment-identifier extension
+      "payment-identifier": { info: { id: "pay_<uuid>" } }  // 16-128 chars [a-zA-Z0-9_-]+
+      // same id + same payload = cached 200; same id + different payload = 409 Conflict
+    },
     accepted?: { ... }  // paymentRequirements the client accepted
   },
   paymentRequirements: {
@@ -364,7 +368,7 @@ Response (invalid, HTTP 200): {
 // GET /supported (x402 V2 facilitator — static config)
 Response: {
   kinds: [{ x402Version: 2, scheme: "exact", network: "stacks:2147483648" }],
-  extensions: [],
+  extensions: ["payment-identifier"],  // client-controlled idempotency key extension
   signers: { "stacks:*": [] }  // empty = any signer accepted
 }
 ```
