@@ -276,7 +276,8 @@ Content-Type: application/json
 - 500 SPONSOR_CONFIG_ERROR — relay misconfigured, not retryable
 - 500 SPONSOR_FAILED — sponsoring failed, retryable: true
 - 502 SETTLEMENT_BROADCAST_FAILED — Stacks node rejected broadcast, retryAfter: 5
-- 422 SETTLEMENT_FAILED — tx broadcast OK but aborted/dropped on-chain, not retryable
+- 422 SETTLEMENT_FAILED — tx broadcast OK but definitively aborted on-chain (abort_* only), not retryable
+  Note: dropped_* statuses are transient — polling continues, returns pending at timeout
 
 ---
 
@@ -640,7 +641,7 @@ Content-Type: application/json
 - amount_insufficient — tx amount is below the required minimum
 - sender_mismatch — tx token type does not match asset
 - broadcast_failed — Stacks node rejected broadcast (retryable)
-- transaction_failed — tx broadcast OK but aborted/dropped on-chain
+- transaction_failed — tx broadcast OK but definitively aborted on-chain (abort_* status only)
 - unexpected_settle_error — unexpected internal error
 
 ---
@@ -1292,7 +1293,7 @@ All errors return JSON with this shape:
 | SPONSOR_FAILED                 | 500  | true      | sponsoring the tx failed |
 | SETTLEMENT_BROADCAST_FAILED    | 502  | true      | Stacks node rejected broadcast, retryAfter: 5 |
 | NONCE_CONFLICT                 | 409  | true      | Sponsor nonce conflict in mempool; resubmit with a new transaction |
-| SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but aborted/dropped on-chain |
+| SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but definitively aborted on-chain (abort_* status only) |
 
 ## API Key Errors (POST /sponsor, POST /fees/config)
 
@@ -1365,6 +1366,22 @@ Do retry (after retryAfter):
 - 409 NONCE_CONFLICT — rebuild and resubmit a new transaction
 - 502 SETTLEMENT_BROADCAST_FAILED — Stacks node may accept on retry
 - 500 INTERNAL_ERROR — may be transient
+
+## Settlement Status: pending vs failed
+
+If POST /relay returns settlement.status: "pending", the transaction is in flight.
+Do NOT treat this as a failure. The relay may have timed out polling (60s limit)
+or encountered a transient Hiro API drop report. Poll GET /verify/:receiptId to
+check if the transaction confirmed.
+
+Hiro's "dropped_replace_by_fee" status is TRANSIENT. In observed incidents, 93%
+of transactions reported as dropped by Hiro actually confirmed on-chain within
+seconds. The relay continues polling through dropped statuses and only returns
+pending at timeout, never SETTLEMENT_FAILED, for dropped transactions.
+
+SETTLEMENT_FAILED (422, retryable: false) is only returned for transactions that
+receive an abort_* status (on-chain rejection), which is a definitive terminal
+state. Only abort_* statuses are truly terminal on Stacks.
 
 Note: POST /relay is idempotent for the same sponsored tx hex (5-min dedup window).
 If you receive a network error after submitting, retrying with the same tx is safe.
@@ -1531,7 +1548,7 @@ Content-Type: application/json
 
 Same set as invalidReason (above), plus:
   broadcast_failed    — node rejected broadcast (may be retryable)
-  transaction_failed  — tx broadcast but aborted/dropped on-chain
+  transaction_failed  — tx broadcast but definitively aborted on-chain (abort_* only)
   unexpected_settle_error — internal error
 
 ## GET /supported — Supported Payment Kinds (Spec Section 7.3)

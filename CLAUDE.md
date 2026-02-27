@@ -580,7 +580,13 @@ Agent                    Relay                              Stacks
 **Settlement states:**
 - `confirmed`: tx confirmed on-chain within 60s — includes `blockHeight`
 - `pending`: broadcast succeeded but confirmation timed out — safe state, poll `/verify/:receiptId`
-- `failed`: tx broadcast OK but aborted/dropped on-chain — returns `SETTLEMENT_FAILED` (422, not retryable)
+- `failed`: tx broadcast OK but definitively aborted on-chain (`abort_*` status) — returns `SETTLEMENT_FAILED` (422, not retryable)
+
+**Drop vs abort semantics:**
+- `dropped_*` from Hiro is TRANSIENT — 93% of `dropped_replace_by_fee` reports actually confirm on-chain.
+  The relay polls through dropped statuses until the 60s timeout, then returns `status: "pending"`.
+- `abort_*` is TERMINAL (on-chain rejection). Only `abort_*` triggers `SETTLEMENT_FAILED` (422, not retryable).
+- Agents should treat `status: "pending"` as "in flight" and poll `/verify/:receiptId` for final status.
 
 **Idempotency:** Submitting the same sponsored tx hex within 5 minutes returns the cached result from KV (dedup). Safe for agents to retry on network failure.
 

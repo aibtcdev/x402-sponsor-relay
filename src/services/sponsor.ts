@@ -11,7 +11,7 @@ import {
   generateNewAccount,
   generateWallet,
 } from "@stacks/wallet-sdk";
-import type { Env, Logger, FeeTransactionType, WalletStatus, WalletsResponse } from "../types";
+import type { Env, Logger, FeeTransactionType, FeePriority, WalletStatus, WalletsResponse } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix } from "../utils";
 import { FeeService } from "./fee";
 
@@ -77,6 +77,13 @@ const cachedSponsorKeys: Map<number, string> = new Map();
 const MAX_ACCOUNT_INDEX = 1000;
 const MAX_WALLET_COUNT = 10;
 const VALID_MNEMONIC_LENGTHS = [12, 24];
+
+/**
+ * Per-wallet chaining limit (mirrors NonceDO's CHAINING_LIMIT = 20).
+ * Used to compute pool capacity for fee pressure calculations.
+ * Pool capacity = SPONSOR_WALLET_COUNT * CHAINING_LIMIT_PER_WALLET.
+ */
+const CHAINING_LIMIT_PER_WALLET = 20;
 
 // Nonce fetch retry configuration
 const NONCE_FETCH_MAX_ATTEMPTS = 3;
@@ -251,6 +258,30 @@ export class SponsorService {
   }
 
   /**
+   * Select fee priority tier based on current pool pressure.
+   *
+   * Pool pressure = totalReserved / poolCapacity
+   * where poolCapacity = walletCount * CHAINING_LIMIT_PER_WALLET.
+   *
+   * Thresholds:
+   *   < 25% → low_priority    (saves fees during normal load)
+   *   25-60% → medium_priority (standard priority)
+   *   > 60% → high_priority   (burst load — reduce RBF risk)
+   *
+   * Returns "medium_priority" as a safe default when pool capacity cannot be determined.
+   */
+  private selectFeePriority(totalReserved: number, walletCount: number): FeePriority {
+    const poolCapacity = walletCount * CHAINING_LIMIT_PER_WALLET;
+    if (poolCapacity <= 0) {
+      return "medium_priority";
+    }
+    const pressure = Math.min(1, totalReserved / poolCapacity);
+    if (pressure < 0.25) return "low_priority";
+    if (pressure < 0.60) return "medium_priority";
+    return "high_priority";
+  }
+
+  /**
    * Compute the capped exponential backoff delay for a retry attempt.
    * For 429 responses, honours the Retry-After header when present.
    */
@@ -422,7 +453,7 @@ export class SponsorService {
   private async fetchNonceFromDO(
     sponsorAddress: string
   ): Promise<
-    | { ok: true; nonce: bigint; walletIndex: number }
+    | { ok: true; nonce: bigint; walletIndex: number; totalReserved: number }
     | ({ ok: false; error: string; status: number } & NonceDOErrorBody)
   > {
     if (!this.env.NONCE_DO) {
@@ -466,14 +497,15 @@ export class SponsorService {
         };
       }
 
-      const data = (await response.json()) as { nonce?: number; walletIndex?: number };
+      const data = (await response.json()) as { nonce?: number; walletIndex?: number; totalReserved?: number };
       if (typeof data?.nonce !== "number") {
         this.logger.warn("Nonce DO response missing nonce field");
         return { ok: false, error: "NonceDO response missing nonce field", status: 500 };
       }
 
       const walletIndex = typeof data.walletIndex === "number" ? data.walletIndex : 0;
-      return { ok: true, nonce: BigInt(data.nonce), walletIndex };
+      const totalReserved = typeof data.totalReserved === "number" ? data.totalReserved : 0;
+      return { ok: true, nonce: BigInt(data.nonce), walletIndex, totalReserved };
     } catch (e) {
       this.logger.warn("Failed to fetch nonce from NonceDO", {
         error: e instanceof Error ? e.message : String(e),
@@ -539,29 +571,9 @@ export class SponsorService {
   ): Promise<SponsorResult> {
     const network = this.getNetwork();
 
-    // Determine fee from FeeService to prevent overpayment
-    let fee: number | undefined;
-    try {
-      const feeService = new FeeService(this.env, this.logger);
-      const feeType = this.payloadToFeeType(transaction.payload.payloadType);
-      const { fees, source: feeSource } = await feeService.getEstimates();
-      const feeTiers = fees[feeType] ?? fees.contract_call;
-      fee = feeTiers["medium_priority"];
-      this.logger.info("Using clamped fee from FeeService", {
-        feeType,
-        fee,
-        feeSource,
-      });
-    } catch (e) {
-      // On failure, let @stacks/transactions estimate the fee (fallback)
-      this.logger.warn("Failed to get clamped fee, falling back to node estimate", {
-        error: e instanceof Error ? e.message : String(e),
-      });
-      fee = undefined;
-    }
-
     // Pre-fetch the sponsor nonce from NonceDO (authoritative coordinator).
-    // When NONCE_DO is configured, it also returns walletIndex for key selection.
+    // When NONCE_DO is configured, it also returns walletIndex for key selection
+    // and totalReserved for pool-pressure-aware fee tier selection.
     // If the DO is unreachable we fail fast (503) rather than silently falling back
     // to the uncoordinated Hiro path which causes nonce races.
     // When NONCE_DO is NOT configured (e.g. local dev), we fall back to Hiro with a warning.
@@ -570,6 +582,8 @@ export class SponsorService {
     // Track whether NonceDO assigned a nonce so we can release it on any failure path
     let nonceFromDO = false;
     let assignedNonceValue: number | undefined;
+    // Pool pressure data from NonceDO for fee tier selection (0 = no data / low pressure)
+    let totalReserved = 0;
 
     if (this.env.NONCE_DO) {
       // Derive wallet 0 address for the NonceDO request.
@@ -590,11 +604,13 @@ export class SponsorService {
       if (doResult.ok) {
         sponsorNonce = doResult.nonce;
         walletIndex = doResult.walletIndex;
+        totalReserved = doResult.totalReserved;
         nonceFromDO = true;
         assignedNonceValue = Number(doResult.nonce);
         this.logger.debug("Using NonceDO sponsor nonce", {
           sponsorNonce: sponsorNonce.toString(),
           walletIndex,
+          totalReserved,
         });
       } else {
         // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED)
@@ -668,6 +684,34 @@ export class SponsorService {
         error: "Service not configured",
         details: `Could not derive key for wallet index ${walletIndex}. Set SPONSOR_MNEMONIC.`,
       };
+    }
+
+    // Select fee tier based on pool pressure (see selectFeePriority for thresholds)
+    let fee: number | undefined;
+    const walletCount = this.getWalletCount();
+    const feePriority = this.selectFeePriority(totalReserved, walletCount);
+    try {
+      const feeService = new FeeService(this.env, this.logger);
+      const feeType = this.payloadToFeeType(transaction.payload.payloadType);
+      const { fees, source: feeSource } = await feeService.getEstimates();
+      const feeTiers = fees[feeType] ?? fees.contract_call;
+      fee = feeTiers[feePriority];
+      const poolCapacity = walletCount * CHAINING_LIMIT_PER_WALLET;
+      this.logger.info("Using clamped fee from FeeService", {
+        feeType,
+        fee,
+        feeSource,
+        feePriority,
+        poolPressurePct: poolCapacity > 0 ? Math.round((totalReserved / poolCapacity) * 100) : 0,
+        totalReserved,
+        poolCapacity,
+      });
+    } catch (e) {
+      // On failure, let @stacks/transactions estimate the fee (fallback)
+      this.logger.warn("Failed to get clamped fee, falling back to node estimate", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      fee = undefined;
     }
 
     try {

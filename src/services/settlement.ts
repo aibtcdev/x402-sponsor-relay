@@ -109,11 +109,23 @@ export class SettlementService {
   }
 
   /**
-   * Returns true if a Hiro tx_status string indicates a terminal (dead) transaction.
-   * Terminal statuses start with "abort_" or "dropped_".
+   * Returns true if a Hiro tx_status is a terminal on-chain abort.
+   * These are permanent failures — the transaction was executed and rejected.
    */
-  private isTxStatusTerminal(txStatus: string | undefined): boolean {
-    return txStatus?.startsWith("abort_") === true || txStatus?.startsWith("dropped_") === true;
+  private isTxAborted(txStatus: string | undefined): boolean {
+    return txStatus?.startsWith("abort_") === true;
+  }
+
+  /**
+   * Returns true if a Hiro tx_status indicates the tx was dropped from mempool.
+   *
+   * IMPORTANT: Hiro's dropped_* statuses are often TRANSIENT. Production data
+   * from 2026-02-27 shows 28 of 30 transactions reported as dropped_replace_by_fee
+   * actually confirmed on-chain. The polling loop must NOT treat these as terminal —
+   * it should log a warning and continue polling until the timeout expires.
+   */
+  private isTxDropped(txStatus: string | undefined): boolean {
+    return txStatus?.startsWith("dropped_") === true;
   }
 
   /** Truncate a hex hash to a short prefix for log context. */
@@ -799,8 +811,8 @@ export class SettlementService {
             }
           }
 
-          if (this.isTxStatusTerminal(txStatus)) {
-            this.logger.warn("Transaction aborted or dropped", {
+          if (this.isTxAborted(txStatus)) {
+            this.logger.warn("Transaction aborted on-chain (terminal)", {
               txid,
               txStatus,
             });
@@ -811,12 +823,21 @@ export class SettlementService {
             };
           }
 
-          // Status is "pending" or something else — continue polling
-          this.logger.debug("Transaction not yet confirmed", {
-            txid,
-            txStatus,
-            elapsedMs: elapsed,
-          });
+          if (this.isTxDropped(txStatus)) {
+            // Transient — see isTxDropped() for rationale. Continue polling.
+            this.logger.warn("Transaction reported as dropped, continuing to poll", {
+              txid,
+              txStatus,
+              elapsedMs: elapsed,
+            });
+          } else {
+            // Status is "pending" or something else — continue polling
+            this.logger.debug("Transaction not yet confirmed", {
+              txid,
+              txStatus,
+              elapsedMs: elapsed,
+            });
+          }
         } else if (response.status === 404) {
           // Transaction not yet indexed — continue polling
           this.logger.debug("Transaction not yet indexed", {
@@ -857,8 +878,11 @@ export class SettlementService {
    * Check whether a txid is still alive in the mempool or confirmed on-chain.
    * Used to validate "pending" dedup entries before returning them to callers.
    *
-   * Returns true  if the tx is pending, success, or the API is unreachable (fail-open).
-   * Returns false if the tx is 404 (never indexed / evicted) or abort_xx / dropped_xx.
+   * Returns true  if the tx is pending, success, dropped (transient), or the API
+   *               is unreachable (fail-open).
+   * Returns false if the tx is 404 (never indexed / evicted) or abort_* (terminal).
+   *
+   * Note: dropped_* statuses are treated as alive — see isTxDropped() for rationale.
    */
   private async verifyTxidAlive(txid: string): Promise<boolean> {
     try {
@@ -884,9 +908,17 @@ export class SettlementService {
       }
 
       const data = (await response.json()) as HiroTxResponse;
-      if (this.isTxStatusTerminal(data.tx_status)) {
-        this.logger.debug("Txid has terminal status", { txid, txStatus: data.tx_status });
+      if (this.isTxAborted(data.tx_status)) {
+        this.logger.debug("Txid has terminal abort status", { txid, txStatus: data.tx_status });
         return false;
+      }
+
+      if (this.isTxDropped(data.tx_status)) {
+        this.logger.debug("Txid has transient dropped status, treating as alive", {
+          txid,
+          txStatus: data.tx_status,
+        });
+        return true;
       }
 
       this.logger.debug("Txid is alive", { txid, txStatus: data.tx_status });
