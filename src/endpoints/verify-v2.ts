@@ -4,8 +4,8 @@ import {
   mapVerifyErrorToV2Code,
   V2_REQUEST_BODY_SCHEMA,
 } from "./v2-helpers";
-import { StatsService } from "../services";
-import type { AppContext, X402VerifyResponseV2 } from "../types";
+import { StatsService, PaymentIdService } from "../services";
+import type { AppContext, X402VerifyResponseV2, X402SettleRequestV2, X402SettlementResponseV2 } from "../types";
 import { X402_V2_ERROR_CODES } from "../types";
 
 /**
@@ -63,10 +63,19 @@ export class VerifyV2 extends BaseEndpoint {
     logger.info("x402 V2 verify request received");
 
     const statsService = new StatsService(c.env, logger);
+    const paymentIdService = new PaymentIdService(c.env.RELAY_KV, logger);
 
     const v2Invalid = (invalidReason: string): Response => {
       const response: X402VerifyResponseV2 = { isValid: false, invalidReason };
       return c.json(response, 200);
+    };
+
+    const v2Conflict = (): Response => {
+      const response: X402VerifyResponseV2 = {
+        isValid: false,
+        invalidReason: X402_V2_ERROR_CODES.PAYMENT_IDENTIFIER_CONFLICT,
+      };
+      return c.json(response, 409);
     };
 
     try {
@@ -87,6 +96,28 @@ export class VerifyV2 extends BaseEndpoint {
       }
 
       const { settleOptions, txHex, settlementService } = validation.data;
+      const paymentIdentifier = validation.data.paymentIdentifier;
+
+      // Payment-identifier cache check (client-controlled idempotency)
+      let paymentIdPayloadHash: string | undefined;
+      if (paymentIdentifier) {
+        const rawBody = body as X402SettleRequestV2;
+        paymentIdPayloadHash = await paymentIdService.computePayloadHash(
+          rawBody.paymentPayload,
+          rawBody.paymentRequirements
+        );
+        const cacheResult = await paymentIdService.checkPaymentId(paymentIdentifier, paymentIdPayloadHash);
+        if (cacheResult.status === "hit") {
+          logger.info("payment-identifier cache hit, returning cached verify response", {
+            id: paymentIdentifier,
+          });
+          return c.json(cacheResult.response as unknown as X402VerifyResponseV2, 200);
+        }
+        if (cacheResult.status === "conflict") {
+          logger.warn("payment-identifier conflict detected", { id: paymentIdentifier });
+          return v2Conflict();
+        }
+      }
 
       const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
 
@@ -122,7 +153,24 @@ export class VerifyV2 extends BaseEndpoint {
       const response: X402VerifyResponseV2 = {
         isValid: true,
         ...(payer ? { payer } : {}),
+        ...(paymentIdentifier
+          ? { extensions: { "payment-identifier": { info: { id: paymentIdentifier } } } }
+          : {}),
       };
+
+      // Cache the verify result under the payment-identifier key for idempotent retries
+      if (paymentIdentifier && paymentIdPayloadHash) {
+        c.executionCtx.waitUntil(
+          paymentIdService
+            .recordPaymentId(
+              paymentIdentifier,
+              paymentIdPayloadHash,
+              response as unknown as X402SettlementResponseV2
+            )
+            .catch(() => {})
+        );
+      }
+
       return c.json(response, 200);
     } catch (e) {
       logger.error("Unexpected verify error", {
