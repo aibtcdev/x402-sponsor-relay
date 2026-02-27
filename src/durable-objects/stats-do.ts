@@ -145,7 +145,11 @@ export class StatsDO {
     for (const [table, columnDef] of migrations) {
       try {
         this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
-      } catch {}
+      } catch (e) {
+        if (!(e instanceof Error) || !e.message.includes("duplicate column")) {
+          throw e;
+        }
+      }
     }
   }
 

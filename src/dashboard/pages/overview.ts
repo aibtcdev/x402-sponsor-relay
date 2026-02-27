@@ -117,17 +117,17 @@ function endpointBreakdownSection(breakdown: EndpointBreakdown): string {
   <p class="text-sm text-gray-400 font-medium">${escapeHtml(name)}</p>
   <p class="text-2xl font-bold text-white mt-2">${formatNumber(total)}</p>
   ${hasDetail ? `
-  <div class="mt-2 space-y-1">
+  <div class="mt-2">
     <div class="flex items-center justify-between text-xs">
       <span style="color: ${successColor}">Success</span>
       <span style="color: ${successColor}">${formatNumber(success!)}</span>
     </div>
-    <div class="flex items-center justify-between text-xs">
+    <div class="flex items-center justify-between text-xs mt-1">
       <span style="color: ${failColor}">Failed</span>
       <span style="color: ${failColor}">${formatNumber(failed!)}</span>
     </div>
     ${clientErrors !== undefined && clientErrors > 0 ? `
-    <div class="flex items-center justify-between text-xs">
+    <div class="flex items-center justify-between text-xs mt-1">
       <span style="color: ${clientColor}">Client Err</span>
       <span style="color: ${clientColor}">${formatNumber(clientErrors)}</span>
     </div>` : ""}
