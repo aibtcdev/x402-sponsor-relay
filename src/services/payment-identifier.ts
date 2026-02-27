@@ -1,7 +1,27 @@
 import type { Logger } from "../types";
 
 const PAYMENT_ID_TTL_SECONDS = 300;
-const PAYMENT_ID_KEY_PREFIX = "payid:";
+const PAYMENT_ID_SETTLE_PREFIX = "payid:settle:";
+const PAYMENT_ID_VERIFY_PREFIX = "payid:verify:";
+
+/** Endpoint discriminant for KV key namespacing. */
+export type PaymentIdEndpoint = "settle" | "verify";
+
+/**
+ * JSON.stringify replacer that sorts object keys recursively.
+ * Produces deterministic output regardless of property insertion order.
+ */
+function sortedReplacer(_key: string, value: unknown): unknown {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return Object.keys(value as Record<string, unknown>)
+      .sort()
+      .reduce<Record<string, unknown>>((sorted, k) => {
+        sorted[k] = (value as Record<string, unknown>)[k];
+        return sorted;
+      }, {});
+  }
+  return value;
+}
 
 /**
  * Shape of a cached payment-identifier entry stored in KV.
@@ -42,7 +62,9 @@ export type PaymentIdCheckResult =
  * - Same id + different payload → conflict (prevent accidental reuse)
  * - Absent id → pass-through (backward compatible)
  *
- * Uses RELAY_KV with "payid:" key prefix and 300s TTL.
+ * Uses RELAY_KV with "payid:{endpoint}:" key prefix and 300s TTL.
+ * Keys are namespaced by endpoint (settle vs verify) to prevent cross-endpoint
+ * cache collisions when the same payment-identifier is used across both flows.
  */
 export class PaymentIdService {
   constructor(
@@ -53,15 +75,14 @@ export class PaymentIdService {
   /**
    * Compute SHA-256 hash of the canonical request payload for conflict fingerprinting.
    *
-   * The hash covers the full { paymentPayload, paymentRequirements } object so
-   * that any change to transaction bytes, amount, recipient, or network produces
-   * a different fingerprint — triggering a conflict for mismatched reuse.
+   * Uses deterministic JSON serialization (sorted keys) so that semantically
+   * identical payloads produce the same hash regardless of key ordering.
    */
   async computePayloadHash(
     paymentPayload: unknown,
     paymentRequirements: unknown
   ): Promise<string> {
-    const canonical = JSON.stringify({ paymentPayload, paymentRequirements });
+    const canonical = JSON.stringify({ paymentPayload, paymentRequirements }, sortedReplacer);
     const data = new TextEncoder().encode(canonical);
     const hashBuffer = await crypto.subtle.digest("SHA-256", data);
     const bytes = new Uint8Array(hashBuffer);
@@ -81,13 +102,15 @@ export class PaymentIdService {
    */
   async checkPaymentId(
     id: string,
-    payloadHash: string
+    payloadHash: string,
+    endpoint: PaymentIdEndpoint
   ): Promise<PaymentIdCheckResult> {
     if (!this.kv) {
       return { status: "miss" };
     }
 
-    const key = `${PAYMENT_ID_KEY_PREFIX}${id}`;
+    const prefix = endpoint === "settle" ? PAYMENT_ID_SETTLE_PREFIX : PAYMENT_ID_VERIFY_PREFIX;
+    const key = `${prefix}${id}`;
 
     try {
       const entry = await this.kv.get<CachedPaymentIdEntry>(key, "json");
@@ -133,13 +156,15 @@ export class PaymentIdService {
   async recordPaymentId(
     id: string,
     payloadHash: string,
-    response: unknown
+    response: unknown,
+    endpoint: PaymentIdEndpoint
   ): Promise<void> {
     if (!this.kv) {
       return;
     }
 
-    const key = `${PAYMENT_ID_KEY_PREFIX}${id}`;
+    const prefix = endpoint === "settle" ? PAYMENT_ID_SETTLE_PREFIX : PAYMENT_ID_VERIFY_PREFIX;
+    const key = `${prefix}${id}`;
     const entry: CachedPaymentIdEntry = {
       payloadHash,
       response,

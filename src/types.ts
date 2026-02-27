@@ -265,6 +265,8 @@ export interface PaymentIdentifierExtension {
 export interface PaymentPayloadExtensions {
   /** Client-controlled idempotency key extension */
   "payment-identifier"?: PaymentIdentifierExtension;
+  /** Allow arbitrary future/unknown x402 extensions */
+  [key: string]: unknown;
 }
 
 /**

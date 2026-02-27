@@ -1450,7 +1450,7 @@ If the asset is unrecognized, the relay returns errorReason: "unrecognized_asset
 Validates that the transaction in paymentPayload satisfies paymentRequirements
 by deserializing it locally. Does NOT broadcast to the network.
 
-Always returns HTTP 200. Check isValid field.
+Returns HTTP 200 for verification results (check isValid field). Returns HTTP 409 if a payment-identifier conflicts with a prior request.
 
 ### Request
 
@@ -1505,8 +1505,9 @@ Content-Type: application/json
 Verifies payment parameters and broadcasts the transaction to the Stacks network.
 Does NOT sponsor — expects a pre-sponsored transaction.
 
-Always returns HTTP 200 for settlement results (success or failure per spec).
-Returns HTTP 400 only for malformed request schema.
+Returns HTTP 200 for settlement results (success or failure per spec).
+Returns HTTP 400 for malformed request schema.
+Returns HTTP 409 if a payment-identifier conflicts with a prior request.
 
 Idempotent: submitting the same tx hex within 5 minutes returns cached result.
 
@@ -1908,7 +1909,7 @@ discovery.get("/.well-known/agent.json", (c) => {
           "GET /supported — returns supported payment kinds (x402Version: 2, scheme: 'exact', CAIP-2 network). " +
           "CAIP-2 networks: 'stacks:1' (mainnet), 'stacks:2147483648' (testnet). " +
           "Assets: 'STX', 'sBTC', or CAIP-19 contract address. " +
-          "Always returns HTTP 200 for settle/verify; HTTP 400 for malformed schema. " +
+          "Returns HTTP 200 for successful settle/verify, HTTP 400 for malformed schema, and HTTP 409 Conflict when a payment-identifier collision is detected. " +
           "Idempotent: same tx hex returns cached result within 5 minutes. " +
           "Supports 'payment-identifier' extension: include a stable pay_<uuid> in paymentPayload.extensions for idempotency across tx rebuilds. " +
           "See /topics/x402-v2-facilitator for payment-identifier details.",

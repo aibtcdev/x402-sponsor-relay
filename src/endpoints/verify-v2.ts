@@ -20,7 +20,7 @@ export class VerifyV2 extends BaseEndpoint {
     tags: ["x402 V2"],
     summary: "Verify an x402 V2 payment (local validation only)",
     description:
-      "x402 V2 facilitator verify endpoint (spec section 7.1). Validates payment parameters by deserializing the transaction locally — does NOT broadcast. Returns HTTP 200 for all results; check isValid field.",
+      "x402 V2 facilitator verify endpoint (spec section 7.1). Validates payment parameters by deserializing the transaction locally — does NOT broadcast. Returns HTTP 200 for verification results; check isValid field. Returns HTTP 409 when a payment-identifier conflicts with a prior request.",
     request: {
       body: {
         content: {
@@ -50,6 +50,25 @@ export class VerifyV2 extends BaseEndpoint {
                   description: "Payer Stacks address (if determinable from transaction)",
                   example: "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7",
                 },
+                extensions: {
+                  type: "object" as const,
+                  description: "Echoed protocol extensions (e.g. payment-identifier)",
+                },
+              },
+            },
+          },
+        },
+      },
+      "409": {
+        description: "Payment-identifier conflict — same id used with a different payload",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object" as const,
+              required: ["isValid"],
+              properties: {
+                isValid: { type: "boolean" as const, example: false },
+                invalidReason: { type: "string" as const, example: "payment_identifier_conflict" },
               },
             },
           },
@@ -105,7 +124,7 @@ export class VerifyV2 extends BaseEndpoint {
           rawBody.paymentPayload,
           rawBody.paymentRequirements
         );
-        const cacheResult = await paymentIdService.checkPaymentId(paymentIdentifier, paymentIdPayloadHash);
+        const cacheResult = await paymentIdService.checkPaymentId(paymentIdentifier, paymentIdPayloadHash, "verify");
         if (cacheResult.status === "hit") {
           logger.info("payment-identifier cache hit, returning cached verify response", {
             id: paymentIdentifier,
@@ -160,7 +179,7 @@ export class VerifyV2 extends BaseEndpoint {
       // Cache the verify result under the payment-identifier key for idempotent retries
       if (paymentIdentifier && paymentIdPayloadHash) {
         c.executionCtx.waitUntil(
-          paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, response).catch(() => {})
+          paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, response, "verify").catch(() => {})
         );
       }
 
