@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.17.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.16.1...x402-sponsor-relay-v1.17.0) (2026-02-27)
+
+
+### Features
+
+* **x402-v2:** payment-identifier extension for client-controlled idempotency ([#133](https://github.com/aibtcdev/x402-sponsor-relay/issues/133)) ([3368ddc](https://github.com/aibtcdev/x402-sponsor-relay/commit/3368ddcd7e9c2f9bd16f80cbd2b7e3e1186b9ab0))
+
 ## [1.16.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.16.0...x402-sponsor-relay-v1.16.1) (2026-02-27)
 
 
