@@ -62,17 +62,14 @@ export class VerifyV2 extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("x402 V2 verify request received");
 
-    // Initialize stats service for metrics recording
     const statsService = new StatsService(c.env, logger);
 
-    // Helper to return a V2 verify failure response
     const v2Invalid = (invalidReason: string): Response => {
       const response: X402VerifyResponseV2 = { isValid: false, invalidReason };
       return c.json(response, 200);
     };
 
     try {
-      // Parse request body
       let body: unknown;
       try {
         body = await c.req.json();
@@ -82,7 +79,6 @@ export class VerifyV2 extends BaseEndpoint {
         return v2Invalid(X402_V2_ERROR_CODES.INVALID_PAYLOAD);
       }
 
-      // Validate V2 request structure (shared with /settle)
       const validation = validateV2Request(body, c.env, logger);
       if (!validation.valid) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
@@ -92,7 +88,6 @@ export class VerifyV2 extends BaseEndpoint {
 
       const { settleOptions, txHex, settlementService } = validation.data;
 
-      // Verify payment parameters locally (no broadcast)
       const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
 
       if (!verifyResult.valid) {
@@ -101,7 +96,6 @@ export class VerifyV2 extends BaseEndpoint {
         return v2Invalid(mapVerifyErrorToV2Code(verifyResult.error));
       }
 
-      // Attempt to convert signer to human-readable address for the payer field
       let payer: string | undefined;
       try {
         payer = settlementService.senderToAddress(

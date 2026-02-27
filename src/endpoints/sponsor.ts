@@ -138,17 +138,12 @@ export class Sponsor extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("Sponsor request received");
 
-    // Initialize stats service for metrics recording
     const statsService = new StatsService(c.env, logger);
 
     try {
-      // Auth is guaranteed by requireAuthMiddleware - get the auth context
       const auth = c.get("auth")!;
-
-      // Parse request body
       const body = (await c.req.json()) as SponsorRequest;
 
-      // Validate required fields
       if (!body.transaction) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
@@ -160,7 +155,6 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
-      // Optional: Verify SIP-018 auth if provided
       if (body.auth) {
         const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
         const authError = stxVerifyService.verifySip018Auth(body.auth, "sponsor");
@@ -176,10 +170,8 @@ export class Sponsor extends BaseEndpoint {
         }
       }
 
-      // Initialize sponsor service
       const sponsorService = new SponsorService(c.env, logger);
 
-      // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
@@ -197,11 +189,9 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
-      // Initialize auth service and get metadata
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
       const metadata = auth.metadata!;
 
-      // Check rate limits before processing
       const rateLimitResult = await authService.checkRateLimit(metadata.keyId, metadata.tier);
       if (!rateLimitResult.allowed) {
         c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));
@@ -259,7 +249,6 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
-      // Sponsor the transaction
       const sponsorResult = await sponsorService.sponsorTransaction(
         validation.transaction
       );
@@ -271,11 +260,9 @@ export class Sponsor extends BaseEndpoint {
         );
       }
 
-      // Broadcast directly to Stacks node
       const network =
         c.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
 
-      // Deserialize the sponsored transaction for broadcast
       const cleanHex = stripHexPrefix(sponsorResult.sponsoredTxHex);
       const sponsoredTx = deserializeTransaction(cleanHex);
 
@@ -291,8 +278,7 @@ export class Sponsor extends BaseEndpoint {
           network,
         });
 
-        // Check for broadcast error
-        if ("error" in result && result.error) {
+          if ("error" in result && result.error) {
           const errorReason =
             typeof result.reason === "string" ? result.reason : "Unknown error";
           logger.error("Broadcast rejected by node", {
@@ -385,7 +371,6 @@ export class Sponsor extends BaseEndpoint {
         );
       }
 
-      // Record fee spent against the API key
       const actualFee = BigInt(sponsorResult.fee);
       await authService.recordFeeSpent(metadata.keyId, actualFee);
 
@@ -419,7 +404,6 @@ export class Sponsor extends BaseEndpoint {
         keyId: metadata.keyId,
       });
 
-      // Return success response
       return this.ok(c, {
         txid,
         explorerUrl: buildExplorerUrl(txid, c.env.STACKS_NETWORK),

@@ -194,14 +194,11 @@ export class Relay extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("Relay request received");
 
-    // Initialize stats service for metrics recording
     const statsService = new StatsService(c.env, logger);
 
     try {
-      // Parse request body
       const body = (await c.req.json()) as RelayRequest;
 
-      // Validate required fields
       if (!body.transaction) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("relay", true).catch(() => {}));
@@ -224,7 +221,6 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Optional: Verify SIP-018 auth if provided
       if (body.auth) {
         const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
         const authError = stxVerifyService.verifySip018Auth(body.auth, "relay");
@@ -240,11 +236,9 @@ export class Relay extends BaseEndpoint {
         }
       }
 
-      // Initialize services
       const sponsorService = new SponsorService(c.env, logger);
       const settlementService = new SettlementService(c.env, logger);
 
-      // Validate settle options
       const settleValidation = settlementService.validateSettleOptions(
         body.settle
       );
@@ -260,12 +254,10 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount }).catch(() => {}));
-        // Determine error code based on validation failure
         const code = validation.error === "Transaction must be sponsored"
           ? "NOT_SPONSORED"
           : "INVALID_TRANSACTION";
@@ -278,7 +270,6 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Check rate limit using sender address from transaction
       if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
         c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));

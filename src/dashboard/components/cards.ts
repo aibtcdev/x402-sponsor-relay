@@ -186,8 +186,6 @@ export function successRateCard(success: number, total: number, clientErrors?: n
  * relay success rate metric.
  */
 export function clientErrorsCard(clientErrors: number, total: number): string {
-  const failed = total - 0; // we don't have success here, compute from clientErrors vs total
-  // Show percentage of total requests that were client errors
   const clientPct = total > 0 ? Math.round((clientErrors / total) * 100) : 0;
   const color = clientErrors === 0 ? colors.status.healthy : colors.status.degraded;
 
@@ -314,16 +312,3 @@ export function topKeysTable(stats: AggregateKeyStats): string {
 </div>`;
 }
 
-/**
- * Complete API keys section for the dashboard
- */
-export function apiKeysSection(stats: AggregateKeyStats): string {
-  return `
-<div class="mb-8">
-  <h3 class="text-lg font-semibold text-white mb-4">API Key Usage</h3>
-  ${apiKeySummaryCards(stats)}
-  <div class="mt-4">
-    ${topKeysTable(stats)}
-  </div>
-</div>`;
-}
