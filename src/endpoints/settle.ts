@@ -5,8 +5,8 @@ import {
   V2_REQUEST_BODY_SCHEMA,
   V2_ERROR_RESPONSE_SCHEMA,
 } from "./v2-helpers";
-import { StatsService } from "../services";
-import type { AppContext, X402SettlementResponseV2 } from "../types";
+import { StatsService, PaymentIdService } from "../services";
+import type { AppContext, X402SettlementResponseV2, X402SettleRequestV2 } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
 /**
@@ -97,12 +97,13 @@ export class Settle extends BaseEndpoint {
     logger.info("x402 V2 settle request received");
 
     const statsService = new StatsService(c.env, logger);
+    const paymentIdService = new PaymentIdService(c.env.RELAY_KV, logger);
 
     const network = CAIP2_NETWORKS[c.env.STACKS_NETWORK];
 
     const v2Error = (
       errorReason: string,
-      status: 200 | 400 | 500,
+      status: 200 | 400 | 409 | 500,
       payer?: string
     ): Response => {
       const body: X402SettlementResponseV2 = {
@@ -130,6 +131,28 @@ export class Settle extends BaseEndpoint {
       }
 
       const { settleOptions, txHex, settlementService } = validation.data;
+      const paymentIdentifier = validation.data.paymentIdentifier;
+
+      // Payment-identifier cache check (client-controlled idempotency, higher priority than dedup)
+      let paymentIdPayloadHash: string | undefined;
+      if (paymentIdentifier) {
+        const rawBody = body as X402SettleRequestV2;
+        paymentIdPayloadHash = await paymentIdService.computePayloadHash(
+          rawBody.paymentPayload,
+          rawBody.paymentRequirements
+        );
+        const cacheResult = await paymentIdService.checkPaymentId(paymentIdentifier, paymentIdPayloadHash);
+        if (cacheResult.status === "hit") {
+          logger.info("payment-identifier cache hit, returning cached settle response", {
+            id: paymentIdentifier,
+          });
+          return c.json(cacheResult.response, 200);
+        }
+        if (cacheResult.status === "conflict") {
+          logger.warn("payment-identifier conflict detected", { id: paymentIdentifier });
+          return v2Error(X402_V2_ERROR_CODES.PAYMENT_IDENTIFIER_CONFLICT, 409);
+        }
+      }
 
       const dedupResult = await settlementService.checkDedup(txHex);
       if (dedupResult) {
@@ -240,7 +263,18 @@ export class Settle extends BaseEndpoint {
         payer,
         transaction: broadcastResult.txid,
         network,
+        ...(paymentIdentifier
+          ? { extensions: { "payment-identifier": { info: { id: paymentIdentifier } } } }
+          : {}),
       };
+
+      // Cache the result under the payment-identifier key for idempotent retries
+      if (paymentIdentifier && paymentIdPayloadHash) {
+        c.executionCtx.waitUntil(
+          paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, response).catch(() => {})
+        );
+      }
+
       return c.json(response, 200);
     } catch (e) {
       logger.error("Unexpected settle error", {
