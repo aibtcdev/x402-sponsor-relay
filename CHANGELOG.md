@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.16.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.15.2...x402-sponsor-relay-v1.16.0) (2026-02-27)
+
+
+### Features
+
+* **stats:** dashboard stats overhaul — accurate metrics and new signals ([#129](https://github.com/aibtcdev/x402-sponsor-relay/issues/129)) ([de52b8d](https://github.com/aibtcdev/x402-sponsor-relay/commit/de52b8d99a2d54a889d993b5363a785becf3748d))
+
 ## [1.15.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.15.1...x402-sponsor-relay-v1.15.2) (2026-02-26)
 
 
