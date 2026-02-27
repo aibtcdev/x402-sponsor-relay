@@ -78,15 +78,7 @@ export class VerifyV2 extends BaseEndpoint {
         body = await c.req.json();
       } catch {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logTransaction({
-          timestamp: new Date().toISOString(),
-          endpoint: "verify",
-          success: false,
-          clientError: true,
-          tokenType: "STX",
-          amount: "0",
-          status: "failed",
-        }).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("verify", true).catch(() => {}));
         return v2Invalid(X402_V2_ERROR_CODES.INVALID_PAYLOAD);
       }
 
@@ -94,15 +86,7 @@ export class VerifyV2 extends BaseEndpoint {
       const validation = validateV2Request(body, c.env, logger);
       if (!validation.valid) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logTransaction({
-          timestamp: new Date().toISOString(),
-          endpoint: "verify",
-          success: false,
-          clientError: true,
-          tokenType: "STX",
-          amount: "0",
-          status: "failed",
-        }).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("verify", true).catch(() => {}));
         return v2Invalid(validation.error.errorReason);
       }
 
@@ -113,16 +97,7 @@ export class VerifyV2 extends BaseEndpoint {
 
       if (!verifyResult.valid) {
         logger.info("Payment verification failed", { error: verifyResult.error });
-        // Client error: payment params don't match requirements
-        c.executionCtx.waitUntil(statsService.logTransaction({
-          timestamp: new Date().toISOString(),
-          endpoint: "verify",
-          success: false,
-          clientError: true,
-          tokenType: settleOptions.tokenType ?? "STX",
-          amount: settleOptions.minAmount,
-          status: "failed",
-        }).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("verify", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
         return v2Invalid(mapVerifyErrorToV2Code(verifyResult.error));
       }
 
@@ -141,12 +116,10 @@ export class VerifyV2 extends BaseEndpoint {
 
       logger.info("x402 V2 verify succeeded", { payer });
 
-      // Record successful verify call — relay performed its job correctly
       c.executionCtx.waitUntil(statsService.logTransaction({
         timestamp: new Date().toISOString(),
         endpoint: "verify",
         success: true,
-        clientError: false,
         tokenType: settleOptions.tokenType ?? "STX",
         amount: settleOptions.minAmount,
         ...(payer ? { sender: payer } : {}),
@@ -162,15 +135,7 @@ export class VerifyV2 extends BaseEndpoint {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
-      c.executionCtx.waitUntil(statsService.logTransaction({
-        timestamp: new Date().toISOString(),
-        endpoint: "verify",
-        success: false,
-        clientError: false,
-        tokenType: "STX",
-        amount: "0",
-        status: "failed",
-      }).catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logFailure("verify", false).catch(() => {}));
       return v2Invalid(X402_V2_ERROR_CODES.UNEXPECTED_VERIFY_ERROR);
     }
   }

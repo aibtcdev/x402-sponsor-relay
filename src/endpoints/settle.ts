@@ -156,18 +156,7 @@ export class Settle extends BaseEndpoint {
       if (!verifyResult.valid) {
         logger.warn("Payment verification failed", { error: verifyResult.error });
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        // Client error: the payment params in the transaction don't match requirements
-        c.executionCtx.waitUntil(
-          statsService.logTransaction({
-            timestamp: new Date().toISOString(),
-            endpoint: "settle",
-            success: false,
-            clientError: true,
-            tokenType: settleOptions.tokenType ?? "STX",
-            amount: settleOptions.minAmount,
-            status: "failed",
-          }).catch(() => {})
-        );
+        c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
       }
 
@@ -186,42 +175,17 @@ export class Settle extends BaseEndpoint {
 
       if ("error" in broadcastResult) {
         if (broadcastResult.nonceConflict) {
-          // Client-side nonce conflict: the pre-signed tx had a stale sender nonce.
-          // Record with clientError:true so it appears in the tx log without counting
-          // against relay success rate (fixes #113/#116 intent; fixes #114 attribution).
           logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
             error: broadcastResult.error,
             senderSigner: verifyResult.data.sender,
           });
-          c.executionCtx.waitUntil(
-            statsService.logTransaction({
-              timestamp: new Date().toISOString(),
-              endpoint: "settle",
-              success: false,
-              clientError: true,
-              tokenType: settleOptions.tokenType ?? "STX",
-              amount: settleOptions.minAmount,
-              status: "failed",
-            }).catch(() => {})
-          );
+          c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
         } else {
-          // Relay-side or network broadcast failure: record as a failed transaction.
           logger.warn("Broadcast/confirm failed", {
             error: broadcastResult.error,
             retryable: broadcastResult.retryable,
           });
-          // Fire-and-forget — never block the error response
-          c.executionCtx.waitUntil(
-            statsService.logTransaction({
-              timestamp: new Date().toISOString(),
-              endpoint: "settle",
-              success: false,
-              clientError: false,
-              tokenType: settleOptions.tokenType ?? "STX",
-              amount: settleOptions.minAmount,
-              status: "failed",
-            }).catch(() => {})
-          );
+          c.executionCtx.waitUntil(statsService.logFailure("settle", false, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
         }
 
         let errorReason: string;
