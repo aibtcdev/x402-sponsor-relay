@@ -153,6 +153,8 @@ static configuration of supported payment kinds.
 
 CAIP-2 network identifiers: "stacks:1" (mainnet), "stacks:2147483648" (testnet)
 Supported assets: "STX", "sBTC", or CAIP-19 contract address (e.g., ".token-name")
+Supported extension: "payment-identifier" — include a pay_<uuid> in paymentPayload.extensions
+for client-controlled idempotency that survives transaction rebuilds between retries.
 
 Full V2 facilitator docs: https://x402-relay.aibtc.com/topics/x402-v2-facilitator
 
@@ -584,6 +586,9 @@ Content-Type: application/json
     "payload": {
       "transaction": "0x00000001..."         // hex-encoded signed sponsored tx
     },
+    "extensions": {                          // optional — payment-identifier extension
+      "payment-identifier": "pay_<uuid>"    // stable id; survives tx rebuilds on retry
+    },
     "accepted": {                            // payment requirements that were accepted
       "scheme": "exact",
       "network": "stacks:2147483648",        // CAIP-2 network
@@ -602,6 +607,11 @@ Content-Type: application/json
     "maxTimeoutSeconds": 60
   }
 }
+
+payment-identifier behavior:
+- Same id + same payload: returns cached response (HTTP 200), no re-broadcast
+- Same id + different payload: 409 Conflict (errorReason: "payment_identifier_conflict")
+- Omitting extensions falls back to sha256 payload dedup (5-min TTL, existing behavior)
 
 ### Success Response (200)
 
@@ -708,11 +718,16 @@ No authentication required.
       "network": "stacks:2147483648"         // or "stacks:1" on mainnet
     }
   ],
-  "extensions": [],                          // no protocol extensions
+  "extensions": ["payment-identifier"],     // client-controlled idempotency keys
   "signers": {
     "stacks:*": []                           // empty = any signer accepted
   }
 }
+
+payment-identifier extension: include a stable id in paymentPayload.extensions to get
+idempotency that survives transaction rebuilds. Same id + same payload = cached response.
+Same id + different payload = 409 Conflict (errorReason: "payment_identifier_conflict").
+See https://x402-relay.aibtc.com/topics/x402-v2-facilitator for full details.
 
 ---
 
@@ -1570,11 +1585,76 @@ GET https://x402-relay.aibtc.com/supported
       "network": "stacks:2147483648"         // "stacks:1" on mainnet
     }
   ],
-  "extensions": [],
+  "extensions": ["payment-identifier"],     // client-controlled idempotency extension
   "signers": {
     "stacks:*": []                           // empty = any signer accepted
   }
 }
+
+## Payment-Identifier Extension
+
+The relay supports the "payment-identifier" extension for client-controlled idempotency.
+This lets agents assign a stable ID to a payment intent that persists across retries,
+even if the transaction must be rebuilt (e.g., new fee, new nonce).
+
+### Format
+
+- Field location: paymentPayload.extensions["payment-identifier"]
+- Length: 16–128 characters
+- Pattern: [a-zA-Z0-9_-]+  (alphanumeric, underscores, hyphens)
+- Recommended prefix: "pay_"
+- Example: "pay_01J7QZXK5XRGBVMK3N9RTNF4WW"
+
+### Behavior
+
+Same id + same payload:
+  Returns the cached response (HTTP 200). No re-broadcast. Use this for safe retry.
+
+Same id + different payload (transaction was rebuilt):
+  Returns 409 Conflict with errorReason: "payment_identifier_conflict".
+  This prevents double-payment when the client retries with a rebuilt tx.
+  To proceed: generate a new payment-identifier for the rebuilt transaction.
+
+Extension omitted entirely:
+  Falls back to sha256 payload dedup (5-minute TTL). Existing behavior preserved.
+
+### Cache TTL
+
+300 seconds (5 minutes), matching the sha256 dedup window.
+
+### Example Request (POST /settle with payment-identifier)
+
+POST https://x402-relay.aibtc.com/settle
+Content-Type: application/json
+
+{
+  "paymentPayload": {
+    "x402Version": 2,
+    "payload": {
+      "transaction": "<hex-encoded sponsored tx>"
+    },
+    "extensions": {
+      "payment-identifier": "pay_01J7QZXK5XRGBVMK3N9RTNF4WW"
+    }
+  },
+  "paymentRequirements": {
+    "scheme": "exact",
+    "network": "stacks:2147483648",
+    "amount": "1000000",
+    "asset": "STX",
+    "payTo": "SP..."
+  }
+}
+
+### When to Use payment-identifier
+
+Use it when:
+- Your agent may need to rebuild the transaction (different nonce, fee adjustment)
+  and you still want idempotency on the payment intent, not the specific tx bytes
+- You want the relay to detect and block double-payments for the same intent
+
+Skip it when:
+- The transaction bytes won't change between retries (plain sha256 dedup is sufficient)
 
 ## Full V2 Flow Example
 
@@ -1587,6 +1667,10 @@ GET https://x402-relay.aibtc.com/supported
    required amount to payTo, and signs it.
 
 4. (Optional) Client calls POST /verify to validate before spending resources.
+
+4b. (Optional) Client includes a "payment-identifier" in paymentPayload.extensions
+    for stable idempotency across retries, even if the tx must be rebuilt.
+    Example: "extensions": { "payment-identifier": "pay_<uuid>" }
 
 5. Client calls POST /settle with the signed tx and paymentRequirements.
    Relay verifies, broadcasts, and returns { success: true, transaction: "0x..." }.
@@ -1825,7 +1909,9 @@ discovery.get("/.well-known/agent.json", (c) => {
           "CAIP-2 networks: 'stacks:1' (mainnet), 'stacks:2147483648' (testnet). " +
           "Assets: 'STX', 'sBTC', or CAIP-19 contract address. " +
           "Always returns HTTP 200 for settle/verify; HTTP 400 for malformed schema. " +
-          "Idempotent: same tx hex returns cached result within 5 minutes.",
+          "Idempotent: same tx hex returns cached result within 5 minutes. " +
+          "Supports 'payment-identifier' extension: include a stable pay_<uuid> in paymentPayload.extensions for idempotency across tx rebuilds. " +
+          "See /topics/x402-v2-facilitator for payment-identifier details.",
         tags: ["x402", "facilitator", "settlement", "stacks", "caip2"],
         examples: [
           "Settle an x402 V2 payment on Stacks",
