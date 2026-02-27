@@ -38,7 +38,7 @@ export class Supported extends BaseEndpoint {
                 extensions: {
                   type: "array" as const,
                   items: { type: "string" as const },
-                  description: "Supported protocol extensions (empty for base spec)",
+                  description: "Supported protocol extensions",
                 },
                 signers: {
                   type: "object" as const,
@@ -70,7 +70,7 @@ export class Supported extends BaseEndpoint {
           network,
         },
       ],
-      extensions: [],
+      extensions: ["payment-identifier"],
       signers: {
         "stacks:*": [],
       },
