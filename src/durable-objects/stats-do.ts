@@ -126,56 +126,27 @@ export class StatsDO {
 
     // Schema migrations — ALTER TABLE ADD COLUMN is idempotent (catch ignores
     // "duplicate column name" errors on repeated DO restarts).
-
-    // tx_log: client error flag (1 = client caused this failure, 0 = relay/network)
-    try {
-      this.sql.exec(`ALTER TABLE tx_log ADD COLUMN client_error INTEGER DEFAULT 0`);
-    } catch {}
-
-    // daily_stats: client errors counter
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN client_errors INTEGER DEFAULT 0`);
-    } catch {}
-
-    // daily_stats: per-endpoint counters
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN relay_total INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN relay_success INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN relay_failed INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN sponsor_total INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN sponsor_success INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN sponsor_failed INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN settle_total INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN settle_success INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN settle_failed INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN settle_client_errors INTEGER DEFAULT 0`);
-    } catch {}
-    try {
-      this.sql.exec(`ALTER TABLE daily_stats ADD COLUMN verify_total INTEGER DEFAULT 0`);
-    } catch {}
-
-    // hourly_stats: client errors counter
-    try {
-      this.sql.exec(`ALTER TABLE hourly_stats ADD COLUMN client_errors INTEGER DEFAULT 0`);
-    } catch {}
+    const migrations: Array<[table: string, column: string]> = [
+      ["tx_log", "client_error INTEGER DEFAULT 0"],
+      ["daily_stats", "client_errors INTEGER DEFAULT 0"],
+      ["daily_stats", "relay_total INTEGER DEFAULT 0"],
+      ["daily_stats", "relay_success INTEGER DEFAULT 0"],
+      ["daily_stats", "relay_failed INTEGER DEFAULT 0"],
+      ["daily_stats", "sponsor_total INTEGER DEFAULT 0"],
+      ["daily_stats", "sponsor_success INTEGER DEFAULT 0"],
+      ["daily_stats", "sponsor_failed INTEGER DEFAULT 0"],
+      ["daily_stats", "settle_total INTEGER DEFAULT 0"],
+      ["daily_stats", "settle_success INTEGER DEFAULT 0"],
+      ["daily_stats", "settle_failed INTEGER DEFAULT 0"],
+      ["daily_stats", "settle_client_errors INTEGER DEFAULT 0"],
+      ["daily_stats", "verify_total INTEGER DEFAULT 0"],
+      ["hourly_stats", "client_errors INTEGER DEFAULT 0"],
+    ];
+    for (const [table, columnDef] of migrations) {
+      try {
+        this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef}`);
+      } catch {}
+    }
   }
 
   // ===========================================================================
