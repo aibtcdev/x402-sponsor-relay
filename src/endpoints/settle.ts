@@ -96,12 +96,10 @@ export class Settle extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("x402 V2 settle request received");
 
-    // Initialize stats service for metrics recording
     const statsService = new StatsService(c.env, logger);
 
     const network = CAIP2_NETWORKS[c.env.STACKS_NETWORK];
 
-    // Helper to return V2-shaped error responses
     const v2Error = (
       errorReason: string,
       status: 200 | 400 | 500,
@@ -118,7 +116,6 @@ export class Settle extends BaseEndpoint {
     };
 
     try {
-      // Parse request body
       let body: unknown;
       try {
         body = await c.req.json();
@@ -126,7 +123,6 @@ export class Settle extends BaseEndpoint {
         return v2Error(X402_V2_ERROR_CODES.INVALID_PAYLOAD, 400);
       }
 
-      // Validate V2 request structure (shared with /verify)
       const validation = validateV2Request(body, c.env, logger);
       if (!validation.valid) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
@@ -135,7 +131,6 @@ export class Settle extends BaseEndpoint {
 
       const { settleOptions, txHex, settlementService } = validation.data;
 
-      // Check dedup — return cached result if available
       const dedupResult = await settlementService.checkDedup(txHex);
       if (dedupResult) {
         logger.info("Dedup hit, returning cached settle result", {
@@ -151,11 +146,11 @@ export class Settle extends BaseEndpoint {
         return c.json(response, 200);
       }
 
-      // Verify payment parameters locally
       const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
       if (!verifyResult.valid) {
         logger.warn("Payment verification failed", { error: verifyResult.error });
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
       }
 
@@ -174,31 +169,17 @@ export class Settle extends BaseEndpoint {
 
       if ("error" in broadcastResult) {
         if (broadcastResult.nonceConflict) {
-          // Client-side nonce conflict: the pre-signed tx had a stale sender nonce.
-          // This is NOT a relay failure — do not record as a failed transaction in
-          // StatsDO (fixes #113). The relay's NonceDO was never involved, so do not
-          // trigger a resync (fixes #116). Log at INFO for attribution (fixes #114).
           logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
             error: broadcastResult.error,
             senderSigner: verifyResult.data.sender,
           });
+          c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
         } else {
-          // Relay-side or network broadcast failure: record as a failed transaction.
           logger.warn("Broadcast/confirm failed", {
             error: broadcastResult.error,
             retryable: broadcastResult.retryable,
           });
-          // Fire-and-forget — never block the error response
-          c.executionCtx.waitUntil(
-            statsService.logTransaction({
-              timestamp: new Date().toISOString(),
-              endpoint: "settle",
-              success: false,
-              tokenType: settleOptions.tokenType ?? "STX",
-              amount: settleOptions.minAmount,
-              status: "failed",
-            }).catch(() => {})
-          );
+          c.executionCtx.waitUntil(statsService.logFailure("settle", false, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
         }
 
         let errorReason: string;
@@ -212,7 +193,6 @@ export class Settle extends BaseEndpoint {
         return v2Error(errorReason, 200);
       }
 
-      // Convert signer hash160 to human-readable Stacks address
       const payer = settlementService.senderToAddress(
         verifyResult.data.transaction,
         c.env.STACKS_NETWORK
@@ -223,7 +203,6 @@ export class Settle extends BaseEndpoint {
           ? broadcastResult.blockHeight
           : undefined;
 
-      // Record dedup for idempotent retries
       await settlementService.recordDedup(txHex, {
         txid: broadcastResult.txid,
         status: broadcastResult.status,

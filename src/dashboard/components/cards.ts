@@ -142,20 +142,62 @@ export function healthCard(
 }
 
 /**
- * Success rate card with visual indicator
+ * Success rate card with visual indicator.
+ *
+ * When clientErrors is provided and > 0, shows the effective success rate
+ * (excluding client errors from the denominator) as the primary metric,
+ * with the raw success rate as secondary subtext. This surfaces the relay's
+ * actual reliability independent of client-caused failures.
+ *
+ * Effective rate formula: success / (success + relayErrors)
+ *   where relayErrors = (total - success) - clientErrors
  */
-export function successRateCard(success: number, total: number): string {
-  const rate = total > 0 ? Math.round((success / total) * 100) : 0;
-  const color = rate >= 95 ? colors.status.healthy : rate >= 80 ? colors.status.degraded : colors.status.down;
+export function successRateCard(success: number, total: number, clientErrors?: number): string {
+  const failed = total - success;
+  const relayErrors = Math.max(0, failed - (clientErrors ?? 0));
+  const effectiveDenominator = success + relayErrors;
+
+  // Effective rate excludes client errors from denominator
+  const effectiveRate = effectiveDenominator > 0 ? Math.round((success / effectiveDenominator) * 100) : 0;
+  // Raw rate includes all requests
+  const rawRate = total > 0 ? Math.round((success / total) * 100) : 0;
+
+  const hasClientErrors = (clientErrors ?? 0) > 0;
+  const color = effectiveRate >= 95 ? colors.status.healthy : effectiveRate >= 80 ? colors.status.degraded : colors.status.down;
 
   return `
 <div class="brand-card p-4">
   <p class="text-sm text-gray-400">Success Rate</p>
-  <p class="text-2xl font-bold mt-2" style="color: ${color}">${rate}%</p>
+  <p class="text-2xl font-bold mt-2" style="color: ${color}">${effectiveRate}%</p>
   <div class="mt-2 h-2 rounded-full overflow-hidden" style="background-color: ${colors.bg.border}">
-    <div class="h-full rounded-full" style="width: ${rate}%; background-color: ${color}"></div>
+    <div class="h-full rounded-full" style="width: ${effectiveRate}%; background-color: ${color}"></div>
   </div>
-  <p class="text-xs text-gray-500 mt-1">${formatNumber(success)} / ${formatNumber(total)}</p>
+  <p class="text-xs text-gray-500 mt-1">${formatNumber(success)} / ${formatNumber(effectiveDenominator)} (relay)</p>
+  ${hasClientErrors ? `<p class="text-xs text-gray-600 mt-0.5">raw: ${rawRate}% (${formatNumber(total)} total)</p>` : ""}
+</div>`;
+}
+
+/**
+ * Client errors card — shows client-caused failures separately from relay errors.
+ *
+ * Client errors include bad params, nonce conflicts, rate limit exceeded,
+ * and other failures where the relay behaved correctly but the client request
+ * was invalid. Displaying these separately prevents them from distorting the
+ * relay success rate metric.
+ */
+export function clientErrorsCard(clientErrors: number, total: number): string {
+  const clientPct = total > 0 ? Math.round((clientErrors / total) * 100) : 0;
+  const color = clientErrors === 0 ? colors.status.healthy : colors.status.degraded;
+
+  return `
+<div class="brand-card p-4">
+  <div class="flex items-center justify-between">
+    <p class="text-sm text-gray-400">Client Errors</p>
+    <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+  </div>
+  <p class="text-2xl font-bold mt-2" style="color: ${color}">${formatNumber(clientErrors)}</p>
+  <p class="text-xs text-gray-500 mt-2">${clientPct}% of requests</p>
+  <p class="text-xs text-gray-600 mt-0.5">bad params, rate limits, nonce conflicts</p>
 </div>`;
 }
 
@@ -270,16 +312,3 @@ export function topKeysTable(stats: AggregateKeyStats): string {
 </div>`;
 }
 
-/**
- * Complete API keys section for the dashboard
- */
-export function apiKeysSection(stats: AggregateKeyStats): string {
-  return `
-<div class="mb-8">
-  <h3 class="text-lg font-semibold text-white mb-4">API Key Usage</h3>
-  ${apiKeySummaryCards(stats)}
-  <div class="mt-4">
-    ${topKeysTable(stats)}
-  </div>
-</div>`;
-}

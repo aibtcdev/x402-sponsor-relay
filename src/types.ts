@@ -727,6 +727,9 @@ export interface DailyStats {
     total: number;
     success: number;
     failed: number;
+    /** Number of failures caused by client errors (bad params, nonce conflicts, rate limits).
+     *  These are excluded from relay success rate calculations. */
+    clientErrors?: number;
   };
   tokens: {
     STX: { count: number; volume: string };
@@ -758,6 +761,16 @@ export interface HealthCheck {
 /**
  * Dashboard overview data for API response
  */
+/**
+ * Per-endpoint transaction breakdown for the dashboard
+ */
+export interface EndpointBreakdown {
+  relay: { total: number; success: number; failed: number };
+  sponsor: { total: number; success: number; failed: number };
+  settle: { total: number; success: number; failed: number; clientErrors: number };
+  verify: { total: number };
+}
+
 export interface DashboardOverview {
   period: "24h" | "7d";
   transactions: {
@@ -766,6 +779,8 @@ export interface DashboardOverview {
     failed: number;
     trend: "up" | "down" | "stable";
     previousTotal: number;
+    /** Number of failures caused by client errors in the rolling 24h window */
+    clientErrors?: number;
   };
   tokens: {
     STX: TokenStats;
@@ -795,6 +810,8 @@ export interface DashboardOverview {
   hourlyData: Array<{ hour: string; transactions: number; success: number; fees?: string }>;
   /** API key aggregate statistics (optional, only present if API_KEYS_KV is configured) */
   apiKeys?: AggregateKeyStats;
+  /** Per-endpoint transaction breakdown (today's calendar-day counters) */
+  endpointBreakdown?: EndpointBreakdown;
 }
 
 /**
@@ -826,12 +843,18 @@ export interface AggregateKeyStats {
   totalFeesToday: string;
   /** Top keys by request count (max 5) */
   topKeys: ApiKeyStatsEntry[];
+  /** Number of keys whose expiresAt is in the past (regardless of active flag) */
+  expiredKeys: number;
+  /** Number of keys with active === false (revoked) */
+  revokedKeys: number;
+  /** Number of keys created within the last 7 days */
+  newKeysLast7Days: number;
 }
 
 /**
  * Endpoint that processed a transaction
  */
-export type RelayEndpointName = "relay" | "sponsor" | "settle";
+export type RelayEndpointName = "relay" | "sponsor" | "settle" | "verify";
 
 /**
  * Individual transaction log entry (stored in StatsDO SQLite)
@@ -863,6 +886,12 @@ export interface TransactionLogEntry {
   sponsorAddress?: string;
   /** Sponsor wallet index (0-based) that paid the fee (optional, for per-wallet tracking) */
   walletIndex?: number;
+  /**
+   * Whether this failure was caused by the client (bad params, bad nonce, rate limit exceeded).
+   * When true, this entry is counted as a client error rather than a relay failure,
+   * allowing the relay success rate to exclude client-caused failures.
+   */
+  clientError?: boolean;
 }
 
 // =============================================================================

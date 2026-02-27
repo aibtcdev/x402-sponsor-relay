@@ -194,16 +194,14 @@ export class Relay extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("Relay request received");
 
-    // Initialize stats service for metrics recording
     const statsService = new StatsService(c.env, logger);
 
     try {
-      // Parse request body
       const body = (await c.req.json()) as RelayRequest;
 
-      // Validate required fields
       if (!body.transaction) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("relay", true).catch(() => {}));
         return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
@@ -214,6 +212,7 @@ export class Relay extends BaseEndpoint {
 
       if (!body.settle) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("relay", true).catch(() => {}));
         return this.err(c, {
           error: "Missing settle options",
           code: "MISSING_SETTLE_OPTIONS",
@@ -222,12 +221,12 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Optional: Verify SIP-018 auth if provided
       if (body.auth) {
         const stxVerifyService = new StxVerifyService(logger, c.env.STACKS_NETWORK);
         const authError = stxVerifyService.verifySip018Auth(body.auth, "relay");
         if (authError) {
           c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logFailure("relay", true).catch(() => {}));
           return this.err(c, {
             error: authError.error,
             code: authError.code,
@@ -237,16 +236,15 @@ export class Relay extends BaseEndpoint {
         }
       }
 
-      // Initialize services
       const sponsorService = new SponsorService(c.env, logger);
       const settlementService = new SettlementService(c.env, logger);
 
-      // Validate settle options
       const settleValidation = settlementService.validateSettleOptions(
         body.settle
       );
       if (settleValidation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount ?? "0" }).catch(() => {}));
         return this.err(c, {
           error: settleValidation.error,
           code: "INVALID_SETTLE_OPTIONS",
@@ -256,11 +254,10 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Validate and deserialize transaction
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        // Determine error code based on validation failure
+        c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount }).catch(() => {}));
         const code = validation.error === "Transaction must be sponsored"
           ? "NOT_SPONSORED"
           : "INVALID_TRANSACTION";
@@ -273,10 +270,10 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Check rate limit using sender address from transaction
       if (!checkRateLimit(validation.senderAddress)) {
         logger.warn("Rate limit exceeded", { sender: validation.senderAddress });
         c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount }).catch(() => {}));
         return this.err(c, {
           error: "Rate limit exceeded",
           code: "RATE_LIMIT_EXCEEDED",
@@ -344,6 +341,7 @@ export class Relay extends BaseEndpoint {
           );
         }
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount }).catch(() => {}));
         return this.err(c, {
           error: verifyResult.error,
           code: "SETTLEMENT_VERIFICATION_FAILED",
@@ -377,21 +375,14 @@ export class Relay extends BaseEndpoint {
           );
         }
 
-        // Record fee even for failed broadcasts — sponsor already paid
-        // Both calls are fire-and-forget (waitUntil) — never block the error response.
-        const tokenTypeFailed = body.settle.tokenType || "STX";
         c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
         c.executionCtx.waitUntil(
-          statsService.logTransaction({
-            timestamp: new Date().toISOString(),
-            endpoint: "relay",
-            success: false,
-            tokenType: tokenTypeFailed,
+          statsService.logFailure("relay", false, {
+            tokenType: body.settle.tokenType || "STX",
             amount: body.settle.minAmount,
             fee: sponsorResult.fee,
             sender: validation.senderAddress,
             recipient: body.settle.expectedRecipient,
-            status: "failed",
           }).catch(() => {})
         );
 
@@ -520,6 +511,7 @@ export class Relay extends BaseEndpoint {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logFailure("relay", false).catch(() => {}));
       return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",

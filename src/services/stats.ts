@@ -5,6 +5,7 @@ import type {
   DailyStats,
   DashboardOverview,
   ErrorCategory,
+  RelayEndpointName,
   TransactionLogEntry,
 } from "../types";
 
@@ -138,6 +139,29 @@ export class StatsService {
     await this.doPost("/record", entry);
   }
 
+  /**
+   * Log a failed transaction with common defaults (timestamp, success:false, status:"failed").
+   * Reduces boilerplate at each error-path call site.
+   */
+  async logFailure(
+    endpoint: RelayEndpointName,
+    clientError: boolean,
+    opts?: { tokenType?: TokenType; amount?: string; fee?: string; sender?: string; recipient?: string }
+  ): Promise<void> {
+    await this.logTransaction({
+      timestamp: new Date().toISOString(),
+      endpoint,
+      success: false,
+      clientError,
+      tokenType: opts?.tokenType ?? "STX",
+      amount: opts?.amount ?? "0",
+      status: "failed",
+      fee: opts?.fee,
+      sender: opts?.sender,
+      recipient: opts?.recipient,
+    });
+  }
+
   // ===========================================================================
   // Read methods (for dashboard and stats endpoints)
   // ===========================================================================
@@ -153,6 +177,7 @@ export class StatsService {
         total: 0,
         success: 0,
         failed: 0,
+        clientErrors: 0,
         trend: "stable",
         previousTotal: 0,
       },

@@ -1,16 +1,17 @@
-import type { DashboardOverview } from "../../types";
+import type { DashboardOverview, AggregateKeyStats, EndpointBreakdown } from "../../types";
 import { htmlDocument, header, footer } from "../components/layout";
 import {
   statsCard,
   tokenCard,
   healthCard,
   successRateCard,
+  clientErrorsCard,
 } from "../components/cards";
 import {
   formatTrend,
   transactionChartConfig,
 } from "../components/charts";
-import { colors, escapeHtml } from "../styles";
+import { colors, escapeHtml, formatNumber } from "../styles";
 
 /** Bar chart SVG icon (reused in empty states) */
 function barChartSvg(sizeClass: string, extraClass = ""): string {
@@ -53,31 +54,100 @@ function chartEmptyState(message: string): string {
 </div>`;
 }
 
+
 /**
- * Settlement status badge card — shows status as a small pill badge
- * rather than a large bold headline, to avoid alarming "Down" text.
+ * Render the API Keys statistics section for the dashboard.
+ * Shows total active, 7-day registrations, expired, and revoked counts.
  */
-function settlementCard(
-  status: "healthy" | "degraded" | "down" | "unknown",
-  uptime24h: number
-): string {
-  const badgeColor = colors.status[status];
-  const label = status.charAt(0).toUpperCase() + status.slice(1);
+function apiKeysSection(apiKeys: AggregateKeyStats): string {
+  return `
+  <!-- API Keys Section -->
+  <div class="mb-6">
+    <div class="brand-section p-6">
+      <h3 class="text-lg font-semibold text-white mb-4">API Keys</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="brand-card p-4">
+          <p class="text-sm text-gray-400">Total Active</p>
+          <p class="text-2xl font-bold text-white mt-2">${escapeHtml(String(apiKeys.totalActiveKeys))}</p>
+        </div>
+        <div class="brand-card p-4">
+          <p class="text-sm text-gray-400">Registered (7d)</p>
+          <p class="text-2xl font-bold text-green-400 mt-2">${escapeHtml(String(apiKeys.newKeysLast7Days))}</p>
+        </div>
+        <div class="brand-card p-4">
+          <p class="text-sm text-gray-400">Expired</p>
+          <p class="text-2xl font-bold text-yellow-400 mt-2">${escapeHtml(String(apiKeys.expiredKeys))}</p>
+        </div>
+        <div class="brand-card p-4">
+          <p class="text-sm text-gray-400">Revoked</p>
+          <p class="text-2xl font-bold text-red-400 mt-2">${escapeHtml(String(apiKeys.revokedKeys))}</p>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+/**
+ * Render the endpoint breakdown section.
+ * Only shown when at least one endpoint has recorded transactions today.
+ */
+function endpointBreakdownSection(breakdown: EndpointBreakdown): string {
+  const totalAcrossEndpoints =
+    breakdown.relay.total +
+    breakdown.sponsor.total +
+    breakdown.settle.total +
+    breakdown.verify.total;
+
+  if (totalAcrossEndpoints === 0) return "";
+
+  function endpointCard(
+    name: string,
+    total: number,
+    success?: number,
+    failed?: number,
+    clientErrors?: number
+  ): string {
+    const hasDetail = success !== undefined && failed !== undefined;
+    const successColor = colors.status.healthy;
+    const failColor = colors.status.down;
+    const clientColor = colors.status.degraded;
+
+    return `
+<div class="brand-card p-4">
+  <p class="text-sm text-gray-400 font-medium">${escapeHtml(name)}</p>
+  <p class="text-2xl font-bold text-white mt-2">${formatNumber(total)}</p>
+  ${hasDetail ? `
+  <div class="mt-2">
+    <div class="flex items-center justify-between text-xs">
+      <span style="color: ${successColor}">Success</span>
+      <span style="color: ${successColor}">${formatNumber(success!)}</span>
+    </div>
+    <div class="flex items-center justify-between text-xs mt-1">
+      <span style="color: ${failColor}">Failed</span>
+      <span style="color: ${failColor}">${formatNumber(failed!)}</span>
+    </div>
+    ${clientErrors !== undefined && clientErrors > 0 ? `
+    <div class="flex items-center justify-between text-xs mt-1">
+      <span style="color: ${clientColor}">Client Err</span>
+      <span style="color: ${clientColor}">${formatNumber(clientErrors)}</span>
+    </div>` : ""}
+  </div>` : `<p class="text-xs text-gray-500 mt-2">verify-only (no settlement)</p>`}
+</div>`;
+  }
 
   return `
-<div class="brand-card p-4">
-  <div class="flex items-center justify-between">
-    <p class="text-sm text-gray-400">Settlement</p>
-    <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
-  </div>
-  <div class="mt-2">
-    <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium"
-          style="background-color: ${badgeColor}20; color: ${badgeColor}; border: 1px solid ${badgeColor}40">
-      ${escapeHtml(label)}
-    </span>
-  </div>
-  <p class="text-xs text-gray-500 mt-2">Uptime 24h: ${uptime24h}%</p>
-</div>`;
+  <!-- Endpoint Breakdown Section -->
+  <div class="mb-6">
+    <div class="brand-section p-6">
+      <h3 class="text-lg font-semibold text-white mb-4">Endpoint Breakdown (Today)</h3>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        ${endpointCard("/relay", breakdown.relay.total, breakdown.relay.success, breakdown.relay.failed)}
+        ${endpointCard("/sponsor", breakdown.sponsor.total, breakdown.sponsor.success, breakdown.sponsor.failed)}
+        ${endpointCard("/settle", breakdown.settle.total, breakdown.settle.success, breakdown.settle.failed, breakdown.settle.clientErrors)}
+        ${endpointCard("/verify", breakdown.verify.total)}
+      </div>
+    </div>
+  </div>`;
 }
 
 /**
@@ -111,9 +181,9 @@ ${header(network)}
       icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`,
     })}
 
-    ${successRateCard(data.transactions.success, data.transactions.total)}
+    ${successRateCard(data.transactions.success, data.transactions.total, data.transactions.clientErrors)}
 
-    ${settlementCard(settlement.status, settlement.uptime24h)}
+    ${clientErrorsCard(data.transactions.clientErrors ?? 0, data.transactions.total)}
 
     ${statsCard("Hiro Latency", `${settlement.avgLatencyMs}ms`, {
       colorClass: settlement.avgLatencyMs > 2000 ? "text-yellow-400" : "text-white",
@@ -162,10 +232,15 @@ ${header(network)}
     </div>
   </div>
 
+  <!-- Endpoint Breakdown Section -->
+  ${data.endpointBreakdown ? endpointBreakdownSection(data.endpointBreakdown) : ""}
+
   <!-- Stacks API Section -->
   <div class="mb-6">
     ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
   </div>
+
+  ${data.apiKeys ? apiKeysSection(data.apiKeys) : ""}
 
   <!-- Sponsor Wallets Section (client-side fetch from /wallets) -->
   <div class="mb-6" x-data="walletApp()" x-init="init()">

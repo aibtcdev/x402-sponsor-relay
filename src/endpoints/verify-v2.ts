@@ -4,6 +4,7 @@ import {
   mapVerifyErrorToV2Code,
   V2_REQUEST_BODY_SCHEMA,
 } from "./v2-helpers";
+import { StatsService } from "../services";
 import type { AppContext, X402VerifyResponseV2 } from "../types";
 import { X402_V2_ERROR_CODES } from "../types";
 
@@ -61,38 +62,40 @@ export class VerifyV2 extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("x402 V2 verify request received");
 
-    // Helper to return a V2 verify failure response
+    const statsService = new StatsService(c.env, logger);
+
     const v2Invalid = (invalidReason: string): Response => {
       const response: X402VerifyResponseV2 = { isValid: false, invalidReason };
       return c.json(response, 200);
     };
 
     try {
-      // Parse request body
       let body: unknown;
       try {
         body = await c.req.json();
       } catch {
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("verify", true).catch(() => {}));
         return v2Invalid(X402_V2_ERROR_CODES.INVALID_PAYLOAD);
       }
 
-      // Validate V2 request structure (shared with /settle)
       const validation = validateV2Request(body, c.env, logger);
       if (!validation.valid) {
+        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("verify", true).catch(() => {}));
         return v2Invalid(validation.error.errorReason);
       }
 
       const { settleOptions, txHex, settlementService } = validation.data;
 
-      // Verify payment parameters locally (no broadcast)
       const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
 
       if (!verifyResult.valid) {
         logger.info("Payment verification failed", { error: verifyResult.error });
+        c.executionCtx.waitUntil(statsService.logFailure("verify", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
         return v2Invalid(mapVerifyErrorToV2Code(verifyResult.error));
       }
 
-      // Attempt to convert signer to human-readable address for the payer field
       let payer: string | undefined;
       try {
         payer = settlementService.senderToAddress(
@@ -107,6 +110,15 @@ export class VerifyV2 extends BaseEndpoint {
 
       logger.info("x402 V2 verify succeeded", { payer });
 
+      c.executionCtx.waitUntil(statsService.logTransaction({
+        timestamp: new Date().toISOString(),
+        endpoint: "verify",
+        success: true,
+        tokenType: settleOptions.tokenType ?? "STX",
+        amount: settleOptions.minAmount,
+        ...(payer ? { sender: payer } : {}),
+      }).catch(() => {}));
+
       const response: X402VerifyResponseV2 = {
         isValid: true,
         ...(payer ? { payer } : {}),
@@ -116,6 +128,8 @@ export class VerifyV2 extends BaseEndpoint {
       logger.error("Unexpected verify error", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
+      c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logFailure("verify", false).catch(() => {}));
       return v2Invalid(X402_V2_ERROR_CODES.UNEXPECTED_VERIFY_ERROR);
     }
   }
