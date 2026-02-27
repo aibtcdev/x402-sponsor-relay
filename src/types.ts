@@ -330,6 +330,8 @@ export interface X402VerifyResponseV2 {
   invalidReason?: string;
   /** Payer Stacks address (if determinable) */
   payer?: string;
+  /** Optional protocol extensions echoed back to the client */
+  extensions?: Record<string, unknown>;
 }
 
 /**
