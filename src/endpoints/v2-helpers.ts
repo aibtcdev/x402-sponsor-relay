@@ -43,6 +43,29 @@ export const V2_REQUEST_BODY_SCHEMA = {
             },
           },
         },
+        extensions: {
+          type: "object" as const,
+          description: "Optional protocol extensions",
+          properties: {
+            "payment-identifier": {
+              type: "object" as const,
+              description: "Client-controlled idempotency key (payment-identifier extension)",
+              properties: {
+                info: {
+                  type: "object" as const,
+                  properties: {
+                    id: {
+                      type: "string" as const,
+                      description:
+                        "16-128 char idempotency key (pattern: [a-zA-Z0-9_-]+, pay_ prefix recommended)",
+                      example: "pay_01JMVP9QE8XA3BDGM5RN7KWTZ4",
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
       },
     },
     paymentRequirements: {
@@ -89,6 +112,13 @@ export interface V2ValidatedRequest {
   settlementService: SettlementService;
   /** Max settlement timeout in seconds from paymentRequirements (optional) */
   maxTimeoutSeconds?: number;
+  /**
+   * Extracted payment-identifier extension id, if provided by client.
+   * Value of extensions["payment-identifier"].info.id from paymentPayload.
+   * Undefined when the extension is absent (backward compatible).
+   * Used in Phase 3 for client-controlled idempotency caching.
+   */
+  paymentIdentifier?: string;
 }
 
 /**
@@ -212,6 +242,43 @@ export function validateV2Request(
       ? req.maxTimeoutSeconds
       : undefined;
 
+  // Extract and validate payment-identifier extension (optional)
+  let paymentIdentifier: string | undefined;
+  const extensions = parsed.paymentPayload.extensions;
+  const paymentIdExt = extensions?.["payment-identifier"];
+  if (paymentIdExt !== undefined) {
+    const id = paymentIdExt?.info?.id;
+    if (typeof id !== "string") {
+      logger.warn("payment-identifier extension present but id is not a string", {
+        idType: typeof id,
+      });
+      return {
+        valid: false,
+        error: { errorReason: X402_V2_ERROR_CODES.INVALID_PAYLOAD, status: 400 },
+      };
+    }
+    if (id.length < 16 || id.length > 128) {
+      logger.warn("payment-identifier id length out of range", {
+        length: id.length,
+        min: 16,
+        max: 128,
+      });
+      return {
+        valid: false,
+        error: { errorReason: X402_V2_ERROR_CODES.INVALID_PAYLOAD, status: 400 },
+      };
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+      logger.warn("payment-identifier id contains invalid characters", { id });
+      return {
+        valid: false,
+        error: { errorReason: X402_V2_ERROR_CODES.INVALID_PAYLOAD, status: 400 },
+      };
+    }
+    logger.debug("payment-identifier extracted", { id });
+    paymentIdentifier = id;
+  }
+
   return {
     valid: true,
     data: {
@@ -224,6 +291,7 @@ export function validateV2Request(
       network,
       settlementService,
       maxTimeoutSeconds,
+      paymentIdentifier,
     },
   };
 }
