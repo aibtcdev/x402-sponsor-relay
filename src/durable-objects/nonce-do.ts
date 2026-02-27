@@ -39,6 +39,8 @@ interface AssignNonceResponse {
   walletIndex: number;
   /** Sponsor address echoed back for convenience */
   sponsorAddress: string;
+  /** Total reserved nonces across all wallets at time of assignment (pool pressure signal) */
+  totalReserved: number;
 }
 
 interface RecordTxidRequest {
@@ -993,7 +995,7 @@ export class NonceDO {
     sponsorAddress: string,
     walletCount: number = 1,
     addresses?: Record<string, string>
-  ): Promise<{ nonce: number; walletIndex: number }> {
+  ): Promise<{ nonce: number; walletIndex: number; totalReserved: number }> {
     if (!sponsorAddress) {
       throw new Error("Missing sponsor address");
     }
@@ -1151,7 +1153,22 @@ export class NonceDO {
       // Advance round-robin to next wallet
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
-      return { nonce: assignedNonce, walletIndex };
+      // Compute totalReserved across all initialized wallets for pool pressure signaling.
+      // Loads each wallet's pool state (fast DO storage reads). The assigned wallet's pool
+      // has already been saved above, so its reserved count is up-to-date.
+      let totalReserved = 0;
+      for (let wi = 0; wi < effectiveWalletCount; wi++) {
+        const wp = await this.loadPoolForWallet(wi);
+        totalReserved += wp?.reserved.length ?? 0;
+      }
+
+      this.log("debug", "nonce_pool_pressure", {
+        walletIndex,
+        totalReserved,
+        poolCapacity: effectiveWalletCount * CHAINING_LIMIT,
+      });
+
+      return { nonce: assignedNonce, walletIndex, totalReserved };
     });
   }
 
@@ -1911,6 +1928,7 @@ export class NonceDO {
           nonce: result.nonce,
           walletIndex: result.walletIndex,
           sponsorAddress: body.sponsorAddress,
+          totalReserved: result.totalReserved,
         };
         return this.jsonResponse(response);
       } catch (error) {
