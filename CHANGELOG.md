@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.16.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.16.0...x402-sponsor-relay-v1.16.1) (2026-02-27)
+
+
+### Bug Fixes
+
+* **resilience:** burst-resilience — transient drop handling and dynamic fees ([#131](https://github.com/aibtcdev/x402-sponsor-relay/issues/131)) ([131cded](https://github.com/aibtcdev/x402-sponsor-relay/commit/131cded91de2bec667ed9de12421286a439becb4))
+
 ## [1.16.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.15.2...x402-sponsor-relay-v1.16.0) (2026-02-27)
 
 
