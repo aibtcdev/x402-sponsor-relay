@@ -686,12 +686,7 @@ export class SponsorService {
       };
     }
 
-    // Determine fee from FeeService using pool-pressure-aware priority selection.
-    // totalReserved comes from NonceDO /assign response (0 when DO is not configured).
-    // selectFeePriority maps pool pressure % to low/medium/high tier:
-    //   <25% → low_priority (saves fees during normal load)
-    //   25-60% → medium_priority
-    //   >60% → high_priority (burst load — reduce genuine RBF risk)
+    // Select fee tier based on pool pressure (see selectFeePriority for thresholds)
     let fee: number | undefined;
     const walletCount = this.getWalletCount();
     const feePriority = this.selectFeePriority(totalReserved, walletCount);
@@ -702,13 +697,12 @@ export class SponsorService {
       const feeTiers = fees[feeType] ?? fees.contract_call;
       fee = feeTiers[feePriority];
       const poolCapacity = walletCount * CHAINING_LIMIT_PER_WALLET;
-      const poolPressurePct = poolCapacity > 0 ? Math.round((totalReserved / poolCapacity) * 100) : 0;
       this.logger.info("Using clamped fee from FeeService", {
         feeType,
         fee,
         feeSource,
         feePriority,
-        poolPressurePct,
+        poolPressurePct: poolCapacity > 0 ? Math.round((totalReserved / poolCapacity) * 100) : 0,
         totalReserved,
         poolCapacity,
       });

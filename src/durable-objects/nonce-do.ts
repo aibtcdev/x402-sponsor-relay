@@ -1153,9 +1153,7 @@ export class NonceDO {
       // Advance round-robin to next wallet
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
-      // Compute totalReserved across all initialized wallets for pool pressure signaling.
-      // Loads each wallet's pool state (fast DO storage reads). The assigned wallet's pool
-      // has already been saved above, so its reserved count is up-to-date.
+      // Compute totalReserved across all wallets for pool pressure signaling
       let totalReserved = 0;
       for (let wi = 0; wi < effectiveWalletCount; wi++) {
         const wp = await this.loadPoolForWallet(wi);

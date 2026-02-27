@@ -824,9 +824,7 @@ export class SettlementService {
           }
 
           if (this.isTxDropped(txStatus)) {
-            // Hiro's dropped_* statuses are often transient — production data shows
-            // 93% of transactions reported as dropped_replace_by_fee actually confirm.
-            // Continue polling instead of giving up.
+            // Transient — see isTxDropped() for rationale. Continue polling.
             this.logger.warn("Transaction reported as dropped, continuing to poll", {
               txid,
               txStatus,
@@ -884,9 +882,7 @@ export class SettlementService {
    *               is unreachable (fail-open).
    * Returns false if the tx is 404 (never indexed / evicted) or abort_* (terminal).
    *
-   * Note: dropped_* statuses are treated as alive because Hiro frequently reports
-   * transient drops for transactions that actually confirm (93% false positive rate
-   * observed in production 2026-02-27).
+   * Note: dropped_* statuses are treated as alive — see isTxDropped() for rationale.
    */
   private async verifyTxidAlive(txid: string): Promise<boolean> {
     try {
@@ -918,8 +914,6 @@ export class SettlementService {
       }
 
       if (this.isTxDropped(data.tx_status)) {
-        // Dropped statuses are transient — treat as alive to avoid invalidating
-        // dedup entries for transactions that will likely confirm.
         this.logger.debug("Txid has transient dropped status, treating as alive", {
           txid,
           txStatus: data.tx_status,
