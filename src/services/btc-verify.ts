@@ -305,16 +305,18 @@ function verifyBip137(address: string, message: string, signatureBase64: string)
 // ---------------------------------------------------------------------------
 
 /**
- * BIP-322 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || varint(msg.len) || msg)
+ * BIP-322 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
  * where tag = "BIP0322-signed-message"
+ *
+ * Note: BIP-322 uses BIP-340 tagged hashes, which do NOT include a varint
+ * length prefix. The varint is a Bitcoin message format thing (BIP-137) and
+ * does not belong here. Fixes: https://github.com/aibtcdev/x402-sponsor-relay/issues/135
  */
 function bip322TaggedHash(message: string): Uint8Array {
   const tagBytes = new TextEncoder().encode("BIP0322-signed-message");
   const tagHash = hashSha256Sync(tagBytes);
   const msgBytes = new TextEncoder().encode(message);
-  const varint = encodeVarInt(msgBytes.length);
-  const msgPart = concatBytes(varint, msgBytes);
-  return hashSha256Sync(concatBytes(tagHash, tagHash, msgPart));
+  return hashSha256Sync(concatBytes(tagHash, tagHash, msgBytes));
 }
 
 /**
