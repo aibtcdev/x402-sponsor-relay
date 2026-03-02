@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.17.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.0...x402-sponsor-relay-v1.17.1) (2026-03-02)
+
+
+### Bug Fixes
+
+* **btc-verify:** remove varint prepend from bip322TaggedHash ([#136](https://github.com/aibtcdev/x402-sponsor-relay/issues/136)) ([a786300](https://github.com/aibtcdev/x402-sponsor-relay/commit/a7863009e49c95c9bc038c49247f8406bb0a368a))
+
 ## [1.17.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.16.1...x402-sponsor-relay-v1.17.0) (2026-02-27)
 
 
