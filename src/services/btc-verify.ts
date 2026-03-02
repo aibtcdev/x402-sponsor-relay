@@ -81,7 +81,7 @@ function detectBtcNetwork(address: string): BTC_NETWORK {
  * Result of BTC signature verification
  */
 export type BtcVerifyResult =
-  | { valid: true; path: "registration" | "self-service"; timestamp?: string }
+  | { valid: true; path: "registration" | "self-service"; timestamp?: string; deprecationNotice?: string }
   | { valid: false; error: string; code: BtcVerifyErrorCode };
 
 /**
@@ -305,10 +305,28 @@ function verifyBip137(address: string, message: string, signatureBase64: string)
 // ---------------------------------------------------------------------------
 
 /**
- * BIP-322 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || varint(msg.len) || msg)
+ * Spec-compliant BIP-322 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
  * where tag = "BIP0322-signed-message"
+ *
+ * BIP-322 uses BIP-340 tagged hashes, which do NOT include a varint length prefix.
+ * The varint is a Bitcoin message format convention (BIP-137) and does not belong here.
+ * Fixes: https://github.com/aibtcdev/x402-sponsor-relay/issues/135
  */
 function bip322TaggedHash(message: string): Uint8Array {
+  const tagBytes = new TextEncoder().encode("BIP0322-signed-message");
+  const tagHash = hashSha256Sync(tagBytes);
+  const msgBytes = new TextEncoder().encode(message);
+  return hashSha256Sync(concatBytes(tagHash, tagHash, msgBytes));
+}
+
+/**
+ * @deprecated Legacy BIP-322 tagged hash with varint prepend — non-standard, remove after transition.
+ *
+ * This was the original (incorrect) implementation that prepended varint(msg.length) before the
+ * message bytes, mirroring BIP-137 convention. Kept only for backward-compat during transition.
+ * See: https://github.com/aibtcdev/x402-sponsor-relay/issues/135
+ */
+function bip322TaggedHashLegacy(message: string): Uint8Array {
   const tagBytes = new TextEncoder().encode("BIP0322-signed-message");
   const tagHash = hashSha256Sync(tagBytes);
   const msgBytes = new TextEncoder().encode(message);
@@ -319,9 +337,9 @@ function bip322TaggedHash(message: string): Uint8Array {
 
 /**
  * Build the BIP-322 to_spend virtual transaction and return its txid (32 bytes, LE).
+ * Takes a pre-computed msgHash so callers can try different hash functions.
  */
-function bip322BuildToSpendTxId(message: string, scriptPubKey: Uint8Array): Uint8Array {
-  const msgHash = bip322TaggedHash(message);
+function bip322BuildToSpendTxId(msgHash: Uint8Array, scriptPubKey: Uint8Array): Uint8Array {
   // scriptSig: OP_0 (0x00) push32 (0x20) <32-byte hash>
   const scriptSig = concatBytes(new Uint8Array([0x00, 0x20]), msgHash);
 
@@ -349,13 +367,9 @@ function bip322BuildToSpendTxId(message: string, scriptPubKey: Uint8Array): Uint
 }
 
 /**
- * BIP-322 "simple" verification for P2WPKH (bc1q/tb1q) addresses.
+ * Inner P2WPKH verifier — takes a pre-computed msgHash so callers can try different hash functions.
  */
-function bip322VerifyP2WPKH(
-  message: string,
-  signatureBase64: string,
-  address: string
-): boolean {
+function bip322VerifyP2WPKHCore(signatureBase64: string, address: string, msgHash: Uint8Array): boolean {
   const sigBytes = new Uint8Array(Buffer.from(signatureBase64, "base64"));
   const witnessItems = RawWitness.decode(sigBytes);
 
@@ -375,7 +389,7 @@ function bip322VerifyP2WPKH(
   const scriptPubKey = p2wpkh(pubkeyBytes, network).script;
 
   // Build to_spend txid
-  const toSpendTxid = bip322BuildToSpendTxId(message, scriptPubKey);
+  const toSpendTxid = bip322BuildToSpendTxId(msgHash, scriptPubKey);
 
   // Build (unsigned) to_sign transaction for sighash computation.
   // allowUnknownOutputs: true is required for the OP_RETURN output in BIP-322 virtual transactions.
@@ -408,16 +422,30 @@ function bip322VerifyP2WPKH(
 }
 
 /**
- * BIP-322 "simple" verification for P2TR (bc1p/tb1p) addresses.
+ * BIP-322 "simple" verification for P2WPKH (bc1q/tb1q) addresses.
+ * Tries spec-compliant BIP-340 hash first; falls back to legacy varint hash for transition.
+ */
+function bip322VerifyP2WPKH(
+  message: string,
+  signatureBase64: string,
+  address: string
+): { verified: boolean; usedLegacy?: boolean } {
+  if (bip322VerifyP2WPKHCore(signatureBase64, address, bip322TaggedHash(message))) {
+    return { verified: true };
+  }
+  if (bip322VerifyP2WPKHCore(signatureBase64, address, bip322TaggedHashLegacy(message))) {
+    return { verified: true, usedLegacy: true };
+  }
+  return { verified: false };
+}
+
+/**
+ * Inner P2TR verifier — takes a pre-computed msgHash so callers can try different hash functions.
  *
  * Reconstructs the to_sign transaction, computes the BIP341 tapscript sighash manually,
  * verifies the Schnorr signature, and checks the pubkey matches the address.
  */
-function bip322VerifyP2TR(
-  message: string,
-  signatureBase64: string,
-  address: string
-): boolean {
+function bip322VerifyP2TRCore(signatureBase64: string, address: string, msgHash: Uint8Array): boolean {
   const sigBytes = new Uint8Array(Buffer.from(signatureBase64, "base64"));
   const witnessItems = RawWitness.decode(sigBytes);
 
@@ -443,7 +471,7 @@ function bip322VerifyP2TR(
   const scriptPubKey = new Uint8Array([0x51, 0x20, ...tweakedKey]);
 
   // Build to_spend txid
-  const toSpendTxid = bip322BuildToSpendTxId(message, scriptPubKey);
+  const toSpendTxid = bip322BuildToSpendTxId(msgHash, scriptPubKey);
 
   // Compute BIP341 sighash manually for SIGHASH_DEFAULT (0x00) key-path spending.
   // hashPrevouts = SHA256(txid_wire_bytes || vout(4LE))
@@ -499,6 +527,24 @@ function bip322VerifyP2TR(
   const sighash = hashSha256Sync(concatBytes(tagHash, tagHash, sigMsg));
 
   return schnorr.verify(schnorrSig, sighash, tweakedKey);
+}
+
+/**
+ * BIP-322 "simple" verification for P2TR (bc1p/tb1p) addresses.
+ * Tries spec-compliant BIP-340 hash first; falls back to legacy varint hash for transition.
+ */
+function bip322VerifyP2TR(
+  message: string,
+  signatureBase64: string,
+  address: string
+): { verified: boolean; usedLegacy?: boolean } {
+  if (bip322VerifyP2TRCore(signatureBase64, address, bip322TaggedHash(message))) {
+    return { verified: true };
+  }
+  if (bip322VerifyP2TRCore(signatureBase64, address, bip322TaggedHashLegacy(message))) {
+    return { verified: true, usedLegacy: true };
+  }
+  return { verified: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +628,7 @@ export class BtcVerifyService {
     timestamp?: string,
     addressType?: BtcAddressType
   ): BtcVerifyResult {
-    const { verified, reason } = this.verifySignatureWithReason(btcAddress, message, signature);
+    const { verified, reason, usedLegacy } = this.verifySignatureWithReason(btcAddress, message, signature);
 
     if (!verified) {
       this.logger.warn(`${path} signature verification failed`, { btcAddress, message, addressType, reason });
@@ -593,8 +639,25 @@ export class BtcVerifyService {
       };
     }
 
-    this.logger.info(`${path} signature verified`, { btcAddress, addressType, ...(timestamp && { timestamp }) });
-    return { valid: true, path, timestamp };
+    if (usedLegacy) {
+      this.logger.warn("BIP-322 legacy hash accepted — agent should update to spec-compliant signing", {
+        btcAddress,
+        addressType,
+      });
+    }
+
+    this.logger.info(`${path} signature verified`, {
+      btcAddress,
+      addressType,
+      ...(timestamp && { timestamp }),
+      ...(usedLegacy && { usedLegacy }),
+    });
+
+    const deprecationNotice = usedLegacy
+      ? "BIP-322 signature uses non-standard tagged hash. Update to spec-compliant signing — see aibtcdev/skills or install latest @aibtc/mcp-server."
+      : undefined;
+
+    return { valid: true, path, timestamp, ...(deprecationNotice && { deprecationNotice }) };
   }
 
   /**
@@ -644,12 +707,13 @@ export class BtcVerifyService {
    *
    * Returns both the verification result and the underlying error reason (if any),
    * so callers can surface actionable messages rather than a bare boolean.
+   * Also returns usedLegacy=true when the legacy (non-standard) hash path was needed.
    */
   private verifySignatureWithReason(
     address: string,
     message: string,
     signature: string
-  ): { verified: boolean; reason?: string } {
+  ): { verified: boolean; reason?: string; usedLegacy?: boolean } {
     try {
       const sigBytes = new Uint8Array(Buffer.from(signature, "base64"));
 
@@ -660,18 +724,16 @@ export class BtcVerifyService {
       } else {
         // BIP-322 path: P2WPKH (bc1q...) and P2TR (bc1p...)
         const addressType = detectAddressType(address);
-        let verified = false;
         if (addressType === "P2WPKH") {
-          verified = bip322VerifyP2WPKH(message, signature, address);
+          return bip322VerifyP2WPKH(message, signature, address);
         } else if (addressType === "P2TR") {
-          verified = bip322VerifyP2TR(message, signature, address);
+          return bip322VerifyP2TR(message, signature, address);
         } else {
           return {
             verified: false,
             reason: `BIP-322 not supported for address type: ${addressType}`,
           };
         }
-        return { verified };
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Unknown error";
