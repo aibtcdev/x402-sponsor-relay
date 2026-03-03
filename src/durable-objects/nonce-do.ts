@@ -809,7 +809,7 @@ export class NonceDO {
    * Record a quarantine event for a specific wallet.
    * Maintains a rolling window of recent quarantine timestamps for the circuit breaker.
    * Also contributes to cross-wallet cascade detection.
-   * Called from releaseNonce() whenever a nonce is moved to spent[].
+   * Called from releaseNonce() only for failure quarantines (not normal consumption).
    */
   private async recordQuarantineEvent(walletIndex: number): Promise<void> {
     const now = new Date().toISOString();
@@ -864,7 +864,7 @@ export class NonceDO {
 
   /**
    * Trigger an eager pool refill for a specific wallet when its available[] pool
-   * has dropped below the low-water threshold after a quarantine event.
+   * has dropped below the low-water threshold after a nonce is moved to spent[].
    * Calls reconcileNonceForWallet() inline rather than waiting for the next alarm cycle.
    * Must be called from within blockConcurrencyWhile context.
    */
@@ -1325,7 +1325,11 @@ export class NonceDO {
       pool.reserved.splice(reservedIdx, 1);
       delete pool.reservedAt[nonce];
 
-      let quarantined = false;
+      // Track whether the nonce moved to spent[] due to a failure (true quarantine)
+      // vs normal consumption (successful broadcast). Only failure quarantines should
+      // count toward the circuit breaker — normal consumption is the happy path.
+      let failureQuarantined = false;
+      let movedToSpent = false;
       if (!txid) {
         // No txid provided: broadcast may have failed. Check if we previously recorded
         // a txid for this nonce (e.g. a retry scenario). If a txid was ever recorded,
@@ -1335,7 +1339,8 @@ export class NonceDO {
           if (!pool.spent.includes(nonce)) {
             pool.spent.push(nonce);
           }
-          quarantined = true;
+          failureQuarantined = true;
+          movedToSpent = true;
           this.log("warn", "nonce_quarantined", {
             walletIndex,
             nonce,
@@ -1351,7 +1356,7 @@ export class NonceDO {
         if (!pool.spent.includes(nonce)) {
           pool.spent.push(nonce);
         }
-        quarantined = true;
+        movedToSpent = true;
         if (fee && fee !== "0") {
           // Broadcast succeeded and fee provided — record in wallet stats
           await this.recordWalletFee(walletIndex, fee);
@@ -1370,10 +1375,16 @@ export class NonceDO {
         poolSpent: pool.spent.length,
       });
 
-      // When a nonce is quarantined (moved to spent[]), record the event for circuit
-      // breaker tracking and trigger an eager pool refill if available[] is running low.
-      if (quarantined) {
+      // Circuit breaker: only record failure quarantines (not normal consumption).
+      // Normal successful broadcasts should not count toward the circuit breaker
+      // threshold — otherwise 3 successful txs within 10 min would trip the breaker.
+      if (failureQuarantined) {
         await this.recordQuarantineEvent(walletIndex);
+      }
+
+      // Eager refill: trigger for any nonce moved to spent[] (both success and failure)
+      // since both shrink the available pool.
+      if (movedToSpent) {
         await this.triggerEagerRefillForWallet(walletIndex, pool);
       }
     });
