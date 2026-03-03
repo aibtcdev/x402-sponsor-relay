@@ -205,6 +205,19 @@ const DEFAULT_FLUSH_RECIPIENT_MAINNET = "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTA
 const DEFAULT_FLUSH_RECIPIENT_TESTNET = "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB";
 /** Maximum number of gap-fill broadcasts per alarm cycle per wallet */
 const MAX_GAP_FILLS_PER_ALARM = 5;
+/**
+ * Per-wallet circuit breaker: if a wallet accumulates this many quarantines
+ * within CIRCUIT_BREAKER_WINDOW_MS, it is skipped during nonce assignment
+ * and an eager resync is triggered for that wallet only.
+ */
+const CIRCUIT_BREAKER_QUARANTINE_THRESHOLD = 3;
+/** Time window for circuit breaker quarantine counting (10 minutes) */
+const CIRCUIT_BREAKER_WINDOW_MS = 10 * 60 * 1000;
+/**
+ * Cross-wallet cascade detection: log a cascade_detected event when quarantine
+ * count across all wallets exceeds this threshold within CIRCUIT_BREAKER_WINDOW_MS.
+ */
+const CASCADE_DETECTION_THRESHOLD = 3;
 
 // Legacy single-wallet pool key (migrated to pool:0 on first access)
 const POOL_KEY = "pool";
@@ -784,6 +797,98 @@ export class NonceDO {
     return `gap_persist:${walletIndex}`;
   }
 
+  /** KV key for per-wallet recent quarantine timestamps (circuit breaker window) */
+  private walletQuarantineRecentKey(walletIndex: number): string {
+    return `wallet_quarantine_recent:${walletIndex}`;
+  }
+
+  /** KV key for cross-wallet cascade quarantine tracking */
+  private readonly cascadeQuarantineKey = "cascade_quarantine_window";
+
+  /**
+   * Record a quarantine event for a specific wallet.
+   * Maintains a rolling window of recent quarantine timestamps for the circuit breaker.
+   * Also contributes to cross-wallet cascade detection.
+   * Called from releaseNonce() only for failure quarantines (not normal consumption).
+   */
+  private async recordQuarantineEvent(walletIndex: number): Promise<void> {
+    const now = new Date().toISOString();
+    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+
+    // Update per-wallet recent quarantine list
+    const recentKey = this.walletQuarantineRecentKey(walletIndex);
+    const existing = (await this.state.storage.get<string[]>(recentKey)) ?? [];
+    const pruned = existing.filter((ts) => new Date(ts).getTime() >= cutoff);
+    pruned.push(now);
+    await this.state.storage.put(recentKey, pruned);
+
+    if (pruned.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD) {
+      this.log("warn", "circuit_breaker_triggered", {
+        walletIndex,
+        quarantineCount: pruned.length,
+        windowMs: CIRCUIT_BREAKER_WINDOW_MS,
+        threshold: CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
+      });
+    }
+
+    // Update cross-wallet cascade window
+    await this.checkCascadeThreshold(walletIndex, now);
+  }
+
+  /**
+   * Check if cross-wallet quarantines have crossed the cascade detection threshold.
+   * Logs a cascade_detected event when >= CASCADE_DETECTION_THRESHOLD quarantines
+   * have occurred across any wallets within the circuit breaker time window.
+   */
+  private async checkCascadeThreshold(walletIndex: number, ts: string): Promise<void> {
+    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+    const existing = (await this.state.storage.get<Array<{ walletIndex: number; ts: string }>>(
+      this.cascadeQuarantineKey
+    )) ?? [];
+
+    const pruned = existing.filter((e) => new Date(e.ts).getTime() >= cutoff);
+    pruned.push({ walletIndex, ts });
+    await this.state.storage.put(this.cascadeQuarantineKey, pruned);
+
+    if (pruned.length >= CASCADE_DETECTION_THRESHOLD) {
+      const uniqueWallets = [...new Set(pruned.map((e) => e.walletIndex))];
+      this.log("warn", "cascade_detected", {
+        totalQuarantinesInWindow: pruned.length,
+        affectedWallets: uniqueWallets,
+        windowMs: CIRCUIT_BREAKER_WINDOW_MS,
+        threshold: CASCADE_DETECTION_THRESHOLD,
+        detectedAt: ts,
+      });
+    }
+  }
+
+  /**
+   * Trigger an eager pool refill for a specific wallet when its available[] pool
+   * has dropped below the low-water threshold after a nonce is moved to spent[].
+   * Calls reconcileNonceForWallet() inline rather than waiting for the next alarm cycle.
+   * Must be called from within blockConcurrencyWhile context.
+   */
+  private async triggerEagerRefillForWallet(walletIndex: number, pool: PoolState): Promise<void> {
+    const lowWaterMark = Math.ceil(POOL_SEED_SIZE / 2);
+    if (pool.available.length >= lowWaterMark) {
+      // Pool is still healthy — no eager refill needed
+      return;
+    }
+    const address = await this.getStoredSponsorAddressForWallet(walletIndex);
+    if (!address) {
+      // Wallet not yet fully initialized — skip
+      return;
+    }
+    this.log("info", "eager_pool_refill_triggered", {
+      walletIndex,
+      availableBeforeRefill: pool.available.length,
+      lowWaterMark,
+    });
+    // reconcileNonceForWallet is the same path the alarm uses; it will call
+    // resetPoolAvailableForWallet if the pool is below target.
+    await this.reconcileNonceForWallet(walletIndex, address);
+  }
+
   /**
    * Record a successful gap-fill transaction fee for a specific wallet.
    * Increments gap-fill-specific counters separately from sponsored tx fees
@@ -1043,6 +1148,29 @@ export class NonceDO {
           continue;
         }
 
+        // Check per-wallet circuit breaker: skip if too many recent quarantines
+        const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+        const recentQuarantines = (
+          await this.state.storage.get<string[]>(this.walletQuarantineRecentKey(walletIndex))
+        ) ?? [];
+        const activeQuarantines = recentQuarantines.filter(
+          (ts) => new Date(ts).getTime() >= cutoff
+        );
+        if (activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD) {
+          this.log("warn", "circuit_breaker_skip", {
+            walletIndex,
+            quarantineCount: activeQuarantines.length,
+            windowMs: CIRCUIT_BREAKER_WINDOW_MS,
+            threshold: CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
+          });
+          // Use cycleCount=0 so these are treated as degraded-but-not-fully-stuck
+          degradedWallets.push({ walletIndex, cycleCount: 0, pool });
+          walletIndex = (walletIndex + 1) % effectiveWalletCount;
+          pool = null;
+          attempts++;
+          continue;
+        }
+
         if (pool.reserved.length < CHAINING_LIMIT) {
           break;
         }
@@ -1197,6 +1325,11 @@ export class NonceDO {
       pool.reserved.splice(reservedIdx, 1);
       delete pool.reservedAt[nonce];
 
+      // Track whether the nonce moved to spent[] due to a failure (true quarantine)
+      // vs normal consumption (successful broadcast). Only failure quarantines should
+      // count toward the circuit breaker — normal consumption is the happy path.
+      let failureQuarantined = false;
+      let movedToSpent = false;
       if (!txid) {
         // No txid provided: broadcast may have failed. Check if we previously recorded
         // a txid for this nonce (e.g. a retry scenario). If a txid was ever recorded,
@@ -1206,6 +1339,8 @@ export class NonceDO {
           if (!pool.spent.includes(nonce)) {
             pool.spent.push(nonce);
           }
+          failureQuarantined = true;
+          movedToSpent = true;
           this.log("warn", "nonce_quarantined", {
             walletIndex,
             nonce,
@@ -1221,6 +1356,7 @@ export class NonceDO {
         if (!pool.spent.includes(nonce)) {
           pool.spent.push(nonce);
         }
+        movedToSpent = true;
         if (fee && fee !== "0") {
           // Broadcast succeeded and fee provided — record in wallet stats
           await this.recordWalletFee(walletIndex, fee);
@@ -1238,6 +1374,19 @@ export class NonceDO {
         poolReserved: pool.reserved.length,
         poolSpent: pool.spent.length,
       });
+
+      // Circuit breaker: only record failure quarantines (not normal consumption).
+      // Normal successful broadcasts should not count toward the circuit breaker
+      // threshold — otherwise 3 successful txs within 10 min would trip the breaker.
+      if (failureQuarantined) {
+        await this.recordQuarantineEvent(walletIndex);
+      }
+
+      // Eager refill: trigger for any nonce moved to spent[] (both success and failure)
+      // since both shrink the available pool.
+      if (movedToSpent) {
+        await this.triggerEagerRefillForWallet(walletIndex, pool);
+      }
     });
   }
 
@@ -1821,6 +1970,10 @@ export class NonceDO {
             if (released > 0) {
               await this.savePoolForWallet(walletIndex, pool);
               this.log("info", "stale_reservations_cleaned", { walletIndex, released });
+              // Trigger eager refill if any stale nonces were quarantined (moved to spent[]),
+              // which would have shrunk available[]. The alarm reconciliation already ran
+              // above, but cleanStaleReservations may have further reduced available[].
+              await this.triggerEagerRefillForWallet(walletIndex, pool);
             }
             totalReservedAfterCycle += pool.reserved.length;
           }

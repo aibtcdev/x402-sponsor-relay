@@ -167,6 +167,24 @@ export class SettlementService {
   }
 
   /**
+   * Build the human-readable list of supported token contracts for error messages.
+   * On testnet, sBTC matches any deployer address (contract name only) since the
+   * deployer address drifts across SDK versions and test environments.
+   */
+  private getSupportedContractsList(): string {
+    const sbtcEntry = this.env.STACKS_NETWORK === "testnet"
+      ? `<any-address>.${SBTC_CONTRACT_NAME} (testnet: any deployer)`
+      : `${SBTC_CONTRACT_MAINNET}.${SBTC_CONTRACT_NAME}`;
+
+    return [
+      "STX (native)",
+      sbtcEntry,
+      `${USDCX_CIRCLE_CONTRACT_MAINNET}.${USDCX_CIRCLE_CONTRACT_NAME}`,
+      `${USDCX_AEUSDC_CONTRACT_MAINNET}.${USDCX_AEUSDC_CONTRACT_NAME}`,
+    ].join(", ");
+  }
+
+  /**
    * Validate settle options (expectedRecipient, minAmount, tokenType)
    */
   validateSettleOptions(settle: SettleOptions):
@@ -373,7 +391,7 @@ export class SettlementService {
         return {
           valid: false,
           error: "Unsupported token contract",
-          details: `Unsupported SIP-010 token contract: ${contractAddressStr}.${contractNameStr}`,
+          details: `Unsupported SIP-010 token contract: ${contractAddressStr}.${contractNameStr}. Supported contracts: ${this.getSupportedContractsList()}`,
         };
       }
       tokenType = matchedToken;
