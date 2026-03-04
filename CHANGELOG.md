@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.17.3](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.2...x402-sponsor-relay-v1.17.3) (2026-03-04)
+
+
+### Bug Fixes
+
+* handle settlement timeout with retry and partial success ([#143](https://github.com/aibtcdev/x402-sponsor-relay/issues/143)) ([#145](https://github.com/aibtcdev/x402-sponsor-relay/issues/145)) ([3429905](https://github.com/aibtcdev/x402-sponsor-relay/commit/3429905d640a1b0fe7c16b6b00c412dedb505625))
+* make token_transfer tier optional in Hiro fee estimation ([#144](https://github.com/aibtcdev/x402-sponsor-relay/issues/144)) ([9c4cc28](https://github.com/aibtcdev/x402-sponsor-relay/commit/9c4cc28f3630b9c3d1fda84fbfba88c46e46673a))
+
 ## [1.17.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.1...x402-sponsor-relay-v1.17.2) (2026-03-03)
 
 
