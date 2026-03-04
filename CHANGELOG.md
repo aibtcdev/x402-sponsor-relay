@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.17.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.1...x402-sponsor-relay-v1.17.2) (2026-03-03)
+
+
+### Bug Fixes
+
+* improve error messages and nonce pool cascade recovery ([#140](https://github.com/aibtcdev/x402-sponsor-relay/issues/140)) ([4041831](https://github.com/aibtcdev/x402-sponsor-relay/commit/40418319cabb466f40fc346738f396e6cc572060))
+
 ## [1.17.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.0...x402-sponsor-relay-v1.17.1) (2026-03-02)
 
 
