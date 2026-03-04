@@ -210,9 +210,10 @@ export class FeeService {
 
       // Guard against malformed responses — validate required fields exist
       // and are finite numbers. Avoids truthiness checks so that 0 is allowed.
-      // Note: smart_contract is optional — Hiro may omit it when there is
-      // insufficient mempool data for that tier. We synthesize it from
-      // contract_call values in that case.
+      // Note: smart_contract and token_transfer are optional — Hiro may omit
+      // them when there is insufficient mempool data for those tiers (e.g.
+      // sparse mempools with no pending token transfers). We synthesize them
+      // from the 'all' aggregate tier or from contract_call values.
       const isValidNumber = (value: unknown): value is number =>
         typeof value === "number" && Number.isFinite(value);
 
@@ -226,12 +227,29 @@ export class FeeService {
       const contractCall = data?.contract_call;
       const smartContract = data?.smart_contract;
 
-      if (!isValidTiers(tokenTransfer) || !isValidTiers(contractCall)) {
-        this.logger.warn("Hiro API fee response missing or invalid required fields", {
+      // contract_call is strictly required — it is the primary use case for the relay
+      if (!isValidTiers(contractCall)) {
+        this.logger.warn("Hiro API fee response missing contract_call tier", {
           hasTokenTransfer: !!tokenTransfer,
-          hasContractCall: !!contractCall,
+          hasContractCall: false,
         });
         return null;
+      }
+
+      // token_transfer is optional — fall back to 'all' aggregate tier when the
+      // mempool has no pending token transfers (sparse mempool periods)
+      let resolvedTokenTransfer: FeePriorityTiers;
+      if (isValidTiers(tokenTransfer)) {
+        resolvedTokenTransfer = tokenTransfer;
+      } else {
+        const allTier = data?.all;
+        if (isValidTiers(allTier)) {
+          this.logger.debug("token_transfer tier absent, using 'all' tier as fallback");
+          resolvedTokenTransfer = allTier;
+        } else {
+          this.logger.debug("token_transfer tier absent, using contract_call tier as fallback");
+          resolvedTokenTransfer = contractCall;
+        }
       }
 
       // Use smart_contract if present and valid; otherwise synthesize from contract_call
@@ -244,7 +262,7 @@ export class FeeService {
       }
 
       const resolved: FeeEstimates = {
-        token_transfer: tokenTransfer,
+        token_transfer: resolvedTokenTransfer,
         contract_call: contractCall,
         smart_contract: resolvedSmartContract,
       };
@@ -288,13 +306,15 @@ export class FeeService {
 
   /**
    * Apply clamps to raw fee estimates.
-   * smart_contract is optional in FeeEstimates; fall back to contract_call tiers
-   * if absent so the output always includes a smart_contract entry.
+   * Both smart_contract and token_transfer are optional in FeeEstimates; fall
+   * back to contract_call tiers if absent so the output always includes all
+   * entries.
    */
   private applyClamps(raw: FeeEstimates, config: FeeClampConfig): FeeEstimates {
+    const tokenTransferTiers = raw.token_transfer ?? raw.contract_call;
     const smartContractTiers = raw.smart_contract ?? raw.contract_call;
     return {
-      token_transfer: this.clampTiers(raw.token_transfer, config.token_transfer),
+      token_transfer: this.clampTiers(tokenTransferTiers, config.token_transfer),
       contract_call: this.clampTiers(raw.contract_call, config.contract_call),
       smart_contract: this.clampTiers(smartContractTiers, config.smart_contract),
     };
