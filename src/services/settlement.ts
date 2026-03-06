@@ -771,8 +771,10 @@ export class SettlementService {
       }
     }
 
-    // All attempts exhausted — return the last error
-    if (lastBroadcastError) {
+    // All attempts exhausted without a successful broadcast — return the last error.
+    // Guard on !txid: if a later retry succeeded (txid is set), lastBroadcastError
+    // reflects an earlier failed attempt and must NOT be treated as a final failure.
+    if (!txid && lastBroadcastError) {
       this.logger.error("Broadcast failed after all attempts", {
         maxAttempts: BROADCAST_MAX_ATTEMPTS,
         lastError: "error" in lastBroadcastError ? lastBroadcastError.details : "unknown",
