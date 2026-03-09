@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.17.4](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.3...x402-sponsor-relay-v1.17.4) (2026-03-09)
+
+
+### Bug Fixes
+
+* clear lastBroadcastError on successful broadcast retry ([#149](https://github.com/aibtcdev/x402-sponsor-relay/issues/149)) ([c57b21b](https://github.com/aibtcdev/x402-sponsor-relay/commit/c57b21b4cc689d6ef7ecc4d6917ce20590e86b69)), closes [#147](https://github.com/aibtcdev/x402-sponsor-relay/issues/147)
+
 ## [1.17.3](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.2...x402-sponsor-relay-v1.17.3) (2026-03-04)
 
 
