@@ -638,6 +638,7 @@ export class SettlementService {
           }
 
           txid = parsedTxid;
+          lastBroadcastError = undefined; // Clear so post-loop guard doesn't falsely trigger (#147)
           this.logger.info("Transaction broadcast successful", { txid, attempt });
           break; // Success — exit retry loop and fall through to polling
         }
