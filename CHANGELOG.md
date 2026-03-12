@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.19.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.18.0...x402-sponsor-relay-v1.19.0) (2026-03-12)
+
+
+### Features
+
+* production hardening — stuck-tx RBF and broadcast failover ([#158](https://github.com/aibtcdev/x402-sponsor-relay/issues/158)) ([7f96850](https://github.com/aibtcdev/x402-sponsor-relay/commit/7f96850a7d9e85d836a714cad258b0145065a378))
+
 ## [1.18.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.4...x402-sponsor-relay-v1.18.0) (2026-03-12)
 
 
