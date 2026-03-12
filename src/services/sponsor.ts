@@ -515,6 +515,49 @@ export class SponsorService {
   }
 
   /**
+   * Validate and deserialize a non-sponsored (standard auth) transaction for self-pay settlement.
+   * Rejects sponsored transactions — callers that want to sponsor should use validateTransaction().
+   */
+  validateNonSponsoredTransaction(txHex: string): TransactionValidationResult {
+    const cleanHex = stripHexPrefix(txHex);
+
+    let transaction: StacksTransactionWire;
+    try {
+      transaction = deserializeTransaction(cleanHex);
+    } catch (e) {
+      this.logger.warn("Failed to deserialize transaction", {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+      return {
+        valid: false,
+        error: "Invalid transaction",
+        details: "Could not deserialize transaction hex",
+      };
+    }
+
+    // Reject sponsored transactions — self-pay requires standard auth
+    if (transaction.auth.authType === AuthType.Sponsored) {
+      this.logger.warn("Self-pay transaction must not be sponsored");
+      return {
+        valid: false,
+        error: "Transaction must not be sponsored for self-pay settlement",
+        details: "Remove sponsored: true when building the transaction for X-Settlement: self-pay",
+      };
+    }
+
+    // Extract sender address for rate limiting (same field as sponsored path)
+    const senderAddress = Buffer.from(
+      transaction.auth.spendingCondition.signer
+    ).toString("hex");
+
+    return {
+      valid: true,
+      transaction,
+      senderAddress,
+    };
+  }
+
+  /**
    * Validate and deserialize a transaction
    */
   validateTransaction(txHex: string): TransactionValidationResult {
