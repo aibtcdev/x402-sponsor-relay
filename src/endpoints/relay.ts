@@ -392,14 +392,17 @@ export class Relay extends BaseEndpoint {
             walletIndex: sponsorWalletIndex,
             broadcastDetails: broadcastResult.details,
           });
+          // Trigger async nonce resync — the DO alarm will reconcile within 60s.
+          // Clients should back off for at least 30s and check GET /health (nonce.circuitBreakerOpen)
+          // before retrying. Rapid retries during nonce drift amplify the cascade.
           this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
           return this.err(c, {
-            error: "Nonce conflict — resubmit with a new transaction",
+            error: "Nonce conflict — back off and retry after checking GET /health for nonce pool status",
             code: "NONCE_CONFLICT",
             status: 409,
             details: broadcastResult.details,
             retryable: true,
-            retryAfter: 1,
+            retryAfter: 30,
           });
         }
 
