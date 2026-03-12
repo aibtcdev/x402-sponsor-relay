@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.18.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.4...x402-sponsor-relay-v1.18.0) (2026-03-12)
+
+
+### Features
+
+* **health:** surface nonce pool state in /health endpoint ([15b1424](https://github.com/aibtcdev/x402-sponsor-relay/commit/15b14245aa50588cfd21cc28b5875098d9bf51ba))
+
+
+### Bug Fixes
+
+* **nonce:** increase NONCE_CONFLICT retry backoff from 1s to 30s ([a89e641](https://github.com/aibtcdev/x402-sponsor-relay/commit/a89e641b8c0b169d71115f46c334331fe5fe6268))
+
 ## [1.17.4](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.17.3...x402-sponsor-relay-v1.17.4) (2026-03-09)
 
 
