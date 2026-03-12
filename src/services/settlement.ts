@@ -526,46 +526,26 @@ export class SettlementService {
   }
 
   /**
-   * Broadcast a pre-deserialized transaction and poll for confirmation.
+   * Broadcast a pre-deserialized transaction through the multi-node failover path.
    *
-   * Polls Hiro API GET /extended/v1/tx/{txid} with exponential backoff:
-   * - Initial delay: 2s, backoff factor: 1.5x, max delay: 8s
-   * - Default max time: 180s (configurable via maxPollTimeMs, capped at 300s)
-   * - Polling is split into POLL_RETRY_ROUNDS rounds; if a round times out,
-   *   the next round re-polls (without re-broadcasting) using the remaining budget
+   * Uses the ordered list of broadcast targets from `getBroadcastTargets` (primary
+   * Hiro node first, then any nodes configured via `BROADCAST_NODE_URLS`). When a
+   * node returns a 5xx response or a network error, the next node in the list is
+   * tried. 4xx responses (including nonce conflicts) are returned immediately since
+   * those errors are about the transaction, not the node.
    *
    * Returns:
-   * - { txid, status: "confirmed", blockHeight } on confirmation
-   * - { txid, status: "pending" } on timeout (includes txid for caller verification)
-   * - { error, details } on broadcast failure or transaction abort/drop
+   * - `{ txid: string }` on a successful broadcast from any node
+   * - `{ error, details, retryable }` on failure from all nodes
    *
-   * @param transaction - Pre-deserialized Stacks transaction
-   * @param maxPollTimeMs - Optional max poll time in ms (default: DEFAULT_POLL_TIME_MS = 180s).
-   *   Callers with shorter upstream timeouts can pass a lower value to get a
-   *   "pending" response before their own timeout fires, avoiding 500 empty-body errors.
-   *   Capped at MAX_POLL_TIME_MS (300s) to prevent unbounded waits.
+   * @param transaction - Pre-deserialized Stacks transaction to broadcast
+   * @param sponsorNonceForLog - Sponsor nonce extracted from the transaction (used
+   *   only for log attribution; pass `null` when not applicable, e.g. RBF transactions).
    */
-  async broadcastAndConfirm(
+  async broadcastWithFailover(
     transaction: StacksTransactionWire,
-    maxPollTimeMs?: number
-  ): Promise<BroadcastAndConfirmResult> {
-    // Resolve effective poll time: caller override (capped at ceiling) or default
-    const effectivePollTimeMs = maxPollTimeMs != null && maxPollTimeMs > 0
-      ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
-      : DEFAULT_POLL_TIME_MS;
-
-    // Extract sponsor nonce once for structured logging in all failure paths
-    const sponsorNonceForLog = extractSponsorNonce(transaction);
-
-    // Broadcast to Stacks node via direct fetch to /v2/transactions.
-    // Using direct fetch instead of broadcastTransaction() from @stacks/transactions
-    // to avoid unhandled throws on non-JSON node responses and gain structured
-    // Ok/Err handling regardless of the node's response content type.
-    //
-    // Retry logic: up to BROADCAST_MAX_ATTEMPTS attempts with exponential backoff.
-    // Retries on HTTP 5xx/522 and network/timeout errors.
-    // Immediate return on nonce conflicts (4xx) — do not retry.
-
+    sponsorNonceForLog: number | null = null
+  ): Promise<{ txid: string } | { error: string; details: string; retryable: boolean; nonceConflict?: boolean }> {
     // Serialize transaction bytes once, outside the retry loop
     const txHex = transaction.serialize();
     if (
@@ -606,8 +586,7 @@ export class SettlementService {
       this.env.BROADCAST_NODE_URLS
     );
 
-    let txid = "";
-    let lastBroadcastError: BroadcastAndConfirmResult | undefined;
+    let lastBroadcastError: { error: string; details: string; retryable: boolean; nonceConflict?: boolean } | undefined;
     let totalAttempt = 0;
 
     // Retry the same node up to BROADCAST_MAX_ATTEMPTS before failing over to the
@@ -653,13 +632,12 @@ export class SettlementService {
               throw new Error("Node returned OK but txid could not be parsed");
             }
 
-            txid = parsedTxid;
             this.logger.info("Transaction broadcast successful", {
-              txid,
+              txid: parsedTxid,
               nodeUrl: target.baseUrl,
               attempt: totalAttempt,
             });
-            break outerLoop; // Success — exit retry loop and fall through to polling
+            return { txid: parsedTxid }; // Success — return txid to caller
           }
 
           // Non-OK response: parse error body and decide whether to retry
@@ -814,10 +792,62 @@ export class SettlementService {
       this.logger.error("Broadcast failed after all nodes and attempts", {
         totalAttempts: totalAttempt,
         nodeCount: broadcastTargets.length,
-        lastError: "error" in lastBroadcastError ? lastBroadcastError.details : "unknown",
+        lastError: lastBroadcastError.details,
       });
       return lastBroadcastError;
     }
+
+    // Should be unreachable (broadcastTargets always has at least one entry), but
+    // return a safe error to satisfy the type checker.
+    return {
+      error: "Broadcast failed",
+      details: "No broadcast targets available",
+      retryable: false,
+    };
+  }
+
+  /**
+   * Broadcast a pre-deserialized transaction and poll for confirmation.
+   *
+   * Delegates the broadcast step to `broadcastWithFailover`, which tries the
+   * primary Hiro node first and falls back to nodes configured via
+   * `BROADCAST_NODE_URLS` on 5xx or network errors.
+   *
+   * Polls Hiro API GET /extended/v1/tx/{txid} with exponential backoff:
+   * - Initial delay: 2s, backoff factor: 1.5x, max delay: 8s
+   * - Default max time: 180s (configurable via maxPollTimeMs, capped at 300s)
+   * - Polling is split into POLL_RETRY_ROUNDS rounds; if a round times out,
+   *   the next round re-polls (without re-broadcasting) using the remaining budget
+   *
+   * Returns:
+   * - { txid, status: "confirmed", blockHeight } on confirmation
+   * - { txid, status: "pending" } on timeout (includes txid for caller verification)
+   * - { error, details } on broadcast failure or transaction abort/drop
+   *
+   * @param transaction - Pre-deserialized Stacks transaction
+   * @param maxPollTimeMs - Optional max poll time in ms (default: DEFAULT_POLL_TIME_MS = 180s).
+   *   Callers with shorter upstream timeouts can pass a lower value to get a
+   *   "pending" response before their own timeout fires, avoiding 500 empty-body errors.
+   *   Capped at MAX_POLL_TIME_MS (300s) to prevent unbounded waits.
+   */
+  async broadcastAndConfirm(
+    transaction: StacksTransactionWire,
+    maxPollTimeMs?: number
+  ): Promise<BroadcastAndConfirmResult> {
+    // Resolve effective poll time: caller override (capped at ceiling) or default
+    const effectivePollTimeMs = maxPollTimeMs != null && maxPollTimeMs > 0
+      ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
+      : DEFAULT_POLL_TIME_MS;
+
+    // Extract sponsor nonce once for structured logging in all failure paths
+    const sponsorNonceForLog = extractSponsorNonce(transaction);
+
+    // Broadcast via multi-node failover path
+    const broadcastResult = await this.broadcastWithFailover(transaction, sponsorNonceForLog);
+    if ("error" in broadcastResult) {
+      return broadcastResult;
+    }
+    const txid = broadcastResult.txid;
 
     // Poll for confirmation with exponential backoff and retry rounds.
     // Polling uses the Hiro extended API (/extended/v1/*), which is Hiro-specific

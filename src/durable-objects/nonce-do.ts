@@ -1,10 +1,10 @@
 import {
   makeSTXTokenTransfer,
-  broadcastTransaction,
 } from "@stacks/transactions";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
 import type { Env, LogsRPC } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
+import { SettlementService } from "../services/settlement";
 
 const APP_ID = "x402-relay";
 
@@ -683,23 +683,33 @@ export class NonceDO {
         fee: GAP_FILL_FEE,
         memo: `gap-fill-${gapNonce}`,
       });
-      const result = await broadcastTransaction({ transaction: tx, network });
+
+      // Use SettlementService.broadcastWithFailover so gap-fill broadcasts also
+      // benefit from multi-node failover when Hiro is degraded.
+      const doLogger = {
+        info: (msg: string, ctx?: Record<string, unknown>) => this.log("info", msg, ctx),
+        warn: (msg: string, ctx?: Record<string, unknown>) => this.log("warn", msg, ctx),
+        error: (msg: string, ctx?: Record<string, unknown>) => this.log("error", msg, ctx),
+        debug: (msg: string, ctx?: Record<string, unknown>) => this.log("debug", msg, ctx),
+      };
+      const settlement = new SettlementService(this.env, doLogger);
+      const result = await settlement.broadcastWithFailover(tx, null);
+
       if ("txid" in result) {
         return result.txid;
       }
-      // Cast to access raw reason string — Hiro may return values not in the typed union
-      // (e.g. "ConflictingNonceInMempool" when a tx with same nonce is already in mempool)
-      const rejection = result as unknown as { reason?: string; error?: string };
-      if (rejection.reason === "ConflictingNonceInMempool") {
-        // Nonce already occupied — not an error, just skip
+
+      // Check for nonce conflict — treat as "already occupied" (not an error)
+      if (result.nonceConflict) {
         return null;
       }
+
       // Other rejection — log and continue
       this.log("warn", "gap_fill_rejected", {
         walletIndex,
         nonce: gapNonce,
-        reason: rejection.reason ?? "unknown",
-        error: rejection.error ?? "",
+        error: result.error,
+        details: result.details,
       });
       return null;
     } catch (e) {
@@ -828,7 +838,21 @@ export class NonceDO {
         fee: RBF_FEE,
         memo: `rbf-${nonce}-attempt-${attemptNum}`,
       });
-      const result = await broadcastTransaction({ transaction: tx, network });
+
+      // Build a Logger adapter so SettlementService can use NonceDO's structured log method.
+      const doLogger = {
+        info: (msg: string, ctx?: Record<string, unknown>) => this.log("info", msg, ctx),
+        warn: (msg: string, ctx?: Record<string, unknown>) => this.log("warn", msg, ctx),
+        error: (msg: string, ctx?: Record<string, unknown>) => this.log("error", msg, ctx),
+        debug: (msg: string, ctx?: Record<string, unknown>) => this.log("debug", msg, ctx),
+      };
+
+      // Use SettlementService.broadcastWithFailover so that RBF broadcasts route
+      // through the same multi-node failover path as normal settlements (#160).
+      // When Hiro is degraded, fallback nodes in BROADCAST_NODE_URLS are tried
+      // instead of consuming all MAX_RBF_ATTEMPTS against a single failing endpoint.
+      const settlement = new SettlementService(this.env, doLogger);
+      const result = await settlement.broadcastWithFailover(tx, null);
 
       // Update state regardless of outcome (increment attempt count to prevent runaway)
       state.lastSeen = now;
@@ -852,12 +876,11 @@ export class NonceDO {
 
       // Broadcast rejected — update state with incremented attempt count
       await this.state.storage.put(key, state);
-      const rejection = result as unknown as { reason?: string; error?: string };
       this.log("warn", "rbf_broadcast_rejected", {
         walletIndex,
         nonce,
-        reason: rejection.reason ?? "unknown",
-        error: rejection.error ?? "",
+        error: result.error,
+        details: result.details,
         attemptNum,
       });
       return null;
