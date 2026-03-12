@@ -18,12 +18,15 @@
     "test:settle": "set -a && . ./.env && set +a && tsx scripts/test-settle.ts",
     "test:fees": "set -a && . ./.env && set +a && tsx scripts/test-fees.ts",
     "test:payment-id": "set -a && . ./.env && set +a && tsx scripts/test-payment-id.ts",
-    "keys": "set -a && . ./.env && set +a && tsx scripts/manage-api-keys.ts"
+    "keys": "set -a && . ./.env && set +a && tsx scripts/manage-api-keys.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
     "@types/node": "^25.0.3",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
+    "vitest": "^4.0.18",
     "wrangler": "^4.58.0"
   },
   "dependencies": {
