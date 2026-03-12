@@ -51,6 +51,13 @@ export interface Env {
   STACKS_NETWORK: "mainnet" | "testnet";
   /** Optional Hiro API key for higher rate limits */
   HIRO_API_KEY?: string;
+  /**
+   * Comma-separated list of fallback Stacks node base URLs for broadcast failover.
+   * Format: "https://node1.example.com,https://node2.example.com"
+   * These are tried in order after the primary Hiro node fails with 5xx/timeout.
+   * Example public fallback: "https://stacks-node-api.mainnet.stacks.co"
+   */
+  BROADCAST_NODE_URLS?: string;
   /** Recipient address for nonce gap-fill transactions (default: SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC) */
   FLUSH_RECIPIENT?: string;
   // LOGS is a service binding to worker-logs, typed loosely to avoid complex Service<> generics

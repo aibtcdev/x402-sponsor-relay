@@ -288,18 +288,24 @@ export class Sponsor extends BaseEndpoint {
           c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
           c.executionCtx.waitUntil(statsService.logFailure("sponsor", false).catch(() => {}));
 
-          // Return nonce to pool — broadcast was rejected, nonce can be reused
+          const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
+            errorReason.includes(reason)
+          );
+
+          // Release nonce back to pool or quarantine it depending on conflict type.
+          // Nonce conflicts mean the nonce slot is occupied in mempool — returning it
+          // to available[] would cause an infinite re-assignment loop. Quarantine it
+          // to spent[] by passing a synthetic txid marker.
           if (sponsorNonce !== null) {
+            const quarantineTxid = isNonceConflict
+              ? `conflict:quarantine:${sponsorNonce}`
+              : undefined;
             c.executionCtx.waitUntil(
-              releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
+              releaseNonceDO(c.env, logger, sponsorNonce, quarantineTxid, sponsorWalletIndex).catch((e) => {
                 logger.warn("Failed to release nonce after broadcast rejection", { error: String(e) });
               })
             );
           }
-
-          const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
-            errorReason.includes(reason)
-          );
 
           if (isNonceConflict) {
             logger.warn("Nonce conflict returned to agent", {
@@ -308,11 +314,11 @@ export class Sponsor extends BaseEndpoint {
               broadcastDetails: errorReason,
             });
             // Trigger async nonce resync — the DO alarm will reconcile within 60s.
-            // Clients should back off for at least 30s and check GET /health (nonce.circuitBreakerOpen)
+            // Clients should back off for at least 30s and check GET /nonce/stats for pool state
             // before retrying. Rapid retries during nonce drift amplify the cascade.
             this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
             return this.err(c, {
-              error: "Nonce conflict — back off and retry after checking GET /health for nonce pool status",
+              error: "Nonce conflict — back off and retry. Check GET /nonce/stats for nonce pool state",
               code: "NONCE_CONFLICT",
               status: 409,
               details: errorReason,

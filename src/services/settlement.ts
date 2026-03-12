@@ -21,7 +21,8 @@ import type {
   DedupResult,
   BroadcastAndConfirmResult,
 } from "../types";
-import { getHiroBaseUrl, getHiroHeaders, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import type { BroadcastTarget } from "../utils";
 import { extractSponsorNonce } from "./sponsor";
 
 // Known SIP-010 token contract addresses
@@ -595,200 +596,240 @@ export class SettlementService {
     }
     const txBytes = new Uint8Array(bytePairs.map((b) => parseInt(b, 16)));
 
-    const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
-    const broadcastUrl = `${hiroBaseUrl}/v2/transactions`;
-    const broadcastHeaders: Record<string, string> = {
-      "Content-Type": "application/octet-stream",
-      ...getHiroHeaders(this.env.HIRO_API_KEY),
-    };
+    // Build ordered list of broadcast targets: primary Hiro first, then fallbacks.
+    // On 5xx or network error from a node, the next target in the list is tried.
+    // On 4xx (bad tx, nonce conflict), we return immediately — no point trying
+    // other nodes since the error is about the transaction, not the node.
+    const broadcastTargets: BroadcastTarget[] = getBroadcastTargets(
+      this.env.STACKS_NETWORK,
+      this.env.HIRO_API_KEY,
+      this.env.BROADCAST_NODE_URLS
+    );
 
     let txid = "";
     let lastBroadcastError: BroadcastAndConfirmResult | undefined;
+    let totalAttempt = 0;
 
-    for (let attempt = 1; attempt <= BROADCAST_MAX_ATTEMPTS; attempt++) {
-      try {
-        const broadcastResponse = await fetch(broadcastUrl, {
-          method: "POST",
-          headers: broadcastHeaders,
-          body: txBytes,
-          signal: AbortSignal.timeout(HIRO_BROADCAST_TIMEOUT_MS),
-        });
+    // Retry the same node up to BROADCAST_MAX_ATTEMPTS before failing over to the
+    // next node. This gives transient errors a chance to resolve before rotating.
+    outerLoop:
+    for (let nodeIndex = 0; nodeIndex < broadcastTargets.length; nodeIndex++) {
+      const target = broadcastTargets[nodeIndex];
+      const broadcastUrl = `${target.baseUrl}/v2/transactions`;
+      const broadcastHeaders: Record<string, string> = {
+        "Content-Type": "application/octet-stream",
+        ...target.headers,
+      };
 
-        const responseText = await broadcastResponse.text();
+      // Each node gets up to BROADCAST_MAX_ATTEMPTS attempts before we move on.
+      // This preserves the existing retry-on-transient-failure behaviour per node.
+      for (let attempt = 1; attempt <= BROADCAST_MAX_ATTEMPTS; attempt++) {
+        totalAttempt++;
+        try {
+          const broadcastResponse = await fetch(broadcastUrl, {
+            method: "POST",
+            headers: broadcastHeaders,
+            body: txBytes,
+            signal: AbortSignal.timeout(HIRO_BROADCAST_TIMEOUT_MS),
+          });
 
-        if (broadcastResponse.ok) {
-          // Success: body is a JSON-quoted txid string, e.g. "\"0x1234...\""
-          let parsedTxid: string;
-          try {
-            parsedTxid = JSON.parse(responseText) as string;
-          } catch {
-            // Some nodes return the txid without JSON quoting
-            parsedTxid = responseText.trim().replace(/^"|"$/g, "");
+          const responseText = await broadcastResponse.text();
+
+          if (broadcastResponse.ok) {
+            // Success: body is a JSON-quoted txid string, e.g. "\"0x1234...\""
+            let parsedTxid: string;
+            try {
+              parsedTxid = JSON.parse(responseText) as string;
+            } catch {
+              // Some nodes return the txid without JSON quoting
+              parsedTxid = responseText.trim().replace(/^"|"$/g, "");
+            }
+
+            if (!parsedTxid || typeof parsedTxid !== "string") {
+              this.logger.error("Broadcast returned OK but unparseable txid", {
+                responseText: responseText.slice(0, 200),
+                nodeUrl: target.baseUrl,
+              });
+              throw new Error("Node returned OK but txid could not be parsed");
+            }
+
+            txid = parsedTxid;
+            this.logger.info("Transaction broadcast successful", {
+              txid,
+              nodeUrl: target.baseUrl,
+              attempt: totalAttempt,
+            });
+            break outerLoop; // Success — exit retry loop and fall through to polling
           }
 
-          if (!parsedTxid || typeof parsedTxid !== "string") {
-            this.logger.error("Broadcast returned OK but unparseable txid", {
-              responseText: responseText.slice(0, 200),
-            });
+          // Non-OK response: parse error body and decide whether to retry
+          let errorMessage = `HTTP ${broadcastResponse.status}`;
+          let errorDetails = responseText.slice(0, 500);
+
+          try {
+            const errorJson = JSON.parse(responseText) as {
+              error?: string;
+              reason?: string;
+              message?: string;
+            };
+            if (errorJson.error || errorJson.reason || errorJson.message) {
+              errorMessage = errorJson.error ?? errorJson.message ?? errorMessage;
+              errorDetails = errorJson.reason ?? errorDetails;
+            }
+          } catch {
+            // Body is not JSON — use raw text as details
+          }
+
+          const conflictDetails = `${errorMessage}: ${errorDetails}`;
+          const isNonceConflict = NONCE_CONFLICT_REASONS.some(
+            (reason) => conflictDetails.includes(reason)
+          );
+
+          if (isNonceConflict) {
+            // Include sender identity for attribution (#114).
+            // The signer field is the hash160 of the sender's public key (not a
+            // human-readable address, but sufficient for log correlation).
+            const senderSigner = transaction.auth.spendingCondition.signer;
+            const senderNonce = Number(transaction.auth.spendingCondition.nonce);
+
+            if (sponsorNonceForLog === null) {
+              // No relay-assigned sponsor nonce: this is a client pre-signed tx.
+              // Log at INFO — the nonce conflict is the client's problem, not the relay's.
+              this.logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
+                status: broadcastResponse.status,
+                details: conflictDetails,
+                senderSigner,
+                senderNonce,
+                nodeUrl: target.baseUrl,
+              });
+            } else {
+              // Relay assigned a sponsor nonce: unexpected conflict on relay side.
+              this.logger.warn("Broadcast rejected due to nonce conflict", {
+                status: broadcastResponse.status,
+                details: conflictDetails,
+                sponsorNonce: sponsorNonceForLog,
+                senderSigner,
+                senderNonce,
+                nodeUrl: target.baseUrl,
+              });
+            }
+            // Nonce conflicts are not retriable — same result on any node
             return {
-              error: "Broadcast failed",
-              details: "Node returned OK but txid could not be parsed",
+              error: "Nonce conflict",
+              details: conflictDetails,
               retryable: true,
+              nonceConflict: true,
             };
           }
 
-          txid = parsedTxid;
-          lastBroadcastError = undefined; // Clear so post-loop guard doesn't falsely trigger (#147)
-          this.logger.info("Transaction broadcast successful", { txid, attempt });
-          break; // Success — exit retry loop and fall through to polling
-        }
-
-        // Non-OK response: parse error body and decide whether to retry
-        let errorMessage = `HTTP ${broadcastResponse.status}`;
-        let errorDetails = responseText.slice(0, 500);
-
-        try {
-          const errorJson = JSON.parse(responseText) as {
-            error?: string;
-            reason?: string;
-            message?: string;
-          };
-          if (errorJson.error || errorJson.reason || errorJson.message) {
-            errorMessage = errorJson.error ?? errorJson.message ?? errorMessage;
-            errorDetails = errorJson.reason ?? errorDetails;
-          }
-        } catch {
-          // Body is not JSON — use raw text as details
-        }
-
-        const conflictDetails = `${errorMessage}: ${errorDetails}`;
-        const isNonceConflict = NONCE_CONFLICT_REASONS.some(
-          (reason) => conflictDetails.includes(reason)
-        );
-
-        if (isNonceConflict) {
-          // Include sender identity for attribution (#114).
-          // The signer field is the hash160 of the sender's public key (not a
-          // human-readable address, but sufficient for log correlation).
-          const senderSigner = transaction.auth.spendingCondition.signer;
-          const senderNonce = Number(transaction.auth.spendingCondition.nonce);
-
-          if (sponsorNonceForLog === null) {
-            // No relay-assigned sponsor nonce: this is a client pre-signed tx.
-            // Log at INFO — the nonce conflict is the client's problem, not the relay's.
-            this.logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
+          // HTTP 4xx (non-nonce): transaction-level rejection, no point trying other nodes
+          if (broadcastResponse.status >= 400 && broadcastResponse.status < 500) {
+            this.logger.error("Broadcast failed with 4xx, not retrying", {
               status: broadcastResponse.status,
-              details: conflictDetails,
-              senderSigner,
-              senderNonce,
+              error: errorMessage,
+              details: errorDetails,
+              nodeUrl: target.baseUrl,
             });
+            return {
+              error: "Broadcast failed",
+              details: errorDetails,
+              retryable: false,
+            };
+          }
+
+          // HTTP 5xx (includes 522 Cloudflare timeout): node-level failure.
+          // Retry this node up to BROADCAST_MAX_ATTEMPTS, then move to next node.
+          if (broadcastResponse.status >= 500) {
+            const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
+            const hasMoreAttempts = attempt < BROADCAST_MAX_ATTEMPTS;
+            const hasMoreNodes = nodeIndex < broadcastTargets.length - 1;
+            const retryMsg = hasMoreAttempts
+              ? `retrying same node in ${retryDelay}ms`
+              : hasMoreNodes
+                ? "moving to next node"
+                : "no retries remaining";
+            this.logger.warn(`Broadcast attempt ${totalAttempt} failed: ${conflictDetails}, ${retryMsg}`, {
+              status: broadcastResponse.status,
+              attempt,
+              maxAttempts: BROADCAST_MAX_ATTEMPTS,
+              nodeUrl: target.baseUrl,
+              retryDelayMs: hasMoreAttempts ? retryDelay : 0,
+            });
+            lastBroadcastError = {
+              error: "Broadcast failed",
+              details: conflictDetails,
+              retryable: true,
+            };
+            if (hasMoreAttempts) {
+              await new Promise((r) => setTimeout(r, retryDelay));
+            }
+            // When all attempts for this node are exhausted, continue outerLoop to next node
           } else {
-            // Relay assigned a sponsor nonce: unexpected conflict on relay side.
-            this.logger.warn("Broadcast rejected due to nonce conflict", {
+            // Unexpected status code (1xx, 3xx) — don't retry any node
+            this.logger.error("Broadcast failed with unexpected status", {
               status: broadcastResponse.status,
-              details: conflictDetails,
-              sponsorNonce: sponsorNonceForLog,
-              senderSigner,
-              senderNonce,
+              error: errorMessage,
+              details: errorDetails,
+              nodeUrl: target.baseUrl,
             });
+            return {
+              error: "Broadcast failed",
+              details: errorDetails,
+              retryable: false,
+            };
           }
-          // Nonce conflicts are not retriable at the broadcast level
-          return {
-            error: "Nonce conflict",
-            details: conflictDetails,
-            retryable: true,
-            nonceConflict: true,
-          };
-        }
-
-        // HTTP 4xx (non-nonce): reject immediately, no retry
-        if (broadcastResponse.status >= 400 && broadcastResponse.status < 500) {
-          this.logger.error("Broadcast failed with 4xx, not retrying", {
-            status: broadcastResponse.status,
-            error: errorMessage,
-            details: errorDetails,
-          });
-          return {
-            error: "Broadcast failed",
-            details: errorDetails,
-            retryable: false,
-          };
-        }
-
-        // Only retry on HTTP 5xx (includes 522 Cloudflare timeout)
-        if (broadcastResponse.status >= 500) {
+        } catch (e) {
+          // Network error, AbortError (timeout), or TypeError — retry this node
+          const errMsg = e instanceof Error ? e.message : String(e);
+          const hasMoreAttempts = attempt < BROADCAST_MAX_ATTEMPTS;
+          const hasMoreNodes = nodeIndex < broadcastTargets.length - 1;
           const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
-          const retryMsg = attempt < BROADCAST_MAX_ATTEMPTS
-            ? `retrying in ${retryDelay}ms`
-            : "no retries remaining";
-          this.logger.warn(`Broadcast attempt ${attempt}/${BROADCAST_MAX_ATTEMPTS} failed: ${conflictDetails}, ${retryMsg}`, {
-            status: broadcastResponse.status,
+          const retryMsg = hasMoreAttempts
+            ? `retrying same node in ${retryDelay}ms`
+            : hasMoreNodes
+              ? "moving to next node"
+              : "no retries remaining";
+          this.logger.warn(`Broadcast attempt ${totalAttempt} failed: ${errMsg}, ${retryMsg}`, {
+            error: errMsg,
             attempt,
             maxAttempts: BROADCAST_MAX_ATTEMPTS,
-            retryDelayMs: retryDelay,
+            nodeUrl: target.baseUrl,
+            retryDelayMs: hasMoreAttempts ? retryDelay : 0,
           });
           lastBroadcastError = {
             error: "Broadcast failed",
-            details: conflictDetails,
+            details: errMsg,
             retryable: true,
           };
-          if (attempt < BROADCAST_MAX_ATTEMPTS) {
+          if (hasMoreAttempts) {
             await new Promise((r) => setTimeout(r, retryDelay));
           }
-        } else {
-          // Unexpected status code (1xx, 3xx) — don't retry, return error
-          this.logger.error("Broadcast failed with unexpected status", {
-            status: broadcastResponse.status,
-            error: errorMessage,
-            details: errorDetails,
-          });
-          return {
-            error: "Broadcast failed",
-            details: errorDetails,
-            retryable: false,
-          };
-        }
-      } catch (e) {
-        // Network error, AbortError (timeout), or TypeError — retry on transient failures
-        const errMsg = e instanceof Error ? e.message : String(e);
-        const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
-        const retryMsg = attempt < BROADCAST_MAX_ATTEMPTS
-          ? `retrying in ${retryDelay}ms`
-          : "no retries remaining";
-        this.logger.warn(`Broadcast attempt ${attempt}/${BROADCAST_MAX_ATTEMPTS} failed: ${errMsg}, ${retryMsg}`, {
-          error: errMsg,
-          attempt,
-          maxAttempts: BROADCAST_MAX_ATTEMPTS,
-          retryDelayMs: retryDelay,
-        });
-        lastBroadcastError = {
-          error: "Broadcast failed",
-          details: errMsg,
-          retryable: true,
-        };
-        if (attempt < BROADCAST_MAX_ATTEMPTS) {
-          await new Promise((r) => setTimeout(r, retryDelay));
+          // When all attempts for this node are exhausted, continue outerLoop to next node
         }
       }
     }
 
-    // All attempts exhausted — return the last error
+    // All nodes and all attempts exhausted — return the last error
     if (lastBroadcastError) {
-      this.logger.error("Broadcast failed after all attempts", {
-        maxAttempts: BROADCAST_MAX_ATTEMPTS,
+      this.logger.error("Broadcast failed after all nodes and attempts", {
+        totalAttempts: totalAttempt,
+        nodeCount: broadcastTargets.length,
         lastError: "error" in lastBroadcastError ? lastBroadcastError.details : "unknown",
       });
       return lastBroadcastError;
     }
 
     // Poll for confirmation with exponential backoff and retry rounds.
+    // Polling uses the Hiro extended API (/extended/v1/*), which is Hiro-specific
+    // and not available on arbitrary Stacks nodes — always use the primary Hiro URL.
     // If the first polling round times out, we retry polling (without
     // re-broadcasting) since the tx is already in the mempool. This handles
     // mainnet conditions where block times can exceed the initial poll window.
     // The per-round budget is effectivePollTimeMs / POLL_RETRY_ROUNDS so the
     // total time stays within the caller's budget.
     const hiroHeaders = getHiroHeaders(this.env.HIRO_API_KEY);
-    const pollUrl = `${hiroBaseUrl}/extended/v1/tx/${txid}`;
+    const hiroPollBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
+    const pollUrl = `${hiroPollBaseUrl}/extended/v1/tx/${txid}`;
     const perRoundBudgetMs = Math.floor(effectivePollTimeMs / POLL_RETRY_ROUNDS);
     const overallStartTime = Date.now();
 
@@ -856,6 +897,10 @@ export class SettlementService {
   ): Promise<BroadcastAndConfirmResult | null> {
     const startTime = Date.now();
     let delay = initialDelay;
+    /** Number of consecutive poll failures (non-200/404 or network error) */
+    let consecutivePollFailures = 0;
+    /** Log a polling_degraded warning when this many consecutive failures occur */
+    const POLL_DEGRADED_THRESHOLD = 3;
 
     while (true) {
       const elapsed = Date.now() - startTime;
@@ -882,6 +927,8 @@ export class SettlementService {
         });
 
         if (response.ok) {
+          // Successful response — reset consecutive failure counter
+          consecutivePollFailures = 0;
           const data = (await response.json()) as HiroTxResponse;
           const txStatus = data.tx_status;
 
@@ -934,29 +981,57 @@ export class SettlementService {
             });
           }
         } else if (response.status === 404) {
-          // Transaction not yet indexed — continue polling
+          // Transaction not yet indexed — continue polling (not a failure)
+          consecutivePollFailures = 0;
           this.logger.debug("Transaction not yet indexed", {
             txid,
             elapsedMs: elapsed,
           });
         } else {
-          // Non-200/404 response — log but continue polling
-          this.logger.warn("Unexpected response from Hiro API during polling", {
+          // Non-200/404 response — log and track consecutive failures
+          consecutivePollFailures++;
+          if (consecutivePollFailures >= POLL_DEGRADED_THRESHOLD) {
+            this.logger.warn("polling_degraded: Hiro API returning repeated errors, increasing poll delay", {
+              txid,
+              status: response.status,
+              consecutivePollFailures,
+              elapsedMs: elapsed,
+            });
+            // Snap delay to max to reduce load pressure on a struggling API
+            delay = MAX_POLL_DELAY_MS;
+          } else {
+            this.logger.warn("Unexpected response from Hiro API during polling", {
+              txid,
+              status: response.status,
+              consecutivePollFailures,
+              elapsedMs: elapsed,
+            });
+          }
+        }
+      } catch (e) {
+        // Network error or timeout during polling — log, track, and continue
+        consecutivePollFailures++;
+        if (consecutivePollFailures >= POLL_DEGRADED_THRESHOLD) {
+          this.logger.warn("polling_degraded: Hiro API unreachable, increasing poll delay", {
             txid,
-            status: response.status,
+            error: e instanceof Error ? e.message : String(e),
+            consecutivePollFailures,
+            elapsedMs: elapsed,
+          });
+          // Snap delay to max to reduce load on a struggling API
+          delay = MAX_POLL_DELAY_MS;
+        } else {
+          this.logger.warn("Error polling for confirmation", {
+            txid,
+            error: e instanceof Error ? e.message : String(e),
+            consecutivePollFailures,
             elapsedMs: elapsed,
           });
         }
-      } catch (e) {
-        // Network error during polling — log and continue
-        this.logger.warn("Error polling for confirmation", {
-          txid,
-          error: e instanceof Error ? e.message : String(e),
-          elapsedMs: elapsed,
-        });
       }
 
-      // Set delay: first iteration starts the backoff series, then exponential growth
+      // Set delay: first iteration starts the backoff series, then exponential growth.
+      // If we snapped delay to MAX_POLL_DELAY_MS above (degraded), leave it there.
       delay = delay === 0 ? INITIAL_POLL_DELAY_MS : Math.min(delay * POLL_BACKOFF_FACTOR, MAX_POLL_DELAY_MS);
     }
   }

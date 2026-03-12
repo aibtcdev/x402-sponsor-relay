@@ -112,6 +112,32 @@ interface GapPersistState {
 }
 
 /**
+ * Tracks RBF attempts for a specific nonce occupying the mempool beyond the stuck threshold.
+ * Persisted in DO storage (key: stuck_tx:{walletIndex}:{nonce}).
+ * Prevents infinite RBF fee escalation and enables observability.
+ */
+interface StuckTxState {
+  nonce: number;
+  /** txid of the original stuck transaction (if discoverable from mempool API) */
+  originalTxid: string | null;
+  firstSeen: string;       // ISO timestamp of first stuck detection
+  lastSeen: string;        // ISO timestamp of most recent detection
+  rbfAttempts: number;     // number of RBF broadcasts sent so far
+  lastRbfTxid: string | null;  // txid of the last RBF broadcast
+}
+
+/**
+ * Parsed entry from Hiro GET /extended/v1/tx/mempool response.
+ * Used to detect pending transactions by nonce and age.
+ */
+interface MempoolTxEntry {
+  tx_id: string;
+  nonce: number;
+  tx_status: string;         // "pending" | other
+  receipt_time_iso: string;  // ISO timestamp (Hiro field: receipt_time_iso)
+}
+
+/**
  * Reservation pool state — persisted as a single JSON object per wallet.
  * available: nonces ready to be assigned (pre-seeded, sorted ascending)
  * reserved: nonces currently in-flight (assigned but not yet confirmed or released)
@@ -160,6 +186,10 @@ interface NonceStatsResponse {
   chainingLimit: number;
   /** Per-wallet pool state (multi-wallet rotation) */
   wallets: WalletPoolStats[];
+  /** Total RBF replacements successfully broadcast for stuck mempool transactions */
+  stuckTxRbfBroadcast: number;
+  /** Total nonces successfully unstuck via RBF (confirmed after replacement) */
+  stuckTxRbfConfirmed: number;
 }
 
 /**
@@ -206,6 +236,20 @@ const DEFAULT_FLUSH_RECIPIENT_TESTNET = "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2K
 /** Maximum number of gap-fill broadcasts per alarm cycle per wallet */
 const MAX_GAP_FILLS_PER_ALARM = 5;
 /**
+ * Age threshold for considering a mempool transaction "stuck" (15 minutes).
+ * Transactions that remain pending beyond this window have a very low confirmation
+ * probability and are candidates for RBF replacement.
+ */
+const STUCK_TX_AGE_MS = 15 * 60 * 1000;
+/**
+ * Fee for RBF replacement self-transfers (90,000 uSTX = 3× GAP_FILL_FEE).
+ * Must exceed the original stuck tx fee to guarantee replacement acceptance
+ * by the Stacks node's mempool eviction policy.
+ */
+const RBF_FEE = 90_000n;
+/** Maximum RBF broadcast attempts per nonce to prevent runaway fee escalation */
+const MAX_RBF_ATTEMPTS = 3;
+/**
  * Per-wallet circuit breaker: if a wallet accumulates this many quarantines
  * within CIRCUIT_BREAKER_WINDOW_MS, it is skipped during nonce assignment
  * and an eager resync is triggered for that wallet only.
@@ -231,6 +275,8 @@ const STATE_KEYS = {
   gapsFilled: "gaps_filled",
   lastHiroSync: "last_hiro_sync",
   lastGapDetected: "last_gap_detected",
+  stuckTxRbfBroadcast: "stuck_tx_rbf_attempted",
+  stuckTxRbfConfirmed: "stuck_tx_rbf_confirmed",
 } as const;
 
 /** Round-robin wallet index storage key */
@@ -421,6 +467,16 @@ export class NonceDO {
   private incrementGapsFilled(): void {
     const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled) + 1;
     this.setStateValue(STATE_KEYS.gapsFilled, gapsFilled);
+  }
+
+  private incrementStuckTxRbfBroadcast(): void {
+    const count = this.getStoredCount(STATE_KEYS.stuckTxRbfBroadcast) + 1;
+    this.setStateValue(STATE_KEYS.stuckTxRbfBroadcast, count);
+  }
+
+  private incrementStuckTxRbfConfirmed(): void {
+    const count = this.getStoredCount(STATE_KEYS.stuckTxRbfConfirmed) + 1;
+    this.setStateValue(STATE_KEYS.stuckTxRbfConfirmed, count);
   }
 
   /**
@@ -657,6 +713,170 @@ export class NonceDO {
   }
 
   /**
+   * Fetch all pending mempool transactions for a specific sponsor address from Hiro.
+   * Returns an array of MempoolTxEntry objects, filtered to tx_status === "pending".
+   * Returns [] on any error — fail-open so a Hiro outage never blocks alarm reconciliation.
+   */
+  private async fetchMempoolTxsForAddress(address: string): Promise<MempoolTxEntry[]> {
+    const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    const pageLimit = 50;
+    const maxPages = 10; // Cap at 500 entries to bound API calls
+    const pending: MempoolTxEntry[] = [];
+
+    try {
+      for (let page = 0; page < maxPages; page++) {
+        const offset = page * pageLimit;
+        const url = `${base}/extended/v1/tx/mempool?sender_address=${encodeURIComponent(address)}&limit=${pageLimit}&offset=${offset}`;
+        const response = await fetch(url, {
+          headers,
+          signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
+        });
+        if (!response.ok) {
+          this.log("warn", "mempool_fetch_failed", {
+            address,
+            status: response.status,
+            page,
+          });
+          break;
+        }
+        const data = (await response.json()) as { results?: unknown[] };
+        if (!Array.isArray(data.results) || data.results.length === 0) break;
+
+        for (const item of data.results) {
+          const entry = item as Record<string, unknown>;
+          if (
+            typeof entry.tx_id === "string" &&
+            typeof entry.nonce === "number" &&
+            typeof entry.tx_status === "string" &&
+            entry.tx_status === "pending" &&
+            typeof entry.receipt_time_iso === "string"
+          ) {
+            pending.push({
+              tx_id: entry.tx_id,
+              nonce: entry.nonce,
+              tx_status: entry.tx_status,
+              receipt_time_iso: entry.receipt_time_iso,
+            });
+          }
+        }
+
+        // Stop paginating when last page returned fewer results than the limit
+        if (data.results.length < pageLimit) break;
+      }
+      return pending;
+    } catch (e) {
+      this.log("warn", "mempool_fetch_error", {
+        address,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return pending; // Return whatever we collected before the error
+    }
+  }
+
+  /**
+   * Broadcast a replace-by-fee (RBF) self-transfer for a nonce that is stuck in the mempool.
+   * Uses RBF_FEE (90,000 uSTX = 3× GAP_FILL_FEE) to guarantee eviction of the stuck tx.
+   * Tracks attempt count in DO storage to cap retries at MAX_RBF_ATTEMPTS.
+   * Returns the replacement txid on success, null if capped or broadcast failed.
+   */
+  private async broadcastRbfForNonce(
+    walletIndex: number,
+    nonce: number,
+    privateKey: string,
+    originalTxid: string | null
+  ): Promise<string | null> {
+    const key = this.walletStuckTxKey(walletIndex, nonce);
+    const existing = await this.state.storage.get<StuckTxState>(key);
+    const now = new Date().toISOString();
+
+    // Load or initialise stuck-tx state
+    const state: StuckTxState = existing ?? {
+      nonce,
+      originalTxid,
+      firstSeen: now,
+      lastSeen: now,
+      rbfAttempts: 0,
+      lastRbfTxid: null,
+    };
+
+    if (state.rbfAttempts >= MAX_RBF_ATTEMPTS) {
+      this.log("warn", "rbf_max_attempts_reached", {
+        walletIndex,
+        nonce,
+        rbfAttempts: state.rbfAttempts,
+        maxAttempts: MAX_RBF_ATTEMPTS,
+        originalTxid: state.originalTxid,
+      });
+      return null;
+    }
+
+    const network = this.env.STACKS_NETWORK ?? "testnet";
+    const defaultRecipient = network === "mainnet"
+      ? DEFAULT_FLUSH_RECIPIENT_MAINNET
+      : DEFAULT_FLUSH_RECIPIENT_TESTNET;
+    const recipient = this.env.FLUSH_RECIPIENT ?? defaultRecipient;
+    const attemptNum = state.rbfAttempts + 1;
+
+    try {
+      const tx = await makeSTXTokenTransfer({
+        recipient,
+        amount: GAP_FILL_AMOUNT,
+        senderKey: privateKey,
+        network,
+        nonce: BigInt(nonce),
+        fee: RBF_FEE,
+        memo: `rbf-${nonce}-attempt-${attemptNum}`,
+      });
+      const result = await broadcastTransaction({ transaction: tx, network });
+
+      // Update state regardless of outcome (increment attempt count to prevent runaway)
+      state.lastSeen = now;
+      state.rbfAttempts = attemptNum;
+      state.originalTxid = state.originalTxid ?? originalTxid;
+
+      if ("txid" in result) {
+        state.lastRbfTxid = result.txid;
+        await this.state.storage.put(key, state);
+        this.incrementStuckTxRbfBroadcast();
+        this.log("info", "rbf_broadcast_success", {
+          walletIndex,
+          nonce,
+          txid: result.txid,
+          fee: RBF_FEE.toString(),
+          attemptNum,
+          originalTxid: state.originalTxid,
+        });
+        return result.txid;
+      }
+
+      // Broadcast rejected — update state with incremented attempt count
+      await this.state.storage.put(key, state);
+      const rejection = result as unknown as { reason?: string; error?: string };
+      this.log("warn", "rbf_broadcast_rejected", {
+        walletIndex,
+        nonce,
+        reason: rejection.reason ?? "unknown",
+        error: rejection.error ?? "",
+        attemptNum,
+      });
+      return null;
+    } catch (e) {
+      // On unexpected error: still increment attempt count so we don't spin
+      state.lastSeen = now;
+      state.rbfAttempts = attemptNum;
+      await this.state.storage.put(key, state);
+      this.log("warn", "rbf_broadcast_error", {
+        walletIndex,
+        nonce,
+        error: e instanceof Error ? e.message : String(e),
+        attemptNum,
+      });
+      return null;
+    }
+  }
+
+  /**
    * Schedule the next alarm.
    * active=true  → 60s interval (in-flight nonces present, frequent reconciliation needed)
    * active=false → 5min interval (all wallets idle, normal cadence)
@@ -795,6 +1015,11 @@ export class NonceDO {
   /** KV key for per-wallet gap persistence tracking state */
   private walletGapPersistKey(walletIndex: number): string {
     return `gap_persist:${walletIndex}`;
+  }
+
+  /** KV key for per-nonce RBF attempt state (stuck mempool tx tracking) */
+  private walletStuckTxKey(walletIndex: number, nonce: number): string {
+    return `stuck_tx:${walletIndex}:${nonce}`;
   }
 
   /** KV key for per-wallet recent quarantine timestamps (circuit breaker window) */
@@ -1464,6 +1689,9 @@ export class NonceDO {
     // Wallet 0 backward-compat fields
     const wallet0 = wallets[0];
 
+    const stuckTxRbfBroadcast = this.getStoredCount(STATE_KEYS.stuckTxRbfBroadcast);
+    const stuckTxRbfConfirmed = this.getStoredCount(STATE_KEYS.stuckTxRbfConfirmed);
+
     return {
       totalAssigned,
       conflictsDetected,
@@ -1479,6 +1707,8 @@ export class NonceDO {
       poolReserved: wallet0?.reserved ?? 0,
       chainingLimit: CHAINING_LIMIT,
       wallets,
+      stuckTxRbfBroadcast,
+      stuckTxRbfConfirmed,
     };
   }
 
@@ -1727,6 +1957,70 @@ export class NonceDO {
       effectivePreviousNonce !== null &&
       effectivePreviousNonce > possible_next_nonce
     ) {
+      // Before resetting the pool backward, check for stuck mempool transactions.
+      // If transactions are stuck in the mempool at in-flight nonces, a pool reset
+      // would only loop: every reset returns to possible_next_nonce which is blocked
+      // by the stuck tx. Instead, broadcast a higher-fee replacement (RBF) and defer
+      // the pool reset by one alarm cycle to let the replacement confirm.
+      const reservedNonces = poolHead?.reserved ?? [];
+      if (reservedNonces.length > 0) {
+        const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+        if (privateKey) {
+          const mempoolTxs = await this.fetchMempoolTxsForAddress(sponsorAddress);
+          // Build a map of nonce → mempool entry for O(1) lookup
+          const mempoolByNonce = new Map<number, MempoolTxEntry>();
+          for (const entry of mempoolTxs) {
+            mempoolByNonce.set(entry.nonce, entry);
+          }
+          const rbfAttempted: number[] = [];
+          const rbfTxids: string[] = [];
+          for (const reservedNonce of reservedNonces) {
+            const mempoolEntry = mempoolByNonce.get(reservedNonce);
+            if (!mempoolEntry) continue;
+            // Check if the mempool tx has been stuck beyond the threshold
+            const receiptMs = new Date(mempoolEntry.receipt_time_iso).getTime();
+            if (!Number.isFinite(receiptMs)) {
+              this.log("warn", "invalid_mempool_receipt_time", {
+                walletIndex,
+                reservedNonce,
+                txId: mempoolEntry.tx_id,
+                receiptTimeIso: mempoolEntry.receipt_time_iso,
+              });
+              continue;
+            }
+            const ageMs = Date.now() - receiptMs;
+            if (ageMs < STUCK_TX_AGE_MS) continue;
+            const rbfTxid = await this.broadcastRbfForNonce(
+              walletIndex,
+              reservedNonce,
+              privateKey,
+              mempoolEntry.tx_id
+            );
+            if (rbfTxid) {
+              rbfAttempted.push(reservedNonce);
+              rbfTxids.push(rbfTxid);
+            }
+          }
+          if (rbfAttempted.length > 0) {
+            this.log("info", "rbf_deferred_reset", {
+              walletIndex,
+              rbfNonces: rbfAttempted,
+              rbfTxids,
+              idleSeconds: Math.round(idleMs / 1000),
+              possibleNextNonce: possible_next_nonce,
+              poolReserved: reservedNonces.length,
+            });
+            // Defer pool reset: give the RBF tx a chance to confirm on the next alarm cycle
+            return {
+              previousNonce: effectivePreviousNonce,
+              newNonce: effectivePreviousNonce,
+              changed: false,
+              reason: `RBF_DEFERRED_RESET: broadcast ${rbfAttempted.length} replacement(s) for stuck nonces [${rbfAttempted.join(",")}], deferring pool reset`,
+            };
+          }
+        }
+      }
+
       if (walletIndex === 0) {
         this.setStoredNonce(possible_next_nonce);
       }
@@ -1961,6 +2255,38 @@ export class NonceDO {
                 possibleNextNonce: cached.value,
                 poolAvailable: pool.available.length,
               });
+            }
+          }
+
+          // Clean up StuckTxState entries for nonces that have been confirmed on-chain.
+          // A nonce is confirmed when it is <= possible_next_nonce - 1 (i.e., the chain
+          // has advanced past it). If the confirmed nonce had RBF attempts, it means our
+          // replacement tx succeeded — increment the stuckTxRbfConfirmed counter.
+          if (cached) {
+            const confirmedThreshold = cached.value - 1; // nonces <= this are confirmed
+            pool = await this.loadPoolForWallet(walletIndex);
+            if (pool !== null) {
+              // Check recently-spent nonces: these are the ones that were broadcast and
+              // may have been stuck. We can't enumerate all possible nonces cheaply, so
+              // check the spent[] array for any nonce that has RBF state and is now confirmed.
+              const spentConfirmed = pool.spent.filter(n => n <= confirmedThreshold);
+              for (const confirmedNonce of spentConfirmed) {
+                const stuckKey = this.walletStuckTxKey(walletIndex, confirmedNonce);
+                const stuckState = await this.state.storage.get<StuckTxState>(stuckKey);
+                if (stuckState && stuckState.rbfAttempts > 0) {
+                  this.incrementStuckTxRbfConfirmed();
+                  this.log("info", "stuck_tx_rbf_confirmed", {
+                    walletIndex,
+                    nonce: confirmedNonce,
+                    rbfAttempts: stuckState.rbfAttempts,
+                    lastRbfTxid: stuckState.lastRbfTxid,
+                    originalTxid: stuckState.originalTxid,
+                  });
+                }
+                if (stuckState) {
+                  await this.state.storage.delete(stuckKey);
+                }
+              }
             }
           }
 
