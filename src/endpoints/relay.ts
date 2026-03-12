@@ -366,10 +366,16 @@ export class Relay extends BaseEndpoint {
       );
 
       if ("error" in broadcastResult) {
-        // Release the nonce back to the pool so it can be reused (broadcast failed)
+        // Release nonce back to pool or quarantine it depending on conflict type.
+        // Nonce conflicts mean the nonce slot is occupied in mempool — returning it
+        // to available[] would cause an infinite re-assignment loop. Quarantine it
+        // to spent[] by passing a synthetic txid marker.
         if (sponsorNonce !== null) {
+          const quarantineTxid = broadcastResult.nonceConflict
+            ? `conflict:quarantine:${sponsorNonce}`
+            : undefined;
           c.executionCtx.waitUntil(
-            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
+            releaseNonceDO(c.env, logger, sponsorNonce, quarantineTxid, sponsorWalletIndex).catch((e) => {
               logger.warn("Failed to release nonce after broadcast failure", { error: String(e) });
             })
           );
