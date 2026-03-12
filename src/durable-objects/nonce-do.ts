@@ -186,8 +186,8 @@ interface NonceStatsResponse {
   chainingLimit: number;
   /** Per-wallet pool state (multi-wallet rotation) */
   wallets: WalletPoolStats[];
-  /** Total RBF broadcast attempts for stuck mempool transactions */
-  stuckTxRbfAttempted: number;
+  /** Total RBF replacements successfully broadcast for stuck mempool transactions */
+  stuckTxRbfBroadcast: number;
   /** Total nonces successfully unstuck via RBF (confirmed after replacement) */
   stuckTxRbfConfirmed: number;
 }
@@ -275,7 +275,7 @@ const STATE_KEYS = {
   gapsFilled: "gaps_filled",
   lastHiroSync: "last_hiro_sync",
   lastGapDetected: "last_gap_detected",
-  stuckTxRbfAttempted: "stuck_tx_rbf_attempted",
+  stuckTxRbfBroadcast: "stuck_tx_rbf_attempted",
   stuckTxRbfConfirmed: "stuck_tx_rbf_confirmed",
 } as const;
 
@@ -469,9 +469,9 @@ export class NonceDO {
     this.setStateValue(STATE_KEYS.gapsFilled, gapsFilled);
   }
 
-  private incrementStuckTxRbfAttempted(): void {
-    const count = this.getStoredCount(STATE_KEYS.stuckTxRbfAttempted) + 1;
-    this.setStateValue(STATE_KEYS.stuckTxRbfAttempted, count);
+  private incrementStuckTxRbfBroadcast(): void {
+    const count = this.getStoredCount(STATE_KEYS.stuckTxRbfBroadcast) + 1;
+    this.setStateValue(STATE_KEYS.stuckTxRbfBroadcast, count);
   }
 
   private incrementStuckTxRbfConfirmed(): void {
@@ -719,39 +719,50 @@ export class NonceDO {
    */
   private async fetchMempoolTxsForAddress(address: string): Promise<MempoolTxEntry[]> {
     const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
-    const url = `${base}/extended/v1/tx/mempool?sender_address=${encodeURIComponent(address)}&limit=50`;
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    const pageLimit = 50;
+    const maxPages = 10; // Cap at 500 entries to bound API calls
+    const pending: MempoolTxEntry[] = [];
+
     try {
-      const response = await fetch(url, {
-        headers,
-        signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
-      });
-      if (!response.ok) {
-        this.log("warn", "mempool_fetch_failed", {
-          address,
-          status: response.status,
+      for (let page = 0; page < maxPages; page++) {
+        const offset = page * pageLimit;
+        const url = `${base}/extended/v1/tx/mempool?sender_address=${encodeURIComponent(address)}&limit=${pageLimit}&offset=${offset}`;
+        const response = await fetch(url, {
+          headers,
+          signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
         });
-        return [];
-      }
-      const data = (await response.json()) as { results?: unknown[] };
-      if (!Array.isArray(data.results)) return [];
-      const pending: MempoolTxEntry[] = [];
-      for (const item of data.results) {
-        const entry = item as Record<string, unknown>;
-        if (
-          typeof entry.tx_id === "string" &&
-          typeof entry.nonce === "number" &&
-          typeof entry.tx_status === "string" &&
-          entry.tx_status === "pending" &&
-          typeof entry.receipt_time_iso === "string"
-        ) {
-          pending.push({
-            tx_id: entry.tx_id,
-            nonce: entry.nonce,
-            tx_status: entry.tx_status,
-            receipt_time_iso: entry.receipt_time_iso,
+        if (!response.ok) {
+          this.log("warn", "mempool_fetch_failed", {
+            address,
+            status: response.status,
+            page,
           });
+          break;
         }
+        const data = (await response.json()) as { results?: unknown[] };
+        if (!Array.isArray(data.results) || data.results.length === 0) break;
+
+        for (const item of data.results) {
+          const entry = item as Record<string, unknown>;
+          if (
+            typeof entry.tx_id === "string" &&
+            typeof entry.nonce === "number" &&
+            typeof entry.tx_status === "string" &&
+            entry.tx_status === "pending" &&
+            typeof entry.receipt_time_iso === "string"
+          ) {
+            pending.push({
+              tx_id: entry.tx_id,
+              nonce: entry.nonce,
+              tx_status: entry.tx_status,
+              receipt_time_iso: entry.receipt_time_iso,
+            });
+          }
+        }
+
+        // Stop paginating when last page returned fewer results than the limit
+        if (data.results.length < pageLimit) break;
       }
       return pending;
     } catch (e) {
@@ -759,7 +770,7 @@ export class NonceDO {
         address,
         error: e instanceof Error ? e.message : String(e),
       });
-      return [];
+      return pending; // Return whatever we collected before the error
     }
   }
 
@@ -827,7 +838,7 @@ export class NonceDO {
       if ("txid" in result) {
         state.lastRbfTxid = result.txid;
         await this.state.storage.put(key, state);
-        this.incrementStuckTxRbfAttempted();
+        this.incrementStuckTxRbfBroadcast();
         this.log("info", "rbf_broadcast_success", {
           walletIndex,
           nonce,
@@ -1678,7 +1689,7 @@ export class NonceDO {
     // Wallet 0 backward-compat fields
     const wallet0 = wallets[0];
 
-    const stuckTxRbfAttempted = this.getStoredCount(STATE_KEYS.stuckTxRbfAttempted);
+    const stuckTxRbfBroadcast = this.getStoredCount(STATE_KEYS.stuckTxRbfBroadcast);
     const stuckTxRbfConfirmed = this.getStoredCount(STATE_KEYS.stuckTxRbfConfirmed);
 
     return {
@@ -1696,7 +1707,7 @@ export class NonceDO {
       poolReserved: wallet0?.reserved ?? 0,
       chainingLimit: CHAINING_LIMIT,
       wallets,
-      stuckTxRbfAttempted,
+      stuckTxRbfBroadcast,
       stuckTxRbfConfirmed,
     };
   }
@@ -1967,7 +1978,17 @@ export class NonceDO {
             const mempoolEntry = mempoolByNonce.get(reservedNonce);
             if (!mempoolEntry) continue;
             // Check if the mempool tx has been stuck beyond the threshold
-            const ageMs = Date.now() - new Date(mempoolEntry.receipt_time_iso).getTime();
+            const receiptMs = new Date(mempoolEntry.receipt_time_iso).getTime();
+            if (!Number.isFinite(receiptMs)) {
+              this.log("warn", "invalid_mempool_receipt_time", {
+                walletIndex,
+                reservedNonce,
+                txId: mempoolEntry.tx_id,
+                receiptTimeIso: mempoolEntry.receipt_time_iso,
+              });
+              continue;
+            }
+            const ageMs = Date.now() - receiptMs;
             if (ageMs < STUCK_TX_AGE_MS) continue;
             const rbfTxid = await this.broadcastRbfForNonce(
               walletIndex,

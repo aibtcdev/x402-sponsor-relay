@@ -610,8 +610,11 @@ export class SettlementService {
     let lastBroadcastError: BroadcastAndConfirmResult | undefined;
     let totalAttempt = 0;
 
+    // Retry the same node up to BROADCAST_MAX_ATTEMPTS before failing over to the
+    // next node. This gives transient errors a chance to resolve before rotating.
     outerLoop:
-    for (const target of broadcastTargets) {
+    for (let nodeIndex = 0; nodeIndex < broadcastTargets.length; nodeIndex++) {
+      const target = broadcastTargets[nodeIndex];
       const broadcastUrl = `${target.baseUrl}/v2/transactions`;
       const broadcastHeaders: Record<string, string> = {
         "Content-Type": "application/octet-stream",
@@ -647,11 +650,7 @@ export class SettlementService {
                 responseText: responseText.slice(0, 200),
                 nodeUrl: target.baseUrl,
               });
-              return {
-                error: "Broadcast failed",
-                details: "Node returned OK but txid could not be parsed",
-                retryable: true,
-              };
+              throw new Error("Node returned OK but txid could not be parsed");
             }
 
             txid = parsedTxid;
@@ -743,7 +742,7 @@ export class SettlementService {
           if (broadcastResponse.status >= 500) {
             const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
             const hasMoreAttempts = attempt < BROADCAST_MAX_ATTEMPTS;
-            const hasMoreNodes = broadcastTargets.indexOf(target) < broadcastTargets.length - 1;
+            const hasMoreNodes = nodeIndex < broadcastTargets.length - 1;
             const retryMsg = hasMoreAttempts
               ? `retrying same node in ${retryDelay}ms`
               : hasMoreNodes
@@ -783,7 +782,7 @@ export class SettlementService {
           // Network error, AbortError (timeout), or TypeError — retry this node
           const errMsg = e instanceof Error ? e.message : String(e);
           const hasMoreAttempts = attempt < BROADCAST_MAX_ATTEMPTS;
-          const hasMoreNodes = broadcastTargets.indexOf(target) < broadcastTargets.length - 1;
+          const hasMoreNodes = nodeIndex < broadcastTargets.length - 1;
           const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
           const retryMsg = hasMoreAttempts
             ? `retrying same node in ${retryDelay}ms`
