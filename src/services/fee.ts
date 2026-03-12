@@ -371,8 +371,11 @@ export class FeeService {
       }
     }
 
-    // Fallback: use floor values from clamp config
-    this.logger.info("Using default floor-based fees", { source: "default" });
+    // Fallback: use floor values from clamp config.
+    // Logs fee_fetch_fallback_used so operators can detect Hiro outage impact.
+    this.logger.warn("fee_fetch_fallback_used: Hiro API unreachable, using floor-based defaults", {
+      source: "default",
+    });
     const config = await this.getClampConfig();
     const defaults: FeeEstimates = {
       token_transfer: this.uniformTiers(config.token_transfer.floor),

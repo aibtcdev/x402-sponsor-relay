@@ -898,6 +898,10 @@ export class SettlementService {
   ): Promise<BroadcastAndConfirmResult | null> {
     const startTime = Date.now();
     let delay = initialDelay;
+    /** Number of consecutive poll failures (non-200/404 or network error) */
+    let consecutivePollFailures = 0;
+    /** Log a polling_degraded warning when this many consecutive failures occur */
+    const POLL_DEGRADED_THRESHOLD = 3;
 
     while (true) {
       const elapsed = Date.now() - startTime;
@@ -924,6 +928,8 @@ export class SettlementService {
         });
 
         if (response.ok) {
+          // Successful response — reset consecutive failure counter
+          consecutivePollFailures = 0;
           const data = (await response.json()) as HiroTxResponse;
           const txStatus = data.tx_status;
 
@@ -976,29 +982,57 @@ export class SettlementService {
             });
           }
         } else if (response.status === 404) {
-          // Transaction not yet indexed — continue polling
+          // Transaction not yet indexed — continue polling (not a failure)
+          consecutivePollFailures = 0;
           this.logger.debug("Transaction not yet indexed", {
             txid,
             elapsedMs: elapsed,
           });
         } else {
-          // Non-200/404 response — log but continue polling
-          this.logger.warn("Unexpected response from Hiro API during polling", {
+          // Non-200/404 response — log and track consecutive failures
+          consecutivePollFailures++;
+          if (consecutivePollFailures >= POLL_DEGRADED_THRESHOLD) {
+            this.logger.warn("polling_degraded: Hiro API returning repeated errors, increasing poll delay", {
+              txid,
+              status: response.status,
+              consecutivePollFailures,
+              elapsedMs: elapsed,
+            });
+            // Snap delay to max to reduce load pressure on a struggling API
+            delay = MAX_POLL_DELAY_MS;
+          } else {
+            this.logger.warn("Unexpected response from Hiro API during polling", {
+              txid,
+              status: response.status,
+              consecutivePollFailures,
+              elapsedMs: elapsed,
+            });
+          }
+        }
+      } catch (e) {
+        // Network error or timeout during polling — log, track, and continue
+        consecutivePollFailures++;
+        if (consecutivePollFailures >= POLL_DEGRADED_THRESHOLD) {
+          this.logger.warn("polling_degraded: Hiro API unreachable, increasing poll delay", {
             txid,
-            status: response.status,
+            error: e instanceof Error ? e.message : String(e),
+            consecutivePollFailures,
+            elapsedMs: elapsed,
+          });
+          // Snap delay to max to reduce load on a struggling API
+          delay = MAX_POLL_DELAY_MS;
+        } else {
+          this.logger.warn("Error polling for confirmation", {
+            txid,
+            error: e instanceof Error ? e.message : String(e),
+            consecutivePollFailures,
             elapsedMs: elapsed,
           });
         }
-      } catch (e) {
-        // Network error during polling — log and continue
-        this.logger.warn("Error polling for confirmation", {
-          txid,
-          error: e instanceof Error ? e.message : String(e),
-          elapsedMs: elapsed,
-        });
       }
 
-      // Set delay: first iteration starts the backoff series, then exponential growth
+      // Set delay: first iteration starts the backoff series, then exponential growth.
+      // If we snapped delay to MAX_POLL_DELAY_MS above (degraded), leave it there.
       delay = delay === 0 ? INITIAL_POLL_DELAY_MS : Math.min(delay * POLL_BACKOFF_FACTOR, MAX_POLL_DELAY_MS);
     }
   }
