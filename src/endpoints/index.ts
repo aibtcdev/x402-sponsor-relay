@@ -10,6 +10,7 @@ export { Fees } from "./fees";
 export { FeesConfig } from "./fees-config";
 export { NonceStatsEndpoint } from "./nonce-stats";
 export { NonceReset } from "./nonce-reset";
+export { NonceHistory } from "./nonce-history";
 export { TransactionLog } from "./transaction-log";
 export { Settle } from "./settle";
 export { VerifyV2 } from "./verify-v2";

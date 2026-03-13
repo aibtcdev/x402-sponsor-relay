@@ -9,6 +9,7 @@ import {
   extractSponsorNonce,
   recordNonceTxid,
   releaseNonceDO,
+  recordBroadcastOutcomeDO,
 } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import { stripHexPrefix } from "../utils";
@@ -379,6 +380,16 @@ export class Relay extends BaseEndpoint {
               logger.warn("Failed to release nonce after broadcast failure", { error: String(e) });
             })
           );
+          // Record broadcast outcome for ledger fidelity (http_status, node_url, error_reason)
+          const failHttpStatus = broadcastResult.nonceConflict ? 409 : 400;
+          c.executionCtx.waitUntil(
+            recordBroadcastOutcomeDO(
+              c.env, logger, sponsorNonce, sponsorWalletIndex,
+              undefined, failHttpStatus, undefined, broadcastResult.details
+            ).catch((e) => {
+              logger.warn("Failed to record broadcast outcome", { error: String(e) });
+            })
+          );
         }
 
         c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
@@ -435,6 +446,15 @@ export class Relay extends BaseEndpoint {
         c.executionCtx.waitUntil(
           recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce).catch((e) => {
             logger.warn("Failed to record nonce txid", { error: String(e) });
+          })
+        );
+        // Record broadcast outcome for ledger fidelity (state='broadcasted', http_status, txid)
+        c.executionCtx.waitUntil(
+          recordBroadcastOutcomeDO(
+            c.env, logger, sponsorNonce, sponsorWalletIndex,
+            broadcastResult.txid, 200, undefined, undefined
+          ).catch((e) => {
+            logger.warn("Failed to record broadcast outcome", { error: String(e) });
           })
         );
       }

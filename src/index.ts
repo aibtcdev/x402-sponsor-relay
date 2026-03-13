@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, Settle, VerifyV2, Supported, Wallets } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, NonceHistory, Settle, VerifyV2, Supported, Wallets } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -93,6 +93,7 @@ openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 openapi.get("/stats/transactions", TransactionLog as unknown as typeof TransactionLog);
 openapi.get("/nonce/stats", NonceStatsEndpoint as unknown as typeof NonceStatsEndpoint);
 openapi.post("/nonce/reset", NonceReset as unknown as typeof NonceReset);
+openapi.get("/nonce/history/:wallet/:nonce", NonceHistory as unknown as typeof NonceHistory);
 openapi.post("/settle", Settle as unknown as typeof Settle);
 // Note: POST /verify (V2 facilitator) and GET /verify/:receiptId (receipt check)
 // share the /verify path but use different HTTP methods — no route collision.
