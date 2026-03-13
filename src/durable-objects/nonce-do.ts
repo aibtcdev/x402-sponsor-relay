@@ -105,17 +105,6 @@ interface ReconcileResult {
 }
 
 /**
- * Tracks how many consecutive alarm cycles a specific gap nonce has been stuck.
- * Persisted in DO storage (key: gap_persist:N) so state survives alarm restarts.
- */
-interface GapPersistState {
-  stuckNonce: number;  // The lowest missing nonce that keeps reappearing
-  cycleCount: number;  // Consecutive alarm cycles the gap has been stuck
-  firstSeen: string;   // ISO timestamp of first detection
-  lastSeen: string;    // ISO timestamp of most recent detection
-}
-
-/**
  * Tracks RBF attempts for a specific nonce occupying the mempool beyond the stuck threshold.
  * Persisted in DO storage (key: stuck_tx:{walletIndex}:{nonce}).
  * Prevents infinite RBF fee escalation and enables observability.
@@ -1060,11 +1049,6 @@ export class NonceDO {
     return `wallet_gap_fill_count:${walletIndex}`;
   }
 
-  /** KV key for per-wallet gap persistence tracking state */
-  private walletGapPersistKey(walletIndex: number): string {
-    return `gap_persist:${walletIndex}`;
-  }
-
   /** KV key for per-nonce RBF attempt state (stuck mempool tx tracking) */
   private walletStuckTxKey(walletIndex: number, nonce: number): string {
     return `stuck_tx:${walletIndex}:${nonce}`;
@@ -1758,23 +1742,6 @@ export class NonceDO {
       while (attempts < effectiveWalletCount) {
         pool = await this.loadPoolOrInit(walletIndex, resolveAddress(walletIndex));
 
-        // Check if this wallet is degraded (stuck gap nonce for >= 2 cycles)
-        const gapState = await this.state.storage.get<GapPersistState>(
-          this.walletGapPersistKey(walletIndex)
-        );
-        if (gapState && gapState.cycleCount >= 2) {
-          this.log("warn", "skipping_degraded_wallet", {
-            walletIndex,
-            stuckNonce: gapState.stuckNonce,
-            cycleCount: gapState.cycleCount,
-          });
-          degradedWallets.push({ walletIndex, cycleCount: gapState.cycleCount, pool });
-          walletIndex = (walletIndex + 1) % effectiveWalletCount;
-          pool = null;
-          attempts++;
-          continue;
-        }
-
         // Check per-wallet circuit breaker: skip if too many recent quarantines
         const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
         const recentQuarantines = (
@@ -2130,7 +2097,44 @@ export class NonceDO {
   }
 
   /**
-   * Core gap-aware nonce reconciliation against Hiro for a specific wallet.
+   * Fetch transaction status from Hiro for a specific txid.
+   * Returns the tx_status string ("success", "pending", "abort_*", "dropped_*") or null on error.
+   * Used by reconcileNonceForWallet to distinguish terminal abort from transient drops.
+   * Fail-open — null means skip the status check and proceed conservatively.
+   */
+  private async fetchTxStatus(txid: string): Promise<string | null> {
+    const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    try {
+      const response = await fetch(`${base}/extended/v1/tx/${txid}`, {
+        headers,
+        signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
+      });
+      if (!response.ok) return null;
+      const data = (await response.json()) as Record<string, unknown>;
+      return typeof data.tx_status === "string" ? data.tx_status : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Ledger-first nonce reconciliation against Hiro for a specific wallet.
+   * The ledger is the primary authority for nonce state.
+   * Hiro data points are corroborating signals — they tell us what the network sees;
+   * the ledger tells us what we intended.
+   *
+   * Cross-reference logic:
+   * - broadcasted(txid) at N, N <= last_executed_tx_nonce → confirmed
+   * - broadcasted(txid) at N, N in detected_mempool_nonces → pending_agree (healthy)
+   * - broadcasted(txid) at N, age < 15min, N in detected_missing_nonces → pending_diverge (Hiro lag, wait)
+   * - broadcasted(txid) at N, age >= 15min, N in detected_missing_nonces → rbf_candidate (check tx status)
+   * - broadcasted(txid) at N, age >= 15min, N not in mempool, N > last_executed → rbf_candidate (evicted)
+   * - assigned at N, age > 10min → expired (never broadcast, return nonce to available)
+   * - no ledger entry at N, N in detected_missing_nonces → gap_fill (true gap we didn't create)
+   * - confirmed at N, N in detected_missing_nonces → ignore (Hiro stale)
+   * - failed at N, N in detected_missing_nonces → gap_fill (known failure, fill the gap)
+   *
    * Shared by alarm(), performResync(), and performReset() — all iterate every initialized wallet.
    */
   private async reconcileNonceForWallet(
@@ -2176,6 +2180,7 @@ export class NonceDO {
 
     const previousNonce = walletIndex === 0 ? this.getStoredNonce() : null;
 
+    // First-time initialization: seed pool from Hiro when no local state exists
     if (walletIndex === 0 && previousNonce === null) {
       this.setStoredNonce(nonceInfo.possible_next_nonce);
       const pool = await this.loadPoolForWallet(walletIndex);
@@ -2190,148 +2195,339 @@ export class NonceDO {
       };
     }
 
-    const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+    const {
+      possible_next_nonce,
+      detected_missing_nonces,
+      detected_mempool_nonces,
+      last_executed_tx_nonce,
+    } = nonceInfo;
 
-    if (detected_missing_nonces.length > 0) {
-      const sortedGaps = [...detected_missing_nonces].sort((a, b) => a - b);
-      const lowestGap = sortedGaps[0];
+    // Build Hiro signal lookup sets
+    const mempoolNonceSet = new Set(detected_mempool_nonces);
+    const missingNonceSet = new Set(detected_missing_nonces);
 
-      if (previousNonce !== null && previousNonce > lowestGap) {
-        if (walletIndex === 0) this.setStoredNonce(lowestGap);
-        this.incrementGapsRecovered();
-        this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
-        this.incrementConflictsDetected();
+    // Query ledger for this wallet's known nonces
+    const broadcastedIntents = this.ledgerGetBroadcastedNonces(walletIndex);
+    const broadcastedByNonce = new Map(broadcastedIntents.map((r) => [r.nonce, r]));
+    const assignedIntents = this.ledgerGetAssignedNonces(walletIndex);
+    const assignedByNonce = new Map(assignedIntents.map((r) => [r.nonce, r]));
 
-        const pool = await this.loadPoolForWallet(walletIndex);
-        if (pool !== null) {
-          await this.resetPoolAvailableForWallet(walletIndex, pool, lowestGap);
-        }
+    // Verdict counters for reconciliation_summary
+    let verdictConfirmed = 0;
+    let verdictPendingAgree = 0;
+    let verdictPendingDiverge = 0;
+    let verdictExpired = 0;
+    let verdictIgnoreStaleHiro = 0;
+    let verdictRbfCandidate = 0;
+    const rbfCandidates: Array<{ nonce: number; txid: string }> = [];
+    const gapFillNonces: number[] = [];
 
-        this.log("warn", "nonce_reconcile_gap_recovery", {
+    // -------------------------------------------------------------------------
+    // Cross-reference: broadcasted nonces (have a txid recorded in ledger)
+    // -------------------------------------------------------------------------
+    for (const [nonce, intent] of broadcastedByNonce) {
+      const txid = intent.txid;
+      const broadcastedAtMs = intent.broadcasted_at
+        ? new Date(intent.broadcasted_at).getTime()
+        : new Date(intent.assigned_at).getTime();
+      const ageMs = Date.now() - broadcastedAtMs;
+
+      let verdict: string;
+      let reason: string;
+
+      if (last_executed_tx_nonce !== null && nonce <= last_executed_tx_nonce) {
+        // Chain advanced past this nonce — confirmed on-chain
+        verdict = "confirmed";
+        reason = "chain_advanced_past_nonce";
+        verdictConfirmed++;
+        this.ledgerMarkConfirmedByReconcile(walletIndex, nonce, txid);
+      } else if (mempoolNonceSet.has(nonce)) {
+        // Both ledger and Hiro agree tx is pending — healthy
+        verdict = "pending_agree";
+        reason = "ledger_and_hiro_both_pending";
+        verdictPendingAgree++;
+      } else if (missingNonceSet.has(nonce) && ageMs < STUCK_TX_AGE_MS) {
+        // Hiro lost sight of tx we know we sent — tx is young, wait for Hiro to catch up
+        verdict = "pending_diverge";
+        reason = "hiro_missing_but_tx_young";
+        verdictPendingDiverge++;
+        this.log("warn", "reconcile_hiro_divergence", {
           walletIndex,
-          previousNonce,
-          newNonce: lowestGap,
-          gaps: sortedGaps,
-          hiroNextNonce: possible_next_nonce,
-          hiroMissingNonces: detected_missing_nonces,
-          poolReserved: pool?.reserved.length ?? 0,
-          poolAvailable: pool?.available.length ?? 0,
+          nonce,
+          txid,
+          ageMs,
+          reason: "hiro_reports_missing_but_we_broadcasted_recently",
         });
-
-        return {
-          previousNonce,
-          newNonce: lowestGap,
-          changed: true,
-          reason: `GAP RECOVERY: reset to lowest gap nonce ${lowestGap} (gaps: ${sortedGaps.join(",")})`,
-        };
+      } else if (missingNonceSet.has(nonce) && ageMs >= STUCK_TX_AGE_MS) {
+        // Hiro and time both say trouble — RBF candidate (tx status check in RBF section)
+        verdict = "rbf_candidate";
+        reason = "hiro_missing_and_tx_old";
+        rbfCandidates.push({ nonce, txid });
+        verdictRbfCandidate++;
+      } else if (
+        !mempoolNonceSet.has(nonce) &&
+        (last_executed_tx_nonce === null || nonce > last_executed_tx_nonce) &&
+        ageMs >= STUCK_TX_AGE_MS
+      ) {
+        // Not in mempool AND not confirmed AND old — likely evicted from all mempools
+        verdict = "rbf_candidate";
+        reason = "not_in_mempool_not_confirmed_old";
+        rbfCandidates.push({ nonce, txid });
+        verdictRbfCandidate++;
+      } else {
+        // Tx is recent or still somewhere we can't see — wait
+        verdict = "pending_wait";
+        reason = "tx_recent_or_status_unclear";
+        verdictPendingAgree++;
       }
 
+      this.log("debug", "reconcile_verdict", {
+        walletIndex,
+        nonce,
+        txid,
+        ledger_state: "broadcasted",
+        hiro_signal: mempoolNonceSet.has(nonce)
+          ? "mempool"
+          : missingNonceSet.has(nonce)
+            ? "missing"
+            : last_executed_tx_nonce !== null && nonce <= last_executed_tx_nonce
+              ? "confirmed"
+              : "unknown",
+        verdict,
+        reason,
+        ageMs,
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-reference: assigned nonces (handed out, not yet broadcast)
+    // -------------------------------------------------------------------------
+    for (const [nonce, intent] of assignedByNonce) {
+      const assignedAtMs = new Date(intent.assigned_at).getTime();
+      const ageMs = Date.now() - assignedAtMs;
+
+      let verdict: string;
+      let reason: string;
+
+      if (ageMs > STALE_THRESHOLD_MS) {
+        // Assigned > 10 min ago, never broadcast — mark expired, return to available
+        verdict = "expired";
+        reason = "stale_assigned_never_broadcast";
+        verdictExpired++;
+        this.ledgerMarkExpiredByReconcile(walletIndex, nonce, reason);
+        // Also remove from pool.reserved and return to pool.available
+        const poolToUpdate = await this.loadPoolForWallet(walletIndex);
+        if (poolToUpdate !== null) {
+          const idx = poolToUpdate.reserved.indexOf(nonce);
+          if (idx !== -1) {
+            poolToUpdate.reserved.splice(idx, 1);
+            delete poolToUpdate.reservedAt[nonce];
+            insertSorted(poolToUpdate.available, nonce);
+            await this.savePoolForWallet(walletIndex, poolToUpdate);
+          }
+        }
+      } else {
+        // Still within grace period — wait
+        verdict = "pending_assign";
+        reason = "within_grace_period";
+        verdictPendingAgree++;
+      }
+
+      this.log("debug", "reconcile_verdict", {
+        walletIndex,
+        nonce,
+        ledger_state: "assigned",
+        hiro_signal: mempoolNonceSet.has(nonce)
+          ? "mempool"
+          : missingNonceSet.has(nonce)
+            ? "missing"
+            : "unknown",
+        verdict,
+        reason,
+        ageMs,
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // Cross-reference: Hiro-detected missing nonces not in our ledger
+    // -------------------------------------------------------------------------
+    if (detected_missing_nonces.length > 0) {
       this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
 
-      // Gap persistence tracking: detect stuck gap nonces across consecutive alarm cycles.
-      // If the same lowestGap nonce reappears for 3+ cycles, the gap-fill tx is itself stuck
-      // (e.g. confirmed but Hiro hasn't caught up, or tx dropped). Reset the pool instead of
-      // filling indefinitely.
-      const gapPersistKey = this.walletGapPersistKey(walletIndex);
-      const existingGapState = await this.state.storage.get<GapPersistState>(gapPersistKey);
-      const now = new Date().toISOString();
+      for (const nonce of detected_missing_nonces) {
+        // Already handled above in broadcastedByNonce or assignedByNonce loops
+        if (broadcastedByNonce.has(nonce) || assignedByNonce.has(nonce)) continue;
 
-      let gapPersistState: GapPersistState;
-      if (existingGapState && existingGapState.stuckNonce === lowestGap) {
-        // Same gap nonce seen again — increment cycle counter
-        gapPersistState = {
-          stuckNonce: lowestGap,
-          cycleCount: existingGapState.cycleCount + 1,
-          firstSeen: existingGapState.firstSeen,
-          lastSeen: now,
-        };
-      } else {
-        // New gap or different nonce — start fresh tracking
-        gapPersistState = {
-          stuckNonce: lowestGap,
-          cycleCount: 1,
-          firstSeen: now,
-          lastSeen: now,
-        };
-      }
-      await this.state.storage.put(gapPersistKey, gapPersistState);
+        // Query ledger directly for this nonce's state
+        const intentRows = this.sql
+          .exec<{ state: string }>(
+            "SELECT state FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+            walletIndex,
+            nonce
+          )
+          .toArray();
+        const intentState = intentRows[0]?.state ?? null;
 
-      // After 3 consecutive cycles with the same stuck nonce, reset the pool instead of
-      // retrying gap-fill. The gap-fill tx may be stuck in mempool and will never clear.
-      if (gapPersistState.cycleCount >= 3) {
-        this.log("warn", "stuck_nonce_pool_reset", {
-          walletIndex,
-          stuckNonce: lowestGap,
-          cycleCount: gapPersistState.cycleCount,
-          firstSeen: gapPersistState.firstSeen,
-          possibleNextNonce: possible_next_nonce,
-        });
-        const poolToReset = await this.loadPoolForWallet(walletIndex);
-        if (poolToReset !== null) {
-          await this.resetPoolAvailableForWallet(walletIndex, poolToReset, possible_next_nonce);
+        let verdict: string;
+        let reason: string;
+
+        if (intentState === null) {
+          // No ledger entry — true gap we didn't create — fill it
+          verdict = "gap_fill";
+          reason = "no_ledger_entry_hiro_missing";
+          gapFillNonces.push(nonce);
+        } else if (intentState === "failed") {
+          // Known failure — fill the gap (we know why it failed)
+          verdict = "gap_fill";
+          reason = "known_failure_hiro_missing";
+          gapFillNonces.push(nonce);
+        } else if (intentState === "confirmed") {
+          // We know this nonce confirmed — Hiro is stale, log and ignore
+          verdict = "ignore_stale_hiro";
+          reason = "confirmed_in_ledger_hiro_still_missing";
+          verdictIgnoreStaleHiro++;
+        } else if (intentState === "expired") {
+          // Nonce expired in ledger (was returned to available) — fill the gap
+          verdict = "gap_fill";
+          reason = "expired_in_ledger_hiro_missing";
+          gapFillNonces.push(nonce);
+        } else {
+          // Unexpected state — log and skip conservatively
+          verdict = "unknown_state";
+          reason = `unexpected_ledger_state_${intentState}`;
+          verdictPendingAgree++;
         }
-        if (walletIndex === 0) {
-          this.setStoredNonce(possible_next_nonce);
-        }
-        await this.state.storage.delete(gapPersistKey);
-        this.log("info", "stuck_nonce_pool_reset_complete", {
-          walletIndex,
-          newHead: possible_next_nonce,
-          stuckNonce: lowestGap,
-        });
-        return {
-          previousNonce,
-          newNonce: possible_next_nonce,
-          changed: true,
-          reason: `STUCK NONCE RESET: nonce ${lowestGap} stuck for ${gapPersistState.cycleCount} alarm cycles, reset pool to ${possible_next_nonce}`,
-        };
-      }
 
-      // Actively fill gaps: derive key and broadcast 1 uSTX transfers for each gap nonce.
-      // Cap per-alarm fills to avoid exceeding Cloudflare alarm execution time limits.
+        this.log("debug", "reconcile_verdict", {
+          walletIndex,
+          nonce,
+          ledger_state: intentState ?? "none",
+          hiro_signal: "missing",
+          verdict,
+          reason,
+        });
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Execute RBF for candidates (both ledger age AND Hiro absence must agree)
+    // -------------------------------------------------------------------------
+    const rbfAttempted: number[] = [];
+    const rbfTxids: string[] = [];
+
+    if (rbfCandidates.length > 0) {
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
-      const filled: number[] = [];
-      const gapsToFill = sortedGaps.slice(0, MAX_GAP_FILLS_PER_ALARM);
+      if (privateKey) {
+        for (const candidate of rbfCandidates) {
+          const { nonce, txid } = candidate;
+          // Optional: check if tx is abort_* (terminal) before RBF — skip RBF if so
+          const txStatus = await this.fetchTxStatus(txid);
+          if (txStatus !== null && txStatus.startsWith("abort_")) {
+            // Transaction was definitively rejected on-chain — mark failed, no RBF
+            this.log("warn", "reconcile_tx_aborted", {
+              walletIndex,
+              nonce,
+              txid,
+              txStatus,
+              reason: "abort_status_skip_rbf",
+            });
+            // Update ledger to reflect the on-chain rejection
+            try {
+              const now = new Date().toISOString();
+              this.sql.exec(
+                `UPDATE nonce_intents SET state = 'failed', error_reason = ?
+                 WHERE wallet_index = ? AND nonce = ?`,
+                `on_chain_abort:${txStatus}`,
+                walletIndex,
+                nonce
+              );
+              this.sql.exec(
+                `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+                 VALUES (?, ?, 'reconcile_aborted', ?, ?)`,
+                walletIndex,
+                nonce,
+                JSON.stringify({ txid, txStatus }),
+                now
+              );
+            } catch { /* fail-open */ }
+            continue;
+          }
+          if (txStatus === "success") {
+            // Tx actually confirmed (Hiro eventually returned it) — mark confirmed
+            this.ledgerMarkConfirmedByReconcile(walletIndex, nonce, txid);
+            verdictConfirmed++;
+            verdictRbfCandidate--;
+            continue;
+          }
+          // Tx is dropped/not found/null — proceed with RBF
+          const rbfTxid = await this.broadcastRbfForNonce(walletIndex, nonce, privateKey, txid);
+          if (rbfTxid) {
+            rbfAttempted.push(nonce);
+            rbfTxids.push(rbfTxid);
+          }
+        }
+      }
+    }
+
+    if (rbfAttempted.length > 0) {
+      this.log("info", "rbf_deferred_reset", {
+        walletIndex,
+        rbfNonces: rbfAttempted,
+        rbfTxids,
+        possibleNextNonce: possible_next_nonce,
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // Execute gap-fills for nonces not in our ledger or in failed state
+    // -------------------------------------------------------------------------
+    const gapFillFilled: number[] = [];
+    if (gapFillNonces.length > 0) {
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      const gapsToFill = gapFillNonces
+        .slice()
+        .sort((a, b) => a - b)
+        .slice(0, MAX_GAP_FILLS_PER_ALARM);
       if (privateKey) {
         for (const gapNonce of gapsToFill) {
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
           if (txid) {
             this.log("info", "gap_filled", { walletIndex, nonce: gapNonce, txid });
             this.incrementGapsFilled();
-            filled.push(gapNonce);
-            // Record gap-fill fee in per-wallet stats (separate counter for observability)
+            gapFillFilled.push(gapNonce);
+            this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
             await this.recordGapFillFee(walletIndex, GAP_FILL_FEE.toString());
           }
         }
       }
-
-      return {
-        previousNonce,
-        newNonce: previousNonce,
-        changed: filled.length > 0,
-        reason:
-          filled.length > 0
-            ? `gap_filled: broadcast ${filled.length} fill tx(s) for nonces [${filled.join(",")}]`
-            : `gaps detected (${sortedGaps.join(",")}) but could not fill (no key or already occupied)`,
-      };
     }
 
-    // Auto-recovery: clear gap persist state when no gaps are detected.
-    // This ensures wallets return to healthy status once the stuck nonce resolves.
-    const existingGapStateForRecovery = await this.state.storage.get<GapPersistState>(
-      this.walletGapPersistKey(walletIndex)
-    );
-    if (existingGapStateForRecovery) {
-      await this.state.storage.delete(this.walletGapPersistKey(walletIndex));
-      this.log("info", "stuck_nonce_gap_cleared", {
-        walletIndex,
-        previousStuckNonce: existingGapStateForRecovery.stuckNonce,
-        previousCycleCount: existingGapStateForRecovery.cycleCount,
-        firstSeen: existingGapStateForRecovery.firstSeen,
-      });
-    }
+    // -------------------------------------------------------------------------
+    // Log reconciliation_summary for this wallet
+    // -------------------------------------------------------------------------
+    this.log("info", "reconciliation_summary", {
+      walletIndex,
+      total_nonces: broadcastedByNonce.size + assignedByNonce.size + gapFillNonces.length,
+      confirmed: verdictConfirmed,
+      pending_agree: verdictPendingAgree,
+      pending_diverge: verdictPendingDiverge,
+      expired: verdictExpired,
+      gap_filled: gapFillFilled.length,
+      rbf_candidates: verdictRbfCandidate,
+      rbf_broadcast: rbfAttempted.length,
+      ignore_stale_hiro: verdictIgnoreStaleHiro,
+      hiro_missing_count: detected_missing_nonces.length,
+      hiro_mempool_count: detected_mempool_nonces.length,
+      possible_next_nonce,
+      last_executed_tx_nonce,
+    });
 
-    // For wallets other than 0 we don't have a SQL counter, so compare pool head
+    // -------------------------------------------------------------------------
+    // Pool maintenance: forward bump, stale reset, refill
+    // These maintain pool.available[] alignment with chain state.
+    // RBF deferral: if we just broadcast RBF replacements, skip the stale pool
+    // reset for one cycle to let the replacement confirm.
+    // -------------------------------------------------------------------------
     const poolHead = await this.loadPoolForWallet(walletIndex);
     const effectivePreviousNonce = walletIndex === 0
       ? previousNonce
@@ -2374,68 +2570,15 @@ export class NonceDO {
       effectivePreviousNonce !== null &&
       effectivePreviousNonce > possible_next_nonce
     ) {
-      // Before resetting the pool backward, check for stuck mempool transactions.
-      // If transactions are stuck in the mempool at in-flight nonces, a pool reset
-      // would only loop: every reset returns to possible_next_nonce which is blocked
-      // by the stuck tx. Instead, broadcast a higher-fee replacement (RBF) and defer
-      // the pool reset by one alarm cycle to let the replacement confirm.
-      const reservedNonces = poolHead?.reserved ?? [];
-      if (reservedNonces.length > 0) {
-        const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
-        if (privateKey) {
-          const mempoolTxs = await this.fetchMempoolTxsForAddress(sponsorAddress);
-          // Build a map of nonce → mempool entry for O(1) lookup
-          const mempoolByNonce = new Map<number, MempoolTxEntry>();
-          for (const entry of mempoolTxs) {
-            mempoolByNonce.set(entry.nonce, entry);
-          }
-          const rbfAttempted: number[] = [];
-          const rbfTxids: string[] = [];
-          for (const reservedNonce of reservedNonces) {
-            const mempoolEntry = mempoolByNonce.get(reservedNonce);
-            if (!mempoolEntry) continue;
-            // Check if the mempool tx has been stuck beyond the threshold
-            const receiptMs = new Date(mempoolEntry.receipt_time_iso).getTime();
-            if (!Number.isFinite(receiptMs)) {
-              this.log("warn", "invalid_mempool_receipt_time", {
-                walletIndex,
-                reservedNonce,
-                txId: mempoolEntry.tx_id,
-                receiptTimeIso: mempoolEntry.receipt_time_iso,
-              });
-              continue;
-            }
-            const ageMs = Date.now() - receiptMs;
-            if (ageMs < STUCK_TX_AGE_MS) continue;
-            const rbfTxid = await this.broadcastRbfForNonce(
-              walletIndex,
-              reservedNonce,
-              privateKey,
-              mempoolEntry.tx_id
-            );
-            if (rbfTxid) {
-              rbfAttempted.push(reservedNonce);
-              rbfTxids.push(rbfTxid);
-            }
-          }
-          if (rbfAttempted.length > 0) {
-            this.log("info", "rbf_deferred_reset", {
-              walletIndex,
-              rbfNonces: rbfAttempted,
-              rbfTxids,
-              idleSeconds: Math.round(idleMs / 1000),
-              possibleNextNonce: possible_next_nonce,
-              poolReserved: reservedNonces.length,
-            });
-            // Defer pool reset: give the RBF tx a chance to confirm on the next alarm cycle
-            return {
-              previousNonce: effectivePreviousNonce,
-              newNonce: effectivePreviousNonce,
-              changed: false,
-              reason: `RBF_DEFERRED_RESET: broadcast ${rbfAttempted.length} replacement(s) for stuck nonces [${rbfAttempted.join(",")}], deferring pool reset`,
-            };
-          }
-        }
+      // If RBF was just broadcast for stuck nonces, defer the pool reset by one cycle
+      // to let the replacement confirm before we reset to possible_next_nonce.
+      if (rbfAttempted.length > 0) {
+        return {
+          previousNonce: effectivePreviousNonce,
+          newNonce: effectivePreviousNonce,
+          changed: false,
+          reason: `RBF_DEFERRED_RESET: broadcast ${rbfAttempted.length} replacement(s) for stuck nonces [${rbfAttempted.join(",")}], deferring pool reset`,
+        };
       }
 
       if (walletIndex === 0) {
@@ -2485,11 +2628,17 @@ export class NonceDO {
       };
     }
 
+    const gapFilledSummary = gapFillFilled.length > 0
+      ? ` gap_filled [${gapFillFilled.join(",")}]`
+      : "";
+    const rbfSummary = rbfAttempted.length > 0
+      ? ` rbf [${rbfAttempted.join(",")}]`
+      : "";
     return {
       previousNonce: effectivePreviousNonce,
       newNonce: effectivePreviousNonce,
-      changed: false,
-      reason: "nonce is consistent with chain state",
+      changed: gapFillFilled.length > 0 || rbfAttempted.length > 0,
+      reason: `nonce is consistent with chain state${gapFilledSummary}${rbfSummary}`,
     };
   }
 
