@@ -1121,7 +1121,7 @@ export class NonceDO {
    */
   private async getInitializedWallets(): Promise<Array<{ walletIndex: number; address: string }>> {
     const wallets: Array<{ walletIndex: number; address: string }> = [];
-    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+    for (let wi = 0; wi < ABSOLUTE_MAX_WALLET_COUNT; wi++) {
       const address = await this.getStoredSponsorAddressForWallet(wi);
       if (!address) break;
       wallets.push({ walletIndex: wi, address });
@@ -1320,14 +1320,31 @@ export class NonceDO {
   ): void {
     try {
       const now = new Date().toISOString();
+
+      // Check current state — if ledgerBroadcastOutcome already set a terminal state
+      // (conflict/failed/broadcasted), don't clobber it. This prevents the race where
+      // releaseNonceDO and recordBroadcastOutcomeDO run concurrently.
+      const currentRows = this.sql
+        .exec<{ state: string }>(
+          "SELECT state FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+          walletIndex,
+          nonce
+        )
+        .toArray();
+      const currentState = currentRows[0]?.state;
+
       if (txid) {
         // Nonce was broadcast successfully — mark as confirmed in the intent ledger.
         // 'confirmed' here means "broadcast accepted by the network".
         // Reconciliation will further validate on-chain confirmation.
+        // Only upgrade from assigned or broadcasted — not from conflict/failed.
+        if (currentState !== "assigned" && currentState !== "broadcasted") {
+          return; // Already in terminal state
+        }
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = 'confirmed', txid = ?, broadcasted_at = ?, confirmed_at = ?
-           WHERE wallet_index = ? AND nonce = ?`,
+           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted')`,
           txid,
           now,
           now,
@@ -1344,12 +1361,15 @@ export class NonceDO {
           now
         );
       } else if (errorReason) {
-        // Broadcast was attempted (txid recorded previously) but release has no txid —
-        // this means the nonce is quarantined due to a failed/conflicting broadcast.
+        // Broadcast was attempted but release has no txid — quarantine.
+        // Only transition from assigned — if already conflict/failed/broadcasted, don't clobber.
+        if (currentState !== "assigned") {
+          return;
+        }
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = 'failed', error_reason = ?
-           WHERE wallet_index = ? AND nonce = ?`,
+           WHERE wallet_index = ? AND nonce = ? AND state = 'assigned'`,
           errorReason,
           walletIndex,
           nonce
@@ -1364,11 +1384,15 @@ export class NonceDO {
           now
         );
       } else {
-        // Nonce was never broadcast — mark expired (creates a gap that reconciliation may fill).
+        // Nonce was never broadcast — mark expired.
+        // Only from assigned — if broadcast outcome already recorded, don't clobber.
+        if (currentState !== "assigned") {
+          return;
+        }
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = 'expired'
-           WHERE wallet_index = ? AND nonce = ?`,
+           WHERE wallet_index = ? AND nonce = ? AND state = 'assigned'`,
           walletIndex,
           nonce
         );
@@ -1415,13 +1439,34 @@ export class NonceDO {
   ): void {
     try {
       const now = new Date().toISOString();
+
+      // Monotonic state transitions: only update if current state allows it.
+      // State ordering: assigned → broadcasted → confirmed (via reconciliation)
+      //                 assigned → conflict | failed (broadcast rejection)
+      // Once in confirmed/conflict/failed/expired, no further transitions from broadcast outcome.
+      const currentRows = this.sql
+        .exec<{ state: string }>(
+          "SELECT state FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+          walletIndex,
+          nonce
+        )
+        .toArray();
+      const currentState = currentRows[0]?.state;
+      if (!currentState || (currentState !== "assigned" && currentState !== "broadcasted")) {
+        // Already in a terminal state (confirmed/conflict/failed/expired) — don't clobber
+        this.log("debug", "ledger_broadcast_outcome_skipped", {
+          walletIndex, nonce, currentState, txid: txid ?? null,
+        });
+        return;
+      }
+
       if (txid) {
         // Broadcast accepted — record txid, status, node URL
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = 'broadcasted', txid = ?, http_status = ?,
                broadcast_node = ?, broadcasted_at = ?
-           WHERE wallet_index = ? AND nonce = ?`,
+           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted')`,
           txid,
           httpStatus ?? 200,
           nodeUrl ?? null,
@@ -1442,14 +1487,13 @@ export class NonceDO {
         // Determine if this is a nonce conflict (quarantine) or generic failure
         const isConflict =
           errorReason !== undefined &&
-          (errorReason.includes("ConflictingNonceInMempool") ||
-            errorReason.includes("conflict:quarantine"));
+          errorReason.includes("ConflictingNonceInMempool");
         const newState = isConflict ? "conflict" : "failed";
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = ?, http_status = ?, broadcast_node = ?,
                error_reason = ?, broadcasted_at = ?
-           WHERE wallet_index = ? AND nonce = ?`,
+           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted')`,
           newState,
           httpStatus ?? null,
           nodeUrl ?? null,
@@ -1733,7 +1777,7 @@ export class NonceDO {
         1,
         Math.min(
           Math.max(walletCount, storedDynamic ?? 0),
-          MAX_WALLET_COUNT
+          this.getSponsorWalletMax()
         )
       );
 
@@ -2788,7 +2832,7 @@ export class NonceDO {
       }
 
       const walletCount = typeof body.walletCount === "number"
-        ? Math.max(1, Math.min(body.walletCount, MAX_WALLET_COUNT))
+        ? Math.max(1, Math.min(body.walletCount, ABSOLUTE_MAX_WALLET_COUNT))
         : 1;
 
       try {
@@ -2831,7 +2875,7 @@ export class NonceDO {
       }
 
       const walletIndex = typeof body.walletIndex === "number"
-        ? Math.max(0, Math.min(body.walletIndex, MAX_WALLET_COUNT - 1))
+        ? Math.max(0, Math.min(body.walletIndex, ABSOLUTE_MAX_WALLET_COUNT - 1))
         : 0;
 
       // fee is optional; only recorded when present and txid is also present
@@ -2898,7 +2942,7 @@ export class NonceDO {
     const walletFeesMatch = url.pathname.match(/^\/wallet-fees\/(\d+)$/);
     if (request.method === "GET" && walletFeesMatch) {
       const wi = parseInt(walletFeesMatch[1], 10);
-      if (!Number.isInteger(wi) || wi < 0 || wi >= MAX_WALLET_COUNT) {
+      if (!Number.isInteger(wi) || wi < 0 || wi >= ABSOLUTE_MAX_WALLET_COUNT) {
         return this.badRequest("Invalid wallet index");
       }
       try {
@@ -2925,7 +2969,7 @@ export class NonceDO {
       if (errorResponse) return errorResponse;
       if (typeof body?.nonce !== "number") return this.badRequest("Missing nonce");
       const walletIndex = typeof body.walletIndex === "number"
-        ? Math.max(0, Math.min(body.walletIndex, MAX_WALLET_COUNT - 1))
+        ? Math.max(0, Math.min(body.walletIndex, ABSOLUTE_MAX_WALLET_COUNT - 1))
         : 0;
       try {
         await this.recordBroadcastOutcome(

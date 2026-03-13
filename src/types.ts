@@ -1129,4 +1129,4 @@ export interface DedupResult {
 export type BroadcastAndConfirmResult =
   | { txid: string; status: "confirmed"; blockHeight: number }
   | { txid: string; status: "pending" }
-  | { error: string; details: string; retryable: boolean; nonceConflict?: boolean };
+  | { error: string; details: string; retryable: boolean; nonceConflict?: boolean; nodeUrl?: string; httpStatus?: number };

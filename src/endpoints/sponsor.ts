@@ -293,20 +293,11 @@ export class Sponsor extends BaseEndpoint {
             errorReason.includes(reason)
           );
 
-          // Release nonce back to pool or quarantine it depending on conflict type.
-          // Nonce conflicts mean the nonce slot is occupied in mempool — returning it
-          // to available[] would cause an infinite re-assignment loop. Quarantine it
-          // to spent[] by passing a synthetic txid marker.
+          // Record broadcast outcome in the intent ledger — authoritative record.
+          // Never pass synthetic txids — txid is reserved for real transaction IDs.
+          // Note: broadcastTransaction() from @stacks/transactions doesn't expose the
+          // raw HTTP status, so we use conventional codes (409 for nonce conflict, 400 otherwise).
           if (sponsorNonce !== null) {
-            const quarantineTxid = isNonceConflict
-              ? `conflict:quarantine:${sponsorNonce}`
-              : undefined;
-            c.executionCtx.waitUntil(
-              releaseNonceDO(c.env, logger, sponsorNonce, quarantineTxid, sponsorWalletIndex).catch((e) => {
-                logger.warn("Failed to release nonce after broadcast rejection", { error: String(e) });
-              })
-            );
-            // Record broadcast outcome for ledger fidelity (http_status, error_reason)
             const rejectHttpStatus = isNonceConflict ? 409 : 400;
             c.executionCtx.waitUntil(
               recordBroadcastOutcomeDO(
@@ -314,6 +305,12 @@ export class Sponsor extends BaseEndpoint {
                 undefined, rejectHttpStatus, undefined, errorReason
               ).catch((e) => {
                 logger.warn("Failed to record broadcast outcome", { error: String(e) });
+              })
+            );
+            // Release nonce without txid — ledgerBroadcastOutcome already set conflict/failed.
+            c.executionCtx.waitUntil(
+              releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
+                logger.warn("Failed to release nonce after broadcast rejection", { error: String(e) });
               })
             );
           }

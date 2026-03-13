@@ -367,27 +367,23 @@ export class Relay extends BaseEndpoint {
       );
 
       if ("error" in broadcastResult) {
-        // Release nonce back to pool or quarantine it depending on conflict type.
-        // Nonce conflicts mean the nonce slot is occupied in mempool — returning it
-        // to available[] would cause an infinite re-assignment loop. Quarantine it
-        // to spent[] by passing a synthetic txid marker.
+        // Record broadcast outcome in the intent ledger — this is the authoritative
+        // record of what happened. releaseNonceDO() handles pool-maintenance (expiry
+        // for unused nonces). Never pass synthetic txids — txid is reserved for real txids.
         if (sponsorNonce !== null) {
-          const quarantineTxid = broadcastResult.nonceConflict
-            ? `conflict:quarantine:${sponsorNonce}`
-            : undefined;
-          c.executionCtx.waitUntil(
-            releaseNonceDO(c.env, logger, sponsorNonce, quarantineTxid, sponsorWalletIndex).catch((e) => {
-              logger.warn("Failed to release nonce after broadcast failure", { error: String(e) });
-            })
-          );
-          // Record broadcast outcome for ledger fidelity (http_status, node_url, error_reason)
-          const failHttpStatus = broadcastResult.nonceConflict ? 409 : 400;
           c.executionCtx.waitUntil(
             recordBroadcastOutcomeDO(
               c.env, logger, sponsorNonce, sponsorWalletIndex,
-              undefined, failHttpStatus, undefined, broadcastResult.details
+              undefined, broadcastResult.httpStatus, broadcastResult.nodeUrl, broadcastResult.details
             ).catch((e) => {
               logger.warn("Failed to record broadcast outcome", { error: String(e) });
+            })
+          );
+          // Release nonce without txid — ledgerBroadcastOutcome already set the correct
+          // state (conflict/failed). releaseNonce sees non-assigned state and no-ops.
+          c.executionCtx.waitUntil(
+            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
+              logger.warn("Failed to release nonce after broadcast failure", { error: String(e) });
             })
           );
         }
@@ -448,11 +444,11 @@ export class Relay extends BaseEndpoint {
             logger.warn("Failed to record nonce txid", { error: String(e) });
           })
         );
-        // Record broadcast outcome for ledger fidelity (state='broadcasted', http_status, txid)
+        // Record broadcast outcome for ledger fidelity (state='broadcasted', http_status=200, txid)
         c.executionCtx.waitUntil(
           recordBroadcastOutcomeDO(
             c.env, logger, sponsorNonce, sponsorWalletIndex,
-            broadcastResult.txid, 200, undefined, undefined
+            broadcastResult.txid, 200, undefined, undefined  // success path — no nodeUrl available from polling result
           ).catch((e) => {
             logger.warn("Failed to record broadcast outcome", { error: String(e) });
           })
