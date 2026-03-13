@@ -86,10 +86,14 @@ interface WalletFeeStats {
 interface HiroNonceInfo {
   /** Last confirmed nonce for this address (null if no confirmed txs yet) */
   last_executed_tx_nonce: number | null;
+  /** Highest nonce seen in this node's mempool for this address (null if none) */
+  last_mempool_tx_nonce: number | null;
   /** Next nonce the network considers valid for submission */
   possible_next_nonce: number;
   /** Nonces in the mempool that are creating gaps (missing nonces below them) */
   detected_missing_nonces: number[];
+  /** All nonces currently visible in Hiro's mempool view for this address */
+  detected_mempool_nonces: number[];
 }
 
 /** Result of a nonce reconciliation pass (shared by alarm and resync) */
@@ -1253,9 +1257,15 @@ export class NonceDO {
       last_executed_tx_nonce: typeof data.last_executed_tx_nonce === "number"
         ? data.last_executed_tx_nonce
         : null,
+      last_mempool_tx_nonce: typeof data.last_mempool_tx_nonce === "number"
+        ? data.last_mempool_tx_nonce
+        : null,
       possible_next_nonce: data.possible_next_nonce,
       detected_missing_nonces: Array.isArray(data.detected_missing_nonces)
         ? data.detected_missing_nonces
+        : [],
+      detected_mempool_nonces: Array.isArray(data.detected_mempool_nonces)
+        ? data.detected_mempool_nonces
         : [],
     };
   }
