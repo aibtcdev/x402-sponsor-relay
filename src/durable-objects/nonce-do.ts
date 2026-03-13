@@ -66,6 +66,20 @@ interface ReleaseNonceRequest {
   fee?: string;
 }
 
+interface BroadcastOutcomeRequest {
+  nonce: number;
+  /** Which wallet pool owns this nonce (default: 0) */
+  walletIndex?: number;
+  /** Transaction ID returned by the broadcast node on success */
+  txid?: string;
+  /** HTTP status code returned by the broadcast node */
+  httpStatus?: number;
+  /** Base URL of the broadcast node */
+  nodeUrl?: string;
+  /** Error string returned by the broadcast node on failure */
+  errorReason?: string;
+}
+
 /**
  * Per-wallet fee statistics (daily + cumulative)
  */
@@ -1152,6 +1166,118 @@ export class NonceDO {
         error: e instanceof Error ? e.message : String(e),
       });
     }
+  }
+
+  /**
+   * Write broadcast outcome to the intent ledger.
+   * Called from the public recordBroadcastOutcome() method and the POST /broadcast-outcome route.
+   *
+   * txid present   → state='broadcasted': broadcast accepted, txid/http_status/broadcast_node recorded
+   * txid absent    → state='conflict' (ConflictingNonceInMempool) or state='failed' (other 4xx)
+   *
+   * This is separate from ledgerRelease() which handles pool-maintenance concerns
+   * (fee accounting, pool availability). ledgerBroadcastOutcome() records the HTTP-level
+   * broadcast signal with full provenance (http_status, node_url, error_reason).
+   *
+   * Never throws — fail-open, errors logged at debug.
+   */
+  private ledgerBroadcastOutcome(
+    walletIndex: number,
+    nonce: number,
+    txid: string | undefined,
+    httpStatus: number | undefined,
+    nodeUrl: string | undefined,
+    errorReason: string | undefined
+  ): void {
+    try {
+      const now = new Date().toISOString();
+      if (txid) {
+        // Broadcast accepted — record txid, status, node URL
+        this.sql.exec(
+          `UPDATE nonce_intents
+           SET state = 'broadcasted', txid = ?, http_status = ?,
+               broadcast_node = ?, broadcasted_at = ?
+           WHERE wallet_index = ? AND nonce = ?`,
+          txid,
+          httpStatus ?? 200,
+          nodeUrl ?? null,
+          now,
+          walletIndex,
+          nonce
+        );
+        this.sql.exec(
+          `INSERT INTO nonce_events
+             (wallet_index, nonce, event, detail, created_at)
+           VALUES (?, ?, 'broadcasted', ?, ?)`,
+          walletIndex,
+          nonce,
+          JSON.stringify({ txid, httpStatus: httpStatus ?? 200, nodeUrl: nodeUrl ?? null }),
+          now
+        );
+      } else {
+        // Determine if this is a nonce conflict (quarantine) or generic failure
+        const isConflict =
+          errorReason !== undefined &&
+          (errorReason.includes("ConflictingNonceInMempool") ||
+            errorReason.includes("conflict:quarantine"));
+        const newState = isConflict ? "conflict" : "failed";
+        this.sql.exec(
+          `UPDATE nonce_intents
+           SET state = ?, http_status = ?, broadcast_node = ?,
+               error_reason = ?, broadcasted_at = ?
+           WHERE wallet_index = ? AND nonce = ?`,
+          newState,
+          httpStatus ?? null,
+          nodeUrl ?? null,
+          errorReason ?? null,
+          now,
+          walletIndex,
+          nonce
+        );
+        this.sql.exec(
+          `INSERT INTO nonce_events
+             (wallet_index, nonce, event, detail, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          walletIndex,
+          nonce,
+          isConflict ? "conflict" : "broadcast_fail",
+          JSON.stringify({
+            httpStatus: httpStatus ?? null,
+            nodeUrl: nodeUrl ?? null,
+            errorReason: errorReason ?? null,
+          }),
+          now
+        );
+      }
+    } catch (e) {
+      this.log("debug", "ledger_broadcast_outcome_error", {
+        walletIndex,
+        nonce,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Record the HTTP-level broadcast outcome for a nonce in the intent ledger.
+   * Exposed as a public method for access via the DO stub RPC.
+   *
+   * On success (txid non-empty): updates state → 'broadcasted' with txid, http_status, broadcast_node.
+   * On conflict (ConflictingNonceInMempool): updates state → 'conflict'.
+   * On other failure (4xx): updates state → 'failed' with error_reason.
+   *
+   * This call is fire-and-forget from the relay/sponsor broadcast path.
+   * It runs alongside releaseNonceDO() which handles pool-maintenance side-effects.
+   */
+  async recordBroadcastOutcome(
+    nonce: number,
+    walletIndex: number,
+    txid: string | undefined,
+    httpStatus: number | undefined,
+    nodeUrl: string | undefined,
+    errorReason: string | undefined
+  ): Promise<void> {
+    this.ledgerBroadcastOutcome(walletIndex, nonce, txid, httpStatus, nodeUrl, errorReason);
   }
 
   // ---------------------------------------------------------------------------
@@ -2544,6 +2670,64 @@ export class NonceDO {
 
     if (request.method === "POST" && url.pathname === "/clear-pools") {
       return this.handleClearPools();
+    }
+
+    if (request.method === "POST" && url.pathname === "/broadcast-outcome") {
+      const { value: body, errorResponse } =
+        await this.parseJson<BroadcastOutcomeRequest>(request);
+      if (errorResponse) return errorResponse;
+      if (typeof body?.nonce !== "number") return this.badRequest("Missing nonce");
+      const walletIndex = typeof body.walletIndex === "number"
+        ? Math.max(0, Math.min(body.walletIndex, MAX_WALLET_COUNT - 1))
+        : 0;
+      try {
+        await this.recordBroadcastOutcome(
+          body.nonce,
+          walletIndex,
+          body.txid,
+          body.httpStatus,
+          body.nodeUrl,
+          body.errorReason
+        );
+        return this.jsonResponse({ success: true });
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    // GET /history/:wallet/:nonce — diagnostic endpoint for full nonce event trail.
+    // Returns the nonce_intents row and all nonce_events for a specific (wallet, nonce) pair.
+    // This is an internal DO endpoint; exposed through the Hono router at GET /nonce/history/:wallet/:nonce.
+    const historyMatch = url.pathname.match(/^\/history\/(\d+)\/(\d+)$/);
+    if (request.method === "GET" && historyMatch) {
+      const walletIdx = parseInt(historyMatch[1], 10);
+      const nonceVal = parseInt(historyMatch[2], 10);
+      if (!Number.isInteger(walletIdx) || !Number.isInteger(nonceVal)) {
+        return this.badRequest("Invalid wallet or nonce");
+      }
+      try {
+        const intent = this.sql
+          .exec(
+            "SELECT * FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+            walletIdx,
+            nonceVal
+          )
+          .toArray();
+        const events = this.sql
+          .exec(
+            "SELECT * FROM nonce_events WHERE wallet_index = ? AND nonce = ? ORDER BY id ASC",
+            walletIdx,
+            nonceVal
+          )
+          .toArray();
+        return this.jsonResponse({
+          intent: intent[0] ?? null,
+          events,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        return this.internalError(error);
+      }
     }
 
     // GET /ledger — diagnostic endpoint for inspecting nonce intent ledger state.
