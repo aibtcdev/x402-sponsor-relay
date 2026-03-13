@@ -4,6 +4,10 @@ import {
   getAddressFromPrivateKey,
   AuthType,
   PayloadType,
+  AddressHashMode,
+  addressHashModeToVersion,
+  addressFromVersionHash,
+  addressToString,
   type StacksTransactionWire,
 } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
@@ -545,10 +549,13 @@ export class SponsorService {
       };
     }
 
-    // Extract sender address for rate limiting (same field as sponsored path)
-    const senderAddress = Buffer.from(
-      transaction.auth.spendingCondition.signer
-    ).toString("hex");
+    // Derive a proper c32check-encoded Stacks address from the signer hash160.
+    // Uses the same hashMode-aware derivation as SettlementService.senderToAddress()
+    // so the address format is consistent across sponsored and self-pay paths.
+    const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+    const { hashMode, signer } = transaction.auth.spendingCondition;
+    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
+    const senderAddress = addressToString(addressFromVersionHash(version, signer));
 
     return {
       valid: true,

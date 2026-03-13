@@ -15,7 +15,7 @@ export class ReceiptService {
   async storeReceipt(data: {
     receiptId: string;
     senderAddress: string;
-    sponsoredTx: string;
+    sponsoredTx?: string;
     fee: string;
     txid: string;
     settlement: SettlementResult;
@@ -36,7 +36,7 @@ export class ReceiptService {
       createdAt: now.toISOString(),
       expiresAt: expiresAt.toISOString(),
       senderAddress: data.senderAddress,
-      sponsoredTx: data.sponsoredTx,
+      ...(data.sponsoredTx !== undefined ? { sponsoredTx: data.sponsoredTx } : {}),
       fee: data.fee,
       txid: data.txid,
       settlement: data.settlement,

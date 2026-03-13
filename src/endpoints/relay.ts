@@ -708,8 +708,9 @@ export class Relay extends BaseEndpoint {
     const storedReceipt = await receiptService.storeReceipt({
       receiptId,
       senderAddress: validation.senderAddress,
-      // No sponsor tx for self-pay — store the original tx for auditability
-      sponsoredTx: body.transaction,
+      // No sponsor tx for self-pay — sponsoredTx is intentionally undefined.
+      // The original transaction hex is available in the request log if needed.
+      sponsoredTx: undefined,
       fee: "0",
       txid: broadcastResult.txid,
       settlement,
@@ -738,7 +739,11 @@ export class Relay extends BaseEndpoint {
     return this.okWithTx(c, {
       txid: broadcastResult.txid,
       settlement,
-      sponsoredTx: null,
+      // sponsoredTx omitted (undefined not null): okWithTx's conditional spread skips
+      // falsy values so this field is absent from the JSON response — self-pay callers
+      // already have their tx and don't need it echoed back. Using undefined (not null)
+      // matches the optional field type and keeps JSON output consistent with omission.
+      sponsoredTx: undefined,
       receiptId: storedReceipt ? receiptId : undefined,
     });
   }
