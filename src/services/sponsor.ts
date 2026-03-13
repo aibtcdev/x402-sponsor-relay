@@ -859,18 +859,12 @@ export class SponsorService {
       }
       const data = (await response.json()) as Partial<typeof empty>;
       return {
-        totalFeesSpent: typeof data.totalFeesSpent === "string" && data.totalFeesSpent !== null
-          ? data.totalFeesSpent : "0",
-        txCount: typeof data.txCount === "number" && data.txCount !== null
-          ? data.txCount : 0,
-        txCountToday: typeof data.txCountToday === "number" && data.txCountToday !== null
-          ? data.txCountToday : 0,
-        feesToday: typeof data.feesToday === "string" && data.feesToday !== null
-          ? data.feesToday : "0",
-        gapFillFeesTotal: typeof data.gapFillFeesTotal === "string" && data.gapFillFeesTotal !== null
-          ? data.gapFillFeesTotal : "0",
-        gapFillCount: typeof data.gapFillCount === "number" && data.gapFillCount !== null
-          ? data.gapFillCount : 0,
+        totalFeesSpent: typeof data.totalFeesSpent === "string" ? data.totalFeesSpent : "0",
+        txCount: typeof data.txCount === "number" ? data.txCount : 0,
+        txCountToday: typeof data.txCountToday === "number" ? data.txCountToday : 0,
+        feesToday: typeof data.feesToday === "string" ? data.feesToday : "0",
+        gapFillFeesTotal: typeof data.gapFillFeesTotal === "string" ? data.gapFillFeesTotal : "0",
+        gapFillCount: typeof data.gapFillCount === "number" ? data.gapFillCount : 0,
       };
     } catch (e) {
       this.logger.warn("Failed to fetch wallet fee stats from NonceDO", {
@@ -1049,6 +1043,63 @@ export async function recordNonceTxid(
       error: e instanceof Error ? e.message : "Unknown error",
       txid,
       nonce,
+    });
+  }
+}
+
+/**
+ * Record the broadcast outcome for a nonce in the NonceDO intent ledger.
+ * Closes the observability loop by writing http_status, node_url, txid, and
+ * error_reason directly into nonce_intents.
+ *
+ * On success (txid non-empty): state → 'broadcasted', records txid/http_status/broadcast_node.
+ * On conflict (ConflictingNonceInMempool): state → 'conflict'.
+ * On other failure: state → 'failed' with error_reason and http_status.
+ *
+ * Call via executionCtx.waitUntil() as fire-and-forget alongside releaseNonceDO().
+ * Never throws — all errors are logged as warnings.
+ *
+ * @param nonce - The sponsor nonce used for this broadcast
+ * @param walletIndex - Wallet index that owns this nonce
+ * @param txid - Transaction ID on success; undefined on failure
+ * @param httpStatus - HTTP status code returned by the broadcast node (0 for network exceptions)
+ * @param nodeUrl - Base URL of the broadcast node; undefined when not available
+ * @param errorReason - Error string on failure; undefined on success
+ */
+export async function recordBroadcastOutcomeDO(
+  env: Env,
+  logger: Logger,
+  nonce: number,
+  walletIndex: number,
+  txid: string | undefined,
+  httpStatus: number | undefined,
+  nodeUrl: string | undefined,
+  errorReason: string | undefined
+): Promise<void> {
+  if (!env.NONCE_DO) {
+    return;
+  }
+  try {
+    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch("https://nonce-do/broadcast-outcome", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ nonce, walletIndex, txid, httpStatus, nodeUrl, errorReason }),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      logger.warn("Nonce DO broadcast-outcome record failed", {
+        status: response.status,
+        body,
+        nonce,
+        walletIndex,
+      });
+    }
+  } catch (e) {
+    logger.warn("Failed to record broadcast outcome in NonceDO", {
+      error: e instanceof Error ? e.message : String(e),
+      nonce,
+      walletIndex,
     });
   }
 }

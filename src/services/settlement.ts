@@ -713,12 +713,15 @@ export class SettlementService {
                 nodeUrl: target.baseUrl,
               });
             }
-            // Nonce conflicts are not retriable — same result on any node
+            // Nonce conflicts are retriable after resync/backoff — the nonce pool
+            // needs time to reconcile before the client retries with a fresh nonce.
             return {
               error: "Nonce conflict",
               details: conflictDetails,
               retryable: true,
               nonceConflict: true,
+              nodeUrl: target.baseUrl,
+              httpStatus: broadcastResponse.status,
             };
           }
 
@@ -734,6 +737,8 @@ export class SettlementService {
               error: "Broadcast failed",
               details: errorDetails,
               retryable: false,
+              nodeUrl: target.baseUrl,
+              httpStatus: broadcastResponse.status,
             };
           }
 
