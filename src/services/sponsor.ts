@@ -859,18 +859,12 @@ export class SponsorService {
       }
       const data = (await response.json()) as Partial<typeof empty>;
       return {
-        totalFeesSpent: typeof data.totalFeesSpent === "string" && data.totalFeesSpent !== null
-          ? data.totalFeesSpent : "0",
-        txCount: typeof data.txCount === "number" && data.txCount !== null
-          ? data.txCount : 0,
-        txCountToday: typeof data.txCountToday === "number" && data.txCountToday !== null
-          ? data.txCountToday : 0,
-        feesToday: typeof data.feesToday === "string" && data.feesToday !== null
-          ? data.feesToday : "0",
-        gapFillFeesTotal: typeof data.gapFillFeesTotal === "string" && data.gapFillFeesTotal !== null
-          ? data.gapFillFeesTotal : "0",
-        gapFillCount: typeof data.gapFillCount === "number" && data.gapFillCount !== null
-          ? data.gapFillCount : 0,
+        totalFeesSpent: typeof data.totalFeesSpent === "string" ? data.totalFeesSpent : "0",
+        txCount: typeof data.txCount === "number" ? data.txCount : 0,
+        txCountToday: typeof data.txCountToday === "number" ? data.txCountToday : 0,
+        feesToday: typeof data.feesToday === "string" ? data.feesToday : "0",
+        gapFillFeesTotal: typeof data.gapFillFeesTotal === "string" ? data.gapFillFeesTotal : "0",
+        gapFillCount: typeof data.gapFillCount === "number" ? data.gapFillCount : 0,
       };
     } catch (e) {
       this.logger.warn("Failed to fetch wallet fee stats from NonceDO", {

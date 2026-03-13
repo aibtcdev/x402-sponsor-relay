@@ -216,10 +216,7 @@ const ALARM_INTERVAL_MS = 5 * 60 * 1000;
  * Fires at 60s so reconciliation catches conflicts during traffic bursts.
  */
 const ALARM_INTERVAL_ACTIVE_MS = 60 * 1000;
-/**
- * Alarm interval used when all wallets are idle (no assigned nonces in ledger).
- * Reverts to the standard 5-minute cadence to avoid unnecessary Hiro API calls.
- */
+/** Alias for readability: idle wallets revert to the standard 5-minute cadence. */
 const ALARM_INTERVAL_IDLE_MS = ALARM_INTERVAL_MS;
 /** Reset to possible_next_nonce if no assignment in this window and we are ahead */
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
@@ -501,14 +498,6 @@ export class NonceDO {
     );
   }
 
-  private getStoredNonce(): number | null {
-    return this.getStateValue(STATE_KEYS.current);
-  }
-
-  private setStoredNonce(value: number): void {
-    this.setStateValue(STATE_KEYS.current, value);
-  }
-
   private getStoredCount(key: string): number {
     return this.getStateValue(key) ?? 0;
   }
@@ -520,29 +509,9 @@ export class NonceDO {
     this.setStateValue(STATE_KEYS.lastAssignedAt, Date.now());
   }
 
-  private incrementConflictsDetected(): void {
-    const conflictsDetected = this.getStoredCount(STATE_KEYS.conflictsDetected) + 1;
-    this.setStateValue(STATE_KEYS.conflictsDetected, conflictsDetected);
-  }
-
-  private incrementGapsRecovered(): void {
-    const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered) + 1;
-    this.setStateValue(STATE_KEYS.gapsRecovered, gapsRecovered);
-  }
-
-  private incrementGapsFilled(): void {
-    const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled) + 1;
-    this.setStateValue(STATE_KEYS.gapsFilled, gapsFilled);
-  }
-
-  private incrementStuckTxRbfBroadcast(): void {
-    const count = this.getStoredCount(STATE_KEYS.stuckTxRbfBroadcast) + 1;
-    this.setStateValue(STATE_KEYS.stuckTxRbfBroadcast, count);
-  }
-
-  private incrementStuckTxRbfConfirmed(): void {
-    const count = this.getStoredCount(STATE_KEYS.stuckTxRbfConfirmed) + 1;
-    this.setStateValue(STATE_KEYS.stuckTxRbfConfirmed, count);
+  /** Increment a counter in nonce_state by 1. */
+  private incrementCounter(key: string): void {
+    this.setStateValue(key, this.getStoredCount(key) + 1);
   }
 
   /**
@@ -576,6 +545,15 @@ export class NonceDO {
     return null;
   }
 
+  /** Resolve the network and flush recipient for gap-fill/RBF transactions. */
+  private getFlushRecipient(): { network: "mainnet" | "testnet"; recipient: string } {
+    const network: "mainnet" | "testnet" = this.env.STACKS_NETWORK ?? "testnet";
+    const defaultRecipient = network === "mainnet"
+      ? DEFAULT_FLUSH_RECIPIENT_MAINNET
+      : DEFAULT_FLUSH_RECIPIENT_TESTNET;
+    return { network, recipient: this.env.FLUSH_RECIPIENT ?? defaultRecipient };
+  }
+
   /**
    * Broadcast a gap-fill STX transfer for a specific nonce.
    * Returns the txid on success, null if the nonce is already occupied or on error.
@@ -586,11 +564,7 @@ export class NonceDO {
     gapNonce: number,
     privateKey: string
   ): Promise<string | null> {
-    const network = this.env.STACKS_NETWORK ?? "testnet";
-    const defaultRecipient = network === "mainnet"
-      ? DEFAULT_FLUSH_RECIPIENT_MAINNET
-      : DEFAULT_FLUSH_RECIPIENT_TESTNET;
-    const recipient = this.env.FLUSH_RECIPIENT ?? defaultRecipient;
+    const { network, recipient } = this.getFlushRecipient();
     try {
       const tx = await makeSTXTokenTransfer({
         recipient,
@@ -667,11 +641,7 @@ export class NonceDO {
       return null;
     }
 
-    const network = this.env.STACKS_NETWORK ?? "testnet";
-    const defaultRecipient = network === "mainnet"
-      ? DEFAULT_FLUSH_RECIPIENT_MAINNET
-      : DEFAULT_FLUSH_RECIPIENT_TESTNET;
-    const recipient = this.env.FLUSH_RECIPIENT ?? defaultRecipient;
+    const { network, recipient } = this.getFlushRecipient();
     const attemptNum = state.rbfAttempts + 1;
 
     try {
@@ -694,7 +664,7 @@ export class NonceDO {
       if ("txid" in result) {
         state.lastRbfTxid = result.txid;
         await this.state.storage.put(key, state);
-        this.incrementStuckTxRbfBroadcast();
+        this.incrementCounter(STATE_KEYS.stuckTxRbfBroadcast);
         this.log("info", "rbf_broadcast_success", {
           walletIndex,
           nonce,
@@ -1695,7 +1665,7 @@ export class NonceDO {
    */
   private ledgerGetWalletHead(walletIndex: number): number | null {
     if (walletIndex === 0) {
-      return this.getStoredNonce();
+      return this.getStateValue(STATE_KEYS.current);
     }
     return this.getStateValue(`wallet_next_nonce:${walletIndex}`);
   }
@@ -1707,7 +1677,7 @@ export class NonceDO {
    */
   private ledgerAdvanceWalletHead(walletIndex: number, nextNonce: number): void {
     if (walletIndex === 0) {
-      this.setStoredNonce(nextNonce);
+      this.setStateValue(STATE_KEYS.current, nextNonce);
     } else {
       this.setStateValue(`wallet_next_nonce:${walletIndex}`, nextNonce);
     }
@@ -2036,7 +2006,7 @@ export class NonceDO {
     const conflictsDetected = this.getStoredCount(STATE_KEYS.conflictsDetected);
     const lastAssignedNonce = this.getStateValue(STATE_KEYS.lastAssignedNonce);
     const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
-    const nextNonce = this.getStoredNonce();
+    const nextNonce = this.getStateValue(STATE_KEYS.current);
     const gapsRecovered = this.getStoredCount(STATE_KEYS.gapsRecovered);
     const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled);
     const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
@@ -2051,32 +2021,29 @@ export class NonceDO {
     const initializedWallets = await this.getInitializedWallets();
     const wallets: WalletPoolStats[] = [];
     for (const { walletIndex, address } of initializedWallets) {
-      const ledgerCounts = this.ledgerCountsByWallet(Number(walletIndex));
-      // available = capacity remaining for new assignments
+      const ledgerCounts = this.ledgerCountsByWallet(walletIndex);
       const available = Math.max(0, CHAINING_LIMIT - ledgerCounts.assigned);
-      // spent = all non-assigned historical nonces (confirmed + failed + expired)
       const spentRows = this.sql
         .exec<{ count: number }>(
           "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('confirmed','failed','expired')",
-          Number(walletIndex)
+          walletIndex
         )
         .toArray();
       const spent = spentRows[0]?.count ?? 0;
-      // maxNonce = highest nonce ever used for this wallet (or head if no intents)
       const maxNonceRows = this.sql
         .exec<{ maxNonce: number | null }>(
           "SELECT MAX(nonce) as maxNonce FROM nonce_intents WHERE wallet_index = ?",
-          Number(walletIndex)
+          walletIndex
         )
         .toArray();
-      const maxNonce = maxNonceRows[0]?.maxNonce ?? (this.ledgerGetWalletHead(Number(walletIndex)) ?? 0);
+      const maxNonce = maxNonceRows[0]?.maxNonce ?? (this.ledgerGetWalletHead(walletIndex) ?? 0);
       wallets.push({
-        walletIndex: Number(walletIndex),
+        walletIndex,
         available,
-        reserved: ledgerCounts.assigned,   // ledger-authoritative: in-flight nonces
+        reserved: ledgerCounts.assigned,
         spent,
         maxNonce,
-        sponsorAddress: address ?? null,
+        sponsorAddress: address,
       });
     }
 
@@ -2095,7 +2062,7 @@ export class NonceDO {
           `SELECT state, COUNT(*) as count FROM nonce_intents
            WHERE wallet_index = ? AND assigned_at >= ?
            GROUP BY state`,
-          Number(walletIndex),
+          walletIndex,
           oneHourAgo
         )
         .toArray();
@@ -2106,7 +2073,7 @@ export class NonceDO {
         }
       }
       walletUtilization.push({
-        walletIndex: Number(walletIndex),
+        walletIndex,
         assigned_count: counts.assigned,
         broadcasted_count: counts.broadcasted,
         confirmed_count: counts.confirmed,
@@ -2225,6 +2192,14 @@ export class NonceDO {
     const mempoolNonceSet = new Set(detected_mempool_nonces);
     const missingNonceSet = new Set(detected_missing_nonces);
 
+    /** Classify a nonce's Hiro signal for debug logging. */
+    const classifyHiroSignal = (n: number): string => {
+      if (mempoolNonceSet.has(n)) return "mempool";
+      if (missingNonceSet.has(n)) return "missing";
+      if (last_executed_tx_nonce !== null && n <= last_executed_tx_nonce) return "confirmed";
+      return "unknown";
+    };
+
     // Query ledger for this wallet's known nonces
     const broadcastedIntents = this.ledgerGetBroadcastedNonces(walletIndex);
     const broadcastedByNonce = new Map(broadcastedIntents.map((r) => [r.nonce, r]));
@@ -2305,13 +2280,7 @@ export class NonceDO {
         nonce,
         txid,
         ledger_state: "broadcasted",
-        hiro_signal: mempoolNonceSet.has(nonce)
-          ? "mempool"
-          : missingNonceSet.has(nonce)
-            ? "missing"
-            : last_executed_tx_nonce !== null && nonce <= last_executed_tx_nonce
-              ? "confirmed"
-              : "unknown",
+        hiro_signal: classifyHiroSignal(nonce),
         verdict,
         reason,
         ageMs,
@@ -2329,14 +2298,11 @@ export class NonceDO {
       let reason: string;
 
       if (ageMs > STALE_THRESHOLD_MS) {
-        // Assigned > 10 min ago, never broadcast — mark expired in ledger.
-        // The assigned nonce creates a gap that Hiro will detect; gap-fill handles it below.
         verdict = "expired";
         reason = "stale_assigned_never_broadcast";
         verdictExpired++;
         this.ledgerMarkExpiredByReconcile(walletIndex, nonce, reason);
       } else {
-        // Still within grace period — wait
         verdict = "pending_assign";
         reason = "within_grace_period";
         verdictPendingAgree++;
@@ -2346,11 +2312,7 @@ export class NonceDO {
         walletIndex,
         nonce,
         ledger_state: "assigned",
-        hiro_signal: mempoolNonceSet.has(nonce)
-          ? "mempool"
-          : missingNonceSet.has(nonce)
-            ? "missing"
-            : "unknown",
+        hiro_signal: classifyHiroSignal(nonce),
         verdict,
         reason,
         ageMs,
@@ -2502,7 +2464,7 @@ export class NonceDO {
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
           if (txid) {
             this.log("info", "gap_filled", { walletIndex, nonce: gapNonce, txid });
-            this.incrementGapsFilled();
+            this.incrementCounter(STATE_KEYS.gapsFilled);
             gapFillFilled.push(gapNonce);
             this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
             await this.recordGapFillFee(walletIndex, GAP_FILL_FEE.toString());
@@ -2540,7 +2502,7 @@ export class NonceDO {
     if (previousNonce !== null && possible_next_nonce > previousNonce) {
       // Chain has advanced past our stored head — forward bump the head.
       this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
-      this.incrementConflictsDetected();
+      this.incrementCounter(STATE_KEYS.conflictsDetected);
 
       this.log("warn", "nonce_reconcile_forward_bump", {
         walletIndex,
@@ -2579,7 +2541,7 @@ export class NonceDO {
       }
 
       this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
-      this.incrementConflictsDetected();
+      this.incrementCounter(STATE_KEYS.conflictsDetected);
 
       this.log("warn", "nonce_reconcile_stale", {
         walletIndex,
@@ -2618,22 +2580,10 @@ export class NonceDO {
   private async performResync(): Promise<{
     success: true;
     action: "resync";
-    wallets: Array<{
-      walletIndex: number;
-      previousNonce: number | null;
-      newNonce: number | null;
-      changed: boolean;
-      reason: string;
-    }>;
+    wallets: Array<ReconcileResult & { walletIndex: number }>;
   }> {
     const initializedWallets = await this.getInitializedWallets();
-    const wallets: Array<{
-      walletIndex: number;
-      previousNonce: number | null;
-      newNonce: number | null;
-      changed: boolean;
-      reason: string;
-    }> = [];
+    const wallets: Array<ReconcileResult & { walletIndex: number }> = [];
     for (const { walletIndex, address } of initializedWallets) {
       const result = await this.reconcileNonceForWallet(walletIndex, address);
       if (result === null) {
@@ -2650,20 +2600,10 @@ export class NonceDO {
   private async performReset(): Promise<{
     success: true;
     action: "reset";
-    wallets: Array<{
-      walletIndex: number;
-      previousNonce: number | null;
-      newNonce: number;
-      changed: boolean;
-    }>;
+    wallets: Array<{ walletIndex: number; previousNonce: number | null; newNonce: number; changed: boolean }>;
   }> {
     const initializedWallets = await this.getInitializedWallets();
-    const wallets: Array<{
-      walletIndex: number;
-      previousNonce: number | null;
-      newNonce: number;
-      changed: boolean;
-    }> = [];
+    const wallets: Array<{ walletIndex: number; previousNonce: number | null; newNonce: number; changed: boolean }> = [];
     for (const { walletIndex, address } of initializedWallets) {
       let nonceInfo: HiroNonceInfo;
       try {
@@ -2683,7 +2623,7 @@ export class NonceDO {
 
       this.ledgerAdvanceWalletHead(walletIndex, safeFloor);
       if (changed) {
-        this.incrementConflictsDetected();
+        this.incrementCounter(STATE_KEYS.conflictsDetected);
       }
 
       wallets.push({
@@ -2723,7 +2663,7 @@ export class NonceDO {
               const stuckKey = this.walletStuckTxKey(walletIndex, confirmedNonce);
               const stuckState = await this.state.storage.get<StuckTxState>(stuckKey);
               if (stuckState && stuckState.rbfAttempts > 0) {
-                this.incrementStuckTxRbfConfirmed();
+                this.incrementCounter(STATE_KEYS.stuckTxRbfConfirmed);
                 this.log("info", "stuck_tx_rbf_confirmed", {
                   walletIndex,
                   nonce: confirmedNonce,
