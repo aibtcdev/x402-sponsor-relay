@@ -2,7 +2,7 @@ import {
   makeSTXTokenTransfer,
 } from "@stacks/transactions";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
-import type { Env, LogsRPC } from "../types";
+import type { Env, Logger, LogsRPC } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 import { SettlementService } from "../services/settlement";
 
@@ -412,6 +412,20 @@ export class NonceDO {
     }
   }
 
+  /**
+   * Returns a Logger adapter that routes SettlementService log calls through
+   * NonceDO's structured `log` method. Extracted to avoid copy-paste between
+   * fillGapNonce and broadcastRbfForNonce.
+   */
+  private makeSettlementLogger(): Logger {
+    return {
+      info: (msg: string, ctx?: Record<string, unknown>) => this.log("info", msg, ctx),
+      warn: (msg: string, ctx?: Record<string, unknown>) => this.log("warn", msg, ctx),
+      error: (msg: string, ctx?: Record<string, unknown>) => this.log("error", msg, ctx),
+      debug: (msg: string, ctx?: Record<string, unknown>) => this.log("debug", msg, ctx),
+    };
+  }
+
   private getStateValue(key: string): number | null {
     const rows = this.sql
       .exec<{ value: number }>(
@@ -686,14 +700,10 @@ export class NonceDO {
 
       // Use SettlementService.broadcastWithFailover so gap-fill broadcasts also
       // benefit from multi-node failover when Hiro is degraded.
-      const doLogger = {
-        info: (msg: string, ctx?: Record<string, unknown>) => this.log("info", msg, ctx),
-        warn: (msg: string, ctx?: Record<string, unknown>) => this.log("warn", msg, ctx),
-        error: (msg: string, ctx?: Record<string, unknown>) => this.log("error", msg, ctx),
-        debug: (msg: string, ctx?: Record<string, unknown>) => this.log("debug", msg, ctx),
-      };
-      const settlement = new SettlementService(this.env, doLogger);
-      const result = await settlement.broadcastWithFailover(tx, null);
+      // SettlementService is lightweight (stores refs to env and logger only),
+      // so constructing it per call has no meaningful overhead.
+      const settlement = new SettlementService(this.env, this.makeSettlementLogger());
+      const result = await settlement.broadcastWithFailover(tx, gapNonce);
 
       if ("txid" in result) {
         return result.txid;
@@ -839,19 +849,21 @@ export class NonceDO {
         memo: `rbf-${nonce}-attempt-${attemptNum}`,
       });
 
-      // Build a Logger adapter so SettlementService can use NonceDO's structured log method.
-      const doLogger = {
-        info: (msg: string, ctx?: Record<string, unknown>) => this.log("info", msg, ctx),
-        warn: (msg: string, ctx?: Record<string, unknown>) => this.log("warn", msg, ctx),
-        error: (msg: string, ctx?: Record<string, unknown>) => this.log("error", msg, ctx),
-        debug: (msg: string, ctx?: Record<string, unknown>) => this.log("debug", msg, ctx),
-      };
-
       // Use SettlementService.broadcastWithFailover so that RBF broadcasts route
       // through the same multi-node failover path as normal settlements (#160).
       // When Hiro is degraded, fallback nodes in BROADCAST_NODE_URLS are tried
       // instead of consuming all MAX_RBF_ATTEMPTS against a single failing endpoint.
-      const settlement = new SettlementService(this.env, doLogger);
+      //
+      // Total attempt budget: MAX_RBF_ATTEMPTS × BROADCAST_MAX_ATTEMPTS × nodeCount.
+      // With default values (3 × 3 × ~2 = 18) this is intentional: the inner loop
+      // short-circuits immediately on 4xx (non-retryable transaction errors), so the
+      // multiplication only materialises in the degraded-Hiro scenario where we want to
+      // exhaust all healthy nodes before bumping fees. Normal 4xx rejections return
+      // after a single broadcast attempt.
+      //
+      // SettlementService is lightweight (stores refs to env and logger only),
+      // so constructing it per RBF attempt has no meaningful overhead.
+      const settlement = new SettlementService(this.env, this.makeSettlementLogger());
       const result = await settlement.broadcastWithFailover(tx, null);
 
       // Update state regardless of outcome (increment attempt count to prevent runaway)
