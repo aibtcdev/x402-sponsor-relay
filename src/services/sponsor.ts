@@ -4,6 +4,10 @@ import {
   getAddressFromPrivateKey,
   AuthType,
   PayloadType,
+  AddressHashMode,
+  addressHashModeToVersion,
+  addressFromVersionHash,
+  addressToString,
   type StacksTransactionWire,
 } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
@@ -512,6 +516,52 @@ export class SponsorService {
       });
       return { ok: false, error: e instanceof Error ? e.message : String(e), status: 503 };
     }
+  }
+
+  /**
+   * Validate and deserialize a non-sponsored (standard auth) transaction for self-pay settlement.
+   * Rejects sponsored transactions — callers that want to sponsor should use validateTransaction().
+   */
+  validateNonSponsoredTransaction(txHex: string): TransactionValidationResult {
+    const cleanHex = stripHexPrefix(txHex);
+
+    let transaction: StacksTransactionWire;
+    try {
+      transaction = deserializeTransaction(cleanHex);
+    } catch (e) {
+      this.logger.warn("Failed to deserialize transaction", {
+        error: e instanceof Error ? e.message : "Unknown error",
+      });
+      return {
+        valid: false,
+        error: "Invalid transaction",
+        details: "Could not deserialize transaction hex",
+      };
+    }
+
+    // Reject sponsored transactions — self-pay requires standard auth
+    if (transaction.auth.authType === AuthType.Sponsored) {
+      this.logger.warn("Self-pay transaction must not be sponsored");
+      return {
+        valid: false,
+        error: "Transaction must not be sponsored for self-pay settlement",
+        details: "Remove sponsored: true when building the transaction for X-Settlement: self-pay",
+      };
+    }
+
+    // Derive a proper c32check-encoded Stacks address from the signer hash160.
+    // Uses the same hashMode-aware derivation as SettlementService.senderToAddress()
+    // so the address format is consistent across sponsored and self-pay paths.
+    const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+    const { hashMode, signer } = transaction.auth.spendingCondition;
+    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
+    const senderAddress = addressToString(addressFromVersionHash(version, signer));
+
+    return {
+      valid: true,
+      transaction,
+      senderAddress,
+    };
   }
 
   /**

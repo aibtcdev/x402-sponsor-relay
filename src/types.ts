@@ -497,8 +497,11 @@ export interface PaymentReceipt {
   expiresAt: string;
   /** Agent's Stacks address (from the signed transaction) */
   senderAddress: string;
-  /** The fully-sponsored transaction hex */
-  sponsoredTx: string;
+  /**
+   * The fully-sponsored transaction hex. Undefined for self-pay settlements
+   * where no sponsor signature was applied (use the request log for the original tx).
+   */
+  sponsoredTx?: string;
   /** Fee paid by sponsor in microSTX */
   fee: string;
   /** Blockchain transaction ID */

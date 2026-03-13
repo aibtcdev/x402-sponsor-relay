@@ -13,7 +13,7 @@ import {
 } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import { stripHexPrefix } from "../utils";
-import type { AppContext, RelayRequest, SettlementResult } from "../types";
+import type { AppContext, RelayRequest, SettlementResult, Logger } from "../types";
 import {
   Error400Response,
   Error401Response,
@@ -253,6 +253,14 @@ export class Relay extends BaseEndpoint {
           details: settleValidation.details,
           retryable: false,
         });
+      }
+
+      // Detect self-pay mode: X-Settlement: self-pay bypasses sponsoring entirely.
+      // The caller provides a pre-signed standard (non-sponsored) transaction and
+      // covers their own fees. The relay only verifies payment params and broadcasts.
+      const settlementHeader = c.req.header("X-Settlement");
+      if (settlementHeader?.toLowerCase() === "self-pay") {
+        return this.handleSelfPay(c, body, sponsorService, settlementService, statsService, logger);
       }
 
       const validation = sponsorService.validateTransaction(body.transaction);
@@ -546,6 +554,214 @@ export class Relay extends BaseEndpoint {
         retryAfter: 5,
       });
     }
+  }
+
+  /**
+   * Handle self-pay settlement (X-Settlement: self-pay).
+   *
+   * The caller provides a fully-signed standard (non-sponsored) transaction and
+   * covers their own network fees. The relay skips sponsoring and only:
+   *   1. Validates and deserializes the transaction (must NOT be sponsored)
+   *   2. Applies rate limiting by sender
+   *   3. Checks the dedup cache for idempotent retries
+   *   4. Verifies payment parameters (recipient, amount, token type)
+   *   5. Broadcasts and polls for confirmation
+   *   6. Records stats and dedup entry
+   *
+   * Response format is identical to the sponsored path. sponsoredTx is null
+   * since no sponsor signature was applied.
+   */
+  private async handleSelfPay(
+    c: AppContext,
+    body: RelayRequest,
+    sponsorService: SponsorService,
+    settlementService: SettlementService,
+    statsService: StatsService,
+    logger: Logger
+  ): Promise<Response> {
+    logger.info("Self-pay settlement requested");
+
+    // Step SP-A — Validate transaction (standard auth only; reject sponsored)
+    const validation = sponsorService.validateNonSponsoredTransaction(body.transaction);
+    if (validation.valid === false) {
+      c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount }).catch(() => {}));
+      return this.err(c, {
+        error: validation.error,
+        code: "INVALID_TRANSACTION",
+        status: 400,
+        details: validation.details,
+        retryable: false,
+      });
+    }
+
+    // Step SP-B — Rate limit by sender (same policy as sponsored path)
+    if (!checkRateLimit(validation.senderAddress)) {
+      logger.warn("Rate limit exceeded (self-pay)", { sender: validation.senderAddress });
+      c.executionCtx.waitUntil(statsService.recordError("rateLimit").catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount }).catch(() => {}));
+      return this.err(c, {
+        error: "Rate limit exceeded",
+        code: "RATE_LIMIT_EXCEEDED",
+        status: 429,
+        details: `Maximum ${RATE_LIMIT} requests per minute`,
+        retryable: true,
+        retryAfter: 60,
+      });
+    }
+
+    // Step SP-C — Dedup check (keyed on original tx hex for idempotent retries)
+    const dedupResult = await settlementService.checkDedup(body.transaction);
+    if (dedupResult) {
+      logger.info("Self-pay dedup hit, returning cached result", {
+        txid: dedupResult.txid,
+        status: dedupResult.status,
+      });
+      return this.okWithTx(c, {
+        txid: dedupResult.txid,
+        settlement: {
+          success: true,
+          status: dedupResult.status,
+          sender: dedupResult.sender,
+          recipient: dedupResult.recipient,
+          amount: dedupResult.amount,
+          blockHeight: dedupResult.blockHeight,
+        },
+        sponsoredTx: undefined,
+        receiptId: dedupResult.receiptId,
+      });
+    }
+
+    // Step SP-D — Verify payment parameters (recipient, amount, token type)
+    // verifyPaymentParams is auth-agnostic — it works on any deserialized tx
+    const verifyResult = settlementService.verifyPaymentParams(
+      body.transaction,
+      body.settle
+    );
+    if (!verifyResult.valid) {
+      c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount }).catch(() => {}));
+      return this.err(c, {
+        error: verifyResult.error,
+        code: "SETTLEMENT_VERIFICATION_FAILED",
+        status: 400,
+        details: verifyResult.details,
+        retryable: false,
+      });
+    }
+
+    // Step SP-E — Broadcast and poll for confirmation
+    const RELAY_OVERHEAD_MS = 5_000;
+    const maxPollTimeMs =
+      body.settle.maxTimeoutSeconds != null && body.settle.maxTimeoutSeconds > 0
+        ? Math.max(body.settle.maxTimeoutSeconds * 1000 - RELAY_OVERHEAD_MS, 1_000)
+        : undefined;
+
+    const broadcastResult = await settlementService.broadcastAndConfirm(
+      verifyResult.data.transaction,
+      maxPollTimeMs
+    );
+
+    if ("error" in broadcastResult) {
+      c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
+      c.executionCtx.waitUntil(
+        statsService.logFailure("relay", false, {
+          tokenType: body.settle.tokenType || "STX",
+          amount: body.settle.minAmount,
+          fee: "0",
+          sender: validation.senderAddress,
+          recipient: body.settle.expectedRecipient,
+        }).catch(() => {})
+      );
+      return this.err(c, {
+        error: broadcastResult.error,
+        code: broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED",
+        status: broadcastResult.retryable ? 502 : 422,
+        details: broadcastResult.details,
+        retryable: broadcastResult.retryable,
+        retryAfter: broadcastResult.retryable ? 5 : undefined,
+      });
+    }
+
+    // Step SP-F — Derive common fields
+    const tokenType = body.settle.tokenType || "STX";
+    const senderAddress = settlementService.senderToAddress(
+      verifyResult.data.transaction,
+      c.env.STACKS_NETWORK
+    );
+    const confirmedBlockHeight =
+      broadcastResult.status === "confirmed" ? broadcastResult.blockHeight : undefined;
+
+    // Record stats (fire-and-forget)
+    c.executionCtx.waitUntil(
+      statsService.logTransaction({
+        timestamp: new Date().toISOString(),
+        endpoint: "relay",
+        success: true,
+        tokenType,
+        amount: body.settle.minAmount,
+        fee: "0",
+        txid: broadcastResult.txid,
+        sender: senderAddress,
+        recipient: verifyResult.data.recipient,
+        status: broadcastResult.status,
+        blockHeight: confirmedBlockHeight,
+      }).catch(() => {})
+    );
+
+    // Step SP-G — Build settlement result and store receipt
+    const settlement: SettlementResult = {
+      success: true,
+      status: broadcastResult.status,
+      sender: senderAddress,
+      recipient: verifyResult.data.recipient,
+      amount: verifyResult.data.amount,
+      blockHeight: confirmedBlockHeight,
+    };
+
+    const receiptService = new ReceiptService(c.env.RELAY_KV, logger);
+    const receiptId = crypto.randomUUID();
+    const storedReceipt = await receiptService.storeReceipt({
+      receiptId,
+      senderAddress: validation.senderAddress,
+      // No sponsor tx for self-pay — sponsoredTx is intentionally undefined.
+      // The original transaction hex is available in the request log if needed.
+      sponsoredTx: undefined,
+      fee: "0",
+      txid: broadcastResult.txid,
+      settlement,
+      settleOptions: body.settle,
+    });
+
+    // Step SP-H — Record dedup entry for idempotent retries
+    await settlementService.recordDedup(body.transaction, {
+      txid: broadcastResult.txid,
+      receiptId: storedReceipt ? receiptId : undefined,
+      status: broadcastResult.status,
+      sender: senderAddress,
+      recipient: verifyResult.data.recipient,
+      amount: verifyResult.data.amount,
+      sponsoredTx: undefined,
+      blockHeight: confirmedBlockHeight,
+    });
+
+    logger.info("Self-pay transaction settled", {
+      txid: broadcastResult.txid,
+      sender: senderAddress,
+      settlement_status: broadcastResult.status,
+      receiptId: storedReceipt ? receiptId : undefined,
+    });
+
+    return this.okWithTx(c, {
+      txid: broadcastResult.txid,
+      settlement,
+      // sponsoredTx omitted (undefined not null): okWithTx's conditional spread skips
+      // falsy values so this field is absent from the JSON response — self-pay callers
+      // already have their tx and don't need it echoed back. Using undefined (not null)
+      // matches the optional field type and keeps JSON output consistent with omission.
+      sponsoredTx: undefined,
+      receiptId: storedReceipt ? receiptId : undefined,
+    });
   }
 }
 
