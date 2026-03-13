@@ -1564,6 +1564,155 @@ export class NonceDO {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Nonce intent ledger reads (Phase 3: reconciliation cross-reference helpers)
+  // These methods query nonce_intents and nonce_events for ledger-first reconciliation.
+  // All write helpers are NEVER allowed to throw — fail-open, errors logged at debug.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Return all nonce_intents rows for a wallet that have a txid recorded.
+   * Covers both 'confirmed' (successful broadcast) and 'failed' (broadcast attempted) states.
+   * Used by reconcileNonceForWallet to cross-reference broadcasted nonces against Hiro state.
+   */
+  private ledgerGetBroadcastedNonces(walletIndex: number): Array<{
+    nonce: number;
+    txid: string;
+    assigned_at: string;
+    broadcasted_at: string | null;
+  }> {
+    return this.sql
+      .exec<{ nonce: number; txid: string; assigned_at: string; broadcasted_at: string | null }>(
+        "SELECT nonce, txid, assigned_at, broadcasted_at FROM nonce_intents WHERE wallet_index = ? AND txid IS NOT NULL",
+        walletIndex
+      )
+      .toArray();
+  }
+
+  /**
+   * Return all nonce_intents rows for a wallet currently in 'assigned' state.
+   * These are nonces handed out but not yet released (in-flight, pending broadcast).
+   * Used by reconcileNonceForWallet to detect stale assignments.
+   */
+  private ledgerGetAssignedNonces(walletIndex: number): Array<{
+    nonce: number;
+    assigned_at: string;
+  }> {
+    return this.sql
+      .exec<{ nonce: number; assigned_at: string }>(
+        "SELECT nonce, assigned_at FROM nonce_intents WHERE wallet_index = ? AND state = 'assigned'",
+        walletIndex
+      )
+      .toArray();
+  }
+
+  /**
+   * Mark a nonce as confirmed during reconciliation (chain advanced past it).
+   * Updates the intent state to 'confirmed' if not already; writes a reconcile_confirmed event.
+   * Fail-open — never throws.
+   */
+  private ledgerMarkConfirmedByReconcile(walletIndex: number, nonce: number, txid: string): void {
+    try {
+      const now = new Date().toISOString();
+      this.sql.exec(
+        `UPDATE nonce_intents
+         SET state = 'confirmed', txid = ?, broadcasted_at = COALESCE(broadcasted_at, ?), confirmed_at = ?
+         WHERE wallet_index = ? AND nonce = ? AND state != 'confirmed'`,
+        txid,
+        now,
+        now,
+        walletIndex,
+        nonce
+      );
+      this.sql.exec(
+        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+         VALUES (?, ?, 'reconcile_confirmed', ?, ?)`,
+        walletIndex,
+        nonce,
+        JSON.stringify({ txid, reason: "chain_advanced_past_nonce" }),
+        now
+      );
+    } catch (e) {
+      this.log("debug", "ledger_reconcile_confirmed_error", {
+        walletIndex,
+        nonce,
+        txid,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Mark an assigned nonce as expired during reconciliation (stale, never broadcast).
+   * Updates the intent state to 'expired'; writes a reconcile_expired event.
+   * Fail-open — never throws.
+   */
+  private ledgerMarkExpiredByReconcile(walletIndex: number, nonce: number, reason: string): void {
+    try {
+      const now = new Date().toISOString();
+      this.sql.exec(
+        `UPDATE nonce_intents
+         SET state = 'expired', error_reason = ?
+         WHERE wallet_index = ? AND nonce = ? AND state = 'assigned'`,
+        reason,
+        walletIndex,
+        nonce
+      );
+      this.sql.exec(
+        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+         VALUES (?, ?, 'reconcile_expired', ?, ?)`,
+        walletIndex,
+        nonce,
+        JSON.stringify({ reason }),
+        now
+      );
+    } catch (e) {
+      this.log("debug", "ledger_reconcile_expired_error", {
+        walletIndex,
+        nonce,
+        reason,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Record a gap-fill broadcast in the ledger for a nonce with no prior intent.
+   * Inserts or replaces an intent row in 'confirmed' state with the fill txid.
+   * Fail-open — never throws.
+   */
+  private ledgerInsertGapFill(walletIndex: number, nonce: number, txid: string): void {
+    try {
+      const now = new Date().toISOString();
+      this.sql.exec(
+        `INSERT OR REPLACE INTO nonce_intents
+           (wallet_index, nonce, state, txid, assigned_at, broadcasted_at, confirmed_at)
+         VALUES (?, ?, 'confirmed', ?, ?, ?, ?)`,
+        walletIndex,
+        nonce,
+        txid,
+        now,
+        now,
+        now
+      );
+      this.sql.exec(
+        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+         VALUES (?, ?, 'gap_fill_broadcast', ?, ?)`,
+        walletIndex,
+        nonce,
+        JSON.stringify({ txid }),
+        now
+      );
+    } catch (e) {
+      this.log("debug", "ledger_gap_fill_insert_error", {
+        walletIndex,
+        nonce,
+        txid,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   /**
    * Assign a nonce from the reservation pool using round-robin wallet selection.
    *
