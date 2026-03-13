@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.20.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.19.0...x402-sponsor-relay-v1.20.0) (2026-03-13)
+
+
+### Features
+
+* support self-pay (non-sponsored) transaction settlement (closes [#128](https://github.com/aibtcdev/x402-sponsor-relay/issues/128)) ([f18d653](https://github.com/aibtcdev/x402-sponsor-relay/commit/f18d65389e80e6718890d5eb834b50665b4ec567))
+
 ## [1.19.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.18.0...x402-sponsor-relay-v1.19.0) (2026-03-12)
 
 
