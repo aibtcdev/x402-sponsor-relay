@@ -119,34 +119,6 @@ interface StuckTxState {
   lastRbfTxid: string | null;  // txid of the last RBF broadcast
 }
 
-/**
- * Parsed entry from Hiro GET /extended/v1/tx/mempool response.
- * Used to detect pending transactions by nonce and age.
- */
-interface MempoolTxEntry {
-  tx_id: string;
-  nonce: number;
-  tx_status: string;         // "pending" | other
-  receipt_time_iso: string;  // ISO timestamp (Hiro field: receipt_time_iso)
-}
-
-/**
- * Reservation pool state — persisted as a single JSON object per wallet.
- * available: nonces ready to be assigned (pre-seeded, sorted ascending)
- * reserved: nonces currently in-flight (assigned but not yet confirmed or released)
- * spent: nonces that were broadcast (txid recorded) and must never be reused.
- *        Once a nonce appears in spent[], it is permanently quarantined from available[].
- * maxNonce: highest nonce ever placed in the pool (used to extend when available runs low)
- * reservedAt: unix ms timestamp of when each nonce was reserved (keyed by nonce as string)
- */
-interface PoolState {
-  available: number[];
-  reserved: number[];
-  spent: number[];
-  maxNonce: number;
-  reservedAt: Record<number, number>;
-}
-
 interface WalletPoolStats {
   walletIndex: number;
   available: number;
@@ -191,25 +163,23 @@ interface NonceStatsResponse {
  * a buffer of 5 for concurrent in-flight requests and gap-fill transactions.
  */
 const CHAINING_LIMIT = 20;
-/** Initial pool pre-seeds this many nonces ahead of the current head */
-const POOL_SEED_SIZE = CHAINING_LIMIT;
 /**
  * Maximum allowed lookahead distance beyond Hiro's possible_next_nonce.
- * If pool.maxNonce would exceed hiroNextNonce + LOOKAHEAD_GUARD_BUFFER, we refuse
- * to extend the pool further. This prevents the pool from running so far ahead of
- * confirmed chain state that a resync would discard a large batch of pre-assigned nonces.
+ * If the next nonce to assign would exceed hiroNextNonce + LOOKAHEAD_GUARD_BUFFER,
+ * we refuse the assignment and return a 429. This prevents the head from running so
+ * far ahead of confirmed chain state that a resync would lose already-assigned nonces.
  * Set equal to CHAINING_LIMIT (20) — same as the in-flight cap for symmetry.
  */
 const LOOKAHEAD_GUARD_BUFFER = CHAINING_LIMIT;
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 /**
- * Alarm interval used when there are in-flight nonces (reserved.length > 0).
+ * Alarm interval used when there are in-flight nonces (assigned state > 0).
  * Fires at 60s so reconciliation catches conflicts during traffic bursts.
  */
 const ALARM_INTERVAL_ACTIVE_MS = 60 * 1000;
 /**
- * Alarm interval used when all wallets are idle (reserved.length === 0).
+ * Alarm interval used when all wallets are idle (no assigned nonces in ledger).
  * Reverts to the standard 5-minute cadence to avoid unnecessary Hiro API calls.
  */
 const ALARM_INTERVAL_IDLE_MS = ALARM_INTERVAL_MS;
@@ -256,8 +226,6 @@ const CIRCUIT_BREAKER_WINDOW_MS = 10 * 60 * 1000;
  */
 const CASCADE_DETECTION_THRESHOLD = 3;
 
-// Legacy single-wallet pool key (migrated to pool:0 on first access)
-const POOL_KEY = "pool";
 const STATE_KEYS = {
   current: "current",
   totalAssigned: "total_assigned",
@@ -286,17 +254,6 @@ class ChainingLimitError extends Error {
     super("CHAINING_LIMIT_EXCEEDED");
     this.name = "ChainingLimitError";
     this.mempoolDepth = mempoolDepth;
-  }
-}
-
-/** Insert a nonce into a sorted ascending array at the correct position. */
-function insertSorted(arr: number[], nonce: number): void {
-  if (arr.includes(nonce)) return;
-  const idx = arr.findIndex((n) => n > nonce);
-  if (idx === -1) {
-    arr.push(nonce);
-  } else {
-    arr.splice(idx, 0, nonce);
   }
 }
 
@@ -517,154 +474,6 @@ export class NonceDO {
   }
 
   /**
-   * Return true if any txid has been recorded for this nonce in nonce_txids.
-   * Used by cleanStaleReservations to distinguish reserved-but-broadcast nonces
-   * from reserved-but-never-broadcast (orphaned) nonces.
-   */
-  private hasTxidForNonce(nonce: number): boolean {
-    const rows = this.sql
-      .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
-        nonce
-      )
-      .toArray();
-    return rows[0].count > 0;
-  }
-
-  /**
-   * Batch version of hasTxidForNonce: returns the set of nonces (from the input)
-   * that have at least one txid recorded in nonce_txids.
-   * Uses a single SQL query with WHERE nonce IN (...) for efficiency.
-   */
-  private getNoncesWithTxids(nonces: number[]): Set<number> {
-    if (nonces.length === 0) return new Set();
-    const placeholders = nonces.map(() => "?").join(",");
-    const rows = this.sql
-      .exec<{ nonce: number }>(
-        `SELECT DISTINCT nonce FROM nonce_txids WHERE nonce IN (${placeholders})`,
-        ...nonces
-      )
-      .toArray();
-    return new Set(rows.map((r) => r.nonce));
-  }
-
-  /**
-   * Release stale reservations for a wallet pool back to available.
-   * A reservation is "stale" when:
-   *   - It has been reserved longer than STALE_THRESHOLD_MS (10 minutes), AND
-   *   - No txid has been recorded for it in nonce_txids (never broadcast).
-   *
-   * This recovers pool capacity lost to fire-and-forget releaseNonceDO failures.
-   * Returns the number of nonces reclaimed (returned to available or quarantined to spent).
-   */
-  private cleanStaleReservations(pool: PoolState, walletIndex: number): number {
-    const now = Date.now();
-    const staleCandidates: number[] = [];
-
-    for (const nonce of pool.reserved) {
-      const reservedAt = pool.reservedAt[nonce];
-      // No timestamp means we can't determine age -- conservatively skip
-      if (reservedAt === undefined) continue;
-      // Still within the grace window
-      if (now - reservedAt < STALE_THRESHOLD_MS) continue;
-      staleCandidates.push(nonce);
-    }
-
-    if (staleCandidates.length === 0) return 0;
-
-    // Batch check which stale nonces have txids recorded
-    const noncesWithTxids = this.getNoncesWithTxids(staleCandidates);
-    const staleNonces = new Set<number>();
-    const staleWithTxid = new Set<number>();
-    for (const nonce of staleCandidates) {
-      if (noncesWithTxids.has(nonce)) {
-        staleWithTxid.add(nonce);
-      } else {
-        staleNonces.add(nonce);
-      }
-    }
-
-    const totalReclaimed = staleNonces.size + staleWithTxid.size;
-    if (totalReclaimed === 0) {
-      return 0;
-    }
-
-    // Filter all stale nonces from reserved
-    const allStale = new Set([...staleNonces, ...staleWithTxid]);
-    pool.reserved = pool.reserved.filter((n) => !allStale.has(n));
-
-    // Nonces without txid: safe to return to available
-    for (const nonce of staleNonces) {
-      delete pool.reservedAt[nonce];
-      insertSorted(pool.available, nonce);
-    }
-
-    // Nonces with txid: quarantine to spent[] — they were broadcast
-    for (const nonce of staleWithTxid) {
-      delete pool.reservedAt[nonce];
-      if (!pool.spent.includes(nonce)) {
-        pool.spent.push(nonce);
-      }
-      this.log("warn", "nonce_quarantined_stale", {
-        walletIndex,
-        nonce,
-        reason: "stale_reservation_with_txid",
-        poolSpent: pool.spent.length,
-      });
-    }
-
-    return totalReclaimed;
-  }
-
-  /**
-   * Remove confirmed nonces from pool.reserved[] for a specific wallet.
-   * A nonce is "confirmed" when it is <= Hiro's last_executed_tx_nonce for that wallet,
-   * meaning the transaction was included in a block and can never conflict again.
-   * Returns the count of nonces removed.
-   *
-   * pool is mutated in place but NOT saved here — callers must save if count > 0.
-   * This prevents reserved[] from accumulating indefinitely across alarm cycles.
-   */
-  private pruneConfirmedReservations(
-    pool: PoolState,
-    lastExecutedTxNonce: number | null
-  ): number {
-    if (lastExecutedTxNonce === null || pool.reserved.length === 0) {
-      return 0;
-    }
-    const before = pool.reserved.length;
-    pool.reserved = pool.reserved.filter((n) => n > lastExecutedTxNonce);
-    // Clean up reservedAt entries for pruned nonces
-    for (const key of Object.keys(pool.reservedAt)) {
-      const n = Number(key);
-      if (n <= lastExecutedTxNonce) {
-        delete pool.reservedAt[n];
-      }
-    }
-    return before - pool.reserved.length;
-  }
-
-  /**
-   * Remove confirmed nonces from pool.spent[] for a specific wallet.
-   * Nonces far below last_executed_tx_nonce can never conflict again and are safe to discard.
-   * This prevents spent[] from growing unbounded over the lifetime of the DO.
-   * Returns the count of nonces removed.
-   *
-   * pool is mutated in place but NOT saved here — callers must save if count > 0.
-   */
-  private pruneConfirmedSpent(
-    pool: PoolState,
-    lastExecutedTxNonce: number | null
-  ): number {
-    if (lastExecutedTxNonce === null || pool.spent.length === 0) {
-      return 0;
-    }
-    const before = pool.spent.length;
-    pool.spent = pool.spent.filter((n) => n > lastExecutedTxNonce);
-    return before - pool.spent.length;
-  }
-
-  /**
    * Derive the private key for a specific wallet index from the mnemonic.
    * Falls back to SPONSOR_PRIVATE_KEY for wallet 0 if no mnemonic is set.
    * Uses the same derivation pattern as SponsorService.deriveSponsorKeyForIndex.
@@ -746,68 +555,6 @@ export class NonceDO {
         error: e instanceof Error ? e.message : String(e),
       });
       return null;
-    }
-  }
-
-  /**
-   * Fetch all pending mempool transactions for a specific sponsor address from Hiro.
-   * Returns an array of MempoolTxEntry objects, filtered to tx_status === "pending".
-   * Returns [] on any error — fail-open so a Hiro outage never blocks alarm reconciliation.
-   */
-  private async fetchMempoolTxsForAddress(address: string): Promise<MempoolTxEntry[]> {
-    const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
-    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
-    const pageLimit = 50;
-    const maxPages = 10; // Cap at 500 entries to bound API calls
-    const pending: MempoolTxEntry[] = [];
-
-    try {
-      for (let page = 0; page < maxPages; page++) {
-        const offset = page * pageLimit;
-        const url = `${base}/extended/v1/tx/mempool?sender_address=${encodeURIComponent(address)}&limit=${pageLimit}&offset=${offset}`;
-        const response = await fetch(url, {
-          headers,
-          signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
-        });
-        if (!response.ok) {
-          this.log("warn", "mempool_fetch_failed", {
-            address,
-            status: response.status,
-            page,
-          });
-          break;
-        }
-        const data = (await response.json()) as { results?: unknown[] };
-        if (!Array.isArray(data.results) || data.results.length === 0) break;
-
-        for (const item of data.results) {
-          const entry = item as Record<string, unknown>;
-          if (
-            typeof entry.tx_id === "string" &&
-            typeof entry.nonce === "number" &&
-            typeof entry.tx_status === "string" &&
-            entry.tx_status === "pending" &&
-            typeof entry.receipt_time_iso === "string"
-          ) {
-            pending.push({
-              tx_id: entry.tx_id,
-              nonce: entry.nonce,
-              tx_status: entry.tx_status,
-              receipt_time_iso: entry.receipt_time_iso,
-            });
-          }
-        }
-
-        // Stop paginating when last page returned fewer results than the limit
-        if (data.results.length < pageLimit) break;
-      }
-      return pending;
-    } catch (e) {
-      this.log("warn", "mempool_fetch_error", {
-        address,
-        error: e instanceof Error ? e.message : String(e),
-      });
-      return pending; // Return whatever we collected before the error
     }
   }
 
@@ -924,61 +671,12 @@ export class NonceDO {
   }
 
   // ---------------------------------------------------------------------------
-  // Per-wallet pool helpers
+  // Per-wallet address and round-robin helpers
   // ---------------------------------------------------------------------------
-
-  /** KV key for per-wallet pool state */
-  private poolKey(walletIndex: number): string {
-    return `pool:${walletIndex}`;
-  }
 
   /** KV key for per-wallet sponsor address */
   private sponsorAddressKey(walletIndex: number): string {
     return `sponsor_address:${walletIndex}`;
-  }
-
-  /**
-   * Load the reservation pool state for a specific wallet.
-   * Handles one-time migration from legacy "pool" key (wallet 0 only).
-   */
-  private async loadPoolForWallet(walletIndex: number): Promise<PoolState | null> {
-    // Try per-wallet key first
-    const pool = await this.state.storage.get<PoolState>(this.poolKey(walletIndex));
-    if (pool != null) {
-      // Backward compat: pools persisted before reservedAt was added won't have the field
-      if (!pool.reservedAt) {
-        pool.reservedAt = {};
-      }
-      // Backward compat: pools persisted before spent[] was added won't have the field
-      if (!pool.spent) {
-        pool.spent = [];
-      }
-      return pool;
-    }
-
-    // Migration: wallet 0 may have state under legacy "pool" key
-    if (walletIndex === 0) {
-      const legacy = await this.state.storage.get<PoolState>(POOL_KEY);
-      if (legacy != null) {
-        // Migrate to per-wallet key, remove legacy
-        if (!legacy.reservedAt) {
-          legacy.reservedAt = {};
-        }
-        if (!legacy.spent) {
-          legacy.spent = [];
-        }
-        await this.state.storage.put(this.poolKey(0), legacy);
-        await this.state.storage.delete(POOL_KEY);
-        return legacy;
-      }
-    }
-
-    return null;
-  }
-
-  /** Persist the reservation pool state for a specific wallet. */
-  private async savePoolForWallet(walletIndex: number, pool: PoolState): Promise<void> {
-    await this.state.storage.put(this.poolKey(walletIndex), pool);
   }
 
   /** Get the stored sponsor address for a specific wallet.
@@ -1120,33 +818,6 @@ export class NonceDO {
   }
 
   /**
-   * Trigger an eager pool refill for a specific wallet when its available[] pool
-   * has dropped below the low-water threshold after a nonce is moved to spent[].
-   * Calls reconcileNonceForWallet() inline rather than waiting for the next alarm cycle.
-   * Must be called from within blockConcurrencyWhile context.
-   */
-  private async triggerEagerRefillForWallet(walletIndex: number, pool: PoolState): Promise<void> {
-    const lowWaterMark = Math.ceil(POOL_SEED_SIZE / 2);
-    if (pool.available.length >= lowWaterMark) {
-      // Pool is still healthy — no eager refill needed
-      return;
-    }
-    const address = await this.getStoredSponsorAddressForWallet(walletIndex);
-    if (!address) {
-      // Wallet not yet fully initialized — skip
-      return;
-    }
-    this.log("info", "eager_pool_refill_triggered", {
-      walletIndex,
-      availableBeforeRefill: pool.available.length,
-      lowWaterMark,
-    });
-    // reconcileNonceForWallet is the same path the alarm uses; it will call
-    // resetPoolAvailableForWallet if the pool is below target.
-    await this.reconcileNonceForWallet(walletIndex, address);
-  }
-
-  /**
    * Record a successful gap-fill transaction fee for a specific wallet.
    * Increments gap-fill-specific counters separately from sponsored tx fees
    * so gap-fill costs are distinguishable in per-wallet stats.
@@ -1284,73 +955,8 @@ export class NonceDO {
     }
   }
 
-  /**
-   * Load or initialize a pool for a specific wallet.
-   * On first init, fetches nonce from Hiro for that wallet's address.
-   */
-  private async loadPoolOrInit(walletIndex: number, sponsorAddress: string): Promise<PoolState> {
-    let pool = await this.loadPoolForWallet(walletIndex);
-
-    // Detect address change: if the stored address differs from the requested one
-    // (e.g. after a wallet derivation fix), wipe the stale pool so it reinitializes
-    // from Hiro with the correct address's nonce.
-    if (pool !== null) {
-      const storedAddr = await this.getStoredSponsorAddressForWallet(walletIndex);
-      if (storedAddr && storedAddr !== sponsorAddress) {
-        this.log("info", "pool_address_changed", {
-          walletIndex,
-          oldAddress: storedAddr,
-          newAddress: sponsorAddress,
-        });
-        pool = null;
-      }
-    }
-
-    if (pool !== null) return pool;
-
-    // Pool not yet initialized for this wallet — seed from Hiro
-    let seedNonce: number;
-    if (walletIndex === 0) {
-      // Wallet 0: prefer the SQL counter if it exists (backward compat migration)
-      const stored = this.getStoredNonce();
-      if (stored !== null) {
-        seedNonce = stored;
-      } else {
-        const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
-        seedNonce = nonceInfo.possible_next_nonce;
-        this.setStoredNonce(seedNonce);
-      }
-    } else {
-      // Other wallets: always fetch fresh from Hiro
-      const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
-      seedNonce = nonceInfo.possible_next_nonce;
-    }
-
-    pool = await this.initPoolForWallet(walletIndex, seedNonce);
-    return pool;
-  }
-
-  /**
-   * Create and persist a fresh pool seeded from the given nonce for a specific wallet.
-   */
-  private async initPoolForWallet(walletIndex: number, seedNonce: number): Promise<PoolState> {
-    const available: number[] = [];
-    for (let i = 0; i < POOL_SEED_SIZE; i++) {
-      available.push(seedNonce + i);
-    }
-    const pool: PoolState = {
-      available,
-      reserved: [],
-      spent: [],
-      maxNonce: seedNonce + POOL_SEED_SIZE - 1,
-      reservedAt: {},
-    };
-    await this.savePoolForWallet(walletIndex, pool);
-    return pool;
-  }
-
   // ---------------------------------------------------------------------------
-  // Nonce intent ledger helpers (Phase 1: dual-write alongside pool state)
+  // Nonce intent ledger helpers
   // These methods write to nonce_intents and nonce_events tables.
   // They are NEVER allowed to throw — errors are logged at debug level so the
   // critical nonce assignment / release path is never disrupted by ledger failures.
@@ -1358,13 +964,13 @@ export class NonceDO {
 
   // ---------------------------------------------------------------------------
   // Nonce intent ledger reads (Phase 2: replace pool-array reads with SQL queries)
-  // All decisional reads (chaining-limit checks, pool pressure, stats) are now
-  // driven by ledger queries. Pool array writes remain intact (dual-write preserved).
+  // All decisional reads (chaining-limit checks, pool pressure, stats) are
+  // driven by ledger queries. nonce_intents is the sole source of truth.
   // ---------------------------------------------------------------------------
 
   /**
    * Count in-flight nonces for a specific wallet from the ledger.
-   * 'assigned' state = nonce was handed out but not yet released (maps to pool.reserved[]).
+   * 'assigned' state = nonce was handed out but not yet released.
    * Used for chaining-limit checks and pool-pressure calculations.
    */
   private ledgerReservedCount(walletIndex: number): number {
@@ -1431,7 +1037,7 @@ export class NonceDO {
 
   /**
    * Write 'assigned' intent + event for a newly reserved nonce.
-   * Called immediately after the nonce is moved from available[] to reserved[].
+   * This is the authoritative assignment record — the sole source of truth.
    */
   private ledgerAssign(walletIndex: number, nonce: number): void {
     try {
@@ -1466,7 +1072,7 @@ export class NonceDO {
    *
    * txid present            → 'confirmed' state (successful broadcast + consumed)
    * txid absent + reason    → 'failed' state (broadcast failed, nonce quarantined)
-   * txid absent + no reason → 'expired' state (nonce returned to available[], never broadcast)
+   * txid absent + no reason → 'expired' state (nonce never broadcast, creates a gap)
    */
   private ledgerRelease(
     walletIndex: number,
@@ -1478,8 +1084,8 @@ export class NonceDO {
       const now = new Date().toISOString();
       if (txid) {
         // Nonce was broadcast successfully — mark as confirmed in the intent ledger.
-        // Note: we don't have on-chain confirmation here; 'confirmed' means "broadcast accepted".
-        // Phase 2+ will upgrade this to a true on-chain confirmation state.
+        // 'confirmed' here means "broadcast accepted by the network".
+        // Reconciliation will further validate on-chain confirmation.
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = 'confirmed', txid = ?, broadcasted_at = ?, confirmed_at = ?
@@ -1520,7 +1126,7 @@ export class NonceDO {
           now
         );
       } else {
-        // Nonce was never broadcast — safely returned to available[].
+        // Nonce was never broadcast — mark expired (creates a gap that reconciliation may fill).
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = 'expired'
@@ -1697,13 +1303,59 @@ export class NonceDO {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Per-wallet nonce head helpers (ledger-authoritative)
+  // ---------------------------------------------------------------------------
+
   /**
-   * Assign a nonce from the reservation pool using round-robin wallet selection.
+   * Get the next nonce head for a specific wallet from the ledger.
+   * Wallet 0: uses STATE_KEYS.current (the existing SQL nonce counter).
+   * Wallets 1+: uses `wallet_next_nonce:{walletIndex}` key in nonce_state.
+   * Returns null if the wallet has never been seeded.
+   */
+  private ledgerGetWalletHead(walletIndex: number): number | null {
+    if (walletIndex === 0) {
+      return this.getStoredNonce();
+    }
+    return this.getStateValue(`wallet_next_nonce:${walletIndex}`);
+  }
+
+  /**
+   * Advance the per-wallet nonce head to `nextNonce`.
+   * Wallet 0: updates STATE_KEYS.current.
+   * Wallets 1+: updates `wallet_next_nonce:{walletIndex}` in nonce_state.
+   */
+  private ledgerAdvanceWalletHead(walletIndex: number, nextNonce: number): void {
+    if (walletIndex === 0) {
+      this.setStoredNonce(nextNonce);
+    } else {
+      this.setStateValue(`wallet_next_nonce:${walletIndex}`, nextNonce);
+    }
+  }
+
+  /**
+   * Initialize the per-wallet nonce head from Hiro if not yet seeded.
+   * Returns the head nonce to use for the first assignment.
+   */
+  private async initWalletHeadFromHiro(
+    walletIndex: number,
+    sponsorAddress: string
+  ): Promise<number> {
+    const existing = this.ledgerGetWalletHead(walletIndex);
+    if (existing !== null) return existing;
+    const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+    const seedNonce = nonceInfo.possible_next_nonce;
+    this.ledgerAdvanceWalletHead(walletIndex, seedNonce);
+    return seedNonce;
+  }
+
+  /**
+   * Assign a nonce for a specific wallet using the ledger as sole source of truth.
    *
    * With walletCount=1 (default): identical behavior to single-wallet mode.
    * With walletCount=N: round-robin across N wallets, each with independent CHAINING_LIMIT.
    *
-   * On first call for a wallet: seeds pool from chain nonce via Hiro.
+   * On first call for a wallet: seeds head nonce from Hiro.
    * Enforces CHAINING_LIMIT per wallet — throws if all wallets are at limit.
    * Returns both the nonce and the walletIndex for the caller to use.
    */
@@ -1727,7 +1379,6 @@ export class NonceDO {
 
       // Round-robin: start from stored nextWalletIndex, find a wallet under chaining limit
       let walletIndex = (await this.getNextWalletIndex()) % effectiveWalletCount;
-      let pool: PoolState | null = null;
 
       // Resolve the correct sponsor address for a given wallet index.
       // In multi-wallet mode, each wallet has its own Stacks address for nonce seeding.
@@ -1737,10 +1388,13 @@ export class NonceDO {
       // Try each wallet in round-robin order; skip any at chaining limit or degraded (stuck nonce)
       let attempts = 0;
       let totalMempoolDepth = 0;
-      // Track degraded wallets for fallback: { walletIndex, cycleCount, pool }
-      const degradedWallets: Array<{ walletIndex: number; cycleCount: number; pool: PoolState }> = [];
+      // Track degraded wallets for fallback (walletIndex only — no pool state needed)
+      const degradedWallets: Array<{ walletIndex: number; cycleCount: number }> = [];
+      let selectedWalletIndex: number | null = null;
+
       while (attempts < effectiveWalletCount) {
-        pool = await this.loadPoolOrInit(walletIndex, resolveAddress(walletIndex));
+        // Ensure wallet head is initialized before circuit breaker check
+        await this.initWalletHeadFromHiro(walletIndex, resolveAddress(walletIndex));
 
         // Check per-wallet circuit breaker: skip if too many recent quarantines
         const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
@@ -1757,25 +1411,23 @@ export class NonceDO {
             windowMs: CIRCUIT_BREAKER_WINDOW_MS,
             threshold: CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
           });
-          // Use cycleCount=0 so these are treated as degraded-but-not-fully-stuck
-          degradedWallets.push({ walletIndex, cycleCount: 0, pool });
+          degradedWallets.push({ walletIndex, cycleCount: 0 });
           walletIndex = (walletIndex + 1) % effectiveWalletCount;
-          pool = null;
           attempts++;
           continue;
         }
 
         if (this.ledgerReservedCount(walletIndex) < CHAINING_LIMIT) {
+          selectedWalletIndex = walletIndex;
           break;
         }
         // This wallet is at its chaining limit; accumulate depth and try the next
         totalMempoolDepth += this.ledgerReservedCount(walletIndex);
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
-        pool = null;
         attempts++;
       }
 
-      if (attempts === effectiveWalletCount || pool === null) {
+      if (selectedWalletIndex === null) {
         // All wallets are either at chaining limit or degraded.
         // If there are degraded-but-not-full wallets, use the least-degraded one as fallback
         // rather than failing with a misleading CHAINING_LIMIT_EXCEEDED error.
@@ -1786,10 +1438,9 @@ export class NonceDO {
           // Sort ascending by cycleCount, pick least-degraded wallet
           degradedNotFull.sort((a, b) => a.cycleCount - b.cycleCount);
           const fallback = degradedNotFull[0];
-          walletIndex = fallback.walletIndex;
-          pool = fallback.pool;
+          selectedWalletIndex = fallback.walletIndex;
           this.log("warn", "all_wallets_degraded_using_least_degraded", {
-            walletIndex,
+            walletIndex: selectedWalletIndex,
             cycleCount: fallback.cycleCount,
             degradedCount: degradedWallets.length,
           });
@@ -1797,6 +1448,8 @@ export class NonceDO {
           throw new ChainingLimitError(totalMempoolDepth);
         }
       }
+
+      walletIndex = selectedWalletIndex;
 
       // Store the per-wallet sponsor address (used by alarm reconciliation)
       await this.setStoredSponsorAddressForWallet(walletIndex, resolveAddress(walletIndex));
@@ -1806,80 +1459,56 @@ export class NonceDO {
       const walletAddr = resolveAddress(walletIndex);
       const hiroNextNonce = await this.fetchNextNonceForWallet(walletIndex, walletAddr);
 
-      // Guard: evict stale nonces from pool head.
-      // Between alarm cycles, confirmed txs advance possible_next_nonce past the
-      // pool head, leaving already-confirmed nonces in available[]. Evict them.
-      if (hiroNextNonce !== null) {
-        let evicted = false;
-        while (pool.available.length > 0 && pool.available[0] < hiroNextNonce) {
-          const staleNonce = pool.available.shift()!;
-          evicted = true;
-          this.log("warn", "nonce_stale_evicted_on_assign", {
-            walletIndex,
-            nonce: staleNonce,
-            hiroNextNonce,
-          });
-        }
-        if (evicted) {
-          await this.savePoolForWallet(walletIndex, pool);
-        }
+      // Compute the nonce to assign from the stored head.
+      let assignedNonce = this.ledgerGetWalletHead(walletIndex)!;
+
+      // Guard: if Hiro's possible_next_nonce is ahead of our stored head, advance head.
+      // This catches the case where txs were confirmed between alarm cycles and the
+      // relay's head is stale. Advance to hiroNextNonce to avoid re-using confirmed nonces.
+      if (hiroNextNonce !== null && assignedNonce < hiroNextNonce) {
+        this.log("warn", "nonce_stale_head_advanced", {
+          walletIndex,
+          oldHead: assignedNonce,
+          hiroNextNonce,
+        });
+        assignedNonce = hiroNextNonce;
       }
 
-      // Extend pool if available is exhausted
-      if (pool.available.length === 0) {
-        // Start from the higher of maxNonce+1 and hiroNextNonce to avoid stale extensions
-        let nextNonce = pool.maxNonce + 1;
-        if (hiroNextNonce !== null && nextNonce < hiroNextNonce) {
-          nextNonce = hiroNextNonce;
-        }
-        // Lookahead cap guard: refuse to extend the pool past hiroNextNonce + LOOKAHEAD_GUARD_BUFFER.
-        // This prevents the pool from running so far ahead of confirmed chain state that a
-        // resync would discard a large batch of pre-assigned nonces, causing a sudden gap.
-        // Fail-open when Hiro is unreachable: if we can't check, allow the extension.
-        if (hiroNextNonce !== null && nextNonce > hiroNextNonce + LOOKAHEAD_GUARD_BUFFER) {
-          this.log("warn", "nonce_lookahead_capped", {
-            walletIndex,
-            poolMaxNonce: pool.maxNonce,
-            nextNonce,
-            hiroNextNonce,
-            limit: hiroNextNonce + LOOKAHEAD_GUARD_BUFFER,
-            poolReserved: pool.reserved.length,
-          });
-          // Treat this the same as chaining limit — caller returns 429 so agent can retry
-          throw new ChainingLimitError(pool.reserved.length);
-        }
-        pool.available.push(nextNonce);
-        pool.maxNonce = nextNonce;
+      // Lookahead cap guard: refuse to assign if we are already LOOKAHEAD_GUARD_BUFFER
+      // nonces ahead of Hiro's possible_next_nonce. This prevents runaway pre-assignment.
+      // Fail-open when Hiro is unreachable (hiroNextNonce === null).
+      if (hiroNextNonce !== null && assignedNonce > hiroNextNonce + LOOKAHEAD_GUARD_BUFFER) {
+        const reservedCount = this.ledgerReservedCount(walletIndex);
+        this.log("warn", "nonce_lookahead_capped", {
+          walletIndex,
+          assignedNonce,
+          hiroNextNonce,
+          limit: hiroNextNonce + LOOKAHEAD_GUARD_BUFFER,
+          reservedCount,
+        });
+        // Treat this the same as chaining limit — caller returns 429 so agent can retry
+        throw new ChainingLimitError(reservedCount);
       }
 
-      // Assign the next available nonce
-      const assignedNonce = pool.available.shift()!;
-      pool.reserved.push(assignedNonce);
-      pool.reservedAt[assignedNonce] = Date.now();
+      // Advance the stored head to assignedNonce + 1 (next wallet assignment)
+      this.ledgerAdvanceWalletHead(walletIndex, assignedNonce + 1);
 
-      await this.savePoolForWallet(walletIndex, pool);
-      this.updateAssignedStats(assignedNonce);
-      // Keep the SQL counter in sync for wallet 0 (stats compatibility)
-      if (walletIndex === 0) {
-        this.setStoredNonce(pool.available[0] ?? assignedNonce + 1);
-      }
-
-      // Dual-write: record assignment in intent ledger (fail-open, never throws)
+      // Record the assignment in the intent ledger (authoritative nonce state)
       this.ledgerAssign(walletIndex, assignedNonce);
+
+      this.updateAssignedStats(assignedNonce);
 
       this.log("info", "nonce_assigned", {
         walletIndex,
         nonce: assignedNonce,
-        poolAvailable: pool.available.length,
-        poolReserved: pool.reserved.length,
-        maxNonce: pool.maxNonce,
+        ledgerReserved: this.ledgerReservedCount(walletIndex),
+        nextHead: assignedNonce + 1,
       });
 
       // Advance round-robin to next wallet
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
       // Compute totalReserved across all wallets for pool pressure signaling.
-      // Phase 2: driven by ledger query instead of pool array sum.
       const totalReserved = this.ledgerTotalReservedForWallets(effectiveWalletCount);
 
       this.log("debug", "nonce_pool_pressure", {
@@ -1893,82 +1522,68 @@ export class NonceDO {
   }
 
   /**
-   * Release a nonce back to the specified wallet's pool or mark it as consumed.
+   * Release a nonce for the specified wallet — updates only the intent ledger.
    *
-   * txid present  → nonce was broadcast successfully (consumed); remove from reserved only.
-   * txid absent   → nonce was NOT broadcast (e.g. broadcast failure); return to available
-   *                 in sorted order so it can be reused.
-   * walletIndex   → which wallet pool to release to (default: 0)
+   * txid present  → nonce was broadcast successfully; mark as 'confirmed' in ledger.
+   * txid absent   → nonce was NOT broadcast (e.g. broadcast failure).
+   *                 If a txid was previously recorded in nonce_txids for this nonce,
+   *                 mark as 'failed' (quarantine). Otherwise mark as 'expired'.
+   * walletIndex   → which wallet the nonce belongs to (default: 0)
    * fee           → when provided with txid (broadcast succeeded), recorded in cumulative wallet stats
    */
   async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0, fee?: string): Promise<void> {
     return this.state.blockConcurrencyWhile(async () => {
-      const pool = await this.loadPoolForWallet(walletIndex);
-      if (pool === null) {
-        // Pool not initialized yet — nothing to release
+      // Verify this nonce is actually in 'assigned' state in the ledger
+      const intentRows = this.sql
+        .exec<{ state: string; txid: string | null }>(
+          "SELECT state, txid FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+          walletIndex,
+          nonce
+        )
+        .toArray();
+
+      const intent = intentRows[0] ?? null;
+      if (intent === null || intent.state !== "assigned") {
+        // Nonce not in assigned state — already released or was never assigned
         return;
       }
 
-      const reservedIdx = pool.reserved.indexOf(nonce);
-      if (reservedIdx === -1) {
-        // Nonce not in reserved — already released or was never assigned from this pool
-        return;
-      }
-
-      // Remove from reserved and clear the reservation timestamp
-      pool.reserved.splice(reservedIdx, 1);
-      delete pool.reservedAt[nonce];
-
-      // Track whether the nonce moved to spent[] due to a failure (true quarantine)
-      // vs normal consumption (successful broadcast). Only failure quarantines should
-      // count toward the circuit breaker — normal consumption is the happy path.
+      // Track whether this is a failure quarantine (for circuit breaker)
       let failureQuarantined = false;
-      let movedToSpent = false;
+
       if (!txid) {
-        // No txid provided: broadcast may have failed. Check if we previously recorded
-        // a txid for this nonce (e.g. a retry scenario). If a txid was ever recorded,
-        // the nonce was broadcast and must go to spent[] — never back to available[].
-        if (this.getNoncesWithTxids([nonce]).has(nonce)) {
-          // Nonce was broadcast at some point — quarantine it permanently
-          if (!pool.spent.includes(nonce)) {
-            pool.spent.push(nonce);
-          }
+        // No txid provided: check if a txid was previously recorded in nonce_txids.
+        // If so, the nonce was broadcast at some point — quarantine as failure.
+        const txidRows = this.sql
+          .exec<{ count: number }>(
+            "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
+            nonce
+          )
+          .toArray();
+        const hasPriorTxid = (txidRows[0]?.count ?? 0) > 0;
+
+        if (hasPriorTxid) {
+          // Nonce was broadcast at some point — quarantine permanently
           failureQuarantined = true;
-          movedToSpent = true;
           this.log("warn", "nonce_quarantined", {
             walletIndex,
             nonce,
             reason: "txid_recorded_on_failed_release",
-            poolSpent: pool.spent.length,
           });
+          this.ledgerRelease(walletIndex, nonce, undefined, "txid_recorded_on_failed_release");
         } else {
-          // Truly unused nonce (never broadcast): safe to return to available
-          insertSorted(pool.available, nonce);
+          // Truly unused nonce (never broadcast) — mark expired
+          // The ledger head already advanced past this nonce on assignment,
+          // so this creates a gap that reconciliation will fill if needed.
+          this.ledgerRelease(walletIndex, nonce, undefined);
         }
       } else {
-        // txid provided: nonce was broadcast successfully — consumed, not reusable
-        if (!pool.spent.includes(nonce)) {
-          pool.spent.push(nonce);
-        }
-        movedToSpent = true;
+        // txid provided: nonce was broadcast successfully — consumed
         if (fee && fee !== "0") {
           // Broadcast succeeded and fee provided — record in wallet stats
           await this.recordWalletFee(walletIndex, fee);
         }
-      }
-
-      await this.savePoolForWallet(walletIndex, pool);
-
-      // Dual-write: record release outcome in intent ledger (fail-open, never throws)
-      if (txid) {
-        // Successful broadcast — nonce consumed
         this.ledgerRelease(walletIndex, nonce, txid);
-      } else if (failureQuarantined) {
-        // No txid on release, but a txid was previously recorded → quarantine failure
-        this.ledgerRelease(walletIndex, nonce, undefined, "txid_recorded_on_failed_release");
-      } else {
-        // Nonce returned to available[] — was never broadcast
-        this.ledgerRelease(walletIndex, nonce, undefined);
       }
 
       this.log("info", "nonce_released", {
@@ -1976,22 +1591,12 @@ export class NonceDO {
         nonce,
         consumed: !!txid,
         txid: txid ?? null,
-        poolAvailable: pool.available.length,
-        poolReserved: pool.reserved.length,
-        poolSpent: pool.spent.length,
+        ledgerReserved: this.ledgerReservedCount(walletIndex),
       });
 
       // Circuit breaker: only record failure quarantines (not normal consumption).
-      // Normal successful broadcasts should not count toward the circuit breaker
-      // threshold — otherwise 3 successful txs within 10 min would trip the breaker.
       if (failureQuarantined) {
         await this.recordQuarantineEvent(walletIndex);
-      }
-
-      // Eager refill: trigger for any nonce moved to spent[] (both success and failure)
-      // since both shrink the available pool.
-      if (movedToSpent) {
-        await this.triggerEagerRefillForWallet(walletIndex, pool);
       }
     });
   }
@@ -2052,20 +1657,35 @@ export class NonceDO {
       .toArray();
     const txidCount = txidRows.length > 0 ? txidRows[0].count : 0;
 
-    // Load per-wallet pool state for reporting.
-    // Phase 2: reserved count is driven by the ledger (nonce_intents WHERE state='assigned').
-    // available, spent, and maxNonce still read from pool arrays (not tracked in ledger yet).
+    // Build per-wallet stats entirely from ledger SQL queries.
     const initializedWallets = await this.getInitializedWallets();
     const wallets: WalletPoolStats[] = [];
     for (const { walletIndex, address } of initializedWallets) {
-      const pool = await this.loadPoolForWallet(walletIndex);
       const ledgerCounts = this.ledgerCountsByWallet(Number(walletIndex));
+      // available = capacity remaining for new assignments
+      const available = Math.max(0, CHAINING_LIMIT - ledgerCounts.assigned);
+      // spent = all non-assigned historical nonces (confirmed + failed + expired)
+      const spentRows = this.sql
+        .exec<{ count: number }>(
+          "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('confirmed','failed','expired')",
+          Number(walletIndex)
+        )
+        .toArray();
+      const spent = spentRows[0]?.count ?? 0;
+      // maxNonce = highest nonce ever used for this wallet (or head if no intents)
+      const maxNonceRows = this.sql
+        .exec<{ maxNonce: number | null }>(
+          "SELECT MAX(nonce) as maxNonce FROM nonce_intents WHERE wallet_index = ?",
+          Number(walletIndex)
+        )
+        .toArray();
+      const maxNonce = maxNonceRows[0]?.maxNonce ?? (this.ledgerGetWalletHead(Number(walletIndex)) ?? 0);
       wallets.push({
-        walletIndex: Number(walletIndex),  // explicit integer coercion
-        available: pool?.available.length ?? 0,
+        walletIndex: Number(walletIndex),
+        available,
         reserved: ledgerCounts.assigned,   // ledger-authoritative: in-flight nonces
-        spent: pool?.spent.length ?? 0,
-        maxNonce: pool?.maxNonce ?? 0,
+        spent,
+        maxNonce,
         sponsorAddress: address ?? null,
       });
     }
@@ -2150,43 +1770,17 @@ export class NonceDO {
 
     this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
 
-    // Populate Hiro nonce cache (used by assignNonce stale-head guard and alarm invariant check)
+    // Populate Hiro nonce cache (used by assignNonce stale-head guard)
     this.hiroNonceCache.set(walletIndex, {
       value: nonceInfo.possible_next_nonce,
       expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
     });
 
-    // Prune confirmed nonces from reserved[] before any pool manipulation.
-    // This keeps reserved[] lean and prevents phantom reservations from accumulating
-    // across alarm cycles. Must happen before resetPoolAvailableForWallet() so the
-    // reserved set is accurate when computing available slots.
-    const poolForPrune = await this.loadPoolForWallet(walletIndex);
-    if (poolForPrune !== null) {
-      const prunedReserved = this.pruneConfirmedReservations(poolForPrune, nonceInfo.last_executed_tx_nonce);
-      const prunedSpent = this.pruneConfirmedSpent(poolForPrune, nonceInfo.last_executed_tx_nonce);
-      if (prunedReserved > 0 || prunedSpent > 0) {
-        await this.savePoolForWallet(walletIndex, poolForPrune);
-        this.log("info", "reserved_pruned", {
-          walletIndex,
-          prunedReserved,
-          prunedSpent,
-          lastExecutedTxNonce: nonceInfo.last_executed_tx_nonce,
-          poolReserved: poolForPrune.reserved.length,
-          poolAvailable: poolForPrune.available.length,
-          poolSpent: poolForPrune.spent.length,
-        });
-      }
-    }
+    const previousNonce = this.ledgerGetWalletHead(walletIndex);
 
-    const previousNonce = walletIndex === 0 ? this.getStoredNonce() : null;
-
-    // First-time initialization: seed pool from Hiro when no local state exists
-    if (walletIndex === 0 && previousNonce === null) {
-      this.setStoredNonce(nonceInfo.possible_next_nonce);
-      const pool = await this.loadPoolForWallet(walletIndex);
-      if (pool !== null) {
-        await this.resetPoolAvailableForWallet(walletIndex, pool, nonceInfo.possible_next_nonce);
-      }
+    // First-time initialization: seed head from Hiro when no local state exists
+    if (previousNonce === null) {
+      this.ledgerAdvanceWalletHead(walletIndex, nonceInfo.possible_next_nonce);
       return {
         previousNonce: null,
         newNonce: nonceInfo.possible_next_nonce,
@@ -2310,22 +1904,12 @@ export class NonceDO {
       let reason: string;
 
       if (ageMs > STALE_THRESHOLD_MS) {
-        // Assigned > 10 min ago, never broadcast — mark expired, return to available
+        // Assigned > 10 min ago, never broadcast — mark expired in ledger.
+        // The assigned nonce creates a gap that Hiro will detect; gap-fill handles it below.
         verdict = "expired";
         reason = "stale_assigned_never_broadcast";
         verdictExpired++;
         this.ledgerMarkExpiredByReconcile(walletIndex, nonce, reason);
-        // Also remove from pool.reserved and return to pool.available
-        const poolToUpdate = await this.loadPoolForWallet(walletIndex);
-        if (poolToUpdate !== null) {
-          const idx = poolToUpdate.reserved.indexOf(nonce);
-          if (idx !== -1) {
-            poolToUpdate.reserved.splice(idx, 1);
-            delete poolToUpdate.reservedAt[nonce];
-            insertSorted(poolToUpdate.available, nonce);
-            await this.savePoolForWallet(walletIndex, poolToUpdate);
-          }
-        }
       } else {
         // Still within grace period — wait
         verdict = "pending_assign";
@@ -2523,37 +2107,26 @@ export class NonceDO {
     });
 
     // -------------------------------------------------------------------------
-    // Pool maintenance: forward bump, stale reset, refill
-    // These maintain pool.available[] alignment with chain state.
-    // RBF deferral: if we just broadcast RBF replacements, skip the stale pool
-    // reset for one cycle to let the replacement confirm.
+    // Head maintenance: forward bump and stale reset based on Hiro signals.
+    // RBF deferral: if we just broadcast RBF replacements, skip the stale reset
+    // for one cycle to let the replacement confirm.
     // -------------------------------------------------------------------------
-    const poolHead = await this.loadPoolForWallet(walletIndex);
-    const effectivePreviousNonce = walletIndex === 0
-      ? previousNonce
-      : (poolHead?.available[0] ?? null);
 
-    if (effectivePreviousNonce !== null && possible_next_nonce > effectivePreviousNonce) {
-      if (walletIndex === 0) {
-        this.setStoredNonce(possible_next_nonce);
-      }
+    if (previousNonce !== null && possible_next_nonce > previousNonce) {
+      // Chain has advanced past our stored head — forward bump the head.
+      this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
       this.incrementConflictsDetected();
-
-      if (poolHead !== null) {
-        await this.resetPoolAvailableForWallet(walletIndex, poolHead, possible_next_nonce);
-      }
 
       this.log("warn", "nonce_reconcile_forward_bump", {
         walletIndex,
-        previousNonce: effectivePreviousNonce,
+        previousNonce,
         newNonce: possible_next_nonce,
         hiroNextNonce: possible_next_nonce,
-        poolReserved: poolHead?.reserved.length ?? 0,
-        poolAvailable: poolHead?.available.length ?? 0,
+        ledgerReserved: this.ledgerReservedCount(walletIndex),
       });
 
       return {
-        previousNonce: effectivePreviousNonce,
+        previousNonce,
         newNonce: possible_next_nonce,
         changed: true,
         reason: `FORWARD BUMP: chain advanced to ${possible_next_nonce}`,
@@ -2567,64 +2140,36 @@ export class NonceDO {
 
     if (
       idleMs > STALE_THRESHOLD_MS &&
-      effectivePreviousNonce !== null &&
-      effectivePreviousNonce > possible_next_nonce
+      previousNonce !== null &&
+      previousNonce > possible_next_nonce
     ) {
-      // If RBF was just broadcast for stuck nonces, defer the pool reset by one cycle
-      // to let the replacement confirm before we reset to possible_next_nonce.
+      // If RBF was just broadcast for stuck nonces, defer the reset by one cycle.
       if (rbfAttempted.length > 0) {
         return {
-          previousNonce: effectivePreviousNonce,
-          newNonce: effectivePreviousNonce,
+          previousNonce,
+          newNonce: previousNonce,
           changed: false,
-          reason: `RBF_DEFERRED_RESET: broadcast ${rbfAttempted.length} replacement(s) for stuck nonces [${rbfAttempted.join(",")}], deferring pool reset`,
+          reason: `RBF_DEFERRED_RESET: broadcast ${rbfAttempted.length} replacement(s) for stuck nonces [${rbfAttempted.join(",")}], deferring head reset`,
         };
       }
 
-      if (walletIndex === 0) {
-        this.setStoredNonce(possible_next_nonce);
-      }
+      this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
       this.incrementConflictsDetected();
-
-      if (poolHead !== null) {
-        await this.resetPoolAvailableForWallet(walletIndex, poolHead, possible_next_nonce);
-      }
 
       this.log("warn", "nonce_reconcile_stale", {
         walletIndex,
-        previousNonce: effectivePreviousNonce,
+        previousNonce,
         newNonce: possible_next_nonce,
         idleSeconds: Math.round(idleMs / 1000),
         hiroNextNonce: possible_next_nonce,
-        poolReserved: poolHead?.reserved.length ?? 0,
-        poolAvailable: poolHead?.available.length ?? 0,
+        ledgerReserved: this.ledgerReservedCount(walletIndex),
       });
 
       return {
-        previousNonce: effectivePreviousNonce,
+        previousNonce,
         newNonce: possible_next_nonce,
         changed: true,
         reason: `STALE DETECTION: idle ${Math.round(idleMs / 1000)}s, reset to chain nonce ${possible_next_nonce}`,
-      };
-    }
-
-    // POOL REFILL: pool is aligned with chain but below target size — refill without bumping head
-    if (
-      poolHead !== null &&
-      poolHead.available.length < POOL_SEED_SIZE &&
-      poolHead.reserved.length === 0 &&
-      (effectivePreviousNonce === null || possible_next_nonce === effectivePreviousNonce)
-    ) {
-      await this.resetPoolAvailableForWallet(
-        walletIndex,
-        poolHead,
-        effectivePreviousNonce ?? possible_next_nonce
-      );
-      return {
-        previousNonce: effectivePreviousNonce,
-        newNonce: effectivePreviousNonce ?? possible_next_nonce,
-        changed: true,
-        reason: `POOL REFILL: available ${poolHead.available.length} < ${POOL_SEED_SIZE}, re-seeded from nonce ${effectivePreviousNonce ?? possible_next_nonce}`,
       };
     }
 
@@ -2635,70 +2180,11 @@ export class NonceDO {
       ? ` rbf [${rbfAttempted.join(",")}]`
       : "";
     return {
-      previousNonce: effectivePreviousNonce,
-      newNonce: effectivePreviousNonce,
+      previousNonce,
+      newNonce: previousNonce,
       changed: gapFillFilled.length > 0 || rbfAttempted.length > 0,
       reason: `nonce is consistent with chain state${gapFilledSummary}${rbfSummary}`,
     };
-  }
-
-  /**
-   * Reset pool.available for a specific wallet to a fresh range starting at newHead.
-   * NEVER touches pool.reserved or pool.spent.
-   * Skips any nonce already in pool.reserved[] or pool.spent[] to prevent overlap.
-   * Enforces the invariant: available ∩ reserved = ∅ and available ∩ spent = ∅.
-   */
-  private async resetPoolAvailableForWallet(
-    walletIndex: number,
-    pool: PoolState,
-    newHead: number
-  ): Promise<void> {
-    const availableSlots = Math.max(1, POOL_SEED_SIZE - pool.reserved.length);
-    // Exclude both reserved and spent nonces from the new available range
-    const excludedSet = new Set([...pool.reserved, ...pool.spent]);
-    const newAvailable: number[] = [];
-    const prevAvailableCount = pool.available.length;
-    // Search up to 2x the seed size beyond newHead to find enough non-excluded slots
-    const searchLimit = newHead + POOL_SEED_SIZE * 2;
-    for (
-      let candidate = newHead;
-      candidate < searchLimit && newAvailable.length < availableSlots;
-      candidate++
-    ) {
-      if (!excludedSet.has(candidate)) {
-        newAvailable.push(candidate);
-      }
-    }
-    // unfilled > 0 means we couldn't find enough non-excluded candidates within the search limit
-    const unfilled = availableSlots - newAvailable.length;
-    if (unfilled > 0) {
-      this.log("warn", "pool_reset_unfilled", {
-        walletIndex,
-        unfilled,
-        availableSlots,
-        filled: newAvailable.length,
-        excludedCount: excludedSet.size,
-        searchLimit,
-      });
-    }
-    pool.available = newAvailable;
-    pool.maxNonce =
-      newAvailable.length > 0
-        ? newAvailable[newAvailable.length - 1]
-        : newHead + availableSlots - 1;
-    await this.savePoolForWallet(walletIndex, pool);
-
-    this.log("info", "pool_available_reset", {
-      walletIndex,
-      newHead,
-      availableSlots,
-      newAvailableCount: newAvailable.length,
-      prevAvailableCount,
-      reservedCount: pool.reserved.length,
-      spentCount: pool.spent.length,
-      unfilled,
-      maxNonce: pool.maxNonce,
-    });
   }
 
   /**
@@ -2767,23 +2253,12 @@ export class NonceDO {
         ? 0
         : nonceInfo.last_executed_tx_nonce + 1;
 
-      // Determine previous head: wallet 0 uses SQL counter, others use pool head
-      const pool = await this.loadPoolForWallet(walletIndex);
-      const previousNonce = walletIndex === 0
-        ? this.getStoredNonce()
-        : (pool?.available[0] ?? null);
+      const previousNonce = this.ledgerGetWalletHead(walletIndex);
       const changed = previousNonce !== safeFloor;
 
-      // Wallet 0: also update the stored scalar nonce used by legacy paths
-      if (walletIndex === 0) {
-        this.setStoredNonce(safeFloor);
-      }
+      this.ledgerAdvanceWalletHead(walletIndex, safeFloor);
       if (changed) {
         this.incrementConflictsDetected();
-      }
-
-      if (pool !== null) {
-        await this.resetPoolAvailableForWallet(walletIndex, pool, safeFloor);
       }
 
       wallets.push({
@@ -2805,66 +2280,36 @@ export class NonceDO {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
           await this.reconcileNonceForWallet(walletIndex, address);
 
-          // Pool invariant self-check: evict any available nonce below Hiro's possible_next_nonce.
-          // Catches nonces that became confirmed between alarm cycles (time-window stale heads).
-          const cached = this.hiroNonceCache.get(walletIndex);
-          let pool = await this.loadPoolForWallet(walletIndex);
-          if (cached && pool !== null) {
-            const staleCount = pool.available.filter(n => n < cached.value).length;
-            if (staleCount > 0) {
-              pool.available = pool.available.filter(n => n >= cached.value);
-              await this.savePoolForWallet(walletIndex, pool);
-              this.log("warn", "pool_invariant_violation", {
-                walletIndex,
-                staleEvicted: staleCount,
-                possibleNextNonce: cached.value,
-                poolAvailable: pool.available.length,
-              });
-            }
-          }
-
           // Clean up StuckTxState entries for nonces that have been confirmed on-chain.
-          // A nonce is confirmed when it is <= possible_next_nonce - 1 (i.e., the chain
-          // has advanced past it). If the confirmed nonce had RBF attempts, it means our
-          // replacement tx succeeded — increment the stuckTxRbfConfirmed counter.
+          // Use the ledger to find recently-confirmed nonces below Hiro's possible_next_nonce - 1.
+          const cached = this.hiroNonceCache.get(walletIndex);
           if (cached) {
             const confirmedThreshold = cached.value - 1; // nonces <= this are confirmed
-            pool = await this.loadPoolForWallet(walletIndex);
-            if (pool !== null) {
-              // Check recently-spent nonces: these are the ones that were broadcast and
-              // may have been stuck. We can't enumerate all possible nonces cheaply, so
-              // check the spent[] array for any nonce that has RBF state and is now confirmed.
-              const spentConfirmed = pool.spent.filter(n => n <= confirmedThreshold);
-              for (const confirmedNonce of spentConfirmed) {
-                const stuckKey = this.walletStuckTxKey(walletIndex, confirmedNonce);
-                const stuckState = await this.state.storage.get<StuckTxState>(stuckKey);
-                if (stuckState && stuckState.rbfAttempts > 0) {
-                  this.incrementStuckTxRbfConfirmed();
-                  this.log("info", "stuck_tx_rbf_confirmed", {
-                    walletIndex,
-                    nonce: confirmedNonce,
-                    rbfAttempts: stuckState.rbfAttempts,
-                    lastRbfTxid: stuckState.lastRbfTxid,
-                    originalTxid: stuckState.originalTxid,
-                  });
-                }
-                if (stuckState) {
-                  await this.state.storage.delete(stuckKey);
-                }
+            // Query ledger for confirmed nonces that may have RBF state to clean up
+            const confirmedNonces = this.sql
+              .exec<{ nonce: number }>(
+                "SELECT nonce FROM nonce_intents WHERE wallet_index = ? AND state = 'confirmed' AND nonce <= ?",
+                walletIndex,
+                confirmedThreshold
+              )
+              .toArray()
+              .map((r) => r.nonce);
+            for (const confirmedNonce of confirmedNonces) {
+              const stuckKey = this.walletStuckTxKey(walletIndex, confirmedNonce);
+              const stuckState = await this.state.storage.get<StuckTxState>(stuckKey);
+              if (stuckState && stuckState.rbfAttempts > 0) {
+                this.incrementStuckTxRbfConfirmed();
+                this.log("info", "stuck_tx_rbf_confirmed", {
+                  walletIndex,
+                  nonce: confirmedNonce,
+                  rbfAttempts: stuckState.rbfAttempts,
+                  lastRbfTxid: stuckState.lastRbfTxid,
+                  originalTxid: stuckState.originalTxid,
+                });
               }
-            }
-          }
-
-          // Clean stale reservations: release nonces reserved > 10 min ago with no broadcast
-          if (pool !== null) {
-            const released = this.cleanStaleReservations(pool, walletIndex);
-            if (released > 0) {
-              await this.savePoolForWallet(walletIndex, pool);
-              this.log("info", "stale_reservations_cleaned", { walletIndex, released });
-              // Trigger eager refill if any stale nonces were quarantined (moved to spent[]),
-              // which would have shrunk available[]. The alarm reconciliation already ran
-              // above, but cleanStaleReservations may have further reduced available[].
-              await this.triggerEagerRefillForWallet(walletIndex, pool);
+              if (stuckState) {
+                await this.state.storage.delete(stuckKey);
+              }
             }
           }
         }
@@ -2872,7 +2317,6 @@ export class NonceDO {
         // Dynamic alarm interval: use active (60s) when any wallet has in-flight nonces,
         // idle (5min) when all wallets are drained. This ensures rapid reconciliation
         // during traffic bursts and doesn't hammer Hiro unnecessarily when idle.
-        // Phase 2: totalReservedAfterCycle is driven by ledger query instead of pool sum.
         const totalReservedAfterCycle = this.ledgerTotalAssigned();
         const isActive = totalReservedAfterCycle > 0;
         const intervalMs = isActive ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
@@ -2917,15 +2361,24 @@ export class NonceDO {
   }
 
   /**
-   * Clear all per-wallet pool state and stored addresses.
-   * Pools will reinitialize from Hiro on the next /assign call.
+   * Clear all per-wallet state and stored addresses.
+   * Wallets will reinitialize from Hiro on the next /assign call.
+   * Also resets nonce heads and clears the nonce_intents ledger for each wallet.
    */
   private async handleClearPools(): Promise<Response> {
     return this.state.blockConcurrencyWhile(async () => {
       const initializedWallets = await this.getInitializedWallets();
       for (const { walletIndex } of initializedWallets) {
-        await this.state.storage.delete(this.poolKey(walletIndex));
+        // Clear sponsor address
         await this.state.storage.delete(this.sponsorAddressKey(walletIndex));
+        // Reset the ledger head for this wallet
+        if (walletIndex === 0) {
+          this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.current);
+        } else {
+          this.sql.exec("DELETE FROM nonce_state WHERE key = ?", `wallet_next_nonce:${walletIndex}`);
+        }
+        // Clear nonce_intents for this wallet
+        this.sql.exec("DELETE FROM nonce_intents WHERE wallet_index = ?", walletIndex);
       }
       // Reset round-robin index
       await this.state.storage.put(NEXT_WALLET_INDEX_KEY, 0);
