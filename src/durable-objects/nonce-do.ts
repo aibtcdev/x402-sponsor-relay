@@ -1362,6 +1362,79 @@ export class NonceDO {
   // critical nonce assignment / release path is never disrupted by ledger failures.
   // ---------------------------------------------------------------------------
 
+  // ---------------------------------------------------------------------------
+  // Nonce intent ledger reads (Phase 2: replace pool-array reads with SQL queries)
+  // All decisional reads (chaining-limit checks, pool pressure, stats) are now
+  // driven by ledger queries. Pool array writes remain intact (dual-write preserved).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Count in-flight nonces for a specific wallet from the ledger.
+   * 'assigned' state = nonce was handed out but not yet released (maps to pool.reserved[]).
+   * Used for chaining-limit checks and pool-pressure calculations.
+   */
+  private ledgerReservedCount(walletIndex: number): number {
+    const rows = this.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state = 'assigned'",
+        walletIndex
+      )
+      .toArray();
+    return rows[0]?.count ?? 0;
+  }
+
+  /**
+   * Count in-flight nonces across all wallets with index < walletCount.
+   * Used to compute totalReserved (pool pressure signal) in assignNonce().
+   */
+  private ledgerTotalReservedForWallets(walletCount: number): number {
+    const rows = this.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index < ? AND state = 'assigned'",
+        walletCount
+      )
+      .toArray();
+    return rows[0]?.count ?? 0;
+  }
+
+  /**
+   * Count in-flight nonces across ALL wallets from the ledger.
+   * Used by alarm() to determine whether to schedule at active or idle interval.
+   */
+  private ledgerTotalAssigned(): number {
+    const rows = this.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE state = 'assigned'"
+      )
+      .toArray();
+    return rows[0]?.count ?? 0;
+  }
+
+  /**
+   * Return per-state counts for a specific wallet from the ledger.
+   * Used by getStats() to report reserved count from the authoritative source.
+   */
+  private ledgerCountsByWallet(walletIndex: number): {
+    assigned: number;
+    confirmed: number;
+    failed: number;
+    expired: number;
+  } {
+    const rows = this.sql
+      .exec<{ state: string; count: number }>(
+        "SELECT state, COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? GROUP BY state",
+        walletIndex
+      )
+      .toArray();
+    const result = { assigned: 0, confirmed: 0, failed: 0, expired: 0 };
+    for (const row of rows) {
+      if (row.state in result) {
+        result[row.state as keyof typeof result] = row.count;
+      }
+    }
+    return result;
+  }
+
   /**
    * Write 'assigned' intent + event for a newly reserved nonce.
    * Called immediately after the nonce is moved from available[] to reserved[].
@@ -1566,11 +1639,11 @@ export class NonceDO {
           continue;
         }
 
-        if (pool.reserved.length < CHAINING_LIMIT) {
+        if (this.ledgerReservedCount(walletIndex) < CHAINING_LIMIT) {
           break;
         }
         // This wallet is at its chaining limit; accumulate depth and try the next
-        totalMempoolDepth += pool.reserved.length;
+        totalMempoolDepth += this.ledgerReservedCount(walletIndex);
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
         pool = null;
         attempts++;
@@ -1581,7 +1654,7 @@ export class NonceDO {
         // If there are degraded-but-not-full wallets, use the least-degraded one as fallback
         // rather than failing with a misleading CHAINING_LIMIT_EXCEEDED error.
         const degradedNotFull = degradedWallets.filter(
-          (d) => d.pool.reserved.length < CHAINING_LIMIT
+          (d) => this.ledgerReservedCount(d.walletIndex) < CHAINING_LIMIT
         );
         if (degradedNotFull.length > 0) {
           // Sort ascending by cycleCount, pick least-degraded wallet
@@ -1679,12 +1752,9 @@ export class NonceDO {
       // Advance round-robin to next wallet
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
-      // Compute totalReserved across all wallets for pool pressure signaling
-      let totalReserved = 0;
-      for (let wi = 0; wi < effectiveWalletCount; wi++) {
-        const wp = await this.loadPoolForWallet(wi);
-        totalReserved += wp?.reserved.length ?? 0;
-      }
+      // Compute totalReserved across all wallets for pool pressure signaling.
+      // Phase 2: driven by ledger query instead of pool array sum.
+      const totalReserved = this.ledgerTotalReservedForWallets(effectiveWalletCount);
 
       this.log("debug", "nonce_pool_pressure", {
         walletIndex,
@@ -1856,15 +1926,18 @@ export class NonceDO {
       .toArray();
     const txidCount = txidRows.length > 0 ? txidRows[0].count : 0;
 
-    // Load per-wallet pool state for reporting
+    // Load per-wallet pool state for reporting.
+    // Phase 2: reserved count is driven by the ledger (nonce_intents WHERE state='assigned').
+    // available, spent, and maxNonce still read from pool arrays (not tracked in ledger yet).
     const initializedWallets = await this.getInitializedWallets();
     const wallets: WalletPoolStats[] = [];
     for (const { walletIndex, address } of initializedWallets) {
       const pool = await this.loadPoolForWallet(walletIndex);
+      const ledgerCounts = this.ledgerCountsByWallet(Number(walletIndex));
       wallets.push({
         walletIndex: Number(walletIndex),  // explicit integer coercion
         available: pool?.available.length ?? 0,
-        reserved: pool?.reserved.length ?? 0,
+        reserved: ledgerCounts.assigned,   // ledger-authoritative: in-flight nonces
         spent: pool?.spent.length ?? 0,
         maxNonce: pool?.maxNonce ?? 0,
         sponsorAddress: address ?? null,
@@ -2419,7 +2492,6 @@ export class NonceDO {
     await this.state.blockConcurrencyWhile(async () => {
       try {
         const initializedWallets = await this.getInitializedWallets();
-        let totalReservedAfterCycle = 0;
 
         for (const { walletIndex, address } of initializedWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
@@ -2486,13 +2558,14 @@ export class NonceDO {
               // above, but cleanStaleReservations may have further reduced available[].
               await this.triggerEagerRefillForWallet(walletIndex, pool);
             }
-            totalReservedAfterCycle += pool.reserved.length;
           }
         }
 
         // Dynamic alarm interval: use active (60s) when any wallet has in-flight nonces,
         // idle (5min) when all wallets are drained. This ensures rapid reconciliation
         // during traffic bursts and doesn't hammer Hiro unnecessarily when idle.
+        // Phase 2: totalReservedAfterCycle is driven by ledger query instead of pool sum.
+        const totalReservedAfterCycle = this.ledgerTotalAssigned();
         const isActive = totalReservedAfterCycle > 0;
         const intervalMs = isActive ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
         this.log("info", "nonce_alarm_scheduled", {
