@@ -355,6 +355,50 @@ export class NonceDO {
       CREATE INDEX IF NOT EXISTS idx_nonce_txids_assigned
         ON nonce_txids(assigned_at DESC);
     `);
+
+    // Nonce intent ledger: tracks lifecycle state per (wallet_index, nonce).
+    // This is the source-of-truth table for the nonce-sovereignty refactor.
+    // Phase 1: written alongside existing pool state (dual-write) for validation.
+    // Phase 2+: reads will migrate here as the authoritative nonce state.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS nonce_intents (
+        wallet_index INTEGER NOT NULL,
+        nonce        INTEGER NOT NULL,
+        state        TEXT    NOT NULL,
+        txid         TEXT,
+        http_status  INTEGER,
+        broadcast_node TEXT,
+        assigned_at    TEXT NOT NULL,
+        broadcasted_at TEXT,
+        confirmed_at   TEXT,
+        block_height   INTEGER,
+        error_reason   TEXT,
+        PRIMARY KEY (wallet_index, nonce)
+      );
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_nonce_intents_state
+        ON nonce_intents(state, wallet_index);
+    `);
+
+    // Nonce event log: append-only audit trail for every nonce lifecycle transition.
+    // Immutable once written — never updated, only inserted and optionally pruned.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS nonce_events (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        wallet_index INTEGER NOT NULL,
+        nonce        INTEGER NOT NULL,
+        event        TEXT    NOT NULL,
+        detail       TEXT,
+        created_at   TEXT    NOT NULL
+      );
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_nonce_events_wallet_nonce
+        ON nonce_events(wallet_index, nonce, created_at DESC);
+    `);
   }
 
   private jsonResponse(body: unknown, status = 200): Response {
@@ -1311,6 +1355,132 @@ export class NonceDO {
     return pool;
   }
 
+  // ---------------------------------------------------------------------------
+  // Nonce intent ledger helpers (Phase 1: dual-write alongside pool state)
+  // These methods write to nonce_intents and nonce_events tables.
+  // They are NEVER allowed to throw — errors are logged at debug level so the
+  // critical nonce assignment / release path is never disrupted by ledger failures.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Write 'assigned' intent + event for a newly reserved nonce.
+   * Called immediately after the nonce is moved from available[] to reserved[].
+   */
+  private ledgerAssign(walletIndex: number, nonce: number): void {
+    try {
+      const now = new Date().toISOString();
+      this.sql.exec(
+        `INSERT OR REPLACE INTO nonce_intents
+           (wallet_index, nonce, state, assigned_at)
+         VALUES (?, ?, 'assigned', ?)`,
+        walletIndex,
+        nonce,
+        now
+      );
+      this.sql.exec(
+        `INSERT INTO nonce_events
+           (wallet_index, nonce, event, created_at)
+         VALUES (?, ?, 'assigned', ?)`,
+        walletIndex,
+        nonce,
+        now
+      );
+    } catch (e) {
+      this.log("debug", "ledger_assign_error", {
+        walletIndex,
+        nonce,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Write release outcome to the intent ledger for a nonce being released.
+   *
+   * txid present            → 'confirmed' state (successful broadcast + consumed)
+   * txid absent + reason    → 'failed' state (broadcast failed, nonce quarantined)
+   * txid absent + no reason → 'expired' state (nonce returned to available[], never broadcast)
+   */
+  private ledgerRelease(
+    walletIndex: number,
+    nonce: number,
+    txid: string | undefined,
+    errorReason?: string
+  ): void {
+    try {
+      const now = new Date().toISOString();
+      if (txid) {
+        // Nonce was broadcast successfully — mark as confirmed in the intent ledger.
+        // Note: we don't have on-chain confirmation here; 'confirmed' means "broadcast accepted".
+        // Phase 2+ will upgrade this to a true on-chain confirmation state.
+        this.sql.exec(
+          `UPDATE nonce_intents
+           SET state = 'confirmed', txid = ?, broadcasted_at = ?, confirmed_at = ?
+           WHERE wallet_index = ? AND nonce = ?`,
+          txid,
+          now,
+          now,
+          walletIndex,
+          nonce
+        );
+        this.sql.exec(
+          `INSERT INTO nonce_events
+             (wallet_index, nonce, event, detail, created_at)
+           VALUES (?, ?, 'confirmed', ?, ?)`,
+          walletIndex,
+          nonce,
+          JSON.stringify({ txid }),
+          now
+        );
+      } else if (errorReason) {
+        // Broadcast was attempted (txid recorded previously) but release has no txid —
+        // this means the nonce is quarantined due to a failed/conflicting broadcast.
+        this.sql.exec(
+          `UPDATE nonce_intents
+           SET state = 'failed', error_reason = ?
+           WHERE wallet_index = ? AND nonce = ?`,
+          errorReason,
+          walletIndex,
+          nonce
+        );
+        this.sql.exec(
+          `INSERT INTO nonce_events
+             (wallet_index, nonce, event, detail, created_at)
+           VALUES (?, ?, 'broadcast_fail', ?, ?)`,
+          walletIndex,
+          nonce,
+          JSON.stringify({ errorReason }),
+          now
+        );
+      } else {
+        // Nonce was never broadcast — safely returned to available[].
+        this.sql.exec(
+          `UPDATE nonce_intents
+           SET state = 'expired'
+           WHERE wallet_index = ? AND nonce = ?`,
+          walletIndex,
+          nonce
+        );
+        this.sql.exec(
+          `INSERT INTO nonce_events
+             (wallet_index, nonce, event, created_at)
+           VALUES (?, ?, 'expired', ?)`,
+          walletIndex,
+          nonce,
+          now
+        );
+      }
+    } catch (e) {
+      this.log("debug", "ledger_release_error", {
+        walletIndex,
+        nonce,
+        txid: txid ?? null,
+        errorReason: errorReason ?? null,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   /**
    * Assign a nonce from the reservation pool using round-robin wallet selection.
    *
@@ -1495,6 +1665,9 @@ export class NonceDO {
         this.setStoredNonce(pool.available[0] ?? assignedNonce + 1);
       }
 
+      // Dual-write: record assignment in intent ledger (fail-open, never throws)
+      this.ledgerAssign(walletIndex, assignedNonce);
+
       this.log("info", "nonce_assigned", {
         walletIndex,
         nonce: assignedNonce,
@@ -1589,6 +1762,18 @@ export class NonceDO {
       }
 
       await this.savePoolForWallet(walletIndex, pool);
+
+      // Dual-write: record release outcome in intent ledger (fail-open, never throws)
+      if (txid) {
+        // Successful broadcast — nonce consumed
+        this.ledgerRelease(walletIndex, nonce, txid);
+      } else if (failureQuarantined) {
+        // No txid on release, but a txid was previously recorded → quarantine failure
+        this.ledgerRelease(walletIndex, nonce, undefined, "txid_recorded_on_failed_release");
+      } else {
+        // Nonce returned to available[] — was never broadcast
+        this.ledgerRelease(walletIndex, nonce, undefined);
+      }
 
       this.log("info", "nonce_released", {
         walletIndex,
@@ -2525,6 +2710,31 @@ export class NonceDO {
 
     if (request.method === "POST" && url.pathname === "/clear-pools") {
       return this.handleClearPools();
+    }
+
+    // GET /ledger — diagnostic endpoint for inspecting nonce intent ledger state.
+    // Returns current nonce_intents rows, last 100 nonce_events, and state counts.
+    // This is an internal DO endpoint (not exposed through the Hono router).
+    if (request.method === "GET" && url.pathname === "/ledger") {
+      try {
+        const intents = this.sql
+          .exec("SELECT * FROM nonce_intents ORDER BY wallet_index ASC, nonce ASC")
+          .toArray();
+        const recentEvents = this.sql
+          .exec("SELECT * FROM nonce_events ORDER BY id DESC LIMIT 100")
+          .toArray();
+        const intentCounts = this.sql
+          .exec("SELECT state, COUNT(*) as count FROM nonce_intents GROUP BY state")
+          .toArray();
+        return this.jsonResponse({
+          intents,
+          recentEvents,
+          intentCounts,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        return this.internalError(error);
+      }
     }
 
     return new Response("Not found", { status: 404 });
