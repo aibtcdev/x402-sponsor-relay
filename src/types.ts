@@ -46,6 +46,10 @@ export interface Env {
   /** Number of sponsor wallets to rotate through (default: "1", max: 10).
    *  Derives BIP-44 accounts 0..N-1 from the mnemonic for round-robin sponsoring. */
   SPONSOR_WALLET_COUNT?: string;
+  /** Maximum number of sponsor wallets for dynamic scaling (default: "10", max: 100).
+   *  Dynamic scaling adds wallets in the alarm cycle when pool pressure is high.
+   *  Must be >= SPONSOR_WALLET_COUNT to allow scaling beyond initial count. */
+  SPONSOR_WALLET_MAX?: string;
   /** Hex-encoded private key (fallback if no mnemonic) */
   SPONSOR_PRIVATE_KEY?: string;
   STACKS_NETWORK: "mainnet" | "testnet";

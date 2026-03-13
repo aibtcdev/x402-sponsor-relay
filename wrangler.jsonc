@@ -33,6 +33,7 @@
   "vars": {
     "STACKS_NETWORK": "testnet",
     "SPONSOR_WALLET_COUNT": "5",
+    "SPONSOR_WALLET_MAX": "10",
     "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB"
   },
   // Cron trigger: run health check every 5 minutes
@@ -58,6 +59,7 @@
       "vars": {
         "STACKS_NETWORK": "testnet",
         "SPONSOR_WALLET_COUNT": "5",
+        "SPONSOR_WALLET_MAX": "10",
         "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB"
       },
       // Bindings must be duplicated per environment
@@ -92,6 +94,7 @@
       "vars": {
         "STACKS_NETWORK": "mainnet",
         "SPONSOR_WALLET_COUNT": "5",
+        "SPONSOR_WALLET_MAX": "10",
         "FLUSH_RECIPIENT": "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC"
       },
       // Bindings must be duplicated per environment

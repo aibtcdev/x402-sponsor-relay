@@ -1,7 +1,9 @@
 import {
   makeSTXTokenTransfer,
   broadcastTransaction,
+  getAddressFromPrivateKey,
 } from "@stacks/transactions";
+import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
 import type { Env, LogsRPC } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
@@ -142,6 +144,24 @@ interface WalletPoolStats {
   sponsorAddress: string | null;
 }
 
+/**
+ * Per-wallet utilization metrics over the last hour.
+ * Counts nonce_intents rows by state with assigned_at within the last 60 minutes.
+ */
+interface WalletUtilization {
+  walletIndex: number;
+  /** Nonces still in 'assigned' state within the last hour */
+  assigned_count: number;
+  /** Nonces that reached 'broadcasted' state within the last hour */
+  broadcasted_count: number;
+  /** Nonces that reached 'confirmed' state within the last hour */
+  confirmed_count: number;
+  /** Nonces that reached 'failed' or 'conflict' state within the last hour */
+  failed_count: number;
+  /** Time window in hours */
+  window_hours: number;
+}
+
 interface NonceStatsResponse {
   totalAssigned: number;
   conflictsDetected: number;
@@ -169,6 +189,10 @@ interface NonceStatsResponse {
   stuckTxRbfBroadcast: number;
   /** Total nonces successfully unstuck via RBF (confirmed after replacement) */
   stuckTxRbfConfirmed: number;
+  /** Per-wallet utilization metrics over the last hour */
+  walletUtilization: WalletUtilization[];
+  /** Dynamic wallet count stored in ledger (null if no scale-up has occurred) */
+  dynamicWalletCount: number | null;
 }
 
 /**
@@ -239,6 +263,25 @@ const CIRCUIT_BREAKER_WINDOW_MS = 10 * 60 * 1000;
  * count across all wallets exceeds this threshold within CIRCUIT_BREAKER_WINDOW_MS.
  */
 const CASCADE_DETECTION_THRESHOLD = 3;
+
+/**
+ * Pool pressure threshold (0.80 = 80%) above which a surge event is recorded.
+ * A surge is active while overall pressure stays above this threshold.
+ */
+const SURGE_PRESSURE_THRESHOLD = 0.80;
+
+/**
+ * Per-wallet pressure threshold (0.75 = 75%) above which a wallet is considered
+ * "high pressure" for dynamic scale-up decisions.
+ * Dynamic scaling triggers only when ALL initialized wallets exceed this threshold.
+ */
+const SCALE_UP_THRESHOLD = 0.75;
+
+/**
+ * Hard ceiling for dynamic wallet scaling — wallets will never be scaled beyond
+ * this value regardless of SPONSOR_WALLET_MAX env var.
+ */
+const ABSOLUTE_MAX_WALLET_COUNT = 100;
 
 const STATE_KEYS = {
   current: "current",
@@ -362,6 +405,21 @@ export class NonceDO {
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_nonce_events_wallet_nonce
         ON nonce_events(wallet_index, nonce, created_at DESC);
+    `);
+
+    // Surge event log: records pool pressure surge events and dynamic scale-up triggers.
+    // An active surge is tracked via the "active_surge_id" key in nonce_state.
+    // resolved_at and duration_ms are null while the surge is still active.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS surge_events (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at          TEXT    NOT NULL,
+        peak_pressure_pct   INTEGER NOT NULL DEFAULT 0,
+        peak_reserved       INTEGER NOT NULL DEFAULT 0,
+        wallet_count_at_peak INTEGER NOT NULL DEFAULT 1,
+        duration_ms         INTEGER,
+        resolved_at         TEXT
+      );
     `);
   }
 
@@ -682,6 +740,202 @@ export class NonceDO {
   private async scheduleAlarm(active = false): Promise<void> {
     const intervalMs = active ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
     await this.state.storage.setAlarm(Date.now() + intervalMs);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dynamic scaling and surge tracking helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Parse SPONSOR_WALLET_MAX from env.
+   * Returns a number in [1, ABSOLUTE_MAX_WALLET_COUNT], defaulting to MAX_WALLET_COUNT (10).
+   */
+  private getSponsorWalletMax(): number {
+    const raw = this.env.SPONSOR_WALLET_MAX;
+    if (!raw) return MAX_WALLET_COUNT;
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n < 1 || n > ABSOLUTE_MAX_WALLET_COUNT) {
+      return MAX_WALLET_COUNT;
+    }
+    return n;
+  }
+
+  /**
+   * Check overall pool pressure and record/update/resolve surge events.
+   * Called from alarm() after all wallet reconciliations complete.
+   * Never throws — fail-open.
+   */
+  private checkAndRecordSurge(
+    walletCount: number
+  ): void {
+    try {
+      if (walletCount === 0) return;
+
+      const poolCapacity = walletCount * CHAINING_LIMIT;
+      const totalReserved = this.ledgerTotalReservedForWallets(walletCount);
+      const overallPressure = poolCapacity > 0 ? totalReserved / poolCapacity : 0;
+      const pressurePct = Math.round(overallPressure * 100);
+      const now = new Date().toISOString();
+
+      // Read active surge id from nonce_state (stored as integer, 0 = none)
+      const activeSurgeId = this.getStateValue("active_surge_id");
+
+      if (overallPressure >= SURGE_PRESSURE_THRESHOLD) {
+        if (activeSurgeId === null || activeSurgeId === 0) {
+          // Start a new surge event
+          const result = this.sql
+            .exec<{ id: number }>(
+              `INSERT INTO surge_events
+                 (started_at, peak_pressure_pct, peak_reserved, wallet_count_at_peak)
+               VALUES (?, ?, ?, ?)
+               RETURNING id`,
+              now,
+              pressurePct,
+              totalReserved,
+              walletCount
+            )
+            .toArray();
+          const newId = result[0]?.id;
+          if (newId !== undefined) {
+            this.setStateValue("active_surge_id", newId);
+            this.log("warn", "surge_started", {
+              surgeId: newId,
+              pressurePct,
+              totalReserved,
+              walletCount,
+            });
+          }
+        } else {
+          // Update existing surge if new peak is higher
+          const existing = this.sql
+            .exec<{ peak_pressure_pct: number; peak_reserved: number }>(
+              "SELECT peak_pressure_pct, peak_reserved FROM surge_events WHERE id = ? LIMIT 1",
+              activeSurgeId
+            )
+            .toArray()[0];
+          if (existing && (pressurePct > existing.peak_pressure_pct || totalReserved > existing.peak_reserved)) {
+            this.sql.exec(
+              `UPDATE surge_events
+               SET peak_pressure_pct = MAX(peak_pressure_pct, ?),
+                   peak_reserved = MAX(peak_reserved, ?),
+                   wallet_count_at_peak = ?
+               WHERE id = ?`,
+              pressurePct,
+              totalReserved,
+              walletCount,
+              activeSurgeId
+            );
+          }
+        }
+      } else if (activeSurgeId !== null && activeSurgeId > 0) {
+        // Pressure dropped below threshold — resolve the surge
+        const startedRows = this.sql
+          .exec<{ started_at: string; peak_pressure_pct: number; peak_reserved: number; wallet_count_at_peak: number }>(
+            "SELECT started_at, peak_pressure_pct, peak_reserved, wallet_count_at_peak FROM surge_events WHERE id = ? LIMIT 1",
+            activeSurgeId
+          )
+          .toArray();
+        const surgeRow = startedRows[0];
+        if (surgeRow) {
+          const startMs = new Date(surgeRow.started_at).getTime();
+          const durationMs = Date.now() - startMs;
+          this.sql.exec(
+            "UPDATE surge_events SET resolved_at = ?, duration_ms = ? WHERE id = ?",
+            now,
+            durationMs,
+            activeSurgeId
+          );
+          this.setStateValue("active_surge_id", 0);
+
+          // Emit structured surge_pattern for operator capacity planning
+          const startedAt = new Date(surgeRow.started_at);
+          const rampRate = durationMs > 0
+            ? Math.round((surgeRow.peak_pressure_pct / (durationMs / 1000)) * 100) / 100
+            : 0;
+          this.log("info", "surge_pattern", {
+            surgeId: activeSurgeId,
+            time_of_day: startedAt.getUTCHours(),
+            day_of_week: startedAt.getUTCDay(),
+            peak_pressure_pct: surgeRow.peak_pressure_pct,
+            peak_reserved: surgeRow.peak_reserved,
+            wallet_count_at_peak: surgeRow.wallet_count_at_peak,
+            duration_ms: durationMs,
+            ramp_rate_pct_per_sec: rampRate,
+          });
+        }
+      }
+    } catch (e) {
+      this.log("debug", "surge_check_error", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Check if dynamic wallet scaling is needed and perform it if so.
+   * Called from alarm() after reconciliation. Scales up by one wallet when:
+   *   - All initialized wallets are above SCALE_UP_THRESHOLD pressure
+   *   - Current wallet count is below SPONSOR_WALLET_MAX
+   *   - SPONSOR_MNEMONIC is available for key derivation
+   *
+   * Never throws — fail-open.
+   */
+  private async checkAndScaleUp(initializedCount: number): Promise<void> {
+    try {
+      if (initializedCount === 0) return;
+
+      const walletMax = this.getSponsorWalletMax();
+      if (initializedCount >= walletMax) {
+        return; // Already at ceiling
+      }
+
+      // Check if ALL wallets are above the scale-up threshold
+      for (let wi = 0; wi < initializedCount; wi++) {
+        const reserved = this.ledgerReservedCount(wi);
+        const pressure = reserved / CHAINING_LIMIT;
+        if (pressure < SCALE_UP_THRESHOLD) {
+          return; // At least one wallet has capacity — no scale-up needed
+        }
+      }
+
+      // All wallets are under pressure — derive and initialize the next wallet
+      const newWalletIndex = initializedCount;
+      const privateKey = await this.derivePrivateKeyForWallet(newWalletIndex);
+      if (!privateKey) {
+        this.log("warn", "scale_up_skipped_no_key", {
+          newWalletIndex,
+          reason: "SPONSOR_MNEMONIC not available or derivation failed",
+        });
+        return;
+      }
+
+      // Derive Stacks address for the new wallet
+      const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+      const newAddress = getAddressFromPrivateKey(privateKey, network);
+
+      // Seed nonce head from Hiro
+      await this.initWalletHeadFromHiro(newWalletIndex, newAddress);
+
+      // Register the new wallet address
+      await this.setStoredSponsorAddressForWallet(newWalletIndex, newAddress);
+
+      // Update dynamic wallet count in nonce_state
+      const newCount = newWalletIndex + 1;
+      this.setStateValue("dynamic_wallet_count", newCount);
+
+      this.log("info", "wallet_scaled_up", {
+        newWalletIndex,
+        newAddress,
+        newWalletCount: newCount,
+        reason: `All ${initializedCount} wallets exceeded ${Math.round(SCALE_UP_THRESHOLD * 100)}% pressure threshold`,
+        walletMax,
+      });
+    } catch (e) {
+      this.log("warn", "scale_up_error", {
+        error: e instanceof Error ? e.message : String(e),
+        initializedCount,
+      });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -1501,7 +1755,17 @@ export class NonceDO {
         await this.scheduleAlarm(true);
       }
 
-      const effectiveWalletCount = Math.max(1, Math.min(walletCount, MAX_WALLET_COUNT));
+      // Use the larger of the caller-supplied count and the dynamically-scaled count
+      // stored in nonce_state. This ensures scale-ups are reflected immediately
+      // without waiting for SponsorService to send the new count.
+      const storedDynamic = this.getStateValue("dynamic_wallet_count");
+      const effectiveWalletCount = Math.max(
+        1,
+        Math.min(
+          Math.max(walletCount, storedDynamic ?? 0),
+          MAX_WALLET_COUNT
+        )
+      );
 
       // Round-robin: start from stored nextWalletIndex, find a wallet under chaining limit
       let walletIndex = (await this.getNextWalletIndex()) % effectiveWalletCount;
@@ -1822,6 +2086,37 @@ export class NonceDO {
     const stuckTxRbfBroadcast = this.getStoredCount(STATE_KEYS.stuckTxRbfBroadcast);
     const stuckTxRbfConfirmed = this.getStoredCount(STATE_KEYS.stuckTxRbfConfirmed);
 
+    // Per-wallet utilization over the last hour (nonce_intents with assigned_at >= 1h ago)
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const walletUtilization: WalletUtilization[] = [];
+    for (const { walletIndex } of initializedWallets) {
+      const rows = this.sql
+        .exec<{ state: string; count: number }>(
+          `SELECT state, COUNT(*) as count FROM nonce_intents
+           WHERE wallet_index = ? AND assigned_at >= ?
+           GROUP BY state`,
+          Number(walletIndex),
+          oneHourAgo
+        )
+        .toArray();
+      const counts = { assigned: 0, broadcasted: 0, confirmed: 0, failed: 0, conflict: 0 };
+      for (const row of rows) {
+        if (row.state in counts) {
+          counts[row.state as keyof typeof counts] = row.count;
+        }
+      }
+      walletUtilization.push({
+        walletIndex: Number(walletIndex),
+        assigned_count: counts.assigned,
+        broadcasted_count: counts.broadcasted,
+        confirmed_count: counts.confirmed,
+        failed_count: counts.failed + counts.conflict,
+        window_hours: 1,
+      });
+    }
+
+    const dynamicWalletCount = this.getStateValue("dynamic_wallet_count");
+
     return {
       totalAssigned,
       conflictsDetected,
@@ -1839,6 +2134,10 @@ export class NonceDO {
       wallets,
       stuckTxRbfBroadcast,
       stuckTxRbfConfirmed,
+      walletUtilization,
+      dynamicWalletCount: dynamicWalletCount !== null && dynamicWalletCount > 0
+        ? dynamicWalletCount
+        : null,
     };
   }
 
@@ -2440,6 +2739,14 @@ export class NonceDO {
           }
         }
 
+        // Surge tracking: record/update/resolve surge events based on pool pressure.
+        // Must run after all wallet reconciliations so ledger counts are current.
+        this.checkAndRecordSurge(initializedWallets.length);
+
+        // Dynamic scaling: add a wallet if ALL initialized wallets are above 75% pressure
+        // and we haven't hit SPONSOR_WALLET_MAX. Runs in the alarm cycle (not request path).
+        await this.checkAndScaleUp(initializedWallets.length);
+
         // Dynamic alarm interval: use active (60s) when any wallet has in-flight nonces,
         // idle (5min) when all wallets are drained. This ensures rapid reconciliation
         // during traffic bursts and doesn't hammer Hiro unnecessarily when idle.
@@ -2748,6 +3055,21 @@ export class NonceDO {
           intents,
           recentEvents,
           intentCounts,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    // GET /surge-history — returns the last 20 surge events for operator diagnostics.
+    if (request.method === "GET" && url.pathname === "/surge-history") {
+      try {
+        const surgeEvents = this.sql
+          .exec("SELECT * FROM surge_events ORDER BY id DESC LIMIT 20")
+          .toArray();
+        return this.jsonResponse({
+          surgeEvents,
           timestamp: new Date().toISOString(),
         });
       } catch (error) {
