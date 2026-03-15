@@ -2319,16 +2319,20 @@ export class NonceDO {
         verdictPendingAgree++;
       }
 
-      this.log("debug", "reconcile_verdict", {
-        walletIndex,
-        nonce,
-        txid,
-        ledger_state: "broadcasted",
-        hiro_signal: classifyHiroSignal(nonce),
-        verdict,
-        reason,
-        ageMs,
-      });
+      // Only log individually for actionable verdicts; routine confirmed/pending
+      // are already captured in the reconciliation_summary aggregate.
+      if (verdict !== "confirmed" && verdict !== "pending_agree" && verdict !== "pending_wait") {
+        this.log("debug", "reconcile_verdict", {
+          walletIndex,
+          nonce,
+          txid,
+          ledger_state: "broadcasted",
+          hiro_signal: classifyHiroSignal(nonce),
+          verdict,
+          reason,
+          ageMs,
+        });
+      }
     }
 
     // -------------------------------------------------------------------------
@@ -2352,15 +2356,19 @@ export class NonceDO {
         verdictPendingAgree++;
       }
 
-      this.log("debug", "reconcile_verdict", {
-        walletIndex,
-        nonce,
-        ledger_state: "assigned",
-        hiro_signal: classifyHiroSignal(nonce),
-        verdict,
-        reason,
-        ageMs,
-      });
+      // Only log individually for actionable verdicts (expired);
+      // routine pending_assign is captured in the summary.
+      if (verdict !== "pending_assign") {
+        this.log("debug", "reconcile_verdict", {
+          walletIndex,
+          nonce,
+          ledger_state: "assigned",
+          hiro_signal: classifyHiroSignal(nonce),
+          verdict,
+          reason,
+          ageMs,
+        });
+      }
     }
 
     // -------------------------------------------------------------------------
@@ -2413,14 +2421,18 @@ export class NonceDO {
           verdictPendingAgree++;
         }
 
-        this.log("debug", "reconcile_verdict", {
-          walletIndex,
-          nonce,
-          ledger_state: intentState ?? "none",
-          hiro_signal: "missing",
-          verdict,
-          reason,
-        });
+        // Only log individually for actionable verdicts;
+        // ignore_stale_hiro is routine and captured in the summary.
+        if (verdict !== "ignore_stale_hiro") {
+          this.log("debug", "reconcile_verdict", {
+            walletIndex,
+            nonce,
+            ledger_state: intentState ?? "none",
+            hiro_signal: "missing",
+            verdict,
+            reason,
+          });
+        }
       }
     }
 
