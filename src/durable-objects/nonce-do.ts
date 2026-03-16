@@ -2253,12 +2253,20 @@ export class NonceDO {
     // Verdict counters for reconciliation_summary
     let verdictConfirmed = 0;
     let verdictPendingAgree = 0;
+    let verdictPendingWait = 0;
+    let verdictPendingAssign = 0;
     let verdictPendingDiverge = 0;
     let verdictExpired = 0;
     let verdictIgnoreStaleHiro = 0;
     let verdictRbfCandidate = 0;
     const rbfCandidates: Array<{ nonce: number; txid: string }> = [];
     const gapFillNonces: number[] = [];
+
+    // Routine verdicts that don't need per-nonce DEBUG logs — the
+    // reconciliation_summary INFO log reports their distinct counts.
+    const ROUTINE_BROADCASTED_VERDICTS = new Set(["confirmed", "pending_agree", "pending_wait"]);
+    const ROUTINE_ASSIGNED_VERDICTS = new Set(["pending_assign"]);
+    const ROUTINE_MISSING_VERDICTS = new Set(["ignore_stale_hiro"]);
 
     // -------------------------------------------------------------------------
     // Cross-reference: broadcasted nonces (have a txid recorded in ledger)
@@ -2316,19 +2324,23 @@ export class NonceDO {
         // Tx is recent or still somewhere we can't see — wait
         verdict = "pending_wait";
         reason = "tx_recent_or_status_unclear";
-        verdictPendingAgree++;
+        verdictPendingWait++;
       }
 
-      this.log("debug", "reconcile_verdict", {
-        walletIndex,
-        nonce,
-        txid,
-        ledger_state: "broadcasted",
-        hiro_signal: classifyHiroSignal(nonce),
-        verdict,
-        reason,
-        ageMs,
-      });
+      // Only log individually for actionable verdicts; routine verdicts
+      // are reported with distinct counts in the reconciliation_summary.
+      if (!ROUTINE_BROADCASTED_VERDICTS.has(verdict)) {
+        this.log("debug", "reconcile_verdict", {
+          walletIndex,
+          nonce,
+          txid,
+          ledger_state: "broadcasted",
+          hiro_signal: classifyHiroSignal(nonce),
+          verdict,
+          reason,
+          ageMs,
+        });
+      }
     }
 
     // -------------------------------------------------------------------------
@@ -2349,18 +2361,22 @@ export class NonceDO {
       } else {
         verdict = "pending_assign";
         reason = "within_grace_period";
-        verdictPendingAgree++;
+        verdictPendingAssign++;
       }
 
-      this.log("debug", "reconcile_verdict", {
-        walletIndex,
-        nonce,
-        ledger_state: "assigned",
-        hiro_signal: classifyHiroSignal(nonce),
-        verdict,
-        reason,
-        ageMs,
-      });
+      // Only log individually for actionable verdicts (expired);
+      // routine verdicts are reported with distinct counts in the summary.
+      if (!ROUTINE_ASSIGNED_VERDICTS.has(verdict)) {
+        this.log("debug", "reconcile_verdict", {
+          walletIndex,
+          nonce,
+          ledger_state: "assigned",
+          hiro_signal: classifyHiroSignal(nonce),
+          verdict,
+          reason,
+          ageMs,
+        });
+      }
     }
 
     // -------------------------------------------------------------------------
@@ -2413,14 +2429,18 @@ export class NonceDO {
           verdictPendingAgree++;
         }
 
-        this.log("debug", "reconcile_verdict", {
-          walletIndex,
-          nonce,
-          ledger_state: intentState ?? "none",
-          hiro_signal: "missing",
-          verdict,
-          reason,
-        });
+        // Only log individually for actionable verdicts;
+        // routine verdicts are reported with distinct counts in the summary.
+        if (!ROUTINE_MISSING_VERDICTS.has(verdict)) {
+          this.log("debug", "reconcile_verdict", {
+            walletIndex,
+            nonce,
+            ledger_state: intentState ?? "none",
+            hiro_signal: "missing",
+            verdict,
+            reason,
+          });
+        }
       }
     }
 
@@ -2525,6 +2545,8 @@ export class NonceDO {
       total_nonces: broadcastedByNonce.size + assignedByNonce.size + gapFillNonces.length,
       confirmed: verdictConfirmed,
       pending_agree: verdictPendingAgree,
+      pending_wait: verdictPendingWait,
+      pending_assign: verdictPendingAssign,
       pending_diverge: verdictPendingDiverge,
       expired: verdictExpired,
       gap_filled: gapFillFilled.length,
