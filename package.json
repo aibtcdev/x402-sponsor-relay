@@ -27,7 +27,7 @@
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18",
-    "wrangler": "^4.58.0"
+    "wrangler": "^4.75.0"
   },
   "dependencies": {
     "@noble/curves": "^2.0.1",
