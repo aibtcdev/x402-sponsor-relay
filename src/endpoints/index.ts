@@ -17,3 +17,4 @@ export { Settle } from "./settle";
 export { VerifyV2 } from "./verify-v2";
 export { Supported } from "./supported";
 export { Wallets } from "./wallets";
+export { Inbox } from "./inbox";

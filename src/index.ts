@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, NonceHistory, NonceSurgeHistory, Settle, VerifyV2, Supported, Wallets } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, NonceHistory, NonceSurgeHistory, Settle, VerifyV2, Supported, Wallets, Inbox } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -51,6 +51,7 @@ const openapi = fromHono(app, {
       { name: "Nonce", description: "Nonce coordinator diagnostics" },
       { name: "x402 V2", description: "x402 V2 facilitator API (spec-compliant)" },
       { name: "Wallets", description: "Sponsor wallet monitoring (balance, fees, pool state)" },
+      { name: "Inbox", description: "On-chain message inbox (paid messages via arc-inbox contract)" },
     ],
     servers: [
       {
@@ -101,6 +102,7 @@ openapi.post("/settle", Settle as unknown as typeof Settle);
 openapi.post("/verify", VerifyV2 as unknown as typeof VerifyV2);
 openapi.get("/supported", Supported as unknown as typeof Supported);
 openapi.get("/wallets", Wallets as unknown as typeof Wallets);
+openapi.post("/inbox", Inbox as unknown as typeof Inbox);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
 app.route("/dashboard", dashboard);
@@ -140,6 +142,7 @@ app.get("/", (c) => {
       settle: "POST /settle - x402 V2 facilitator settle",
       verifyV2: "POST /verify - x402 V2 facilitator verify",
       supported: "GET /supported - x402 V2 supported payment kinds",
+      inbox: "POST /inbox - Post paid message to on-chain inbox (arc-inbox contract)",
     },
     payment: {
       tokens: ["STX", "sBTC", "USDCx"],

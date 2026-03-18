@@ -36,3 +36,7 @@ export { SettlementService } from "./settlement";
 export { SettlementHealthService } from "./settlement-health";
 
 export { PaymentIdService } from "./payment-identifier";
+
+export { InboxService } from "./inbox";
+export type { InboxPostResult, InboxPostFailure, InboxPostOutcome } from "./inbox";
+export { MAX_CONTENT_LENGTH, MIN_PAYMENT_STX, MIN_PAYMENT_SBTC } from "./inbox";

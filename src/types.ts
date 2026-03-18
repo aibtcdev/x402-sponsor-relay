@@ -473,6 +473,20 @@ export interface RelayRequest {
 }
 
 /**
+ * Request body for /inbox endpoint
+ */
+export interface InboxRequest {
+  /** Message content (max 1024 UTF-8 characters) */
+  content: string;
+  /** Hex-encoded signed sponsored payment transaction (STX or sBTC transfer) */
+  transaction: string;
+  /** Settlement options for payment validation */
+  settle: SettleOptions;
+  /** Optional SIP-018 authentication */
+  auth?: Sip018Auth;
+}
+
+/**
  * Settlement result in API response format
  */
 export interface SettlementResult {
@@ -578,7 +592,10 @@ export type RelayErrorCode =
   | "NONCE_RESET_FAILED"
   | "NONCE_DO_UNAVAILABLE"
   | "UNSUPPORTED_ADDRESS_TYPE"
-  | "INVALID_BTC_ADDRESS";
+  | "INVALID_BTC_ADDRESS"
+  | "MISSING_CONTENT"
+  | "EMPTY_CONTENT"
+  | "CONTENT_TOO_LONG";
 
 /**
  * Structured error response with retry guidance
