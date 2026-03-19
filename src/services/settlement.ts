@@ -21,7 +21,7 @@ import type {
   DedupResult,
   BroadcastAndConfirmResult,
 } from "../types";
-import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, CLIENT_REJECTION_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
 import { extractSponsorNonce } from "./sponsor";
 
@@ -725,18 +725,34 @@ export class SettlementService {
             };
           }
 
-          // HTTP 4xx (non-nonce): transaction-level rejection, no point trying other nodes
+          // HTTP 4xx (non-nonce): transaction-level rejection, no point trying other nodes.
+          // Match against CLIENT_REJECTION_REASONS to distinguish client-caused rejections
+          // (bad tx, insufficient funds, wrong network) from unexpected relay-side failures.
           if (broadcastResponse.status >= 400 && broadcastResponse.status < 500) {
-            this.logger.error("Broadcast failed with 4xx, not retrying", {
-              status: broadcastResponse.status,
-              error: errorMessage,
-              details: errorDetails,
-              nodeUrl: target.baseUrl,
-            });
+            const matchedReason = CLIENT_REJECTION_REASONS.find(
+              (reason) => conflictDetails.includes(reason)
+            );
+            if (matchedReason) {
+              this.logger.warn("Broadcast rejected by node (client error), not retrying", {
+                status: broadcastResponse.status,
+                error: errorMessage,
+                details: errorDetails,
+                clientRejection: matchedReason,
+                nodeUrl: target.baseUrl,
+              });
+            } else {
+              this.logger.error("Broadcast failed with 4xx, not retrying", {
+                status: broadcastResponse.status,
+                error: errorMessage,
+                details: errorDetails,
+                nodeUrl: target.baseUrl,
+              });
+            }
             return {
               error: "Broadcast failed",
               details: errorDetails,
               retryable: false,
+              clientRejection: matchedReason,
               nodeUrl: target.baseUrl,
               httpStatus: broadcastResponse.status,
             };

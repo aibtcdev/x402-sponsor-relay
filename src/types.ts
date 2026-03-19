@@ -1132,4 +1132,14 @@ export interface DedupResult {
 export type BroadcastAndConfirmResult =
   | { txid: string; status: "confirmed"; blockHeight: number }
   | { txid: string; status: "pending" }
-  | { error: string; details: string; retryable: boolean; nonceConflict?: boolean; nodeUrl?: string; httpStatus?: number };
+  | {
+      error: string;
+      details: string;
+      retryable: boolean;
+      nonceConflict?: boolean;
+      /** Matched Stacks node rejection reason (e.g. "NotEnoughFunds") when the 4xx
+       *  rejection was caused by the client submitting an invalid transaction. */
+      clientRejection?: string;
+      nodeUrl?: string;
+      httpStatus?: number;
+    };
