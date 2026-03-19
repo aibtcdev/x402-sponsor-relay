@@ -154,7 +154,7 @@ export class BaseEndpoint extends OpenAPIRoute {
           error: "Sender has insufficient funds — top up the wallet and re-sign the transaction",
           code: "CLIENT_INSUFFICIENT_FUNDS",
           status: 422,
-          details,
+          details: `${details} (node reason: ${clientRejection})`,
           retryable: false,
         });
       case "BadNonce":
@@ -162,7 +162,7 @@ export class BaseEndpoint extends OpenAPIRoute {
           error: "Sender nonce is invalid — re-sign the transaction with the correct account nonce",
           code: "CLIENT_BAD_NONCE",
           status: 422,
-          details,
+          details: `${details} (node reason: ${clientRejection})`,
           retryable: true,
         });
       case "ConflictingNonceInMempool":
@@ -170,18 +170,18 @@ export class BaseEndpoint extends OpenAPIRoute {
           error: "Sender nonce conflicts with a pending mempool transaction — wait and retry",
           code: "CLIENT_NONCE_CONFLICT",
           status: 409,
-          details,
+          details: `${details} (node reason: ${clientRejection})`,
           retryable: true,
           retryAfter: 30,
         });
       default:
-        // Recognized as a client rejection but no specific mapping — generic 502
+        // Recognized as a client rejection but no specific mapping — 422 (client tx invalid)
         return this.err(c, {
-          error: "Transaction rejected by the Stacks node",
+          error: `Transaction rejected by the Stacks node: ${clientRejection}`,
           code: "BROADCAST_REJECTED",
-          status: 502,
-          details,
-          retryable: false,
+          status: 422,
+          details: `${details} (node reason: ${clientRejection})`,
+          retryable: true,
         });
     }
   }
@@ -217,6 +217,6 @@ export class BaseEndpoint extends OpenAPIRoute {
       c.header("Retry-After", opts.retryAfter.toString());
     }
 
-    return c.json(response, opts.status as 400 | 401 | 402 | 404 | 429 | 500 | 502 | 504);
+    return c.json(response, opts.status as 400 | 401 | 402 | 404 | 409 | 422 | 429 | 500 | 502 | 503 | 504);
   }
 }

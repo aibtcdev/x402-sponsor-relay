@@ -306,7 +306,7 @@ export class Sponsor extends BaseEndpoint {
             });
           }
 
-          c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
+          c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
           c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError).catch(() => {}));
 
           // Record broadcast outcome in the intent ledger — authoritative record.
@@ -331,13 +331,10 @@ export class Sponsor extends BaseEndpoint {
             );
           }
 
-          // Map client-caused Stacks node rejections to distinct actionable error codes.
-          // Check clientRejection BEFORE isNonceConflict: if the client submitted a bad
-          // nonce, that's a client error even though the sponsor nonce pool also sees it.
-          if (clientRejection) {
-            return this.clientRejectionResponse(c, clientRejection, errorReason);
-          }
-
+          // On the sponsored path, nonce conflicts are ambiguous — the Stacks node doesn't
+          // say whose nonce conflicted (client vs sponsor). Check nonceConflict FIRST to
+          // ensure the sponsor nonce pool gets resynced. Non-nonce client rejections
+          // (NotEnoughFunds, etc.) fall through to clientRejectionResponse.
           if (isNonceConflict) {
             logger.warn("Nonce conflict returned to agent", {
               sponsorNonce,
@@ -356,6 +353,11 @@ export class Sponsor extends BaseEndpoint {
               retryable: true,
               retryAfter: 30,
             });
+          }
+
+          // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
+          if (clientRejection) {
+            return this.clientRejectionResponse(c, clientRejection, errorReason);
           }
 
           return this.err(c, {

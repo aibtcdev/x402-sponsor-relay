@@ -410,18 +410,11 @@ export class Relay extends BaseEndpoint {
           }).catch(() => {})
         );
 
-        // Map client-caused Stacks node rejections to distinct actionable error codes.
-        // Check clientRejection BEFORE nonceConflict: if the client submitted a bad nonce,
-        // that's a client error even though nonceConflict is also set. The sponsor nonce
-        // pool doesn't need resync for client-caused nonce errors.
-        if (clientRejection) {
-          logger.warn("Broadcast rejected by node (client error)", {
-            clientRejection,
-            details: broadcastResult.details,
-          });
-          return this.clientRejectionResponse(c, clientRejection, broadcastResult.details);
-        }
-
+        // On the sponsored path, nonce conflicts are ambiguous — the Stacks node doesn't
+        // say whose nonce conflicted (client vs sponsor). Since the relay has a sponsor
+        // nonce pool that needs resync on conflict, check nonceConflict FIRST to ensure
+        // the pool gets resynced. For non-nonce client rejections (NotEnoughFunds, etc.),
+        // return actionable error codes via clientRejectionResponse.
         if (broadcastResult.nonceConflict) {
           logger.warn("Nonce conflict returned to agent", {
             sponsorNonce,
@@ -440,6 +433,15 @@ export class Relay extends BaseEndpoint {
             retryable: true,
             retryAfter: 30,
           });
+        }
+
+        // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
+        if (clientRejection) {
+          logger.warn("Broadcast rejected by node (client error)", {
+            clientRejection,
+            details: broadcastResult.details,
+          });
+          return this.clientRejectionResponse(c, clientRejection, broadcastResult.details);
         }
 
         // Distinguish retryable broadcast failures from non-retryable on-chain failures
