@@ -286,16 +286,18 @@ export class Sponsor extends BaseEndpoint {
           const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
             errorReason.includes(reason)
           );
+          // CLIENT_REJECTION_REASONS is a superset of NONCE_CONFLICT_REASONS,
+          // so clientRejection is always set when isNonceConflict is true.
           const clientRejection = CLIENT_REJECTION_REASONS.find((reason) =>
             errorReason.includes(reason)
           );
-          const isClientError = isNonceConflict || clientRejection !== undefined;
+          const isClientError = clientRejection !== undefined;
 
           if (isClientError) {
             logger.warn("Broadcast rejected by node (client error)", {
               error: result.error,
               reason: errorReason,
-              clientRejection: clientRejection ?? (isNonceConflict ? "Nonce" : undefined),
+              clientRejection,
             });
           } else {
             logger.error("Broadcast rejected by node", {
@@ -329,6 +331,13 @@ export class Sponsor extends BaseEndpoint {
             );
           }
 
+          // Map client-caused Stacks node rejections to distinct actionable error codes.
+          // Check clientRejection BEFORE isNonceConflict: if the client submitted a bad
+          // nonce, that's a client error even though the sponsor nonce pool also sees it.
+          if (clientRejection) {
+            return this.clientRejectionResponse(c, clientRejection, errorReason);
+          }
+
           if (isNonceConflict) {
             logger.warn("Nonce conflict returned to agent", {
               sponsorNonce,
@@ -347,11 +356,6 @@ export class Sponsor extends BaseEndpoint {
               retryable: true,
               retryAfter: 30,
             });
-          }
-
-          // Map client-caused Stacks node rejections to distinct actionable error codes
-          if (clientRejection) {
-            return this.clientRejectionResponse(c, clientRejection, errorReason);
           }
 
           return this.err(c, {

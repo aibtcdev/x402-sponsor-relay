@@ -410,6 +410,18 @@ export class Relay extends BaseEndpoint {
           }).catch(() => {})
         );
 
+        // Map client-caused Stacks node rejections to distinct actionable error codes.
+        // Check clientRejection BEFORE nonceConflict: if the client submitted a bad nonce,
+        // that's a client error even though nonceConflict is also set. The sponsor nonce
+        // pool doesn't need resync for client-caused nonce errors.
+        if (clientRejection) {
+          logger.warn("Broadcast rejected by node (client error)", {
+            clientRejection,
+            details: broadcastResult.details,
+          });
+          return this.clientRejectionResponse(c, clientRejection, broadcastResult.details);
+        }
+
         if (broadcastResult.nonceConflict) {
           logger.warn("Nonce conflict returned to agent", {
             sponsorNonce,
@@ -428,15 +440,6 @@ export class Relay extends BaseEndpoint {
             retryable: true,
             retryAfter: 30,
           });
-        }
-
-        // Map client-caused Stacks node rejections to distinct actionable error codes
-        if (clientRejection) {
-          logger.warn("Broadcast rejected by node (client error)", {
-            clientRejection,
-            details: broadcastResult.details,
-          });
-          return this.clientRejectionResponse(c, clientRejection, broadcastResult.details);
         }
 
         // Distinguish retryable broadcast failures from non-retryable on-chain failures
@@ -689,13 +692,30 @@ export class Relay extends BaseEndpoint {
         }).catch(() => {})
       );
 
-      // Map client-caused Stacks node rejections to distinct actionable error codes
+      // Map client-caused Stacks node rejections to distinct actionable error codes.
+      // Self-pay has no sponsor nonce pool, so nonce errors are always client errors.
+      // clientRejection covers nonce errors too (BadNonce, ConflictingNonceInMempool).
       if (clientRejection) {
         logger.warn("Self-pay broadcast rejected by node (client error)", {
           clientRejection,
           details: broadcastResult.details,
         });
         return this.clientRejectionResponse(c, clientRejection, broadcastResult.details);
+      }
+
+      // Safety net: nonceConflict without clientRejection should not happen after the
+      // settlement.ts fix, but handle defensively in case of future changes.
+      if (broadcastResult.nonceConflict) {
+        logger.warn("Self-pay nonce conflict (no clientRejection matched)", {
+          details: broadcastResult.details,
+        });
+        return this.err(c, {
+          error: "Sender nonce conflict — re-sign the transaction with the correct account nonce",
+          code: "CLIENT_BAD_NONCE",
+          status: 422,
+          details: broadcastResult.details,
+          retryable: true,
+        });
       }
 
       return this.err(c, {

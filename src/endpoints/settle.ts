@@ -204,15 +204,9 @@ export class Settle extends BaseEndpoint {
       if ("error" in broadcastResult) {
         const clientRejection = broadcastResult.clientRejection;
 
-        if (broadcastResult.nonceConflict) {
-          // Sponsor nonce conflict — not client-caused, relay must resync
-          logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
-            error: broadcastResult.error,
-            senderSigner: verifyResult.data.sender,
-          });
-          c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
-          return v2Error(X402_V2_ERROR_CODES.CONFLICTING_NONCE, 200);
-        } else if (clientRejection === "NotEnoughFunds") {
+        // /settle broadcasts pre-signed txs — there is no sponsor nonce pool.
+        // Check clientRejection first: nonce errors are always client errors here.
+        if (clientRejection === "NotEnoughFunds") {
           logger.warn("Broadcast rejected: sender has insufficient funds", {
             error: broadcastResult.error,
             clientRejection,
@@ -233,11 +227,18 @@ export class Settle extends BaseEndpoint {
           });
           c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
           return v2Error(X402_V2_ERROR_CODES.CONFLICTING_NONCE, 200);
+        } else if (clientRejection) {
+          // Other client rejection (FeeTooLow, BadTransactionVersion, etc.)
+          logger.warn("Broadcast rejected by node (client error)", {
+            error: broadcastResult.error,
+            clientRejection,
+          });
+          c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
+          return v2Error(X402_V2_ERROR_CODES.TRANSACTION_FAILED, 200);
         } else {
           logger.warn("Broadcast/confirm failed", {
             error: broadcastResult.error,
             retryable: broadcastResult.retryable,
-            clientRejection,
           });
           c.executionCtx.waitUntil(statsService.logFailure("settle", false, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
           const errorReason = broadcastResult.retryable
