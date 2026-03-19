@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.20.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.20.0...x402-sponsor-relay-v1.20.1) (2026-03-19)
+
+
+### Bug Fixes
+
+* surface client-side broadcast rejections as actionable 4xx errors ([#177](https://github.com/aibtcdev/x402-sponsor-relay/issues/177)) ([6247560](https://github.com/aibtcdev/x402-sponsor-relay/commit/6247560d6fd665676adb114743707e850bb40720))
+
 ## [1.20.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.19.0...x402-sponsor-relay-v1.20.0) (2026-03-13)
 
 
