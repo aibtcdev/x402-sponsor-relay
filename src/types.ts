@@ -398,6 +398,10 @@ export const X402_V2_ERROR_CODES = {
   CONFLICTING_NONCE: "conflicting_nonce",
   PAYMENT_IDENTIFIER_CONFLICT: "payment_identifier_conflict",
   PAYMENT_IDENTIFIER_REQUIRED: "payment_identifier_required",
+  /** Sender had insufficient funds — client must top up wallet before retrying */
+  CLIENT_INSUFFICIENT_FUNDS: "client_insufficient_funds",
+  /** Sender nonce is invalid — client must re-sign with the correct account nonce */
+  CLIENT_BAD_NONCE: "client_bad_nonce",
 } as const;
 
 /**
@@ -546,10 +550,14 @@ export type RelayErrorCode =
   | "SPONSOR_CONFIG_ERROR"
   | "SPONSOR_FAILED"
   | "BROADCAST_FAILED"
+  | "BROADCAST_REJECTED"
   | "SETTLEMENT_VERIFICATION_FAILED"
   | "SETTLEMENT_BROADCAST_FAILED"
   | "NONCE_CONFLICT"
   | "SETTLEMENT_FAILED"
+  | "CLIENT_INSUFFICIENT_FUNDS"
+  | "CLIENT_BAD_NONCE"
+  | "CLIENT_NONCE_CONFLICT"
   | "NOT_FOUND"
   | "INTERNAL_ERROR"
   | "MISSING_API_KEY"
