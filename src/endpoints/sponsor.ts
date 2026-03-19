@@ -350,45 +350,8 @@ export class Sponsor extends BaseEndpoint {
           }
 
           // Map client-caused Stacks node rejections to distinct actionable error codes
-          if (clientRejection === "NotEnoughFunds") {
-            return this.err(c, {
-              error: "Sender has insufficient funds — top up the wallet and re-sign the transaction",
-              code: "CLIENT_INSUFFICIENT_FUNDS",
-              status: 422,
-              details: errorReason,
-              retryable: false,
-            });
-          }
-
-          if (clientRejection === "BadNonce") {
-            return this.err(c, {
-              error: "Sender nonce is invalid — re-sign the transaction with the correct account nonce",
-              code: "CLIENT_BAD_NONCE",
-              status: 422,
-              details: errorReason,
-              retryable: true,
-            });
-          }
-
-          if (clientRejection === "ConflictingNonceInMempool") {
-            return this.err(c, {
-              error: "Sender nonce conflicts with a pending mempool transaction — wait and retry",
-              code: "CLIENT_NONCE_CONFLICT",
-              status: 409,
-              details: errorReason,
-              retryable: true,
-              retryAfter: 30,
-            });
-          }
-
           if (clientRejection) {
-            return this.err(c, {
-              error: "Transaction rejected by the Stacks node",
-              code: "BROADCAST_REJECTED",
-              status: 502,
-              details: errorReason,
-              retryable: false,
-            });
+            return this.clientRejectionResponse(c, clientRejection, errorReason);
           }
 
           return this.err(c, {
