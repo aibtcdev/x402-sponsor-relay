@@ -1309,6 +1309,10 @@ All errors return JSON with this shape:
 | SETTLEMENT_BROADCAST_FAILED    | 502  | true      | Stacks node rejected broadcast, retryAfter: 5 |
 | NONCE_CONFLICT                 | 409  | true      | Sponsor nonce conflict in mempool; resubmit with a new transaction |
 | SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but definitively aborted on-chain (abort_* status only) |
+| CLIENT_INSUFFICIENT_FUNDS      | 422  | false     | Sender had insufficient funds — top up wallet before re-signing and retrying |
+| CLIENT_BAD_NONCE               | 422  | true      | Sender nonce is invalid — re-sign with the correct account nonce and retry |
+| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender nonce conflicts in mempool — wait for pending tx, then re-sign and retry |
+| BROADCAST_REJECTED             | 502  | false     | Stacks node rejected the transaction for another client-caused reason |
 
 ## API Key Errors (POST /sponsor, POST /fees/config)
 
@@ -1374,11 +1378,15 @@ Do NOT retry:
 - 400 errors — the request body must be corrected first
 - 401 errors — fix auth (new key, fix signature)
 - 404 errors — the resource doesn't exist
-- 409 errors — the conflict must be resolved (except NONCE_CONFLICT)
+- 409 errors — the conflict must be resolved (except NONCE_CONFLICT and CLIENT_NONCE_CONFLICT)
+- 422 CLIENT_INSUFFICIENT_FUNDS — fund the wallet first, then re-sign and submit
+- 502 BROADCAST_REJECTED — another client-caused rejection, inspect details field
 
 Do retry (after retryAfter):
 - 429 rate limit — wait for the window to reset
-- 409 NONCE_CONFLICT — rebuild and resubmit a new transaction
+- 409 NONCE_CONFLICT — relay sponsor nonce conflict; rebuild and resubmit a new transaction
+- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; wait for pending mempool tx, re-sign and retry
+- 422 CLIENT_BAD_NONCE — re-fetch the sender's current nonce, re-sign, and resubmit
 - 502 SETTLEMENT_BROADCAST_FAILED — Stacks node may accept on retry
 - 500 INTERNAL_ERROR — may be transient
 

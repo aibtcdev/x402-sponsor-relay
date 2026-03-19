@@ -396,9 +396,12 @@ export class Relay extends BaseEndpoint {
           );
         }
 
-        c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
+        const clientRejection = broadcastResult.clientRejection;
+        const isClientError = clientRejection !== undefined;
+
+        c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "internal").catch(() => {}));
         c.executionCtx.waitUntil(
-          statsService.logFailure("relay", false, {
+          statsService.logFailure("relay", isClientError, {
             tokenType: body.settle.tokenType || "STX",
             amount: body.settle.minAmount,
             fee: sponsorResult.fee,
@@ -407,6 +410,11 @@ export class Relay extends BaseEndpoint {
           }).catch(() => {})
         );
 
+        // On the sponsored path, nonce conflicts are ambiguous — the Stacks node doesn't
+        // say whose nonce conflicted (client vs sponsor). Since the relay has a sponsor
+        // nonce pool that needs resync on conflict, check nonceConflict FIRST to ensure
+        // the pool gets resynced. For non-nonce client rejections (NotEnoughFunds, etc.),
+        // return actionable error codes via clientRejectionResponse.
         if (broadcastResult.nonceConflict) {
           logger.warn("Nonce conflict returned to agent", {
             sponsorNonce,
@@ -425,6 +433,15 @@ export class Relay extends BaseEndpoint {
             retryable: true,
             retryAfter: 30,
           });
+        }
+
+        // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
+        if (clientRejection) {
+          logger.warn("Broadcast rejected by node (client error)", {
+            clientRejection,
+            details: broadcastResult.details,
+          });
+          return this.clientRejectionResponse(c, clientRejection, broadcastResult.details);
         }
 
         // Distinguish retryable broadcast failures from non-retryable on-chain failures
@@ -663,9 +680,12 @@ export class Relay extends BaseEndpoint {
     );
 
     if ("error" in broadcastResult) {
-      c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
+      const clientRejection = broadcastResult.clientRejection;
+      const isClientError = clientRejection !== undefined;
+
+      c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "internal").catch(() => {}));
       c.executionCtx.waitUntil(
-        statsService.logFailure("relay", false, {
+        statsService.logFailure("relay", isClientError, {
           tokenType: body.settle.tokenType || "STX",
           amount: body.settle.minAmount,
           fee: "0",
@@ -673,6 +693,33 @@ export class Relay extends BaseEndpoint {
           recipient: body.settle.expectedRecipient,
         }).catch(() => {})
       );
+
+      // Map client-caused Stacks node rejections to distinct actionable error codes.
+      // Self-pay has no sponsor nonce pool, so nonce errors are always client errors.
+      // clientRejection covers nonce errors too (BadNonce, ConflictingNonceInMempool).
+      if (clientRejection) {
+        logger.warn("Self-pay broadcast rejected by node (client error)", {
+          clientRejection,
+          details: broadcastResult.details,
+        });
+        return this.clientRejectionResponse(c, clientRejection, broadcastResult.details);
+      }
+
+      // Safety net: nonceConflict without clientRejection should not happen after the
+      // settlement.ts fix, but handle defensively in case of future changes.
+      if (broadcastResult.nonceConflict) {
+        logger.warn("Self-pay nonce conflict (no clientRejection matched)", {
+          details: broadcastResult.details,
+        });
+        return this.err(c, {
+          error: "Sender nonce conflict — re-sign the transaction with the correct account nonce",
+          code: "CLIENT_BAD_NONCE",
+          status: 422,
+          details: broadcastResult.details,
+          retryable: true,
+        });
+      }
+
       return this.err(c, {
         error: broadcastResult.error,
         code: broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED",

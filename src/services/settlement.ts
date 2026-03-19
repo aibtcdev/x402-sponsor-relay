@@ -21,7 +21,7 @@ import type {
   DedupResult,
   BroadcastAndConfirmResult,
 } from "../types";
-import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, CLIENT_REJECTION_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
 import { extractSponsorNonce } from "./sponsor";
 
@@ -685,58 +685,78 @@ export class SettlementService {
             (reason) => conflictDetails.includes(reason)
           );
 
-          if (isNonceConflict) {
-            // Include sender identity for attribution (#114).
-            // The signer field is the hash160 of the sender's public key (not a
-            // human-readable address, but sufficient for log correlation).
-            const senderSigner = transaction.auth.spendingCondition.signer;
-            const senderNonce = Number(transaction.auth.spendingCondition.nonce);
+          // HTTP 4xx: transaction-level rejection, no point trying other nodes.
+          // Match against CLIENT_REJECTION_REASONS first — this is a superset of
+          // NONCE_CONFLICT_REASONS, so nonce errors get clientRejection set too.
+          // We also set nonceConflict for nonce errors so that endpoints with a
+          // sponsor nonce pool (e.g. /relay sponsored path) can trigger resync.
+          if (broadcastResponse.status >= 400 && broadcastResponse.status < 500) {
+            const matchedReason = CLIENT_REJECTION_REASONS.find(
+              (reason) => conflictDetails.includes(reason)
+            );
 
-            if (sponsorNonceForLog === null) {
-              // No relay-assigned sponsor nonce: this is a client pre-signed tx.
-              // Log at INFO — the nonce conflict is the client's problem, not the relay's.
-              this.logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
-                status: broadcastResponse.status,
+            if (isNonceConflict) {
+              // Include sender identity for attribution (#114).
+              const senderSigner = transaction.auth.spendingCondition.signer;
+              const senderNonce = Number(transaction.auth.spendingCondition.nonce);
+
+              if (sponsorNonceForLog === null) {
+                // No relay-assigned sponsor nonce: this is a client pre-signed tx.
+                // Log at INFO — the nonce conflict is the client's problem, not the relay's.
+                this.logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
+                  status: broadcastResponse.status,
+                  details: conflictDetails,
+                  senderSigner,
+                  senderNonce,
+                  nodeUrl: target.baseUrl,
+                });
+              } else {
+                // Relay assigned a sponsor nonce: unexpected conflict on relay side.
+                this.logger.warn("Broadcast rejected due to nonce conflict", {
+                  status: broadcastResponse.status,
+                  details: conflictDetails,
+                  sponsorNonce: sponsorNonceForLog,
+                  senderSigner,
+                  senderNonce,
+                  nodeUrl: target.baseUrl,
+                });
+              }
+              // Nonce conflicts are retriable after resync/backoff — the nonce pool
+              // needs time to reconcile before the client retries with a fresh nonce.
+              // clientRejection is ALSO set so endpoints without a sponsor nonce pool
+              // (e.g. /settle, self-pay /relay) can map it to a client error code.
+              return {
+                error: "Nonce conflict",
                 details: conflictDetails,
-                senderSigner,
-                senderNonce,
+                retryable: true,
+                nonceConflict: true,
+                clientRejection: matchedReason,
+                nodeUrl: target.baseUrl,
+                httpStatus: broadcastResponse.status,
+              };
+            }
+
+            if (matchedReason) {
+              this.logger.warn("Broadcast rejected by node (client error), not retrying", {
+                status: broadcastResponse.status,
+                error: errorMessage,
+                details: errorDetails,
+                clientRejection: matchedReason,
                 nodeUrl: target.baseUrl,
               });
             } else {
-              // Relay assigned a sponsor nonce: unexpected conflict on relay side.
-              this.logger.warn("Broadcast rejected due to nonce conflict", {
+              this.logger.error("Broadcast failed with 4xx, not retrying", {
                 status: broadcastResponse.status,
-                details: conflictDetails,
-                sponsorNonce: sponsorNonceForLog,
-                senderSigner,
-                senderNonce,
+                error: errorMessage,
+                details: errorDetails,
                 nodeUrl: target.baseUrl,
               });
             }
-            // Nonce conflicts are retriable after resync/backoff — the nonce pool
-            // needs time to reconcile before the client retries with a fresh nonce.
-            return {
-              error: "Nonce conflict",
-              details: conflictDetails,
-              retryable: true,
-              nonceConflict: true,
-              nodeUrl: target.baseUrl,
-              httpStatus: broadcastResponse.status,
-            };
-          }
-
-          // HTTP 4xx (non-nonce): transaction-level rejection, no point trying other nodes
-          if (broadcastResponse.status >= 400 && broadcastResponse.status < 500) {
-            this.logger.error("Broadcast failed with 4xx, not retrying", {
-              status: broadcastResponse.status,
-              error: errorMessage,
-              details: errorDetails,
-              nodeUrl: target.baseUrl,
-            });
             return {
               error: "Broadcast failed",
               details: errorDetails,
               retryable: false,
+              clientRejection: matchedReason,
               nodeUrl: target.baseUrl,
               httpStatus: broadcastResponse.status,
             };

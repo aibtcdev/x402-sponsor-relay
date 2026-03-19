@@ -12,7 +12,7 @@ import {
   recordBroadcastOutcomeDO,
 } from "../services";
 import type { AppContext, SponsorRequest } from "../types";
-import { buildExplorerUrl, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import { buildExplorerUrl, CLIENT_REJECTION_REASONS, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 import {
   Error400Response,
   Error401Response,
@@ -282,16 +282,32 @@ export class Sponsor extends BaseEndpoint {
           if ("error" in result && result.error) {
           const errorReason =
             typeof result.reason === "string" ? result.reason : "Unknown error";
-          logger.error("Broadcast rejected by node", {
-            error: result.error,
-            reason: errorReason,
-          });
-          c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
-          c.executionCtx.waitUntil(statsService.logFailure("sponsor", false).catch(() => {}));
 
           const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
             errorReason.includes(reason)
           );
+          // CLIENT_REJECTION_REASONS is a superset of NONCE_CONFLICT_REASONS,
+          // so clientRejection is always set when isNonceConflict is true.
+          const clientRejection = CLIENT_REJECTION_REASONS.find((reason) =>
+            errorReason.includes(reason)
+          );
+          const isClientError = clientRejection !== undefined;
+
+          if (isClientError) {
+            logger.warn("Broadcast rejected by node (client error)", {
+              error: result.error,
+              reason: errorReason,
+              clientRejection,
+            });
+          } else {
+            logger.error("Broadcast rejected by node", {
+              error: result.error,
+              reason: errorReason,
+            });
+          }
+
+          c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError).catch(() => {}));
 
           // Record broadcast outcome in the intent ledger — authoritative record.
           // Never pass synthetic txids — txid is reserved for real transaction IDs.
@@ -315,6 +331,10 @@ export class Sponsor extends BaseEndpoint {
             );
           }
 
+          // On the sponsored path, nonce conflicts are ambiguous — the Stacks node doesn't
+          // say whose nonce conflicted (client vs sponsor). Check nonceConflict FIRST to
+          // ensure the sponsor nonce pool gets resynced. Non-nonce client rejections
+          // (NotEnoughFunds, etc.) fall through to clientRejectionResponse.
           if (isNonceConflict) {
             logger.warn("Nonce conflict returned to agent", {
               sponsorNonce,
@@ -333,6 +353,11 @@ export class Sponsor extends BaseEndpoint {
               retryable: true,
               retryAfter: 30,
             });
+          }
+
+          // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
+          if (clientRejection) {
+            return this.clientRejectionResponse(c, clientRejection, errorReason);
           }
 
           return this.err(c, {

@@ -202,29 +202,53 @@ export class Settle extends BaseEndpoint {
       );
 
       if ("error" in broadcastResult) {
-        if (broadcastResult.nonceConflict) {
-          logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
+        const clientRejection = broadcastResult.clientRejection;
+        const isClientError = clientRejection !== undefined;
+
+        // Record stats once for all error branches
+        c.executionCtx.waitUntil(
+          statsService.logFailure("settle", isClientError, {
+            tokenType: settleOptions.tokenType,
+            amount: settleOptions.minAmount,
+          }).catch(() => {})
+        );
+
+        // /settle broadcasts pre-signed txs — there is no sponsor nonce pool.
+        // Nonce errors are always client errors here.
+        if (clientRejection === "NotEnoughFunds") {
+          logger.warn("Broadcast rejected: sender has insufficient funds", {
             error: broadcastResult.error,
-            senderSigner: verifyResult.data.sender,
+            clientRejection,
           });
-          c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
+          return v2Error(X402_V2_ERROR_CODES.CLIENT_INSUFFICIENT_FUNDS, 200);
+        } else if (clientRejection === "BadNonce") {
+          logger.warn("Broadcast rejected: sender nonce is invalid", {
+            error: broadcastResult.error,
+            clientRejection,
+          });
+          return v2Error(X402_V2_ERROR_CODES.CLIENT_BAD_NONCE, 200);
+        } else if (clientRejection === "ConflictingNonceInMempool") {
+          logger.warn("Broadcast rejected: sender nonce conflicts in mempool", {
+            error: broadcastResult.error,
+            clientRejection,
+          });
+          return v2Error(X402_V2_ERROR_CODES.CONFLICTING_NONCE, 200);
+        } else if (clientRejection) {
+          logger.warn("Broadcast rejected by node (client error)", {
+            error: broadcastResult.error,
+            clientRejection,
+          });
+          return v2Error(X402_V2_ERROR_CODES.TRANSACTION_FAILED, 200);
         } else {
           logger.warn("Broadcast/confirm failed", {
             error: broadcastResult.error,
             retryable: broadcastResult.retryable,
           });
-          c.executionCtx.waitUntil(statsService.logFailure("settle", false, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
+          const errorReason = broadcastResult.retryable
+            ? X402_V2_ERROR_CODES.BROADCAST_FAILED
+            : X402_V2_ERROR_CODES.TRANSACTION_FAILED;
+          return v2Error(errorReason, 200);
         }
-
-        let errorReason: string;
-        if (broadcastResult.nonceConflict) {
-          errorReason = X402_V2_ERROR_CODES.CONFLICTING_NONCE;
-        } else if (broadcastResult.retryable) {
-          errorReason = X402_V2_ERROR_CODES.BROADCAST_FAILED;
-        } else {
-          errorReason = X402_V2_ERROR_CODES.TRANSACTION_FAILED;
-        }
-        return v2Error(errorReason, 200);
       }
 
       const payer = settlementService.senderToAddress(

@@ -135,6 +135,58 @@ export class BaseEndpoint extends OpenAPIRoute {
   }
 
   /**
+   * Map a client rejection reason from BroadcastAndConfirmResult to a structured
+   * error response. The switch covers known reasons (NotEnoughFunds, BadNonce,
+   * ConflictingNonceInMempool) with specific codes/statuses, and falls through
+   * to a generic BROADCAST_REJECTED response for any other client rejection.
+   *
+   * Shared by /relay (sponsored + self-pay) and /sponsor to avoid duplicating
+   * the same if/else chain across three call sites.
+   */
+  protected clientRejectionResponse(
+    c: AppContext,
+    clientRejection: string,
+    details: string
+  ): Response {
+    switch (clientRejection) {
+      case "NotEnoughFunds":
+        return this.err(c, {
+          error: "Sender has insufficient funds — top up the wallet and re-sign the transaction",
+          code: "CLIENT_INSUFFICIENT_FUNDS",
+          status: 422,
+          details: `${details} (node reason: ${clientRejection})`,
+          retryable: false,
+        });
+      case "BadNonce":
+        return this.err(c, {
+          error: "Sender nonce is invalid — re-sign the transaction with the correct account nonce",
+          code: "CLIENT_BAD_NONCE",
+          status: 422,
+          details: `${details} (node reason: ${clientRejection})`,
+          retryable: true,
+        });
+      case "ConflictingNonceInMempool":
+        return this.err(c, {
+          error: "Sender nonce conflicts with a pending mempool transaction — wait and retry",
+          code: "CLIENT_NONCE_CONFLICT",
+          status: 409,
+          details: `${details} (node reason: ${clientRejection})`,
+          retryable: true,
+          retryAfter: 30,
+        });
+      default:
+        // Recognized as a client rejection but no specific mapping — 422 (client tx invalid)
+        return this.err(c, {
+          error: `Transaction rejected by the Stacks node: ${clientRejection}`,
+          code: "BROADCAST_REJECTED",
+          status: 422,
+          details: `${details} (node reason: ${clientRejection})`,
+          retryable: true,
+        });
+    }
+  }
+
+  /**
    * Return a structured error response with retry guidance
    */
   protected err(
@@ -165,6 +217,6 @@ export class BaseEndpoint extends OpenAPIRoute {
       c.header("Retry-After", opts.retryAfter.toString());
     }
 
-    return c.json(response, opts.status as 400 | 401 | 402 | 404 | 429 | 500 | 502 | 504);
+    return c.json(response, opts.status as 400 | 401 | 402 | 404 | 409 | 422 | 429 | 500 | 502 | 503 | 504);
   }
 }
