@@ -407,6 +407,8 @@ export class Relay extends BaseEndpoint {
           }).catch(() => {})
         );
 
+        const clientRejection = broadcastResult.clientRejection;
+
         if (broadcastResult.nonceConflict) {
           logger.warn("Nonce conflict returned to agent", {
             sponsorNonce,
@@ -424,6 +426,64 @@ export class Relay extends BaseEndpoint {
             details: broadcastResult.details,
             retryable: true,
             retryAfter: 30,
+          });
+        }
+
+        // Map client-caused Stacks node rejections to distinct actionable error codes
+        if (clientRejection === "NotEnoughFunds") {
+          logger.warn("Broadcast rejected: sender has insufficient funds", {
+            clientRejection,
+            details: broadcastResult.details,
+          });
+          return this.err(c, {
+            error: "Sender has insufficient funds — top up the wallet and re-sign the transaction",
+            code: "CLIENT_INSUFFICIENT_FUNDS",
+            status: 422,
+            details: broadcastResult.details,
+            retryable: false,
+          });
+        }
+
+        if (clientRejection === "BadNonce") {
+          logger.warn("Broadcast rejected: sender nonce is invalid", {
+            clientRejection,
+            details: broadcastResult.details,
+          });
+          return this.err(c, {
+            error: "Sender nonce is invalid — re-sign the transaction with the correct account nonce",
+            code: "CLIENT_BAD_NONCE",
+            status: 422,
+            details: broadcastResult.details,
+            retryable: true,
+          });
+        }
+
+        if (clientRejection === "ConflictingNonceInMempool") {
+          logger.warn("Broadcast rejected: sender nonce conflicts in mempool", {
+            clientRejection,
+            details: broadcastResult.details,
+          });
+          return this.err(c, {
+            error: "Sender nonce conflicts with a pending mempool transaction — wait and retry",
+            code: "CLIENT_NONCE_CONFLICT",
+            status: 409,
+            details: broadcastResult.details,
+            retryable: true,
+            retryAfter: 30,
+          });
+        }
+
+        if (clientRejection) {
+          logger.warn("Broadcast rejected by node (client error)", {
+            clientRejection,
+            details: broadcastResult.details,
+          });
+          return this.err(c, {
+            error: "Transaction rejected by the Stacks node",
+            code: "BROADCAST_REJECTED",
+            status: 502,
+            details: broadcastResult.details,
+            retryable: false,
           });
         }
 
@@ -663,9 +723,12 @@ export class Relay extends BaseEndpoint {
     );
 
     if ("error" in broadcastResult) {
-      c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
+      const clientRejection = broadcastResult.clientRejection;
+      const isClientError = clientRejection !== undefined;
+
+      c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "internal").catch(() => {}));
       c.executionCtx.waitUntil(
-        statsService.logFailure("relay", false, {
+        statsService.logFailure("relay", isClientError, {
           tokenType: body.settle.tokenType || "STX",
           amount: body.settle.minAmount,
           fee: "0",
@@ -673,6 +736,65 @@ export class Relay extends BaseEndpoint {
           recipient: body.settle.expectedRecipient,
         }).catch(() => {})
       );
+
+      // Map client-caused Stacks node rejections to distinct actionable error codes
+      if (clientRejection === "NotEnoughFunds") {
+        logger.warn("Self-pay broadcast rejected: sender has insufficient funds", {
+          clientRejection,
+          details: broadcastResult.details,
+        });
+        return this.err(c, {
+          error: "Sender has insufficient funds — top up the wallet and re-sign the transaction",
+          code: "CLIENT_INSUFFICIENT_FUNDS",
+          status: 422,
+          details: broadcastResult.details,
+          retryable: false,
+        });
+      }
+
+      if (clientRejection === "BadNonce") {
+        logger.warn("Self-pay broadcast rejected: sender nonce is invalid", {
+          clientRejection,
+          details: broadcastResult.details,
+        });
+        return this.err(c, {
+          error: "Sender nonce is invalid — re-sign the transaction with the correct account nonce",
+          code: "CLIENT_BAD_NONCE",
+          status: 422,
+          details: broadcastResult.details,
+          retryable: true,
+        });
+      }
+
+      if (clientRejection === "ConflictingNonceInMempool") {
+        logger.warn("Self-pay broadcast rejected: sender nonce conflicts in mempool", {
+          clientRejection,
+          details: broadcastResult.details,
+        });
+        return this.err(c, {
+          error: "Sender nonce conflicts with a pending mempool transaction — wait and retry",
+          code: "CLIENT_NONCE_CONFLICT",
+          status: 409,
+          details: broadcastResult.details,
+          retryable: true,
+          retryAfter: 30,
+        });
+      }
+
+      if (clientRejection) {
+        logger.warn("Self-pay broadcast rejected by node (client error)", {
+          clientRejection,
+          details: broadcastResult.details,
+        });
+        return this.err(c, {
+          error: "Transaction rejected by the Stacks node",
+          code: "BROADCAST_REJECTED",
+          status: 502,
+          details: broadcastResult.details,
+          retryable: false,
+        });
+      }
+
       return this.err(c, {
         error: broadcastResult.error,
         code: broadcastResult.retryable ? "SETTLEMENT_BROADCAST_FAILED" : "SETTLEMENT_FAILED",
