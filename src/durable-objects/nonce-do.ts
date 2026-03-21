@@ -2518,9 +2518,11 @@ export class NonceDO {
       });
     }
 
-    // Only stamp lastGapDetected when there are genuine unresolvable gaps that
-    // require gap-fill broadcasts — not for every Hiro-reported missing nonce
-    // (many are already tracked as assigned/broadcasted/confirmed in the ledger).
+    // Only stamp lastGapDetected when there are genuine gaps that require
+    // gap-fill broadcasts — not for every Hiro-reported missing nonce (many are
+    // already tracked as assigned/broadcasted/confirmed in the ledger).
+    // Without this gate the 10-minute window in health.ts (RECENT_CONFLICT_WINDOW_MS)
+    // never expires because the alarm refreshes the timestamp every 60s cycle.
     if (gapFillNonces.length > 0) {
       this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
     }
