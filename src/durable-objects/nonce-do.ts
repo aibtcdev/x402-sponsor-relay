@@ -3,6 +3,7 @@ import {
   getAddressFromPrivateKey,
 } from "@stacks/transactions";
 import type { StacksTransactionWire } from "@stacks/transactions";
+import { hexToBytes } from "@stacks/common";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
 import type { Env, LogsRPC } from "../types";
@@ -578,11 +579,7 @@ export class NonceDO {
     };
 
     const txHex = tx.serialize();
-    const bytePairs = txHex.match(/.{2}/g);
-    if (!bytePairs) {
-      return { ok: false, status: 0, reason: "serialize_failed", body: "Could not serialize tx to bytes" };
-    }
-    const txBytes = new Uint8Array(bytePairs.map((b: string) => parseInt(b, 16)));
+    const txBytes = hexToBytes(txHex);
 
     const response = await fetch(`${baseUrl}/v2/transactions`, {
       method: "POST",
@@ -746,9 +743,6 @@ export class NonceDO {
         return result.txid;
       }
 
-      // Broadcast rejected — update state with incremented attempt count and raw details
-      await this.state.storage.put(key, state);
-
       // If the node reports BadNonce, the nonce was consumed by a confirmed tx.
       // Cap attempts to prevent further retries — the reconcile loop's
       // last_executed_tx_nonce check will mark it confirmed on the next cycle.
@@ -765,6 +759,8 @@ export class NonceDO {
         return null;
       }
 
+      // Other rejection — persist incremented attempt count and log details
+      await this.state.storage.put(key, state);
       this.log("warn", "rbf_broadcast_rejected", {
         walletIndex,
         nonce,
