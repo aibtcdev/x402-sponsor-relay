@@ -1,8 +1,8 @@
 import {
   makeSTXTokenTransfer,
-  broadcastTransaction,
   getAddressFromPrivateKey,
 } from "@stacks/transactions";
+import type { StacksTransactionWire } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
 import type { Env, LogsRPC } from "../types";
@@ -555,6 +555,79 @@ export class NonceDO {
   }
 
   /**
+   * Broadcast a serialized transaction via direct fetch to /v2/transactions.
+   * Returns { ok: true, txid } on success, { ok: false, status, reason, body } on failure.
+   *
+   * Uses direct fetch instead of broadcastTransaction() from @stacks/transactions
+   * to capture the raw HTTP status and response body on all failures — the library
+   * function throws a generic "unable to parse node response" error when the node
+   * returns a non-JSON body, losing all diagnostic information.
+   */
+  private async broadcastRawTx(
+    tx: StacksTransactionWire,
+    context: string
+  ): Promise<
+    | { ok: true; txid: string }
+    | { ok: false; status: number; reason: string; body: string }
+  > {
+    const network: "mainnet" | "testnet" = this.env.STACKS_NETWORK ?? "testnet";
+    const baseUrl = getHiroBaseUrl(network);
+    const headers: Record<string, string> = {
+      "Content-Type": "application/octet-stream",
+      ...getHiroHeaders(this.env.HIRO_API_KEY),
+    };
+
+    const txHex = tx.serialize();
+    const bytePairs = txHex.match(/.{2}/g);
+    if (!bytePairs) {
+      return { ok: false, status: 0, reason: "serialize_failed", body: "Could not serialize tx to bytes" };
+    }
+    const txBytes = new Uint8Array(bytePairs.map((b: string) => parseInt(b, 16)));
+
+    const response = await fetch(`${baseUrl}/v2/transactions`, {
+      method: "POST",
+      headers,
+      body: txBytes,
+      signal: AbortSignal.timeout(12_000),
+    });
+
+    const responseText = await response.text();
+
+    if (response.ok) {
+      let txid: string;
+      try {
+        txid = JSON.parse(responseText) as string;
+      } catch {
+        txid = responseText.trim().replace(/^"|"$/g, "");
+      }
+      return { ok: true, txid };
+    }
+
+    // Non-OK: try to parse JSON error, fall back to raw text
+    let reason = `http_${response.status}`;
+    let body = responseText.slice(0, 500);
+    try {
+      const errorJson = JSON.parse(responseText) as {
+        error?: string;
+        reason?: string;
+        reason_data?: unknown;
+      };
+      if (errorJson.reason) reason = errorJson.reason;
+      if (errorJson.error) body = errorJson.error;
+    } catch {
+      // Non-JSON response — keep raw text (could be HTML error page)
+    }
+
+    this.log("warn", `${context}_raw_response`, {
+      httpStatus: response.status,
+      reason,
+      body: responseText.slice(0, 500),
+    });
+
+    return { ok: false, status: response.status, reason, body };
+  }
+
+  /**
    * Broadcast a gap-fill STX transfer for a specific nonce.
    * Returns the txid on success, null if the nonce is already occupied or on error.
    * Amount: 1 uSTX. Fee: 30,000 uSTX (RBF-capable). Memo: gap-fill-{nonce}.
@@ -575,23 +648,20 @@ export class NonceDO {
         fee: GAP_FILL_FEE,
         memo: `gap-fill-${gapNonce}`,
       });
-      const result = await broadcastTransaction({ transaction: tx, network });
-      if ("txid" in result) {
+      const result = await this.broadcastRawTx(tx, "gap_fill");
+      if (result.ok) {
         return result.txid;
       }
-      // Cast to access raw reason string — Hiro may return values not in the typed union
-      // (e.g. "ConflictingNonceInMempool" when a tx with same nonce is already in mempool)
-      const rejection = result as unknown as { reason?: string; error?: string };
-      if (rejection.reason === "ConflictingNonceInMempool") {
+      if (result.reason === "ConflictingNonceInMempool") {
         // Nonce already occupied — not an error, just skip
         return null;
       }
-      // Other rejection — log and continue
       this.log("warn", "gap_fill_rejected", {
         walletIndex,
         nonce: gapNonce,
-        reason: rejection.reason ?? "unknown",
-        error: rejection.error ?? "",
+        httpStatus: result.status,
+        reason: result.reason,
+        body: result.body,
       });
       return null;
     } catch (e) {
@@ -654,14 +724,14 @@ export class NonceDO {
         fee: RBF_FEE,
         memo: `rbf-${nonce}-attempt-${attemptNum}`,
       });
-      const result = await broadcastTransaction({ transaction: tx, network });
+      const result = await this.broadcastRawTx(tx, "rbf");
 
       // Update state regardless of outcome (increment attempt count to prevent runaway)
       state.lastSeen = now;
       state.rbfAttempts = attemptNum;
       state.originalTxid = state.originalTxid ?? originalTxid;
 
-      if ("txid" in result) {
+      if (result.ok) {
         state.lastRbfTxid = result.txid;
         await this.state.storage.put(key, state);
         this.incrementCounter(STATE_KEYS.stuckTxRbfBroadcast);
@@ -676,14 +746,14 @@ export class NonceDO {
         return result.txid;
       }
 
-      // Broadcast rejected — update state with incremented attempt count
+      // Broadcast rejected — update state with incremented attempt count and raw details
       await this.state.storage.put(key, state);
-      const rejection = result as unknown as { reason?: string; error?: string };
       this.log("warn", "rbf_broadcast_rejected", {
         walletIndex,
         nonce,
-        reason: rejection.reason ?? "unknown",
-        error: rejection.error ?? "",
+        httpStatus: result.status,
+        reason: result.reason,
+        body: result.body,
         attemptNum,
       });
       return null;
