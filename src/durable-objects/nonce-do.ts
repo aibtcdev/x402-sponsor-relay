@@ -2383,7 +2383,12 @@ export class NonceDO {
     // Cross-reference: Hiro-detected missing nonces not in our ledger
     // -------------------------------------------------------------------------
     if (detected_missing_nonces.length > 0) {
-      this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+      // NOTE: lastGapDetected is set AFTER the loop, only when true gap-fills are
+      // needed (gapFillNonces.length > 0).  Setting it here unconditionally caused
+      // the circuit breaker to latch open: the alarm runs every 60s, Hiro routinely
+      // reports transient "missing" nonces that are already tracked in the ledger
+      // (assigned/broadcasted/confirmed), and the 10-minute RECENT_CONFLICT_WINDOW
+      // never expired because the timestamp was refreshed every cycle.
 
       for (const nonce of detected_missing_nonces) {
         // Already handled above in broadcastedByNonce or assignedByNonce loops
@@ -2516,6 +2521,14 @@ export class NonceDO {
     // -------------------------------------------------------------------------
     // Execute gap-fills for nonces not in our ledger or in failed state
     // -------------------------------------------------------------------------
+
+    // Only stamp lastGapDetected when there are genuine unresolvable gaps that
+    // require gap-fill broadcasts — not for every Hiro-reported missing nonce
+    // (many are already tracked as assigned/broadcasted/confirmed in the ledger).
+    if (gapFillNonces.length > 0) {
+      this.setStateValue(STATE_KEYS.lastGapDetected, Date.now());
+    }
+
     const gapFillFilled: number[] = [];
     if (gapFillNonces.length > 0) {
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
