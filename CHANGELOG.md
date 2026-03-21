@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.20.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.20.1...x402-sponsor-relay-v1.20.2) (2026-03-21)
+
+
+### Bug Fixes
+
+* **nonce-do:** prevent circuit breaker latch on transient Hiro gap reports ([#182](https://github.com/aibtcdev/x402-sponsor-relay/issues/182)) ([75a82b3](https://github.com/aibtcdev/x402-sponsor-relay/commit/75a82b32e31cdf6659532392651c1cf3d394ab09))
+
 ## [1.20.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.20.0...x402-sponsor-relay-v1.20.1) (2026-03-19)
 
 
