@@ -748,6 +748,23 @@ export class NonceDO {
 
       // Broadcast rejected — update state with incremented attempt count and raw details
       await this.state.storage.put(key, state);
+
+      // If the node reports BadNonce, the nonce was consumed by a confirmed tx.
+      // Cap attempts to prevent further retries — the reconcile loop's
+      // last_executed_tx_nonce check will mark it confirmed on the next cycle.
+      if (result.reason === "BadNonce") {
+        state.rbfAttempts = MAX_RBF_ATTEMPTS;
+        await this.state.storage.put(key, state);
+        this.log("info", "rbf_nonce_consumed", {
+          walletIndex,
+          nonce,
+          reason: result.reason,
+          body: result.body,
+          attemptNum,
+        });
+        return null;
+      }
+
       this.log("warn", "rbf_broadcast_rejected", {
         walletIndex,
         nonce,
@@ -2530,7 +2547,26 @@ export class NonceDO {
       if (privateKey) {
         for (const candidate of rbfCandidates) {
           const { nonce, txid } = candidate;
-          // Optional: check if tx is abort_* (terminal) before RBF — skip RBF if so
+          // Check if this nonce is already consumed on-chain via last_executed_tx_nonce.
+          // This catches cases where the txid lookup returns null/dropped but the nonce
+          // has actually been executed (e.g. by a replacement tx that Hiro hasn't indexed).
+          if (last_executed_tx_nonce !== null && nonce <= last_executed_tx_nonce) {
+            this.log("info", "reconcile_nonce_already_executed", {
+              walletIndex,
+              nonce,
+              txid,
+              last_executed_tx_nonce,
+              reason: "nonce_below_last_executed_skip_rbf",
+            });
+            this.ledgerMarkConfirmedByReconcile(walletIndex, nonce, txid);
+            // Clean up any stuck-tx state for this nonce
+            const stuckKey = this.walletStuckTxKey(walletIndex, nonce);
+            await this.state.storage.delete(stuckKey);
+            verdictConfirmed++;
+            verdictRbfCandidate--;
+            continue;
+          }
+          // Check if tx is abort_* (terminal) before RBF — skip RBF if so
           const txStatus = await this.fetchTxStatus(txid);
           if (txStatus !== null && txStatus.startsWith("abort_")) {
             // Transaction was definitively rejected on-chain — mark failed, no RBF
@@ -2560,11 +2596,17 @@ export class NonceDO {
                 now
               );
             } catch { /* fail-open */ }
+            // Clean up stuck-tx state for aborted nonce
+            const abortStuckKey = this.walletStuckTxKey(walletIndex, nonce);
+            await this.state.storage.delete(abortStuckKey);
             continue;
           }
           if (txStatus === "success") {
             // Tx actually confirmed (Hiro eventually returned it) — mark confirmed
             this.ledgerMarkConfirmedByReconcile(walletIndex, nonce, txid);
+            // Clean up stuck-tx state for confirmed nonce
+            const confirmStuckKey = this.walletStuckTxKey(walletIndex, nonce);
+            await this.state.storage.delete(confirmStuckKey);
             verdictConfirmed++;
             verdictRbfCandidate--;
             continue;
