@@ -603,23 +603,29 @@ export class NonceDO {
     // Non-OK: try to parse JSON error, fall back to raw text
     let reason = `http_${response.status}`;
     let body = responseText.slice(0, 500);
+    let parsedJson = false;
     try {
       const errorJson = JSON.parse(responseText) as {
         error?: string;
         reason?: string;
         reason_data?: unknown;
       };
+      parsedJson = true;
       if (errorJson.reason) reason = errorJson.reason;
       if (errorJson.error) body = errorJson.error;
     } catch {
       // Non-JSON response — keep raw text (could be HTML error page)
     }
 
-    this.log("warn", `${context}_raw_response`, {
-      httpStatus: response.status,
-      reason,
-      body: responseText.slice(0, 500),
-    });
+    // Only log here for unexpected cases (5xx or non-JSON responses).
+    // Callers log expected outcomes (ConflictingNonceInMempool, BadNonce) at appropriate levels.
+    if (response.status >= 500 || !parsedJson) {
+      this.log("warn", `${context}_raw_response`, {
+        httpStatus: response.status,
+        reason,
+        body: responseText.slice(0, 500),
+      });
+    }
 
     return { ok: false, status: response.status, reason, body };
   }
@@ -747,8 +753,8 @@ export class NonceDO {
       // Cap attempts to prevent further retries — the reconcile loop's
       // last_executed_tx_nonce check will mark it confirmed on the next cycle.
       if (result.reason === "BadNonce") {
-        state.rbfAttempts = MAX_RBF_ATTEMPTS;
-        await this.state.storage.put(key, state);
+        // Terminal — delete stuck-tx state entirely to avoid orphaned entries
+        await this.state.storage.delete(key);
         this.log("info", "rbf_nonce_consumed", {
           walletIndex,
           nonce,
@@ -2595,6 +2601,7 @@ export class NonceDO {
             // Clean up stuck-tx state for aborted nonce
             const abortStuckKey = this.walletStuckTxKey(walletIndex, nonce);
             await this.state.storage.delete(abortStuckKey);
+            verdictRbfCandidate--;
             continue;
           }
           if (txStatus === "success") {
