@@ -2355,7 +2355,14 @@ export class NonceDO {
     // reconciliation_summary INFO log reports their distinct counts.
     const ROUTINE_BROADCASTED_VERDICTS = new Set(["confirmed", "pending_agree", "pending_wait"]);
     const ROUTINE_ASSIGNED_VERDICTS = new Set(["pending_assign"]);
-    const ROUTINE_MISSING_VERDICTS = new Set(["ignore_stale_hiro"]);
+    // conflict_resolved_* and conflict_stale_gap_fill have their own info-level
+    // log via conflict_nonce_resolved — skip the redundant reconcile_verdict debug log.
+    const ROUTINE_MISSING_VERDICTS = new Set([
+      "ignore_stale_hiro",
+      "conflict_resolved_consumed",
+      "conflict_stale_gap_fill",
+      "conflict_recent_skip",
+    ]);
 
     // -------------------------------------------------------------------------
     // Cross-reference: broadcasted nonces (have a txid recorded in ledger)
@@ -2483,15 +2490,20 @@ export class NonceDO {
         // Already handled above in broadcastedByNonce or assignedByNonce loops
         if (broadcastedByNonce.has(nonce) || assignedByNonce.has(nonce)) continue;
 
-        // Query ledger directly for this nonce's state
+        // Query ledger directly for this nonce's state and metadata
         const intentRows = this.sql
-          .exec<{ state: string }>(
-            "SELECT state FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+          .exec<{ state: string; txid: string | null; assigned_at: string }>(
+            "SELECT state, txid, assigned_at FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
             walletIndex,
             nonce
           )
           .toArray();
         const intentState = intentRows[0]?.state ?? null;
+        const intentTxid = intentRows[0]?.txid ?? null;
+        const intentAssignedAt = intentRows[0]?.assigned_at ?? null;
+        const intentAgeMs = intentAssignedAt ? Date.now() - new Date(intentAssignedAt).getTime() : Infinity;
+        // Use 5 minutes as the threshold for "old enough to abandon" conflict nonces
+        const CONFLICT_ABANDON_AGE_MS = 5 * 60 * 1000;
 
         let verdict: string;
         let reason: string;
@@ -2516,6 +2528,50 @@ export class NonceDO {
           verdict = "gap_fill";
           reason = "expired_in_ledger_hiro_missing";
           gapFillNonces.push(nonce);
+        } else if (intentState === "conflict") {
+          // Two txs were broadcast for this nonce slot (ConflictingNonceInMempool).
+          // Hiro reports the nonce as missing, meaning neither tx is currently in the mempool.
+          // Recovery strategy:
+          //   1. If chain advanced past this nonce (last_executed_tx_nonce >= nonce):
+          //      one of the txs confirmed — mark as confirmed and clean up.
+          //   2. If the conflict is old enough (>5 min) and nonce not yet consumed:
+          //      both txs are gone and neither confirmed — gap-fill to unblock the wallet.
+          //   3. If the conflict is recent: skip conservatively, let it age out.
+          if (last_executed_tx_nonce !== null && nonce <= last_executed_tx_nonce) {
+            // Chain consumed this nonce — mark confirmed (txid may be null if we never got one)
+            verdict = "conflict_resolved_consumed";
+            reason = "chain_advanced_past_conflict_nonce";
+            if (intentTxid) {
+              this.ledgerMarkConfirmedByReconcile(walletIndex, nonce, intentTxid);
+              const stuckKey = this.walletStuckTxKey(walletIndex, nonce);
+              await this.state.storage.delete(stuckKey);
+            }
+            verdictConfirmed++;
+            this.log("info", "conflict_nonce_resolved", {
+              walletIndex,
+              nonce,
+              txid: intentTxid,
+              last_executed_tx_nonce,
+              reason: "chain_advanced_past_conflict_nonce",
+            });
+          } else if (intentAgeMs >= CONFLICT_ABANDON_AGE_MS) {
+            // Conflict is stale and nonce not consumed — gap-fill to restore capacity
+            verdict = "conflict_stale_gap_fill";
+            reason = "conflict_nonce_old_hiro_missing_gap_fill";
+            gapFillNonces.push(nonce);
+            this.log("info", "conflict_nonce_resolved", {
+              walletIndex,
+              nonce,
+              txid: intentTxid,
+              ageMs: intentAgeMs,
+              reason: "conflict_stale_gap_fill",
+            });
+          } else {
+            // Conflict is recent — skip conservatively
+            verdict = "conflict_recent_skip";
+            reason = "conflict_nonce_recent_skip";
+            verdictPendingAgree++;
+          }
         } else {
           // Unexpected state — log and skip conservatively
           verdict = "unknown_state";
