@@ -11,5 +11,5 @@
     "lib": ["ES2022"]
   },
   "include": ["src/**/*", "worker-configuration.d.ts"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "src/__tests__"]
 }

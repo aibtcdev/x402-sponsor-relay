@@ -146,11 +146,12 @@ export class Access extends BaseEndpoint {
       }
 
       // If targetUrl is provided, proxy the request
-      if (body.targetUrl) {
+      const targetUrl = body.targetUrl;
+      if (targetUrl) {
         // Validate targetUrl to prevent SSRF - only allow HTTPS to public hosts
         let parsedUrl: URL;
         try {
-          parsedUrl = new URL(body.targetUrl);
+          parsedUrl = new URL(targetUrl);
         } catch {
           return this.err(c, {
             error: "Invalid target URL",
@@ -183,16 +184,19 @@ export class Access extends BaseEndpoint {
 
         logger.info("Proxying request to downstream service", {
           receiptId: body.receiptId,
-          targetUrl: body.targetUrl,
+          targetUrl,
         });
 
         try {
-          const proxyResponse = await fetch(body.targetUrl, {
+          const proxyHeaders: Record<string, string> = {
+            "Content-Type": "application/json",
+          };
+          if (receipt.sponsoredTx) {
+            proxyHeaders["X-Payment"] = receipt.sponsoredTx;
+          }
+          const proxyResponse = await fetch(targetUrl, {
             method: receipt.settleOptions.method || "GET",
-            headers: {
-              "X-Payment": receipt.sponsoredTx,
-              "Content-Type": "application/json",
-            },
+            headers: proxyHeaders,
           });
 
           const proxyBody = await proxyResponse.text();
@@ -249,7 +253,7 @@ export class Access extends BaseEndpoint {
         } catch (e) {
           logger.error("Proxy request failed", {
             receiptId: body.receiptId,
-            targetUrl: body.targetUrl,
+            targetUrl,
             error: e instanceof Error ? e.message : "Unknown error",
           });
           return this.err(c, {

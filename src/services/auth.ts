@@ -4,12 +4,10 @@ import type {
   ApiKeyUsage,
   ApiKeyFeeStats,
   ApiKeyValidationResult,
-  ApiKeyErrorCode,
   RateLimitTier,
   TokenType,
   AggregateKeyStats,
   ApiKeyStatsEntry,
-  ApiKeyStatus,
 } from "../types";
 import { TIER_LIMITS } from "../types";
 
