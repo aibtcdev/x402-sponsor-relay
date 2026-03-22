@@ -4,7 +4,6 @@ import {
   p2wpkh,
   p2pkh,
   p2sh,
-  p2tr,
   Script,
   SigHash,
   RawWitness,
