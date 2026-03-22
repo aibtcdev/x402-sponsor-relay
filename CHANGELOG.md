@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.20.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.20.1...x402-sponsor-relay-v1.20.2) (2026-03-22)
+
+
+### Bug Fixes
+
+* **nonce-do:** add recovery path for conflict nonces ([#188](https://github.com/aibtcdev/x402-sponsor-relay/issues/188)) ([44df333](https://github.com/aibtcdev/x402-sponsor-relay/commit/44df3336ff202456cbd69c3e06f1bc47fe4d233e))
+* **nonce-do:** prevent circuit breaker latch on transient Hiro gap reports ([#182](https://github.com/aibtcdev/x402-sponsor-relay/issues/182)) ([75a82b3](https://github.com/aibtcdev/x402-sponsor-relay/commit/75a82b32e31cdf6659532392651c1cf3d394ab09))
+* **nonce-do:** resolve RBF broadcast failures for stuck wallets ([2f36e53](https://github.com/aibtcdev/x402-sponsor-relay/commit/2f36e539dc1b01f2447e27df0148e54387a50307)), closes [#184](https://github.com/aibtcdev/x402-sponsor-relay/issues/184)
+
 ## [1.20.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.20.0...x402-sponsor-relay-v1.20.1) (2026-03-19)
 
 
