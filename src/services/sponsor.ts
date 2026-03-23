@@ -669,7 +669,14 @@ export class SponsorService {
         // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED, 503 LOW_HEADROOM)
         const isChainingLimit = doResult.code === "CHAINING_LIMIT_EXCEEDED";
         const isLowHeadroom = doResult.code === "LOW_HEADROOM";
-        const code = isChainingLimit ? "RATE_LIMIT_EXCEEDED" : isLowHeadroom ? "LOW_HEADROOM" : "NONCE_DO_UNAVAILABLE";
+        let code: string;
+        if (isChainingLimit) {
+          code = "RATE_LIMIT_EXCEEDED";
+        } else if (isLowHeadroom) {
+          code = "LOW_HEADROOM";
+        } else {
+          code = "NONCE_DO_UNAVAILABLE";
+        }
         this.logger.error("NonceDO nonce assignment failed", {
           code: doResult.code,
           error: doResult.error,
