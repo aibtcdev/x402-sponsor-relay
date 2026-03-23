@@ -65,6 +65,8 @@ export interface SponsorFailure {
   details: string;
   /** Optional machine-readable error code for callers */
   code?: string;
+  /** Seconds the caller should wait before retrying (set for LOW_HEADROOM and similar transient errors) */
+  retryAfter?: number;
 }
 
 /**
@@ -109,6 +111,7 @@ interface NonceDOErrorBody {
   code?: string;
   mempoolDepth?: number;
   estimatedDrainSeconds?: number;
+  retryAfterSeconds?: number;
 }
 
 /**
@@ -663,15 +666,17 @@ export class SponsorService {
           totalReserved,
         });
       } else {
-        // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED)
+        // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED, 503 LOW_HEADROOM)
         const isChainingLimit = doResult.code === "CHAINING_LIMIT_EXCEEDED";
-        const code = isChainingLimit ? "RATE_LIMIT_EXCEEDED" : "NONCE_DO_UNAVAILABLE";
+        const isLowHeadroom = doResult.code === "LOW_HEADROOM";
+        const code = isChainingLimit ? "RATE_LIMIT_EXCEEDED" : isLowHeadroom ? "LOW_HEADROOM" : "NONCE_DO_UNAVAILABLE";
         this.logger.error("NonceDO nonce assignment failed", {
           code: doResult.code,
           error: doResult.error,
           status: doResult.status,
           mempoolDepth: doResult.mempoolDepth,
           estimatedDrainSeconds: doResult.estimatedDrainSeconds,
+          retryAfterSeconds: doResult.retryAfterSeconds,
         });
 
         let details: string;
@@ -679,6 +684,10 @@ export class SponsorService {
           details = `All sponsor wallets at chaining limit (mempool depth: ${doResult.mempoolDepth}); retry in ~${doResult.estimatedDrainSeconds}s`;
         } else if (isChainingLimit) {
           details = "All sponsor wallets at chaining limit; retry in a few seconds";
+        } else if (isLowHeadroom && doResult.retryAfterSeconds !== undefined) {
+          details = `Nonce pool headroom is low; retry in ~${doResult.retryAfterSeconds}s`;
+        } else if (isLowHeadroom) {
+          details = "Nonce pool headroom is low; retry in a few seconds";
         } else {
           details = "NonceDO did not return a nonce; retry in a few seconds";
         }
@@ -688,6 +697,7 @@ export class SponsorService {
           error: doResult.error,
           details,
           code,
+          retryAfter: isLowHeadroom ? doResult.retryAfterSeconds : undefined,
         };
       }
     } else {
