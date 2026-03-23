@@ -5,6 +5,30 @@ import { VERSION } from "../version";
 /** Window within which a gap detection is considered "recent" (10 minutes) */
 const RECENT_CONFLICT_WINDOW_MS = 10 * 60 * 1000;
 
+/** Fraction of pool that must be available to be considered "healthy" (≥60%) */
+const CAPACITY_HEALTHY_THRESHOLD = 0.6;
+/** Fraction below which the pool is "critical" (<20%) */
+const CAPACITY_CRITICAL_THRESHOLD = 0.2;
+
+/** Machine-readable pool health status for agent circuit-breaker gating */
+type PoolStatus = "healthy" | "degraded" | "critical";
+
+/**
+ * Derive a PoolStatus from effective capacity and circuit-breaker state.
+ * - "critical": circuit breaker open OR capacity < 20%
+ * - "degraded": capacity < 60% (but not critical)
+ * - "healthy": capacity ≥ 60% and circuit breaker closed
+ */
+function derivePoolStatus(effectiveCapacity: number, circuitBreakerOpen: boolean): PoolStatus {
+  if (circuitBreakerOpen || effectiveCapacity < CAPACITY_CRITICAL_THRESHOLD) {
+    return "critical";
+  }
+  if (effectiveCapacity < CAPACITY_HEALTHY_THRESHOLD) {
+    return "degraded";
+  }
+  return "healthy";
+}
+
 /**
  * Condensed nonce pool state surfaced by /health.
  * Derived from the full NonceStatsResponse returned by NonceDO GET /stats.
@@ -24,6 +48,17 @@ interface NonceHealthState {
   circuitBreakerOpen: boolean;
   /** ISO timestamp of last gap/conflict detection, or null if none */
   lastConflictAt: string | null;
+  /**
+   * Fraction of total pool capacity currently available (0.0–1.0).
+   * Computed as poolAvailable / (poolAvailable + poolReserved).
+   * 1.0 when pool is empty (no reserved nonces) — idle is healthy.
+   */
+  effectiveCapacity: number;
+  /**
+   * Machine-readable pool health for agent circuit-breaker gating.
+   * "healthy" ≥60% capacity, "degraded" <60%, "critical" <20% or circuit open.
+   */
+  poolStatus: PoolStatus;
 }
 
 /**
@@ -87,6 +122,23 @@ export class Health extends BaseEndpoint {
                         "ISO timestamp of the most recent nonce gap/conflict detection, or null",
                       example: null,
                     },
+                    effectiveCapacity: {
+                      type: "number" as const,
+                      description:
+                        "Fraction of pool capacity currently available (0.0–1.0). " +
+                        "Computed as poolAvailable / (poolAvailable + poolReserved). " +
+                        "1.0 when pool is idle (no reserved nonces).",
+                      example: 0.88,
+                    },
+                    poolStatus: {
+                      type: "string" as const,
+                      enum: ["healthy", "degraded", "critical"],
+                      description:
+                        "Machine-readable pool health for agent circuit-breaker gating. " +
+                        "'healthy' ≥60% capacity, 'degraded' <60%, " +
+                        "'critical' <20% or circuit breaker open.",
+                      example: "healthy",
+                    },
                   },
                 },
               },
@@ -147,12 +199,19 @@ export class Health extends BaseEndpoint {
       const circuitBreakerOpen =
         recentConflict || (raw.poolAvailable === 0 && raw.poolReserved > 0);
 
+      const totalPool = raw.poolAvailable + raw.poolReserved;
+      // When pool is idle (nothing reserved), treat as fully available
+      const effectiveCapacity = totalPool === 0 ? 1.0 : raw.poolAvailable / totalPool;
+      const poolStatus = derivePoolStatus(effectiveCapacity, circuitBreakerOpen);
+
       return {
         poolAvailable: raw.poolAvailable,
         poolReserved: raw.poolReserved,
         conflictsDetected: raw.conflictsDetected,
         circuitBreakerOpen,
         lastConflictAt,
+        effectiveCapacity,
+        poolStatus,
       };
     } catch (e) {
       logger.warn("Failed to fetch nonce state for health check", {
