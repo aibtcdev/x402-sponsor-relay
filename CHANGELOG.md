@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.21.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.20.2...x402-sponsor-relay-v1.21.0) (2026-03-23)
+
+
+### Features
+
+* **health:** add effectiveCapacity and poolStatus to nonce health ([#192](https://github.com/aibtcdev/x402-sponsor-relay/issues/192)) ([7896aea](https://github.com/aibtcdev/x402-sponsor-relay/commit/7896aea07351887a6c469408e7cbc962945debfc))
+
+
+### Bug Fixes
+
+* headroom-aware wallet selection + soft-reject + LOW_HEADROOM propagation ([48c4ff5](https://github.com/aibtcdev/x402-sponsor-relay/commit/48c4ff56d9f588534a10721e55102d458e13c2de)), closes [#193](https://github.com/aibtcdev/x402-sponsor-relay/issues/193)
+
 ## [1.20.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.20.1...x402-sponsor-relay-v1.20.2) (2026-03-22)
 
 
