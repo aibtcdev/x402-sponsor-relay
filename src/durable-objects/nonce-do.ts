@@ -215,7 +215,7 @@ const LOOKAHEAD_GUARD_BUFFER = CHAINING_LIMIT;
  * value, return 503 (Low Headroom) instead of assigning. Prevents burst traffic from
  * exhausting the last nonce slots and hitting TooMuchChaining rejections.
  */
-const SOFT_REJECT_HEADROOM_THRESHOLD = 2;
+const SOFT_REJECT_HEADROOM_THRESHOLD = Math.ceil(CHAINING_LIMIT * 0.1);
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 /**
@@ -332,7 +332,8 @@ class LowHeadroomError extends Error {
     this.name = "LowHeadroomError";
     this.maxHeadroom = maxHeadroom;
     // Estimate: each confirmed tx frees one nonce slot. ~2 txs/s drain rate.
-    this.retryAfterSeconds = Math.ceil((SOFT_REJECT_HEADROOM_THRESHOLD - maxHeadroom + 1) / 2) + 5;
+    // Backoff scales with pool pressure: more reserved nonces → longer wait.
+    this.retryAfterSeconds = Math.ceil((CHAINING_LIMIT - maxHeadroom) / 2) + 5;
   }
 }
 
@@ -1964,7 +1965,6 @@ export class NonceDO {
           throw new LowHeadroomError(best.headroom);
         }
         selectedWalletIndex = best.walletIndex;
-        totalMempoolDepth += eligibleWallets.reduce((sum, w) => sum + (CHAINING_LIMIT - w.headroom), 0);
       }
 
       if (selectedWalletIndex === null) {
@@ -3104,7 +3104,6 @@ export class NonceDO {
             JSON.stringify({
               error: "Nonce pool headroom is low; back off and retry",
               code: "LOW_HEADROOM",
-              maxHeadroom: error.maxHeadroom,
               retryAfterSeconds: error.retryAfterSeconds,
             }),
             {
