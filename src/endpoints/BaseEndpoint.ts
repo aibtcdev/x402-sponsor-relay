@@ -174,6 +174,15 @@ export class BaseEndpoint extends OpenAPIRoute {
           retryable: true,
           retryAfter: 30,
         });
+      case "SignatureValidation":
+        return this.err(c, {
+          error: "Transaction signature validation failed",
+          code: "SIGNATURE_VALIDATION_FAILED",
+          status: 422,
+          details: `${details} (node reason: ${clientRejection})`,
+          hint: "Ensure the transaction targets the correct network, is signed with the right key, and all post-conditions are properly signed.",
+          retryable: false,
+        });
       default:
         // Recognized as a client rejection but no specific mapping — 422 (client tx invalid)
         return this.err(c, {
@@ -196,6 +205,7 @@ export class BaseEndpoint extends OpenAPIRoute {
       code: RelayErrorCode;
       status: number;
       details?: string;
+      hint?: string;
       retryable: boolean;
       retryAfter?: number;
     }
@@ -210,6 +220,10 @@ export class BaseEndpoint extends OpenAPIRoute {
 
     if (opts.details) {
       response.details = opts.details;
+    }
+
+    if (opts.hint) {
+      response.hint = opts.hint;
     }
 
     if (opts.retryAfter !== undefined) {

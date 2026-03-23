@@ -586,7 +586,8 @@ export type RelayErrorCode =
   | "NONCE_RESET_FAILED"
   | "NONCE_DO_UNAVAILABLE"
   | "UNSUPPORTED_ADDRESS_TYPE"
-  | "INVALID_BTC_ADDRESS";
+  | "INVALID_BTC_ADDRESS"
+  | "SIGNATURE_VALIDATION_FAILED";
 
 /**
  * Structured error response with retry guidance
@@ -596,6 +597,7 @@ export interface RelayErrorResponse {
   error: string;
   code: RelayErrorCode;
   details?: string;
+  hint?: string;
   retryable: boolean;
   retryAfter?: number; // seconds
   requestId: string;
