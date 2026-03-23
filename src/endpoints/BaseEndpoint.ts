@@ -80,7 +80,7 @@ export class BaseEndpoint extends OpenAPIRoute {
    */
   protected sponsorFailureResponse(
     c: AppContext,
-    failure: { error: string; details: string; code?: string },
+    failure: { error: string; details: string; code?: string; retryAfter?: number },
     statsWaitUntil: Promise<void>
   ) {
     c.executionCtx.waitUntil(statsWaitUntil);
@@ -90,7 +90,12 @@ export class BaseEndpoint extends OpenAPIRoute {
     let retryable: boolean;
     let retryAfter: number | undefined;
 
-    if (failure.code === "NONCE_DO_UNAVAILABLE") {
+    if (failure.code === "LOW_HEADROOM") {
+      code = "LOW_HEADROOM";
+      status = 503;
+      retryable = true;
+      retryAfter = failure.retryAfter ?? 10;
+    } else if (failure.code === "NONCE_DO_UNAVAILABLE") {
       code = "NONCE_DO_UNAVAILABLE";
       status = 503;
       retryable = true;

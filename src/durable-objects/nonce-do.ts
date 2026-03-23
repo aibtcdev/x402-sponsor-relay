@@ -210,6 +210,12 @@ const CHAINING_LIMIT = 20;
  * Set equal to CHAINING_LIMIT (20) — same as the in-flight cap for symmetry.
  */
 const LOOKAHEAD_GUARD_BUFFER = CHAINING_LIMIT;
+/**
+ * Soft-reject threshold: if the best available wallet has headroom at or below this
+ * value, return 503 (Low Headroom) instead of assigning. Prevents burst traffic from
+ * exhausting the last nonce slots and hitting TooMuchChaining rejections.
+ */
+const SOFT_REJECT_HEADROOM_THRESHOLD = Math.ceil(CHAINING_LIMIT * 0.1);
 
 const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 /**
@@ -309,6 +315,25 @@ class ChainingLimitError extends Error {
     super("CHAINING_LIMIT_EXCEEDED");
     this.name = "ChainingLimitError";
     this.mempoolDepth = mempoolDepth;
+  }
+}
+
+/**
+ * Thrown when all wallets have headroom at or below SOFT_REJECT_HEADROOM_THRESHOLD.
+ * The pool is not full yet, but a burst would likely cause TooMuchChaining rejections.
+ * Callers should back off and retry after `retryAfterSeconds`.
+ */
+class LowHeadroomError extends Error {
+  readonly maxHeadroom: number;
+  readonly retryAfterSeconds: number;
+
+  constructor(maxHeadroom: number) {
+    super("LOW_HEADROOM");
+    this.name = "LowHeadroomError";
+    this.maxHeadroom = maxHeadroom;
+    // Estimate: each confirmed tx frees one nonce slot. ~2 txs/s drain rate.
+    // Backoff scales with pool pressure: more reserved nonces → longer wait.
+    this.retryAfterSeconds = Math.ceil((CHAINING_LIMIT - maxHeadroom) / 2) + 5;
   }
 }
 
@@ -1883,6 +1908,8 @@ export class NonceDO {
       let totalMempoolDepth = 0;
       // Track degraded wallets for fallback (walletIndex only — no pool state needed)
       const degradedWallets: Array<{ walletIndex: number; cycleCount: number }> = [];
+      /** Eligible (under chaining limit) wallets with their available headroom */
+      const eligibleWallets: Array<{ walletIndex: number; headroom: number }> = [];
       let selectedWalletIndex: number | null = null;
 
       while (attempts < effectiveWalletCount) {
@@ -1910,14 +1937,34 @@ export class NonceDO {
           continue;
         }
 
-        if (this.ledgerReservedCount(walletIndex) < CHAINING_LIMIT) {
-          selectedWalletIndex = walletIndex;
-          break;
+        const reserved = this.ledgerReservedCount(walletIndex);
+        if (reserved < CHAINING_LIMIT) {
+          // Collect all eligible wallets; select by headroom after full scan
+          eligibleWallets.push({ walletIndex, headroom: CHAINING_LIMIT - reserved });
+        } else {
+          // This wallet is at its chaining limit; accumulate depth for error reporting
+          totalMempoolDepth += reserved;
         }
-        // This wallet is at its chaining limit; accumulate depth and try the next
-        totalMempoolDepth += this.ledgerReservedCount(walletIndex);
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
         attempts++;
+      }
+
+      // Select wallet with most chain headroom (fewest in-flight nonces).
+      // Prefer a wallet that has more room to absorb additional burst traffic.
+      if (eligibleWallets.length > 0) {
+        eligibleWallets.sort((a, b) => b.headroom - a.headroom);
+        const best = eligibleWallets[0];
+        // Soft-reject: if even the best wallet is nearly full, tell the caller to back off
+        // rather than assigning into a pool that could hit TooMuchChaining in the next burst.
+        if (best.headroom <= SOFT_REJECT_HEADROOM_THRESHOLD) {
+          this.log("warn", "low_headroom_soft_reject", {
+            maxHeadroom: best.headroom,
+            threshold: SOFT_REJECT_HEADROOM_THRESHOLD,
+            eligibleCount: eligibleWallets.length,
+          });
+          throw new LowHeadroomError(best.headroom);
+        }
+        selectedWalletIndex = best.walletIndex;
       }
 
       if (selectedWalletIndex === null) {
@@ -3052,6 +3099,22 @@ export class NonceDO {
         };
         return this.jsonResponse(response);
       } catch (error) {
+        if (error instanceof LowHeadroomError) {
+          return new Response(
+            JSON.stringify({
+              error: "Nonce pool headroom is low; back off and retry",
+              code: "LOW_HEADROOM",
+              retryAfterSeconds: error.retryAfterSeconds,
+            }),
+            {
+              status: 503,
+              headers: {
+                "content-type": "application/json",
+                "Retry-After": String(error.retryAfterSeconds),
+              },
+            }
+          );
+        }
         if (error instanceof ChainingLimitError) {
           const mempoolDepth = error.mempoolDepth;
           // Assume ~2 txs/s drain rate (conservative estimate for Stacks testnet/mainnet)
