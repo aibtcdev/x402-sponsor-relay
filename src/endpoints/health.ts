@@ -201,7 +201,8 @@ export class Health extends BaseEndpoint {
 
       const totalPool = raw.poolAvailable + raw.poolReserved;
       // When pool is idle (nothing reserved), treat as fully available
-      const effectiveCapacity = totalPool === 0 ? 1.0 : raw.poolAvailable / totalPool;
+      const effectiveCapacity =
+        totalPool === 0 ? 1.0 : Math.round((raw.poolAvailable / totalPool) * 100) / 100;
       const poolStatus = derivePoolStatus(effectiveCapacity, circuitBreakerOpen);
 
       return {
