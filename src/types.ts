@@ -402,6 +402,8 @@ export const X402_V2_ERROR_CODES = {
   CLIENT_INSUFFICIENT_FUNDS: "client_insufficient_funds",
   /** Sender nonce is invalid — client must re-sign with the correct account nonce */
   CLIENT_BAD_NONCE: "client_bad_nonce",
+  /** Transaction signature is invalid — wrong network, mismatched key, or corrupted bytes */
+  SIGNATURE_VALIDATION_FAILED: "signature_validation_failed",
 } as const;
 
 /**
@@ -558,6 +560,7 @@ export type RelayErrorCode =
   | "CLIENT_INSUFFICIENT_FUNDS"
   | "CLIENT_BAD_NONCE"
   | "CLIENT_NONCE_CONFLICT"
+  | "SIGNATURE_VALIDATION_FAILED"
   | "NOT_FOUND"
   | "INTERNAL_ERROR"
   | "MISSING_API_KEY"

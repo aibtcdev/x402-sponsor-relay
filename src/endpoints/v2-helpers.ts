@@ -338,3 +338,25 @@ export function mapVerifyErrorToV2Code(errorMessage: string): string {
   }
 }
 
+/**
+ * Map a client rejection reason from BroadcastAndConfirmResult to a V2 error code.
+ *
+ * Used by /settle to convert known Stacks node rejection reasons (e.g. NotEnoughFunds,
+ * SignatureValidation) into x402 V2 spec-compliant errorReason strings.
+ * Unknown client rejections fall through to TRANSACTION_FAILED.
+ */
+export function mapClientRejectionToV2Code(clientRejection: string): string {
+  switch (clientRejection) {
+    case "SignatureValidation":
+      return X402_V2_ERROR_CODES.SIGNATURE_VALIDATION_FAILED;
+    case "NotEnoughFunds":
+      return X402_V2_ERROR_CODES.CLIENT_INSUFFICIENT_FUNDS;
+    case "BadNonce":
+      return X402_V2_ERROR_CODES.CLIENT_BAD_NONCE;
+    case "ConflictingNonceInMempool":
+      return X402_V2_ERROR_CODES.CONFLICTING_NONCE;
+    default:
+      return X402_V2_ERROR_CODES.TRANSACTION_FAILED;
+  }
+}
+

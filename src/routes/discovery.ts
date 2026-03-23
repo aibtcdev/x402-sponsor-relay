@@ -1312,7 +1312,8 @@ All errors return JSON with this shape:
 | CLIENT_INSUFFICIENT_FUNDS      | 422  | false     | Sender had insufficient funds — top up wallet before re-signing and retrying |
 | CLIENT_BAD_NONCE               | 422  | true      | Sender nonce is invalid — re-sign with the correct account nonce and retry |
 | CLIENT_NONCE_CONFLICT          | 409  | true      | Sender nonce conflicts in mempool — wait for pending tx, then re-sign and retry |
-| BROADCAST_REJECTED             | 502  | false     | Stacks node rejected the transaction for another client-caused reason |
+| SIGNATURE_VALIDATION_FAILED    | 422  | false     | Invalid signature — wrong network, mismatched key, or corrupted transaction bytes |
+| BROADCAST_REJECTED             | 422  | true      | Stacks node rejected the transaction for another client-caused reason |
 
 ## API Key Errors (POST /sponsor, POST /fees/config)
 
@@ -1380,7 +1381,8 @@ Do NOT retry:
 - 404 errors — the resource doesn't exist
 - 409 errors — the conflict must be resolved (except NONCE_CONFLICT and CLIENT_NONCE_CONFLICT)
 - 422 CLIENT_INSUFFICIENT_FUNDS — fund the wallet first, then re-sign and submit
-- 502 BROADCAST_REJECTED — another client-caused rejection, inspect details field
+- 422 SIGNATURE_VALIDATION_FAILED — wrong network, mismatched key, or corrupted bytes; rebuild the transaction
+- 422 BROADCAST_REJECTED — another client-caused rejection, inspect details field; retryable after fixing the transaction
 
 Do retry (after retryAfter):
 - 429 rate limit — wait for the window to reset

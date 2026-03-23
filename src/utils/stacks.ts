@@ -26,6 +26,7 @@ export const CLIENT_REJECTION_REASONS = [
   "BadTransactionVersion",
   "NetworkVersionMismatch",
   "Deserialization",
+  "SignatureValidation",
 ];
 
 /**

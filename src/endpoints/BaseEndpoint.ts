@@ -142,8 +142,9 @@ export class BaseEndpoint extends OpenAPIRoute {
   /**
    * Map a client rejection reason from BroadcastAndConfirmResult to a structured
    * error response. The switch covers known reasons (NotEnoughFunds, BadNonce,
-   * ConflictingNonceInMempool) with specific codes/statuses, and falls through
-   * to a generic BROADCAST_REJECTED response for any other client rejection.
+   * ConflictingNonceInMempool, SignatureValidation) with specific codes/statuses,
+   * and falls through to a generic BROADCAST_REJECTED response for any other
+   * client rejection.
    *
    * Shared by /relay (sponsored + self-pay) and /sponsor to avoid duplicating
    * the same if/else chain across three call sites.
@@ -178,6 +179,14 @@ export class BaseEndpoint extends OpenAPIRoute {
           details: `${details} (node reason: ${clientRejection})`,
           retryable: true,
           retryAfter: 30,
+        });
+      case "SignatureValidation":
+        return this.err(c, {
+          error: "Transaction rejected: invalid signature. Ensure the transaction targets the correct network, is signed with the correct key, and post-conditions are properly signed",
+          code: "SIGNATURE_VALIDATION_FAILED",
+          status: 422,
+          details: `${details} (node reason: ${clientRejection})`,
+          retryable: false,
         });
       default:
         // Recognized as a client rejection but no specific mapping — 422 (client tx invalid)
