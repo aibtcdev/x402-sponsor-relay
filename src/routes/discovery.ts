@@ -1382,13 +1382,15 @@ Do NOT retry:
 - 409 errors — the conflict must be resolved (except NONCE_CONFLICT and CLIENT_NONCE_CONFLICT)
 - 422 CLIENT_INSUFFICIENT_FUNDS — fund the wallet first, then re-sign and submit
 - 422 SIGNATURE_VALIDATION_FAILED — wrong network, mismatched key, or corrupted bytes; rebuild the transaction
-- 422 BROADCAST_REJECTED — another client-caused rejection, inspect details field; retryable after fixing the transaction
+
+Do retry (after fixing the transaction):
+- 422 BROADCAST_REJECTED — inspect the details field, correct the transaction, and resubmit
+- 422 CLIENT_BAD_NONCE — re-fetch the sender's current nonce, re-sign, and resubmit
+- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; wait for pending mempool tx, re-sign and retry
+- 409 NONCE_CONFLICT — relay sponsor nonce conflict; rebuild and resubmit a new transaction
 
 Do retry (after retryAfter):
 - 429 rate limit — wait for the window to reset
-- 409 NONCE_CONFLICT — relay sponsor nonce conflict; rebuild and resubmit a new transaction
-- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; wait for pending mempool tx, re-sign and retry
-- 422 CLIENT_BAD_NONCE — re-fetch the sender's current nonce, re-sign, and resubmit
 - 502 SETTLEMENT_BROADCAST_FAILED — Stacks node may accept on retry
 - 500 INTERNAL_ERROR — may be transient
 
