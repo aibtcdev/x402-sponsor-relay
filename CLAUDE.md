@@ -88,7 +88,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `POST /fees/config` - Update fee clamps (admin, requires API key)
 - `GET /stats` - Relay statistics (JSON API)
 - `GET /dashboard` - Public dashboard (HTML)
-- `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast, no sponsoring)
+- `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast; auto-sponsors transactions with empty sponsor slot)
 - `POST /verify` - x402 V2 facilitator verify (local validation only, no broadcast)
 - `GET /supported` - x402 V2 supported payment kinds (static config)
 
@@ -308,7 +308,7 @@ Response (error - stale timestamp): {
   retryable: false
 }
 
-// POST /settle (x402 V2 facilitator — verify + broadcast, no sponsoring)
+// POST /settle (x402 V2 facilitator — verify + broadcast; auto-sponsors empty sponsor slots)
 // CAIP-2 networks: "stacks:1" (mainnet), "stacks:2147483648" (testnet)
 // Assets: "STX", "sBTC", or CAIP-19 contract address
 Request: {

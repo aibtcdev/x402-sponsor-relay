@@ -550,11 +550,12 @@ All fields are optional — only provided types are updated.
 ## POST /settle — x402 V2 Facilitator Settle (Spec Section 7.2)
 
 Spec-compliant x402 V2 facilitator settle endpoint. Verifies payment parameters
-locally and broadcasts the pre-sponsored transaction to the Stacks network.
+locally and broadcasts the transaction to the Stacks network.
 
-IMPORTANT: This endpoint does NOT sponsor. The transaction in the payload must
-already be fully signed (sponsored: true). The relay verifies that the transaction
-satisfies the paymentRequirements and broadcasts it.
+Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer) —
+standard x402 clients that build transactions with sponsored:true and fee:0 are handled
+transparently. Pre-sponsored transactions (fully-signed sponsor slot) are also accepted
+and broadcast directly without re-sponsoring.
 
 Returns HTTP 200 for all settlement results (success or failure).
 Returns HTTP 400 only for malformed request schema.
@@ -1515,7 +1516,8 @@ Content-Type: application/json
 ## POST /settle — Verify + Broadcast (Spec Section 7.2)
 
 Verifies payment parameters and broadcasts the transaction to the Stacks network.
-Does NOT sponsor — expects a pre-sponsored transaction.
+Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer).
+Pre-sponsored transactions are also accepted and broadcast directly.
 
 Returns HTTP 200 for settlement results (success or failure per spec).
 Returns HTTP 400 for malformed request schema.
@@ -1695,8 +1697,9 @@ Skip it when:
 - The /settle endpoint polls for confirmation up to 60 seconds. If confirmation
   times out, the transaction is still broadcast and success: true is returned.
   Poll the Stacks node directly for final confirmation status.
-- Use POST /relay (the native relay endpoint) if you also need fee sponsorship.
-  POST /settle is for clients that already have a fully-sponsored transaction.
+- POST /settle auto-sponsors transactions with an empty sponsor slot, so standard
+  x402 clients (sponsored:true, fee:0) work without pre-sponsoring. Use POST /relay
+  if you need the full relay flow (settle options, payment receipts, dedup).
 - See GET /fees for current fee estimates before building your transaction.
 `,
   };
@@ -1916,7 +1919,7 @@ discovery.get("/.well-known/agent.json", (c) => {
         name: "x402 V2 Facilitator",
         description:
           "Spec-compliant x402 V2 facilitator (coinbase/x402 spec section 7). " +
-          "POST /settle — verifies payment params locally and broadcasts the pre-sponsored transaction; returns { success, transaction, network, payer }. " +
+          "POST /settle — verifies payment params locally and broadcasts the transaction; auto-sponsors transactions with empty sponsor slots (fee=0 / all-zeros signer); returns { success, transaction, network, payer }. " +
           "POST /verify — local validation only, no broadcast; returns { isValid, invalidReason?, payer? }. " +
           "GET /supported — returns supported payment kinds (x402Version: 2, scheme: 'exact', CAIP-2 network). " +
           "CAIP-2 networks: 'stacks:1' (mainnet), 'stacks:2147483648' (testnet). " +

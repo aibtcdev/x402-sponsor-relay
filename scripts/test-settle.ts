@@ -18,12 +18,14 @@
  * What this tests:
  *   1. GET  /supported    — relay's supported payment kinds
  *   2. POST /verify       — local validation only (no broadcast)
- *   3. POST /settle       — verify + broadcast (idempotent)
+ *   3. POST /settle       — verify + broadcast with pre-sponsored tx (idempotent)
+ *   6. POST /settle       — auto-sponsor test: empty sponsor slot (fee=0)
  *   4. Error cases        — wrong network, missing fields
  *
- * Note: POST /settle expects a pre-signed sponsored transaction. This script
- * builds a sponsored tx (sponsored: true) and sends it to /settle. In a real
- * x402 flow, the client builds this tx after seeing a 402 response from a server.
+ * Note: POST /settle auto-sponsors transactions with an empty sponsor slot
+ * (fee=0 / all-zeros signer). Standard x402 clients that build transactions with
+ * sponsored:true and fee:0 work without pre-sponsoring. Pre-sponsored transactions
+ * (fully-signed sponsor slot) are also accepted and broadcast directly.
  *
  * Spec reference:
  *   https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
@@ -156,7 +158,7 @@ async function main() {
   const recipient = process.env.TEST_RECIPIENT || AIBTC_TESTNET;
   console.log(`Recipient address: ${recipient}`);
 
-  // Build a standard (non-sponsored) STX transfer — /settle does NOT sponsor
+  // Build a standard (non-sponsored) STX transfer for Tests 2, 3, 4, 5
   console.log("\nBuilding standard transaction...");
   const transaction = await makeSTXTokenTransfer({
     recipient,
@@ -298,7 +300,7 @@ async function main() {
   console.log(`Amount: ${paymentRequirements.amount} microSTX`);
   console.log(`Asset: ${paymentRequirements.asset}`);
   console.log(`PayTo: ${paymentRequirements.payTo}`);
-  console.log(`(This will broadcast the transaction if valid)`);
+  console.log(`(Sender-signed tx with fee=1000 — already has fee, /settle broadcasts directly)`);
 
   try {
     const response = await fetch(`${relayUrl}/settle`, {
@@ -405,6 +407,78 @@ async function main() {
       console.log(`\n[OK] Correct error: invalid_payload returned for empty body`);
     } else {
       console.warn(`\n[WARN] Expected invalid_payload, got: ${result.invalidReason}`);
+    }
+  } catch (e) {
+    console.error("\n--- NETWORK ERROR ---");
+    console.error(e instanceof Error ? e.message : e);
+  }
+
+  // =========================================================================
+  // Test 6: POST /settle — Auto-Sponsor (empty sponsor slot)
+  // =========================================================================
+  section("Test 6: POST /settle — Auto-Sponsor (empty sponsor slot)");
+
+  // Build a sponsored:true transaction with fee:0 — sponsor slot is all-zeros.
+  // /settle detects the empty slot and auto-sponsors before broadcast.
+  console.log("\nBuilding sponsored:true, fee:0 transaction (empty sponsor slot)...");
+  const autoSponsorTx = await makeSTXTokenTransfer({
+    recipient,
+    amount: 1000n,
+    senderKey: privateKey,
+    network: "testnet",
+    memo: "test-settle-auto-sponsor",
+    anchorMode: AnchorMode.Any,
+    sponsored: true,
+    fee: 0n, // Empty sponsor slot — relay will fill this
+  });
+
+  const autoSponsorHex = autoSponsorTx.serialize();
+  console.log(`Transaction hex: ${autoSponsorHex.slice(0, 50)}...`);
+  console.log(`sponsored: true, fee: 0 (empty slot — relay auto-sponsors)`);
+
+  const autoSponsorPayload = {
+    x402Version: 2,
+    payload: { transaction: autoSponsorHex },
+    accepted: paymentRequirements,
+  };
+
+  const autoSponsorRequest: X402SettleRequestV2 = {
+    x402Version: 2,
+    paymentPayload: autoSponsorPayload,
+    paymentRequirements,
+  };
+
+  console.log(`\nPOST ${relayUrl}/settle`);
+  console.log(`(Relay should auto-sponsor the empty slot, then verify and broadcast)`);
+
+  try {
+    const response = await fetch(`${relayUrl}/settle`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(autoSponsorRequest),
+    });
+
+    const result = (await response.json()) as X402SettlementResponseV2;
+
+    console.log(`\n--- RESULT (HTTP ${response.status}) ---`);
+    console.log(`success: ${result.success}`);
+    console.log(`network: ${result.network}`);
+    console.log(`transaction: ${result.transaction || "(empty)"}`);
+    if (result.payer) {
+      console.log(`payer: ${result.payer}`);
+    }
+    if (result.errorReason) {
+      console.log(`errorReason: ${result.errorReason}`);
+    }
+
+    if (result.success && result.transaction) {
+      console.log(`\n[OK] Auto-sponsor + settlement succeeded`);
+      console.log(
+        `Explorer: https://explorer.hiro.so/txid/${result.transaction}?chain=testnet`
+      );
+    } else if (!result.success) {
+      console.log(`\n[INFO] Settlement failed: ${result.errorReason}`);
+      console.log(`  Check relay logs for details. May fail if sponsor wallet is out of funds.`);
     }
   } catch (e) {
     console.error("\n--- NETWORK ERROR ---");
