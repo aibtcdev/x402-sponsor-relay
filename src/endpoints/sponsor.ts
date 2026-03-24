@@ -296,7 +296,7 @@ export class Sponsor extends BaseEndpoint {
       );
 
       if (!broadcastResult.success) {
-        const { errorMessage, errorDetails, httpStatus, isNonceConflict, clientRejection } = broadcastResult;
+        const { errorMessage, errorDetails, httpStatus, isNonceConflict, clientRejection, nodeUrl } = broadcastResult;
         const isClientError = clientRejection !== undefined;
 
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
@@ -305,11 +305,10 @@ export class Sponsor extends BaseEndpoint {
         // Record broadcast outcome in the intent ledger.
         // httpStatus 0 = network/timeout exception (no HTTP response received).
         if (sponsorNonce !== null) {
-          const rejectHttpStatus = httpStatus;
           c.executionCtx.waitUntil(
             recordBroadcastOutcomeDO(
               c.env, logger, sponsorNonce, sponsorWalletIndex,
-              undefined, rejectHttpStatus, undefined, errorDetails
+              undefined, httpStatus, nodeUrl, errorDetails
             ).catch((e) => {
               logger.warn("Failed to record broadcast outcome", { error: String(e) });
             })
