@@ -1,5 +1,4 @@
-import { broadcastTransaction, deserializeTransaction } from "@stacks/transactions";
-import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
+import { deserializeTransaction } from "@stacks/transactions";
 import { BaseEndpoint } from "./BaseEndpoint";
 import {
   SponsorService,
@@ -11,8 +10,6 @@ import {
   releaseNonceDO,
   recordBroadcastOutcomeDO,
 } from "../services";
-import type { AppContext, SponsorRequest } from "../types";
-import { buildExplorerUrl, CLIENT_REJECTION_REASONS, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 import {
   Error400Response,
   Error401Response,
@@ -22,6 +19,25 @@ import {
   Error502Response,
   Error503Response,
 } from "../schemas";
+import type { AppContext, Env, Logger, SponsorRequest } from "../types";
+import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import type { BroadcastTarget } from "../utils";
+
+const BROADCAST_MAX_ATTEMPTS = 3;
+const BROADCAST_RETRY_BASE_DELAY_MS = 1_000;
+const BROADCAST_RETRY_MAX_DELAY_MS = 2_000;
+const BROADCAST_TIMEOUT_MS = 12_000;
+
+type BroadcastResult =
+  | { success: true; txid: string }
+  | {
+      success: false;
+      errorMessage: string;
+      errorDetails: string;
+      httpStatus?: number;
+      isNonceConflict: boolean;
+      clientRejection?: string;
+    };
 
 /**
  * Sponsor endpoint - sponsors and broadcasts transactions directly
@@ -261,9 +277,6 @@ export class Sponsor extends BaseEndpoint {
         );
       }
 
-      const network =
-        c.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
-
       const cleanHex = stripHexPrefix(sponsorResult.sponsoredTxHex);
       const sponsoredTx = deserializeTransaction(cleanHex);
 
@@ -272,140 +285,72 @@ export class Sponsor extends BaseEndpoint {
       // walletIndex from NonceDO assignment — routes release to the correct per-wallet pool
       const sponsorWalletIndex = sponsorResult.walletIndex;
 
-      let txid: string;
-      try {
-        const result = await broadcastTransaction({
-          transaction: sponsoredTx,
-          network,
-        });
+      // Broadcast with retry: raw fetch to /v2/transactions instead of library
+      // broadcastTransaction() which swallows response bodies and has no retry.
+      // Retry on 5xx/network errors with backoff; fail fast on 4xx.
+      const broadcastResult = await this.broadcastWithRetry(
+        sponsoredTx.serialize(), c.env, logger
+      );
 
-          if ("error" in result && result.error) {
-          const errorReason =
-            typeof result.reason === "string" ? result.reason : "Unknown error";
+      if (!broadcastResult.success) {
+        const { errorMessage, errorDetails, httpStatus, isNonceConflict, clientRejection } = broadcastResult;
+        const isClientError = clientRejection !== undefined;
 
-          const isNonceConflict = NONCE_CONFLICT_REASONS.some((reason) =>
-            errorReason.includes(reason)
-          );
-          // CLIENT_REJECTION_REASONS is a superset of NONCE_CONFLICT_REASONS,
-          // so clientRejection is always set when isNonceConflict is true.
-          const clientRejection = CLIENT_REJECTION_REASONS.find((reason) =>
-            errorReason.includes(reason)
-          );
-          const isClientError = clientRejection !== undefined;
+        c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError).catch(() => {}));
 
-          if (isClientError) {
-            logger.warn("Broadcast rejected by node (client error)", {
-              error: result.error,
-              reason: errorReason,
-              clientRejection,
-            });
-          } else {
-            logger.error("Broadcast rejected by node", {
-              error: result.error,
-              reason: errorReason,
-            });
-          }
-
-          c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
-          c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError).catch(() => {}));
-
-          // Record broadcast outcome in the intent ledger — authoritative record.
-          // Never pass synthetic txids — txid is reserved for real transaction IDs.
-          // Note: broadcastTransaction() from @stacks/transactions doesn't expose the
-          // raw HTTP status, so we use conventional codes (409 for nonce conflict, 400 otherwise).
-          if (sponsorNonce !== null) {
-            const rejectHttpStatus = isNonceConflict ? 409 : 400;
-            c.executionCtx.waitUntil(
-              recordBroadcastOutcomeDO(
-                c.env, logger, sponsorNonce, sponsorWalletIndex,
-                undefined, rejectHttpStatus, undefined, errorReason
-              ).catch((e) => {
-                logger.warn("Failed to record broadcast outcome", { error: String(e) });
-              })
-            );
-            // Release nonce without txid — ledgerBroadcastOutcome already set conflict/failed.
-            c.executionCtx.waitUntil(
-              releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
-                logger.warn("Failed to release nonce after broadcast rejection", { error: String(e) });
-              })
-            );
-          }
-
-          // On the sponsored path, nonce conflicts are ambiguous — the Stacks node doesn't
-          // say whose nonce conflicted (client vs sponsor). Check nonceConflict FIRST to
-          // ensure the sponsor nonce pool gets resynced. Non-nonce client rejections
-          // (NotEnoughFunds, etc.) fall through to clientRejectionResponse.
-          if (isNonceConflict) {
-            logger.warn("Nonce conflict returned to agent", {
-              sponsorNonce,
-              walletIndex: sponsorWalletIndex,
-              broadcastDetails: errorReason,
-            });
-            // Trigger async nonce resync — the DO alarm will reconcile within 60s.
-            // Clients should back off for at least 30s and check GET /nonce/stats for pool state
-            // before retrying. Rapid retries during nonce drift amplify the cascade.
-            this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
-            return this.err(c, {
-              error: "Nonce conflict — back off and retry. Check GET /nonce/stats for nonce pool state",
-              code: "NONCE_CONFLICT",
-              status: 409,
-              details: errorReason,
-              retryable: true,
-              retryAfter: 30,
-            });
-          }
-
-          // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
-          if (clientRejection) {
-            return this.clientRejectionResponse(c, clientRejection, errorReason);
-          }
-
-          return this.err(c, {
-            error: "Transaction rejected by network",
-            code: "BROADCAST_FAILED",
-            status: 502,
-            details: errorReason,
-            retryable: true,
-            retryAfter: 5,
-          });
-        }
-
-        txid = result.txid;
-      } catch (e) {
-        logger.error("Broadcast failed", {
-          error: e instanceof Error ? e.message : "Unknown error",
-        });
-        c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", false).catch(() => {}));
-
-        // Return nonce to pool — broadcast threw an exception, nonce can be reused
+        // Record broadcast outcome in the intent ledger
         if (sponsorNonce !== null) {
-          c.executionCtx.waitUntil(
-            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e2) => {
-              logger.warn("Failed to release nonce after broadcast exception", { error: String(e2) });
-            })
-          );
-          // Record broadcast outcome for ledger fidelity (exception = http_status 0)
-          const exceptionReason = e instanceof Error ? e.message : "Unknown broadcast exception";
+          const rejectHttpStatus = httpStatus ?? (isNonceConflict ? 409 : 400);
           c.executionCtx.waitUntil(
             recordBroadcastOutcomeDO(
               c.env, logger, sponsorNonce, sponsorWalletIndex,
-              undefined, 0, undefined, exceptionReason
-            ).catch((e2) => {
-              logger.warn("Failed to record broadcast outcome", { error: String(e2) });
+              undefined, rejectHttpStatus, undefined, errorDetails
+            ).catch((e) => {
+              logger.warn("Failed to record broadcast outcome", { error: String(e) });
+            })
+          );
+          c.executionCtx.waitUntil(
+            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
+              logger.warn("Failed to release nonce after broadcast rejection", { error: String(e) });
             })
           );
         }
 
+        // Nonce conflicts: trigger resync and return 409
+        if (isNonceConflict) {
+          logger.warn("Nonce conflict returned to agent", {
+            sponsorNonce,
+            walletIndex: sponsorWalletIndex,
+            broadcastDetails: errorDetails,
+          });
+          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
+          return this.err(c, {
+            error: "Nonce conflict — back off and retry. Check GET /nonce/stats for nonce pool state",
+            code: "NONCE_CONFLICT",
+            status: 409,
+            details: errorDetails,
+            retryable: true,
+            retryAfter: 30,
+          });
+        }
+
+        // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
+        if (clientRejection) {
+          return this.clientRejectionResponse(c, clientRejection, errorDetails);
+        }
+
         return this.err(c, {
-          error: "Failed to broadcast transaction",
+          error: errorMessage,
           code: "BROADCAST_FAILED",
           status: 502,
-          details: e instanceof Error ? e.message : "Unknown error",
+          details: errorDetails,
           retryable: true,
           retryAfter: 5,
         });
       }
+
+      const txid = broadcastResult.txid;
 
       if (sponsorNonce !== null) {
         // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
@@ -485,6 +430,232 @@ export class Sponsor extends BaseEndpoint {
         retryAfter: 5,
       });
     }
+  }
+
+  /**
+   * Broadcast a serialized transaction with retry and node failover.
+   *
+   * Uses raw fetch to /v2/transactions instead of the library broadcastTransaction()
+   * to get full control over retry behaviour and to log raw response bodies when
+   * Hiro returns unparseable responses (fixes #211).
+   *
+   * Retry strategy (same as SettlementService):
+   * - Up to BROADCAST_MAX_ATTEMPTS per node with exponential backoff
+   * - Fail over to next node after exhausting attempts
+   * - Immediate return on 4xx (transaction-level rejection)
+   * - Retry on 5xx and network/timeout errors
+   */
+  private async broadcastWithRetry(
+    txHex: string,
+    env: Env,
+    logger: Logger
+  ): Promise<BroadcastResult> {
+    const txBytes = Buffer.from(stripHexPrefix(txHex), "hex");
+    if (txBytes.length === 0) {
+      return {
+        success: false,
+        errorMessage: "Failed to broadcast transaction",
+        errorDetails: "Serialized transaction hex could not be converted to bytes",
+        isNonceConflict: false,
+      };
+    }
+
+    const broadcastTargets: BroadcastTarget[] = getBroadcastTargets(
+      env.STACKS_NETWORK, env.HIRO_API_KEY, env.BROADCAST_NODE_URLS
+    );
+
+    let lastError: BroadcastResult & { success: false } | undefined;
+    let totalAttempt = 0;
+
+    for (let nodeIndex = 0; nodeIndex < broadcastTargets.length; nodeIndex++) {
+      const target = broadcastTargets[nodeIndex];
+      const broadcastUrl = `${target.baseUrl}/v2/transactions`;
+      const headers: Record<string, string> = {
+        "Content-Type": "application/octet-stream",
+        ...target.headers,
+      };
+
+      for (let attempt = 1; attempt <= BROADCAST_MAX_ATTEMPTS; attempt++) {
+        totalAttempt++;
+        try {
+          const response = await fetch(broadcastUrl, {
+            method: "POST",
+            headers,
+            body: txBytes,
+            signal: AbortSignal.timeout(BROADCAST_TIMEOUT_MS),
+          });
+
+          const responseText = await response.text();
+
+          if (response.ok) {
+            const parsedTxid = this.parseTxid(responseText);
+            if (!parsedTxid) {
+              logger.error("Broadcast returned OK but unparseable txid", {
+                responseText: responseText.slice(0, 500),
+                contentType: response.headers.get("content-type"),
+                nodeUrl: target.baseUrl,
+              });
+              throw new Error("Node returned OK but txid could not be parsed");
+            }
+            return { success: true, txid: parsedTxid };
+          }
+
+          const { errorMessage, errorDetails } = this.parseErrorBody(responseText, response.status);
+
+          if (!response.headers.get("content-type")?.includes("json")) {
+            logger.warn("Broadcast returned non-JSON error response", {
+              status: response.status,
+              contentType: response.headers.get("content-type"),
+              bodyPreview: responseText.slice(0, 500),
+              nodeUrl: target.baseUrl,
+            });
+          }
+
+          const conflictDetails = `${errorMessage}: ${errorDetails}`;
+
+          if (response.status >= 400 && response.status < 500) {
+            return this.handle4xxRejection(logger, response.status, errorMessage, errorDetails, conflictDetails, target.baseUrl);
+          }
+
+          if (response.status >= 500) {
+            this.logRetriableFailure(logger, totalAttempt, conflictDetails, attempt, nodeIndex, broadcastTargets.length, target.baseUrl);
+            lastError = {
+              success: false,
+              errorMessage: "Failed to broadcast transaction",
+              errorDetails: conflictDetails,
+              httpStatus: response.status,
+              isNonceConflict: false,
+            };
+            if (attempt < BROADCAST_MAX_ATTEMPTS) {
+              await this.retryDelay(attempt);
+            }
+            continue;
+          }
+
+          logger.error("Broadcast failed with unexpected status", {
+            status: response.status,
+            bodyPreview: responseText.slice(0, 500),
+            nodeUrl: target.baseUrl,
+          });
+          return {
+            success: false,
+            errorMessage: "Failed to broadcast transaction",
+            errorDetails,
+            httpStatus: response.status,
+            isNonceConflict: false,
+          };
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          this.logRetriableFailure(logger, totalAttempt, errMsg, attempt, nodeIndex, broadcastTargets.length, target.baseUrl);
+          lastError = {
+            success: false,
+            errorMessage: "Failed to broadcast transaction",
+            errorDetails: errMsg,
+            isNonceConflict: false,
+          };
+          if (attempt < BROADCAST_MAX_ATTEMPTS) {
+            await this.retryDelay(attempt);
+          }
+        }
+      }
+    }
+
+    logger.error("Broadcast failed after all nodes and attempts", {
+      totalAttempts: totalAttempt,
+    });
+
+    return lastError ?? {
+      success: false,
+      errorMessage: "Failed to broadcast transaction",
+      errorDetails: "All broadcast targets exhausted",
+      isNonceConflict: false,
+    };
+  }
+
+  private parseTxid(responseText: string): string | null {
+    let txid: string;
+    try {
+      txid = JSON.parse(responseText) as string;
+    } catch {
+      txid = responseText.trim().replace(/^"|"$/g, "");
+    }
+    return txid && typeof txid === "string" ? txid : null;
+  }
+
+  private parseErrorBody(
+    responseText: string,
+    status: number
+  ): { errorMessage: string; errorDetails: string } {
+    let errorMessage = `HTTP ${status}`;
+    let errorDetails = responseText.slice(0, 500);
+    try {
+      const json = JSON.parse(responseText) as { error?: string; reason?: string; message?: string };
+      if (json.error || json.reason || json.message) {
+        errorMessage = json.error ?? json.message ?? errorMessage;
+        errorDetails = json.reason ?? errorDetails;
+      }
+    } catch {
+      // Not JSON — use raw text
+    }
+    return { errorMessage, errorDetails };
+  }
+
+  private handle4xxRejection(
+    logger: Logger,
+    status: number,
+    errorMessage: string,
+    errorDetails: string,
+    conflictDetails: string,
+    nodeUrl: string
+  ): BroadcastResult & { success: false } {
+    const isNonceConflict = NONCE_CONFLICT_REASONS.some((r) => conflictDetails.includes(r));
+    const clientRejection = CLIENT_REJECTION_REASONS.find((r) => conflictDetails.includes(r));
+
+    const logMethod = clientRejection ? "warn" : "error";
+    const logLabel = clientRejection ? "Broadcast rejected by node (client error)" : "Broadcast rejected by node";
+    logger[logMethod](logLabel, {
+      status,
+      error: errorMessage,
+      reason: errorDetails,
+      ...(clientRejection && { clientRejection }),
+      nodeUrl,
+    });
+
+    return { success: false, errorMessage, errorDetails, httpStatus: status, isNonceConflict, clientRejection };
+  }
+
+  private logRetriableFailure(
+    logger: Logger,
+    totalAttempt: number,
+    details: string,
+    attempt: number,
+    nodeIndex: number,
+    nodeCount: number,
+    nodeUrl: string
+  ): void {
+    const hasMoreAttempts = attempt < BROADCAST_MAX_ATTEMPTS;
+    const hasMoreNodes = nodeIndex < nodeCount - 1;
+    const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
+
+    let retryMsg: string;
+    if (hasMoreAttempts) {
+      retryMsg = `retrying same node in ${retryDelay}ms`;
+    } else if (hasMoreNodes) {
+      retryMsg = "moving to next node";
+    } else {
+      retryMsg = "no retries remaining";
+    }
+
+    logger.warn(`Broadcast attempt ${totalAttempt} failed: ${details}, ${retryMsg}`, {
+      attempt,
+      maxAttempts: BROADCAST_MAX_ATTEMPTS,
+      nodeUrl,
+    });
+  }
+
+  private retryDelay(attempt: number): Promise<void> {
+    const delay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
+    return new Promise((r) => setTimeout(r, delay));
   }
 }
 
