@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.22.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.21.1...x402-sponsor-relay-v1.22.0) (2026-03-24)
+
+
+### Features
+
+* increase sponsor wallet pool from 5 to 10 ([#209](https://github.com/aibtcdev/x402-sponsor-relay/issues/209)) ([0ce4475](https://github.com/aibtcdev/x402-sponsor-relay/commit/0ce44757198761573837cd5df428b1f399dcdd54))
+* **settle:** auto-detect and sponsor transactions with empty sponsor auth ([#205](https://github.com/aibtcdev/x402-sponsor-relay/issues/205)) ([f0fe7ce](https://github.com/aibtcdev/x402-sponsor-relay/commit/f0fe7ce4382477b3630f48afb000f650b938744c))
+* **settle:** return after broadcast, add GET /settle/status/:txid ([#208](https://github.com/aibtcdev/x402-sponsor-relay/issues/208)) ([a2fa247](https://github.com/aibtcdev/x402-sponsor-relay/commit/a2fa247beb8e94b0469a2e068060f85313fbd893))
+
 ## [1.21.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.21.0...x402-sponsor-relay-v1.21.1) (2026-03-24)
 
 
