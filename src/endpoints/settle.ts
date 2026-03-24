@@ -1,3 +1,4 @@
+import { deserializeTransaction } from "@stacks/transactions";
 import { BaseEndpoint } from "./BaseEndpoint";
 import {
   validateV2Request,
@@ -6,7 +7,17 @@ import {
   V2_REQUEST_BODY_SCHEMA,
   V2_ERROR_RESPONSE_SCHEMA,
 } from "./v2-helpers";
-import { StatsService, PaymentIdService } from "../services";
+import {
+  StatsService,
+  PaymentIdService,
+  SponsorService,
+  hasSponsorSignature,
+  extractSponsorNonce,
+  releaseNonceDO,
+  recordBroadcastOutcomeDO,
+  recordNonceTxid,
+} from "../services";
+import { stripHexPrefix } from "../utils";
 import type { AppContext, X402SettlementResponseV2, X402SettleRequestV2 } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
@@ -15,7 +26,7 @@ import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
  * POST /settle (spec section 7.2)
  *
  * Verifies payment parameters locally and broadcasts the transaction.
- * Does NOT sponsor -- expects a pre-sponsored transaction in paymentPayload.
+ * Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer).
  * Returns x402 V2 spec-compliant settlement response.
  */
 export class Settle extends BaseEndpoint {
@@ -23,7 +34,7 @@ export class Settle extends BaseEndpoint {
     tags: ["x402 V2"],
     summary: "Settle an x402 V2 payment",
     description:
-      "x402 V2 facilitator settle endpoint (spec section 7.2). Verifies payment parameters locally and broadcasts the transaction to the Stacks network. Does not sponsor — expects a fully-sponsored transaction in paymentPayload.payload.transaction. Returns HTTP 200 for settlement results (success or failure); HTTP 400 for invalid request schema; HTTP 409 when a payment-identifier conflicts with a prior request.",
+      "x402 V2 facilitator settle endpoint (spec section 7.2). Verifies payment parameters locally and broadcasts the transaction to the Stacks network. Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer) — standard x402 clients that build transactions with sponsored:true and fee:0 are handled transparently. Returns HTTP 200 for settlement results (success or failure); HTTP 400 for invalid request schema; HTTP 409 when a payment-identifier conflicts with a prior request.",
     request: {
       body: {
         content: {
@@ -181,11 +192,103 @@ export class Settle extends BaseEndpoint {
         return c.json(response, 200);
       }
 
-      const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
+      // Deserialize transaction to inspect sponsor slot
+      let parsedTx: ReturnType<typeof deserializeTransaction>;
+      try {
+        parsedTx = deserializeTransaction(stripHexPrefix(txHex));
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logger.warn("Failed to deserialize transaction for sponsor-slot inspection", { error: errMsg });
+        c.executionCtx.waitUntil(
+          Promise.all([
+            statsService.recordError("validation"),
+            statsService.logFailure("settle", true),
+          ]).catch(() => {})
+        );
+        return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
+      }
+
+      // Auto-sponsor branch: if the sponsor slot is empty (fee=0n or all-zeros signer),
+      // route through SponsorService to fill it before verification and broadcast.
+      // This handles standard x402 clients that build transactions with sponsored:true, fee:0n.
+      let activeHex = txHex;
+      let sponsorFee: string | undefined;
+      let sponsorNonce: number | null = null;
+      let sponsorWalletIndex = 0;
+
+      // Shared context for failure stats (used by auto-sponsor, verify, and broadcast paths)
+      const failureCtx = { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount };
+
+      if (!hasSponsorSignature(parsedTx)) {
+        logger.info("Sponsor slot is empty — auto-sponsoring transaction");
+
+        const sponsorService = new SponsorService(c.env, logger);
+
+        // Validate the transaction is sponsorable
+        const validateResult = sponsorService.validateTransaction(txHex);
+        if (!validateResult.valid) {
+          logger.warn("Transaction failed sponsor validation", { error: validateResult.error });
+          c.executionCtx.waitUntil(
+            Promise.all([
+              statsService.recordError("validation"),
+              statsService.logFailure("settle", true, failureCtx),
+            ]).catch(() => {})
+          );
+          return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
+        }
+
+        // Sponsor the transaction (reserves nonce from NonceDO, adds fee + sponsor sig)
+        const sponsorResult = await sponsorService.sponsorTransaction(validateResult.transaction);
+        if (!sponsorResult.success) {
+          logger.warn("Sponsoring failed", { error: sponsorResult.error, code: sponsorResult.code });
+          c.executionCtx.waitUntil(
+            Promise.all([
+              statsService.recordError("sponsoring"),
+              statsService.logFailure("settle", false, failureCtx),
+            ]).catch(() => {})
+          );
+          // LOW_HEADROOM / CHAINING_LIMIT_EXCEEDED are transient — signal retryable
+          const errorReason =
+            sponsorResult.code === "LOW_HEADROOM" || sponsorResult.code === "CHAINING_LIMIT_EXCEEDED"
+              ? X402_V2_ERROR_CODES.BROADCAST_FAILED
+              : X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE;
+          return v2Error(errorReason, 200);
+        }
+
+        // Extract nonce for lifecycle management (release on failure, consume on success)
+        const sponsoredTx = deserializeTransaction(stripHexPrefix(sponsorResult.sponsoredTxHex));
+        sponsorNonce = extractSponsorNonce(sponsoredTx);
+        sponsorWalletIndex = sponsorResult.walletIndex;
+        sponsorFee = sponsorResult.fee;
+        // Use the sponsored hex for verification and broadcast
+        activeHex = sponsorResult.sponsoredTxHex;
+
+        logger.info("Transaction auto-sponsored", {
+          fee: sponsorFee,
+          walletIndex: sponsorWalletIndex,
+          sponsorNonce,
+        });
+      }
+
+      const verifyResult = settlementService.verifyPaymentParams(activeHex, settleOptions);
       if (!verifyResult.valid) {
         logger.warn("Payment verification failed", { error: verifyResult.error });
-        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
+
+        // Release reserved sponsor nonce (if any) before returning — verify failed pre-broadcast
+        if (sponsorNonce !== null) {
+          c.executionCtx.waitUntil(
+            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
+              logger.warn("Failed to release nonce after verify failure", { error: String(e) });
+            })
+          );
+        }
+
+        c.executionCtx.waitUntil(
+          Promise.all([
+            statsService.recordError("validation"),
+            statsService.logFailure("settle", true, failureCtx),
+          ]).catch(() => {})
+        );
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
       }
 
@@ -203,24 +306,42 @@ export class Settle extends BaseEndpoint {
       );
 
       if ("error" in broadcastResult) {
+        // Record nonce lifecycle (release reserved nonce on broadcast failure)
+        if (sponsorNonce !== null) {
+          c.executionCtx.waitUntil(
+            Promise.all([
+              recordBroadcastOutcomeDO(
+                c.env, logger, sponsorNonce, sponsorWalletIndex,
+                undefined, broadcastResult.httpStatus, broadcastResult.nodeUrl, broadcastResult.details
+              ),
+              releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex),
+            ]).catch((e) => {
+              logger.warn("Failed nonce lifecycle after broadcast failure", { error: String(e) });
+            })
+          );
+        }
+
         const clientRejection = broadcastResult.clientRejection;
         const isClientError = clientRejection !== undefined;
 
         // Record stats once for all error branches
         c.executionCtx.waitUntil(
-          statsService.logFailure("settle", isClientError, {
-            tokenType: settleOptions.tokenType,
-            amount: settleOptions.minAmount,
-          }).catch(() => {})
+          statsService.logFailure("settle", isClientError, failureCtx).catch(() => {})
         );
 
-        // /settle broadcasts pre-signed txs — there is no sponsor nonce pool.
-        // Nonce errors are always client errors here.
         if (clientRejection) {
           logger.warn("Broadcast rejected by node (client error)", {
             error: broadcastResult.error,
             clientRejection,
           });
+          // Nonce conflicts when auto-sponsoring → trigger resync via CONFLICTING_NONCE
+          if (broadcastResult.nonceConflict && sponsorNonce !== null) {
+            logger.warn("Nonce conflict on auto-sponsored settle", {
+              sponsorNonce,
+              walletIndex: sponsorWalletIndex,
+            });
+            return v2Error(X402_V2_ERROR_CODES.CONFLICTING_NONCE, 200);
+          }
           return v2Error(mapClientRejectionToV2Code(clientRejection), 200);
         } else {
           logger.warn("Broadcast/confirm failed", {
@@ -232,6 +353,22 @@ export class Settle extends BaseEndpoint {
             : X402_V2_ERROR_CODES.TRANSACTION_FAILED;
           return v2Error(errorReason, 200);
         }
+      }
+
+      // Consume the sponsor nonce on broadcast success (fire-and-forget)
+      if (sponsorNonce !== null) {
+        c.executionCtx.waitUntil(
+          Promise.all([
+            releaseNonceDO(c.env, logger, sponsorNonce, broadcastResult.txid, sponsorWalletIndex, sponsorFee),
+            recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce),
+            recordBroadcastOutcomeDO(
+              c.env, logger, sponsorNonce, sponsorWalletIndex,
+              broadcastResult.txid, 200, undefined, undefined
+            ),
+          ]).catch((e) => {
+            logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
+          })
+        );
       }
 
       const payer = settlementService.senderToAddress(
@@ -254,7 +391,7 @@ export class Settle extends BaseEndpoint {
       });
 
       // Record successful transaction stats (fire-and-forget, never blocks response)
-      // No fee: /settle does not sponsor, it only broadcasts pre-sponsored txs
+      // Include fee when auto-sponsoring occurred; undefined otherwise (pre-sponsored txs)
       c.executionCtx.waitUntil(
         statsService.logTransaction({
           timestamp: new Date().toISOString(),
@@ -267,6 +404,7 @@ export class Settle extends BaseEndpoint {
           recipient: verifyResult.data.recipient,
           status: broadcastResult.status,
           blockHeight: confirmedBlockHeight,
+          fee: sponsorFee,
         }).catch(() => {})
       );
 
