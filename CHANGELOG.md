@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.22.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.22.0...x402-sponsor-relay-v1.22.1) (2026-03-24)
+
+
+### Bug Fixes
+
+* **sponsor:** add broadcast retry with backoff and raw response logging ([#212](https://github.com/aibtcdev/x402-sponsor-relay/issues/212)) ([bc0e49f](https://github.com/aibtcdev/x402-sponsor-relay/commit/bc0e49f4b8252af2f0920943557dd6ecf8cda068))
+
 ## [1.22.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.21.1...x402-sponsor-relay-v1.22.0) (2026-03-24)
 
 
