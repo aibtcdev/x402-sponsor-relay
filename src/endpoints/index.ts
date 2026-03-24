@@ -14,6 +14,7 @@ export { NonceHistory } from "./nonce-history";
 export { NonceSurgeHistory } from "./nonce-surge-history";
 export { TransactionLog } from "./transaction-log";
 export { Settle } from "./settle";
+export { SettleStatus } from "./settle-status";
 export { VerifyV2 } from "./verify-v2";
 export { Supported } from "./supported";
 export { Wallets } from "./wallets";
