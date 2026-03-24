@@ -2,6 +2,7 @@ import { BaseEndpoint } from "./BaseEndpoint";
 import {
   validateV2Request,
   mapVerifyErrorToV2Code,
+  mapClientRejectionToV2Code,
   V2_REQUEST_BODY_SCHEMA,
   V2_ERROR_RESPONSE_SCHEMA,
 } from "./v2-helpers";
@@ -215,30 +216,12 @@ export class Settle extends BaseEndpoint {
 
         // /settle broadcasts pre-signed txs — there is no sponsor nonce pool.
         // Nonce errors are always client errors here.
-        if (clientRejection === "NotEnoughFunds") {
-          logger.warn("Broadcast rejected: sender has insufficient funds", {
-            error: broadcastResult.error,
-            clientRejection,
-          });
-          return v2Error(X402_V2_ERROR_CODES.CLIENT_INSUFFICIENT_FUNDS, 200);
-        } else if (clientRejection === "BadNonce") {
-          logger.warn("Broadcast rejected: sender nonce is invalid", {
-            error: broadcastResult.error,
-            clientRejection,
-          });
-          return v2Error(X402_V2_ERROR_CODES.CLIENT_BAD_NONCE, 200);
-        } else if (clientRejection === "ConflictingNonceInMempool") {
-          logger.warn("Broadcast rejected: sender nonce conflicts in mempool", {
-            error: broadcastResult.error,
-            clientRejection,
-          });
-          return v2Error(X402_V2_ERROR_CODES.CONFLICTING_NONCE, 200);
-        } else if (clientRejection) {
+        if (clientRejection) {
           logger.warn("Broadcast rejected by node (client error)", {
             error: broadcastResult.error,
             clientRejection,
           });
-          return v2Error(X402_V2_ERROR_CODES.TRANSACTION_FAILED, 200);
+          return v2Error(mapClientRejectionToV2Code(clientRejection), 200);
         } else {
           logger.warn("Broadcast/confirm failed", {
             error: broadcastResult.error,
