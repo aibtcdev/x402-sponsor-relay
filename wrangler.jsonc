@@ -32,7 +32,7 @@
   ],
   "vars": {
     "STACKS_NETWORK": "testnet",
-    "SPONSOR_WALLET_COUNT": "5",
+    "SPONSOR_WALLET_COUNT": "10",
     "SPONSOR_WALLET_MAX": "10",
     "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB"
   },
@@ -58,7 +58,7 @@
       "observability": { "enabled": false },
       "vars": {
         "STACKS_NETWORK": "testnet",
-        "SPONSOR_WALLET_COUNT": "5",
+        "SPONSOR_WALLET_COUNT": "10",
         "SPONSOR_WALLET_MAX": "10",
         "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB"
       },
@@ -93,7 +93,7 @@
       "observability": { "enabled": false },
       "vars": {
         "STACKS_NETWORK": "mainnet",
-        "SPONSOR_WALLET_COUNT": "5",
+        "SPONSOR_WALLET_COUNT": "10",
         "SPONSOR_WALLET_MAX": "10",
         "FLUSH_RECIPIENT": "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC"
       },

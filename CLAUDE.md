@@ -466,10 +466,10 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
   - `SPONSOR_PRIVATE_KEY` - Hex private key (fallback, not recommended)
   - `HIRO_API_KEY` - Optional API key for Hiro fee estimation endpoint (higher rate limits)
 - Vars set in `wrangler.jsonc` (not secrets):
-  - `SPONSOR_WALLET_COUNT` - Number of sponsor wallets for round-robin nonce rotation (default: "5")
-    - All environments (local dev, staging, production) use `"5"` per wrangler.jsonc
-    - Derives BIP-44 accounts 0..4 from `SPONSOR_MNEMONIC` and coordinates each wallet's
-      nonce pool via `NonceDO`. Using 5 wallets allows up to 5 concurrent sponsorings
+  - `SPONSOR_WALLET_COUNT` - Number of sponsor wallets for round-robin nonce rotation (default: "10")
+    - All environments (local dev, staging, production) use `"10"` per wrangler.jsonc
+    - Derives BIP-44 accounts 0..9 from `SPONSOR_MNEMONIC` and coordinates each wallet's
+      nonce pool via `NonceDO`. Using 10 wallets allows up to 10 concurrent sponsorings
       without nonce conflicts, significantly improving throughput under load.
     - Set to `"1"` for low-traffic use or when only one funded address is available.
       The system works correctly with any count from 1 to 10.
