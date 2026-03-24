@@ -466,13 +466,15 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
   - `SPONSOR_PRIVATE_KEY` - Hex private key (fallback, not recommended)
   - `HIRO_API_KEY` - Optional API key for Hiro fee estimation endpoint (higher rate limits)
 - Vars set in `wrangler.jsonc` (not secrets):
-  - `SPONSOR_WALLET_COUNT` - Number of sponsor wallets for round-robin nonce rotation (default: "10")
-    - All environments (local dev, staging, production) use `"10"` per wrangler.jsonc
-    - Derives BIP-44 accounts 0..9 from `SPONSOR_MNEMONIC` and coordinates each wallet's
-      nonce pool via `NonceDO`. Using 10 wallets allows up to 10 concurrent sponsorings
-      without nonce conflicts, significantly improving throughput under load.
-    - Set to `"1"` for low-traffic use or when only one funded address is available.
-      The system works correctly with any count from 1 to 10.
+  - `SPONSOR_WALLET_COUNT` - Number of sponsor wallets for round-robin nonce rotation (configured as `"10"` in `wrangler.jsonc`; if unset at runtime, the code defaults to `1`)
+    - All environments (local dev, staging, production) currently set `"10"` in `wrangler.jsonc`
+    - Derives BIP-44 accounts `0..(walletCount-1)` from `SPONSOR_MNEMONIC` and coordinates each wallet's
+      nonce pool via `NonceDO`. Each wallet supports up to `CHAINING_LIMIT` (20) in-flight sponsored
+      transactions, so total capacity is `SPONSOR_WALLET_COUNT × CHAINING_LIMIT` (e.g., 10 wallets → up to
+      200 concurrently in-flight nonces without conflicts, significantly improving throughput under load).
+    - Set `SPONSOR_WALLET_COUNT` to `"1"` (matching the code default when the env var is omitted) for
+      low-traffic use or when only one funded address is available. The system works correctly with any
+      count from 1 to 10.
 
 ## Deployment
 
