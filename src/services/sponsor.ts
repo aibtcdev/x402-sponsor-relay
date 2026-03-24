@@ -1078,6 +1078,50 @@ export function extractSponsorNonce(
   return nonceNumber;
 }
 
+/**
+ * Determines whether a transaction's sponsor authorization slot is already filled.
+ *
+ * Returns `true` when the transaction is ready to broadcast as-is:
+ *   - Non-sponsored transactions (authType !== Sponsored) — no sponsor needed
+ *   - Sponsored transactions where the sponsor has already set a non-zero fee
+ *     and a non-zero signer hash
+ *
+ * Returns `false` when the sponsor slot is empty and sponsoring is required:
+ *   - Sponsored transactions where fee === 0n (no fee set yet)
+ *   - Sponsored transactions where the signer is all-zeros (placeholder hash)
+ *   - Sponsored transactions missing the sponsorSpendingCondition entirely
+ *
+ * This is the canonical check for detecting client-built "stub" sponsored transactions
+ * (built with `sponsored: true, fee: 0n`) that need the relay to fill in the sponsor slot.
+ */
+export function hasSponsorSignature(transaction: StacksTransactionWire): boolean {
+  // Non-sponsored transactions don't need a sponsor slot — treat as ready to broadcast
+  if (transaction.auth.authType !== AuthType.Sponsored) {
+    return true;
+  }
+
+  // Sponsored auth but no sponsorSpendingCondition present — needs sponsoring
+  if (!("sponsorSpendingCondition" in transaction.auth)) {
+    return false;
+  }
+
+  const sponsorCondition = transaction.auth.sponsorSpendingCondition;
+
+  // Empty fee means the sponsor slot has not been filled yet
+  if (sponsorCondition.fee === 0n) {
+    return false;
+  }
+
+  // All-zeros signer is the placeholder set by clients before sponsor signing
+  // 20 bytes = 40 hex characters, all zero
+  if (/^0+$/.test(sponsorCondition.signer)) {
+    return false;
+  }
+
+  // Fee is non-zero and signer is a real address hash — slot is filled
+  return true;
+}
+
 export async function recordNonceTxid(
   env: Env,
   logger: Logger,
