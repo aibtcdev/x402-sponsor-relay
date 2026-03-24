@@ -19,8 +19,8 @@
  *   1. GET  /supported    — relay's supported payment kinds
  *   2. POST /verify       — local validation only (no broadcast)
  *   3. POST /settle       — verify + broadcast with pre-sponsored tx (idempotent)
- *   6. POST /settle       — auto-sponsor test: empty sponsor slot (fee=0)
  *   4. Error cases        — wrong network, missing fields
+ *   6. POST /settle       — auto-sponsor test: empty sponsor slot (fee=0)
  *
  * Note: POST /settle auto-sponsors transactions with an empty sponsor slot
  * (fee=0 / all-zeros signer). Standard x402 clients that build transactions with

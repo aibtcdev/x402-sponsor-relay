@@ -1095,30 +1095,25 @@ export function extractSponsorNonce(
  * (built with `sponsored: true, fee: 0n`) that need the relay to fill in the sponsor slot.
  */
 export function hasSponsorSignature(transaction: StacksTransactionWire): boolean {
-  // Non-sponsored transactions don't need a sponsor slot — treat as ready to broadcast
   if (transaction.auth.authType !== AuthType.Sponsored) {
     return true;
   }
 
-  // Sponsored auth but no sponsorSpendingCondition present — needs sponsoring
   if (!("sponsorSpendingCondition" in transaction.auth)) {
     return false;
   }
 
   const sponsorCondition = transaction.auth.sponsorSpendingCondition;
 
-  // Empty fee means the sponsor slot has not been filled yet
   if (sponsorCondition.fee === 0n) {
     return false;
   }
 
-  // All-zeros signer is the placeholder set by clients before sponsor signing
-  // 20 bytes = 40 hex characters, all zero
+  // All-zeros signer = placeholder hash (20 bytes = 40 hex chars)
   if (/^0+$/.test(sponsorCondition.signer)) {
     return false;
   }
 
-  // Fee is non-zero and signer is a real address hash — slot is filled
   return true;
 }
 

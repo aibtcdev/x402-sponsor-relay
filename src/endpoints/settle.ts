@@ -210,6 +210,9 @@ export class Settle extends BaseEndpoint {
       let sponsorNonce: number | null = null;
       let sponsorWalletIndex = 0;
 
+      // Shared context for failure stats (used by auto-sponsor, verify, and broadcast paths)
+      const failureCtx = { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount };
+
       if (!hasSponsorSignature(parsedTx)) {
         logger.info("Sponsor slot is empty — auto-sponsoring transaction");
 
@@ -219,12 +222,11 @@ export class Settle extends BaseEndpoint {
         const validateResult = sponsorService.validateTransaction(txHex);
         if (!validateResult.valid) {
           logger.warn("Transaction failed sponsor validation", { error: validateResult.error });
-          c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
           c.executionCtx.waitUntil(
-            statsService.logFailure("settle", true, {
-              tokenType: settleOptions.tokenType,
-              amount: settleOptions.minAmount,
-            }).catch(() => {})
+            Promise.all([
+              statsService.recordError("validation"),
+              statsService.logFailure("settle", true, failureCtx),
+            ]).catch(() => {})
           );
           return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
         }
@@ -233,12 +235,11 @@ export class Settle extends BaseEndpoint {
         const sponsorResult = await sponsorService.sponsorTransaction(validateResult.transaction);
         if (!sponsorResult.success) {
           logger.warn("Sponsoring failed", { error: sponsorResult.error, code: sponsorResult.code });
-          c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
           c.executionCtx.waitUntil(
-            statsService.logFailure("settle", false, {
-              tokenType: settleOptions.tokenType,
-              amount: settleOptions.minAmount,
-            }).catch(() => {})
+            Promise.all([
+              statsService.recordError("sponsoring"),
+              statsService.logFailure("settle", false, failureCtx),
+            ]).catch(() => {})
           );
           // LOW_HEADROOM / CHAINING_LIMIT_EXCEEDED are transient — signal retryable
           const errorReason =
@@ -276,8 +277,12 @@ export class Settle extends BaseEndpoint {
           );
         }
 
-        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("settle", true, { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount }).catch(() => {}));
+        c.executionCtx.waitUntil(
+          Promise.all([
+            statsService.recordError("validation"),
+            statsService.logFailure("settle", true, failureCtx),
+          ]).catch(() => {})
+        );
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
       }
 
@@ -298,16 +303,14 @@ export class Settle extends BaseEndpoint {
         // Record nonce lifecycle (release reserved nonce on broadcast failure)
         if (sponsorNonce !== null) {
           c.executionCtx.waitUntil(
-            recordBroadcastOutcomeDO(
-              c.env, logger, sponsorNonce, sponsorWalletIndex,
-              undefined, broadcastResult.httpStatus, broadcastResult.nodeUrl, broadcastResult.details
-            ).catch((e) => {
-              logger.warn("Failed to record broadcast outcome", { error: String(e) });
-            })
-          );
-          c.executionCtx.waitUntil(
-            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
-              logger.warn("Failed to release nonce after broadcast failure", { error: String(e) });
+            Promise.all([
+              recordBroadcastOutcomeDO(
+                c.env, logger, sponsorNonce, sponsorWalletIndex,
+                undefined, broadcastResult.httpStatus, broadcastResult.nodeUrl, broadcastResult.details
+              ),
+              releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex),
+            ]).catch((e) => {
+              logger.warn("Failed nonce lifecycle after broadcast failure", { error: String(e) });
             })
           );
         }
@@ -317,10 +320,7 @@ export class Settle extends BaseEndpoint {
 
         // Record stats once for all error branches
         c.executionCtx.waitUntil(
-          statsService.logFailure("settle", isClientError, {
-            tokenType: settleOptions.tokenType,
-            amount: settleOptions.minAmount,
-          }).catch(() => {})
+          statsService.logFailure("settle", isClientError, failureCtx).catch(() => {})
         );
 
         if (clientRejection) {
@@ -352,21 +352,15 @@ export class Settle extends BaseEndpoint {
       // Consume the sponsor nonce on broadcast success (fire-and-forget)
       if (sponsorNonce !== null) {
         c.executionCtx.waitUntil(
-          releaseNonceDO(c.env, logger, sponsorNonce, broadcastResult.txid, sponsorWalletIndex, sponsorFee).catch((e) => {
-            logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
-          })
-        );
-        c.executionCtx.waitUntil(
-          recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce).catch((e) => {
-            logger.warn("Failed to record nonce txid", { error: String(e) });
-          })
-        );
-        c.executionCtx.waitUntil(
-          recordBroadcastOutcomeDO(
-            c.env, logger, sponsorNonce, sponsorWalletIndex,
-            broadcastResult.txid, 200, undefined, undefined
-          ).catch((e) => {
-            logger.warn("Failed to record broadcast outcome", { error: String(e) });
+          Promise.all([
+            releaseNonceDO(c.env, logger, sponsorNonce, broadcastResult.txid, sponsorWalletIndex, sponsorFee),
+            recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce),
+            recordBroadcastOutcomeDO(
+              c.env, logger, sponsorNonce, sponsorWalletIndex,
+              broadcastResult.txid, 200, undefined, undefined
+            ),
+          ]).catch((e) => {
+            logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
           })
         );
       }
