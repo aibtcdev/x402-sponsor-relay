@@ -2838,13 +2838,46 @@ export class NonceDO {
         };
       }
 
-      this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
+      // Guard: don't reset past nonces that were actually broadcast and may still
+      // be pending in the mempool. Hiro's possible_next_nonce can lag behind the
+      // mempool, so resetting to it would re-assign nonces that are still in-flight,
+      // causing ConflictingNonceInMempool on the next broadcast.
+      const broadcastedInRange = this.sql
+        .exec<{ max_nonce: number | null }>(
+          `SELECT MAX(nonce) as max_nonce FROM nonce_intents
+           WHERE wallet_index = ? AND nonce >= ? AND nonce < ?
+             AND state IN ('broadcasted', 'assigned')`,
+          walletIndex,
+          possible_next_nonce,
+          previousNonce
+        )
+        .toArray();
+      const highestInFlight = broadcastedInRange[0]?.max_nonce;
+
+      // If there are in-flight nonces above Hiro's value, reset to just past
+      // the highest one instead of blindly trusting Hiro.
+      const safeResetTarget = highestInFlight !== null
+        ? Math.max(possible_next_nonce, highestInFlight + 1)
+        : possible_next_nonce;
+
+      if (highestInFlight !== null) {
+        this.log("warn", "nonce_reconcile_stale_guarded", {
+          walletIndex,
+          previousNonce,
+          hiroNextNonce: possible_next_nonce,
+          highestInFlight,
+          safeResetTarget,
+          idleSeconds: Math.round(idleMs / 1000),
+        });
+      }
+
+      this.ledgerAdvanceWalletHead(walletIndex, safeResetTarget);
       this.incrementCounter(STATE_KEYS.conflictsDetected);
 
       this.log("warn", "nonce_reconcile_stale", {
         walletIndex,
         previousNonce,
-        newNonce: possible_next_nonce,
+        newNonce: safeResetTarget,
         idleSeconds: Math.round(idleMs / 1000),
         hiroNextNonce: possible_next_nonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
@@ -2852,9 +2885,9 @@ export class NonceDO {
 
       return {
         previousNonce,
-        newNonce: possible_next_nonce,
+        newNonce: safeResetTarget,
         changed: true,
-        reason: `STALE DETECTION: idle ${Math.round(idleMs / 1000)}s, reset to chain nonce ${possible_next_nonce}`,
+        reason: `STALE DETECTION: idle ${Math.round(idleMs / 1000)}s, reset to ${safeResetTarget === possible_next_nonce ? "chain" : "guarded"} nonce ${safeResetTarget}`,
       };
     }
 
