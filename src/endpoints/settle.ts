@@ -382,6 +382,7 @@ export class Settle extends BaseEndpoint {
       });
 
       // Store tx status in KV for GET /settle/status/:txid
+      // Awaited (not waitUntil) to ensure the record exists before background polling starts
       const txStatusRecord: TxStatusRecord = {
         txid,
         status: "broadcast",
@@ -392,9 +393,7 @@ export class Settle extends BaseEndpoint {
         sponsorFee,
         broadcastAt: new Date().toISOString(),
       };
-      c.executionCtx.waitUntil(
-        settlementService.recordTxStatus(txStatusRecord).catch(() => {})
-      );
+      await settlementService.recordTxStatus(txStatusRecord);
 
       // Record successful transaction stats (fire-and-forget)
       c.executionCtx.waitUntil(

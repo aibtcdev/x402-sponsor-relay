@@ -560,7 +560,8 @@ export class SettlementService {
   async broadcastOnly(
     transaction: StacksTransactionWire,
   ): Promise<BroadcastOnlyResult> {
-    const result = await this.broadcastAndConfirm(transaction, 1);
+    // Pass 0 to skip polling entirely — broadcastAndConfirm returns {txid, status:"pending"}
+    const result = await this.broadcastAndConfirm(transaction, 0);
     if ("error" in result) return result;
     return { txid: result.txid };
   }
@@ -607,6 +608,9 @@ export class SettlementService {
     transaction: StacksTransactionWire,
     maxPollTimeMs?: number
   ): Promise<BroadcastAndConfirmResult> {
+    // When maxPollTimeMs is explicitly 0, skip polling entirely (broadcast-only mode).
+    const skipPolling = maxPollTimeMs === 0;
+
     // Resolve effective poll time: caller override (capped at ceiling) or default
     const effectivePollTimeMs = maxPollTimeMs != null && maxPollTimeMs > 0
       ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
@@ -900,6 +904,11 @@ export class SettlementService {
         lastError: "error" in lastBroadcastError ? lastBroadcastError.details : "unknown",
       });
       return lastBroadcastError;
+    }
+
+    // Skip polling if caller requested broadcast-only mode (maxPollTimeMs === 0)
+    if (skipPolling) {
+      return { txid, status: "pending" };
     }
 
     // Poll for confirmation with exponential backoff and retry rounds.

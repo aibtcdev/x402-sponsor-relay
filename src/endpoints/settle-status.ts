@@ -7,7 +7,7 @@ import type { AppContext } from "../types";
  * GET /settle/status/:txid
  *
  * Returns the relay's internal view of a transaction's settlement status.
- * Includes nonce ledger state, wallet index, broadcast timestamp, and
+ * Includes settlement status, wallet index, broadcast timestamp, and
  * optionally proxies the Hiro API tx status for comparison.
  */
 export class SettleStatus extends BaseEndpoint {
@@ -76,11 +76,9 @@ export class SettleStatus extends BaseEndpoint {
 
   async handle(c: AppContext) {
     const logger = this.getLogger(c);
-    const txid = c.req.param("txid");
-
-    if (!txid) {
-      return c.json({ success: false, error: "Missing txid parameter" }, 400);
-    }
+    // Normalize txid: accept with or without 0x prefix, store/lookup with 0x
+    const rawTxid = c.req.param("txid")!;
+    const txid = rawTxid.startsWith("0x") ? rawTxid : `0x${rawTxid}`;
 
     try {
       const settlementService = new SettlementService(c.env, logger);
