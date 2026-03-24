@@ -289,8 +289,10 @@ export class Sponsor extends BaseEndpoint {
       // Broadcast with retry: raw fetch to /v2/transactions instead of library
       // broadcastTransaction() which swallows response bodies and has no retry.
       // Retry on 5xx/network errors with backoff; fail fast on 4xx.
+      // Pass cleanHex directly — it's already stripped hex from sponsoredTxHex.
+      // Avoids a deserialize→re-serialize round-trip through sponsoredTx.serialize().
       const broadcastResult = await this.broadcastWithRetry(
-        sponsoredTx.serialize(), c.env, logger
+        cleanHex, c.env, logger
       );
 
       if (!broadcastResult.success) {
@@ -583,13 +585,14 @@ export class Sponsor extends BaseEndpoint {
   }
 
   private parseTxid(responseText: string): string | null {
-    let txid: string;
     try {
-      txid = JSON.parse(responseText) as string;
+      const parsed: unknown = JSON.parse(responseText);
+      if (typeof parsed === "string" && parsed) return parsed;
     } catch {
-      txid = responseText.trim().replace(/^"|"$/g, "");
+      const trimmed = responseText.trim().replace(/^"|"$/g, "");
+      if (trimmed) return trimmed;
     }
-    return txid && typeof txid === "string" ? txid : null;
+    return null;
   }
 
   private parseErrorBody(
