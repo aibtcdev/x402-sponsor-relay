@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.21.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.21.0...x402-sponsor-relay-v1.21.1) (2026-03-24)
+
+
+### Bug Fixes
+
+* enrich SignatureValidation broadcast rejection with diagnostic hints ([#200](https://github.com/aibtcdev/x402-sponsor-relay/issues/200)) ([697a563](https://github.com/aibtcdev/x402-sponsor-relay/commit/697a56347d8dae3f8ad45960c1dc5310d397f827))
+
 ## [1.21.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.20.2...x402-sponsor-relay-v1.21.0) (2026-03-23)
 
 
