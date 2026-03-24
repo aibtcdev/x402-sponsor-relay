@@ -12,9 +12,9 @@ The relay uses a pool of sponsor wallets to sign and broadcast Stacks transactio
 
 | Parameter | Value | Env var |
 |-----------|-------|---------|
-| Wallet count | 5 | `SPONSOR_WALLET_COUNT` |
+| Wallet count | 10 | `SPONSOR_WALLET_COUNT` |
 | Max in-flight per wallet | 20 | hardcoded `CHAINING_LIMIT` |
-| Total pool capacity | 100 concurrent nonces | `walletCount × 20` |
+| Total pool capacity | 200 concurrent nonces | `walletCount × 20` |
 | Alarm interval (active) | 60s | `ALARM_INTERVAL_ACTIVE_MS` |
 | Alarm interval (idle) | 5 min | `ALARM_INTERVAL_IDLE_MS` |
 | Stale assignment threshold | 10 min | `STALE_THRESHOLD_MS` |
@@ -263,10 +263,10 @@ GET /dashboard/api/logs/x402-relay?message=circuit_breaker_skip
 
 ### Current capacity
 
-With `SPONSOR_WALLET_COUNT=5` and `CHAINING_LIMIT=20`:
-- **Max concurrent sponsorings:** 100 (5 × 20)
-- **Conflict probability is low** when pool pressure stays below 80% (80 in-flight)
-- **Surge threshold:** 80 in-flight nonces across all 5 wallets
+With `SPONSOR_WALLET_COUNT=10` and `CHAINING_LIMIT=20`:
+- **Max concurrent sponsorings:** 200 (10 × 20)
+- **Conflict probability is low** when pool pressure stays below 80% (160 in-flight)
+- **Surge threshold:** 160 in-flight nonces across all 10 wallets
 
 ### Signs of capacity pressure
 
@@ -299,8 +299,8 @@ If peak concurrent sponsorings = P:
 
 Examples:
 - 30 concurrent → 3 wallets
-- 60 concurrent → 5 wallets (current)
-- 120 concurrent → 10 wallets
+- 60 concurrent → 5 wallets
+- 120 concurrent → 10 wallets (current)
 - 200 concurrent → 17 wallets (requires `SPONSOR_WALLET_MAX` increase and funded addresses)
 
 ---
