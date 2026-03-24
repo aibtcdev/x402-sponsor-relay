@@ -34,9 +34,10 @@ type BroadcastResult =
       success: false;
       errorMessage: string;
       errorDetails: string;
-      httpStatus?: number;
+      httpStatus: number;
       isNonceConflict: boolean;
       clientRejection?: string;
+      nodeUrl?: string;
     };
 
 /**
@@ -299,9 +300,10 @@ export class Sponsor extends BaseEndpoint {
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError).catch(() => {}));
 
-        // Record broadcast outcome in the intent ledger
+        // Record broadcast outcome in the intent ledger.
+        // httpStatus 0 = network/timeout exception (no HTTP response received).
         if (sponsorNonce !== null) {
-          const rejectHttpStatus = httpStatus ?? (isNonceConflict ? 409 : 400);
+          const rejectHttpStatus = httpStatus;
           c.executionCtx.waitUntil(
             recordBroadcastOutcomeDO(
               c.env, logger, sponsorNonce, sponsorWalletIndex,
@@ -340,13 +342,15 @@ export class Sponsor extends BaseEndpoint {
           return this.clientRejectionResponse(c, clientRejection, errorDetails);
         }
 
+        // Generic 4xx = non-retryable transaction rejection; 5xx/network = retryable
+        const is4xx = httpStatus >= 400 && httpStatus < 500;
         return this.err(c, {
           error: errorMessage,
           code: "BROADCAST_FAILED",
-          status: 502,
+          status: is4xx ? 400 : 502,
           details: errorDetails,
-          retryable: true,
-          retryAfter: 5,
+          retryable: !is4xx,
+          retryAfter: is4xx ? undefined : 5,
         });
       }
 
@@ -440,7 +444,7 @@ export class Sponsor extends BaseEndpoint {
    * Hiro returns unparseable responses (fixes #211).
    *
    * Retry strategy (same as SettlementService):
-   * - Up to BROADCAST_MAX_ATTEMPTS per node with exponential backoff
+   * - Up to BROADCAST_MAX_ATTEMPTS per node with fixed backoff (1s then 2s)
    * - Fail over to next node after exhausting attempts
    * - Immediate return on 4xx (transaction-level rejection)
    * - Retry on 5xx and network/timeout errors
@@ -456,6 +460,7 @@ export class Sponsor extends BaseEndpoint {
         success: false,
         errorMessage: "Failed to broadcast transaction",
         errorDetails: "Serialized transaction hex could not be converted to bytes",
+        httpStatus: 0,
         isNonceConflict: false,
       };
     }
@@ -525,6 +530,7 @@ export class Sponsor extends BaseEndpoint {
               errorDetails: conflictDetails,
               httpStatus: response.status,
               isNonceConflict: false,
+              nodeUrl: target.baseUrl,
             };
             if (attempt < BROADCAST_MAX_ATTEMPTS) {
               await this.retryDelay(attempt);
@@ -543,6 +549,7 @@ export class Sponsor extends BaseEndpoint {
             errorDetails,
             httpStatus: response.status,
             isNonceConflict: false,
+            nodeUrl: target.baseUrl,
           };
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
@@ -551,7 +558,9 @@ export class Sponsor extends BaseEndpoint {
             success: false,
             errorMessage: "Failed to broadcast transaction",
             errorDetails: errMsg,
+            httpStatus: 0,
             isNonceConflict: false,
+            nodeUrl: target.baseUrl,
           };
           if (attempt < BROADCAST_MAX_ATTEMPTS) {
             await this.retryDelay(attempt);
@@ -568,6 +577,7 @@ export class Sponsor extends BaseEndpoint {
       success: false,
       errorMessage: "Failed to broadcast transaction",
       errorDetails: "All broadcast targets exhausted",
+      httpStatus: 0,
       isNonceConflict: false,
     };
   }
@@ -621,7 +631,7 @@ export class Sponsor extends BaseEndpoint {
       nodeUrl,
     });
 
-    return { success: false, errorMessage, errorDetails, httpStatus: status, isNonceConflict, clientRejection };
+    return { success: false, errorMessage, errorDetails, httpStatus: status, isNonceConflict, clientRejection, nodeUrl };
   }
 
   private logRetriableFailure(
