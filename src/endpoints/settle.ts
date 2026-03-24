@@ -26,7 +26,7 @@ import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
  * POST /settle (spec section 7.2)
  *
  * Verifies payment parameters locally and broadcasts the transaction.
- * Does NOT sponsor -- expects a pre-sponsored transaction in paymentPayload.
+ * Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer).
  * Returns x402 V2 spec-compliant settlement response.
  */
 export class Settle extends BaseEndpoint {
@@ -193,12 +193,18 @@ export class Settle extends BaseEndpoint {
       }
 
       // Deserialize transaction to inspect sponsor slot
-      let parsedTx;
+      let parsedTx: ReturnType<typeof deserializeTransaction>;
       try {
         parsedTx = deserializeTransaction(stripHexPrefix(txHex));
-      } catch {
-        logger.warn("Failed to deserialize transaction for sponsor-slot inspection");
-        c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logger.warn("Failed to deserialize transaction for sponsor-slot inspection", { error: errMsg });
+        c.executionCtx.waitUntil(
+          Promise.all([
+            statsService.recordError("validation"),
+            statsService.logFailure("settle", true),
+          ]).catch(() => {})
+        );
         return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
       }
 

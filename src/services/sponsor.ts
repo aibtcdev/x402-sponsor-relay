@@ -1110,7 +1110,8 @@ export function hasSponsorSignature(transaction: StacksTransactionWire): boolean
   }
 
   // All-zeros signer = placeholder hash (20 bytes = 40 hex chars)
-  if (/^0+$/.test(sponsorCondition.signer)) {
+  const signerHex = sponsorCondition.signer.replace(/^0x/, "");
+  if (signerHex.length > 0 && /^0+$/.test(signerHex)) {
     return false;
   }
 

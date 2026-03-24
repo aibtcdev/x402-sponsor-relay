@@ -18,8 +18,9 @@
  * What this tests:
  *   1. GET  /supported    — relay's supported payment kinds
  *   2. POST /verify       — local validation only (no broadcast)
- *   3. POST /settle       — verify + broadcast with pre-sponsored tx (idempotent)
- *   4. Error cases        — wrong network, missing fields
+ *   3. POST /settle       — verify + broadcast with sponsored tx (idempotent)
+ *   4. POST /verify       — error case: wrong network
+ *   5. POST /verify       — error case: missing required fields
  *   6. POST /settle       — auto-sponsor test: empty sponsor slot (fee=0)
  *
  * Note: POST /settle auto-sponsors transactions with an empty sponsor slot
