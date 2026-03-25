@@ -3210,6 +3210,118 @@ export class NonceDO {
     });
   }
 
+  /**
+   * Admin: fill all nonce gaps for a specific wallet by querying Hiro for the
+   * gap range and broadcasting 1 uSTX transfers. Bypasses MAX_GAP_FILLS_PER_ALARM
+   * and gap-fill throttle — intended for manual intervention on stuck wallets.
+   */
+  private async handleFillGaps(walletIndex: number): Promise<Response> {
+    try {
+      const address = await this.getStoredSponsorAddressForWallet(walletIndex);
+      if (!address) {
+        return this.badRequest(`Wallet ${walletIndex} not initialized`);
+      }
+
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      if (!privateKey) {
+        return this.badRequest(`Cannot derive key for wallet ${walletIndex}`);
+      }
+
+      // Fetch current chain state
+      let nonceInfo: HiroNonceInfo;
+      try {
+        nonceInfo = await this.fetchNonceInfo(address);
+      } catch (_e) {
+        return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
+      }
+
+      const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+      const head = this.ledgerGetWalletHead(walletIndex);
+
+      // Compute gaps: Hiro-reported missing nonces + any range between
+      // last_executed and head that Hiro doesn't see (ledger-only gaps)
+      const gapSet = new Set(detected_missing_nonces);
+
+      // Also check contiguous range from possible_next_nonce to head for
+      // nonces not in the mempool (Hiro won't report these as "missing"
+      // if it doesn't know about them)
+      if (head !== null && head > possible_next_nonce) {
+        for (let n = possible_next_nonce; n < head; n++) {
+          gapSet.add(n);
+        }
+      }
+
+      // Remove nonces that are already in the mempool (broadcasted/assigned)
+      const inFlightRows = this.sql
+        .exec<{ nonce: number }>(
+          `SELECT nonce FROM nonce_intents
+           WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted')
+             AND nonce >= ?`,
+          walletIndex,
+          possible_next_nonce
+        )
+        .toArray();
+      for (const row of inFlightRows) {
+        gapSet.delete(row.nonce);
+      }
+
+      const gaps = [...gapSet].sort((a, b) => a - b);
+
+      if (gaps.length === 0) {
+        return this.jsonResponse({
+          success: true,
+          walletIndex,
+          address,
+          message: "No gaps found",
+          possible_next_nonce,
+          head,
+          filled: [],
+          failed: [],
+        });
+      }
+
+      this.log("info", "admin_fill_gaps_start", {
+        walletIndex,
+        gapCount: gaps.length,
+        gaps,
+        possible_next_nonce,
+        head,
+      });
+
+      const filled: Array<{ nonce: number; txid: string }> = [];
+      const failed: Array<{ nonce: number; reason: string }> = [];
+
+      for (const gapNonce of gaps) {
+        const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
+        if (txid) {
+          filled.push({ nonce: gapNonce, txid });
+          this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
+          this.incrementCounter(STATE_KEYS.gapsFilled);
+        } else {
+          failed.push({ nonce: gapNonce, reason: "broadcast rejected or already occupied" });
+        }
+      }
+
+      this.log("info", "admin_fill_gaps_complete", {
+        walletIndex,
+        filledCount: filled.length,
+        failedCount: failed.length,
+      });
+
+      return this.jsonResponse({
+        success: true,
+        walletIndex,
+        address,
+        possible_next_nonce,
+        head,
+        filled,
+        failed,
+      });
+    } catch (error) {
+      return this.internalError(error);
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
@@ -3393,6 +3505,14 @@ export class NonceDO {
       } catch (error) {
         return this.internalError(error);
       }
+    }
+
+    // POST /fill-gaps/:wallet — admin: immediately fill all gaps for a specific wallet.
+    // Bypasses MAX_GAP_FILLS_PER_ALARM and RBF logic — just broadcasts gap-fill txs.
+    const fillGapsMatch = url.pathname.match(/^\/fill-gaps\/(\d+)$/);
+    if (request.method === "POST" && fillGapsMatch) {
+      const walletIdx = parseInt(fillGapsMatch[1], 10);
+      return this.state.blockConcurrencyWhile(() => this.handleFillGaps(walletIdx));
     }
 
     // GET /history/:wallet/:nonce — diagnostic endpoint for full nonce event trail.
