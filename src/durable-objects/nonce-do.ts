@@ -161,6 +161,10 @@ interface WalletUtilization {
   failed_count: number;
   /** Time window in hours */
   window_hours: number;
+  /** Chain gap headroom (CHAINING_LIMIT - (head - chainFrontier)), null if no frontier */
+  chain_gap_headroom: number | null;
+  /** Monotonic chain frontier (highest confirmed nonce from Hiro) */
+  chain_frontier: number | null;
 }
 
 interface NonceStatsResponse {
@@ -357,6 +361,17 @@ export class NonceDO {
   private readonly env: Env;
   /** Per-wallet cache of Hiro possible_next_nonce to avoid redundant API calls */
   private readonly hiroNonceCache = new Map<number, { value: number; expiresAt: number }>();
+
+  /**
+   * Monotonic chain frontier per wallet — the highest `possible_next_nonce` ever
+   * observed from Hiro for each wallet. Only advances forward (Math.max), so
+   * load-balanced Hiro nodes returning stale/inconsistent values can never regress it.
+   *
+   * Used for O(1) headroom calculation: headroom = CHAINING_LIMIT - (head - chainFrontier).
+   * Stored in nonce_state as `chain_frontier:{walletIndex}` for persistence across restarts.
+   * Also cached in-memory for fast reads during nonce assignment.
+   */
+  private readonly chainFrontierCache = new Map<number, number>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.state = ctx;
@@ -856,7 +871,13 @@ export class NonceDO {
       if (walletCount === 0) return;
 
       const poolCapacity = walletCount * CHAINING_LIMIT;
-      const totalReserved = this.ledgerTotalInFlightForWallets(walletCount);
+      // Sum headroom across all wallets using chain gap where available
+      let totalHeadroom = 0;
+      for (let wi = 0; wi < walletCount; wi++) {
+        const h = this.headroomFromChainGap(wi);
+        totalHeadroom += h ?? (CHAINING_LIMIT - this.ledgerInFlightCount(wi));
+      }
+      const totalReserved = poolCapacity - totalHeadroom;
       const overallPressure = poolCapacity > 0 ? totalReserved / poolCapacity : 0;
       const pressurePct = Math.round(overallPressure * 100);
       const now = new Date().toISOString();
@@ -975,8 +996,9 @@ export class NonceDO {
 
       // Check if ALL wallets are above the scale-up threshold
       for (let wi = 0; wi < initializedCount; wi++) {
-        const inFlight = this.ledgerInFlightCount(wi);
-        const pressure = inFlight / CHAINING_LIMIT;
+        const h = this.headroomFromChainGap(wi);
+        const headroom = h ?? (CHAINING_LIMIT - this.ledgerInFlightCount(wi));
+        const pressure = 1 - (headroom / CHAINING_LIMIT);
         if (pressure < SCALE_UP_THRESHOLD) {
           return; // At least one wallet has capacity — no scale-up needed
         }
@@ -1297,6 +1319,7 @@ export class NonceDO {
         value: info.possible_next_nonce,
         expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
       });
+      this.advanceChainFrontier(walletIndex, info.possible_next_nonce);
       return info.possible_next_nonce;
     } catch (_e) {
       this.log("debug", "nonce_lookahead_check_skipped", {
@@ -1346,20 +1369,6 @@ export class NonceDO {
       .exec<{ count: number }>(
         "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')",
         walletIndex
-      )
-      .toArray();
-    return rows[0]?.count ?? 0;
-  }
-
-  /**
-   * Count all in-flight nonces across all wallets with index < walletCount.
-   * Used to compute totalReserved (pool pressure signal) in assignNonce().
-   */
-  private ledgerTotalInFlightForWallets(walletCount: number): number {
-    const rows = this.sql
-      .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index < ? AND state IN ('assigned', 'broadcasted', 'confirmed')",
-        walletCount
       )
       .toArray();
     return rows[0]?.count ?? 0;
@@ -1857,6 +1866,62 @@ export class NonceDO {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Chain frontier — monotonic high-water mark of Hiro's possible_next_nonce.
+  // Used for O(1) headroom calculation without SQL or API calls.
+  // ---------------------------------------------------------------------------
+
+  private chainFrontierKey(walletIndex: number): string {
+    return `chain_frontier:${walletIndex}`;
+  }
+
+  /**
+   * Read the chain frontier for a wallet. Checks in-memory cache first,
+   * falls back to persistent nonce_state. Returns null if never observed.
+   */
+  private getChainFrontier(walletIndex: number): number | null {
+    const cached = this.chainFrontierCache.get(walletIndex);
+    if (cached !== undefined) return cached;
+    const stored = this.getStateValue(this.chainFrontierKey(walletIndex));
+    if (stored !== null) this.chainFrontierCache.set(walletIndex, stored);
+    return stored;
+  }
+
+  /**
+   * Advance the chain frontier for a wallet. Only moves forward (monotonic).
+   * Called on every Hiro observation to absorb the highest confirmed nonce,
+   * filtering out load-balanced inconsistency where a stale node returns a
+   * lower value.
+   */
+  private advanceChainFrontier(walletIndex: number, hiroNextNonce: number): void {
+    const current = this.getChainFrontier(walletIndex);
+    const next = current !== null ? Math.max(current, hiroNextNonce) : hiroNextNonce;
+    if (current === next) return; // no change
+    this.chainFrontierCache.set(walletIndex, next);
+    this.setStateValue(this.chainFrontierKey(walletIndex), next);
+  }
+
+  /**
+   * Compute headroom for a wallet using the chain frontier (O(1), no SQL).
+   * headroom = CHAINING_LIMIT - (assignmentHead - chainFrontier)
+   *
+   * The gap (head - frontier) represents all nonces that are outstanding:
+   * assigned, broadcasted, confirmed-but-pending, and silently-failed.
+   * This naturally errs conservative — failed broadcasts inflate the gap
+   * until reconciliation cleans them up.
+   *
+   * Returns null if no chain frontier exists (cold start) — caller should
+   * fall back to ledgerInFlightCount().
+   */
+  private headroomFromChainGap(walletIndex: number): number | null {
+    const frontier = this.getChainFrontier(walletIndex);
+    if (frontier === null) return null;
+    const head = this.ledgerGetWalletHead(walletIndex);
+    if (head === null) return null;
+    const gap = head - frontier;
+    return Math.max(0, CHAINING_LIMIT - gap);
+  }
+
   /**
    * Initialize the per-wallet nonce head from Hiro if not yet seeded.
    * Returns the head nonce to use for the first assignment.
@@ -1870,6 +1935,7 @@ export class NonceDO {
     const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
     const seedNonce = nonceInfo.possible_next_nonce;
     this.ledgerAdvanceWalletHead(walletIndex, seedNonce);
+    this.advanceChainFrontier(walletIndex, seedNonce);
     return seedNonce;
   }
 
@@ -1953,13 +2019,16 @@ export class NonceDO {
           continue;
         }
 
-        const inFlight = this.ledgerInFlightCount(walletIndex);
-        if (inFlight < CHAINING_LIMIT) {
+        // Headroom from chain gap (O(1), no SQL) — preferred.
+        // Falls back to SQL-based ledgerInFlightCount on cold start (no frontier yet).
+        const chainGapHeadroom = this.headroomFromChainGap(walletIndex);
+        const headroom = chainGapHeadroom ?? (CHAINING_LIMIT - this.ledgerInFlightCount(walletIndex));
+        if (headroom > 0) {
           // Collect all eligible wallets; select by headroom after full scan
-          eligibleWallets.push({ walletIndex, headroom: CHAINING_LIMIT - inFlight });
+          eligibleWallets.push({ walletIndex, headroom });
         } else {
           // This wallet is at its chaining limit; accumulate depth for error reporting
-          totalMempoolDepth += inFlight;
+          totalMempoolDepth += CHAINING_LIMIT - headroom; // headroom ≤ 0 → overshoot
         }
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
         attempts++;
@@ -1987,9 +2056,10 @@ export class NonceDO {
         // All wallets are either at chaining limit or degraded.
         // If there are degraded-but-not-full wallets, use the least-degraded one as fallback
         // rather than failing with a misleading CHAINING_LIMIT_EXCEEDED error.
-        const degradedNotFull = degradedWallets.filter(
-          (d) => this.ledgerInFlightCount(d.walletIndex) < CHAINING_LIMIT
-        );
+        const degradedNotFull = degradedWallets.filter((d) => {
+          const h = this.headroomFromChainGap(d.walletIndex);
+          return (h ?? (CHAINING_LIMIT - this.ledgerInFlightCount(d.walletIndex))) > 0;
+        });
         if (degradedNotFull.length > 0) {
           // Sort ascending by cycleCount, pick least-degraded wallet
           degradedNotFull.sort((a, b) => a.cycleCount - b.cycleCount);
@@ -2058,6 +2128,7 @@ export class NonceDO {
         walletIndex,
         nonce: assignedNonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
+        chainGapHeadroom: this.headroomFromChainGap(walletIndex),
         nextHead: assignedNonce + 1,
       });
 
@@ -2065,7 +2136,13 @@ export class NonceDO {
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
       // Compute totalReserved across all wallets for pool pressure signaling.
-      const totalReserved = this.ledgerTotalInFlightForWallets(effectiveWalletCount);
+      // Prefer chain gap (O(1), no SQL) where available.
+      let totalHeadroomSum = 0;
+      for (let wi = 0; wi < effectiveWalletCount; wi++) {
+        const h = this.headroomFromChainGap(wi);
+        totalHeadroomSum += h ?? (CHAINING_LIMIT - this.ledgerInFlightCount(wi));
+      }
+      const totalReserved = (effectiveWalletCount * CHAINING_LIMIT) - totalHeadroomSum;
 
       this.log("debug", "nonce_pool_pressure", {
         walletIndex,
@@ -2275,6 +2352,8 @@ export class NonceDO {
         confirmed_count: counts.confirmed,
         failed_count: counts.failed + counts.conflict,
         window_hours: 1,
+        chain_gap_headroom: this.headroomFromChainGap(walletIndex),
+        chain_frontier: this.getChainFrontier(walletIndex),
       });
     }
 
@@ -2363,6 +2442,7 @@ export class NonceDO {
       value: nonceInfo.possible_next_nonce,
       expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
     });
+    this.advanceChainFrontier(walletIndex, nonceInfo.possible_next_nonce);
 
     const previousNonce = this.ledgerGetWalletHead(walletIndex);
 
