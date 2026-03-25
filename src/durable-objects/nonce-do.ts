@@ -856,7 +856,7 @@ export class NonceDO {
       if (walletCount === 0) return;
 
       const poolCapacity = walletCount * CHAINING_LIMIT;
-      const totalReserved = this.ledgerTotalReservedForWallets(walletCount);
+      const totalReserved = this.ledgerTotalInFlightForWallets(walletCount);
       const overallPressure = poolCapacity > 0 ? totalReserved / poolCapacity : 0;
       const pressurePct = Math.round(overallPressure * 100);
       const now = new Date().toISOString();
@@ -975,7 +975,7 @@ export class NonceDO {
 
       // Check if ALL wallets are above the scale-up threshold
       for (let wi = 0; wi < initializedCount; wi++) {
-        const reserved = this.ledgerReservedCount(wi);
+        const reserved = this.ledgerInFlightCount(wi);
         const pressure = reserved / CHAINING_LIMIT;
         if (pressure < SCALE_UP_THRESHOLD) {
           return; // At least one wallet has capacity — no scale-up needed
@@ -1321,9 +1321,8 @@ export class NonceDO {
   // ---------------------------------------------------------------------------
 
   /**
-   * Count in-flight nonces for a specific wallet from the ledger.
-   * 'assigned' state = nonce was handed out but not yet released.
-   * Used for chaining-limit checks and pool-pressure calculations.
+   * Count nonces in 'assigned' state only (handed out, not yet broadcast).
+   * Used for diagnostics/logging — NOT for chaining-limit decisions.
    */
   private ledgerReservedCount(walletIndex: number): number {
     const rows = this.sql
@@ -1336,13 +1335,29 @@ export class NonceDO {
   }
 
   /**
-   * Count in-flight nonces across all wallets with index < walletCount.
-   * Used to compute totalReserved (pool pressure signal) in assignNonce().
+   * Count all in-flight nonces for a wallet: assigned (handed out, not yet broadcast)
+   * + broadcasted (in the Stacks mempool awaiting confirmation).
+   * The Stacks node's TooMuchChaining limit (25) counts ALL pending txs from a sender,
+   * so chaining-limit decisions must count both states, not just 'assigned'.
    */
-  private ledgerTotalReservedForWallets(walletCount: number): number {
+  private ledgerInFlightCount(walletIndex: number): number {
     const rows = this.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index < ? AND state = 'assigned'",
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted')",
+        walletIndex
+      )
+      .toArray();
+    return rows[0]?.count ?? 0;
+  }
+
+  /**
+   * Count all in-flight nonces across all wallets with index < walletCount.
+   * Used to compute totalReserved (pool pressure signal) in assignNonce().
+   */
+  private ledgerTotalInFlightForWallets(walletCount: number): number {
+    const rows = this.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index < ? AND state IN ('assigned', 'broadcasted')",
         walletCount
       )
       .toArray();
@@ -1937,13 +1952,13 @@ export class NonceDO {
           continue;
         }
 
-        const reserved = this.ledgerReservedCount(walletIndex);
-        if (reserved < CHAINING_LIMIT) {
+        const inFlight = this.ledgerInFlightCount(walletIndex);
+        if (inFlight < CHAINING_LIMIT) {
           // Collect all eligible wallets; select by headroom after full scan
-          eligibleWallets.push({ walletIndex, headroom: CHAINING_LIMIT - reserved });
+          eligibleWallets.push({ walletIndex, headroom: CHAINING_LIMIT - inFlight });
         } else {
           // This wallet is at its chaining limit; accumulate depth for error reporting
-          totalMempoolDepth += reserved;
+          totalMempoolDepth += inFlight;
         }
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
         attempts++;
@@ -1972,7 +1987,7 @@ export class NonceDO {
         // If there are degraded-but-not-full wallets, use the least-degraded one as fallback
         // rather than failing with a misleading CHAINING_LIMIT_EXCEEDED error.
         const degradedNotFull = degradedWallets.filter(
-          (d) => this.ledgerReservedCount(d.walletIndex) < CHAINING_LIMIT
+          (d) => this.ledgerInFlightCount(d.walletIndex) < CHAINING_LIMIT
         );
         if (degradedNotFull.length > 0) {
           // Sort ascending by cycleCount, pick least-degraded wallet
@@ -2018,16 +2033,16 @@ export class NonceDO {
       // nonces ahead of Hiro's possible_next_nonce. This prevents runaway pre-assignment.
       // Fail-open when Hiro is unreachable (hiroNextNonce === null).
       if (hiroNextNonce !== null && assignedNonce > hiroNextNonce + LOOKAHEAD_GUARD_BUFFER) {
-        const reservedCount = this.ledgerReservedCount(walletIndex);
+        const inFlightCount = this.ledgerInFlightCount(walletIndex);
         this.log("warn", "nonce_lookahead_capped", {
           walletIndex,
           assignedNonce,
           hiroNextNonce,
           limit: hiroNextNonce + LOOKAHEAD_GUARD_BUFFER,
-          reservedCount,
+          inFlightCount,
         });
         // Treat this the same as chaining limit — caller returns 429 so agent can retry
-        throw new ChainingLimitError(reservedCount);
+        throw new ChainingLimitError(inFlightCount);
       }
 
       // Advance the stored head to assignedNonce + 1 (next wallet assignment)
@@ -2049,7 +2064,7 @@ export class NonceDO {
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
       // Compute totalReserved across all wallets for pool pressure signaling.
-      const totalReserved = this.ledgerTotalReservedForWallets(effectiveWalletCount);
+      const totalReserved = this.ledgerTotalInFlightForWallets(effectiveWalletCount);
 
       this.log("debug", "nonce_pool_pressure", {
         walletIndex,
@@ -2746,15 +2761,27 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
-    // Execute gap-fills for nonces not in our ledger or in failed state
+    // Execute gap-fills for nonces not in our ledger or in failed state.
+    // Throttle against mempool depth: each gap-fill adds a pending tx, so stop
+    // when the wallet would hit TooMuchChaining (25 node limit, CHAINING_LIMIT=20).
     // -------------------------------------------------------------------------
     const gapFillFilled: number[] = [];
     if (gapFillNonces.length > 0) {
+      const currentInFlight = this.ledgerInFlightCount(walletIndex);
+      if (currentInFlight >= CHAINING_LIMIT) {
+        this.log("info", "gap_fill_throttled", {
+          walletIndex,
+          currentInFlight,
+          chainingLimit: CHAINING_LIMIT,
+          gapCount: gapFillNonces.length,
+        });
+      }
+      const gapFillBudget = Math.max(0, CHAINING_LIMIT - currentInFlight);
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
       const gapsToFill = gapFillNonces
         .slice()
         .sort((a, b) => a - b)
-        .slice(0, MAX_GAP_FILLS_PER_ALARM);
+        .slice(0, Math.min(MAX_GAP_FILLS_PER_ALARM, gapFillBudget));
       if (privateKey) {
         for (const gapNonce of gapsToFill) {
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
