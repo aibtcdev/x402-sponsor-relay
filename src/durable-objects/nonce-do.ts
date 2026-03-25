@@ -244,6 +244,8 @@ const DEFAULT_FLUSH_RECIPIENT_MAINNET = "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTA
 const DEFAULT_FLUSH_RECIPIENT_TESTNET = "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB";
 /** Maximum number of gap-fill broadcasts per alarm cycle per wallet */
 const MAX_GAP_FILLS_PER_ALARM = 5;
+/** Maximum gap-fills per admin /fill-gaps call (prevents DO stall on degenerate ranges) */
+const MAX_ADMIN_GAP_FILLS = 50;
 /**
  * Age threshold for considering a mempool transaction "stuck" (15 minutes).
  * Transactions that remain pending beyond this window have a very low confirmation
@@ -3272,7 +3274,6 @@ export class NonceDO {
         gapSet.delete(row.nonce);
       }
 
-      const MAX_ADMIN_GAP_FILLS = 50;
       const allGaps = [...gapSet].sort((a, b) => a - b);
       const truncated = allGaps.length > MAX_ADMIN_GAP_FILLS;
       const gaps = allGaps.slice(0, MAX_ADMIN_GAP_FILLS);
