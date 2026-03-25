@@ -1912,8 +1912,10 @@ export class NonceDO {
     if (frontier === null) return null;
     const head = this.ledgerGetWalletHead(walletIndex);
     if (head === null) return null;
-    const gap = head - frontier;
-    return Math.max(0, CHAINING_LIMIT - gap);
+    // Clamp gap to [0, ∞) — frontier can exceed head if Hiro advances
+    // before the ledger head is forward-bumped, making gap negative.
+    const gap = Math.max(0, head - frontier);
+    return Math.min(CHAINING_LIMIT, CHAINING_LIMIT - gap);
   }
 
   /**
@@ -3187,8 +3189,10 @@ export class NonceDO {
         } else {
           this.sql.exec("DELETE FROM nonce_state WHERE key = ?", `wallet_next_nonce:${walletIndex}`);
         }
-        // Clear nonce_intents for this wallet
+        // Clear nonce_intents and chain frontier for this wallet
         this.sql.exec("DELETE FROM nonce_intents WHERE wallet_index = ?", walletIndex);
+        this.sql.exec("DELETE FROM nonce_state WHERE key = ?", this.chainFrontierKey(walletIndex));
+        this.chainFrontierCache.delete(walletIndex);
       }
       // Reset round-robin index
       await this.state.storage.put(NEXT_WALLET_INDEX_KEY, 0);
@@ -3251,11 +3255,12 @@ export class NonceDO {
         }
       }
 
-      // Remove nonces that are already in the mempool (broadcasted/assigned)
+      // Remove nonces that are already in the mempool (assigned/broadcasted/confirmed).
+      // 'confirmed' = broadcast accepted, still pending on-chain — same as ledgerInFlightCount.
       const inFlightRows = this.sql
         .exec<{ nonce: number }>(
           `SELECT nonce FROM nonce_intents
-           WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted')
+           WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')
              AND nonce >= ?`,
           walletIndex,
           possible_next_nonce

@@ -95,7 +95,7 @@ openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 openapi.get("/stats/transactions", TransactionLog as unknown as typeof TransactionLog);
 openapi.get("/nonce/stats", NonceStatsEndpoint as unknown as typeof NonceStatsEndpoint);
 openapi.post("/nonce/reset", NonceReset as unknown as typeof NonceReset);
-openapi.post("/nonce/fill-gaps/:wallet", NonceFillGaps as any);
+openapi.post("/nonce/fill-gaps/:wallet", NonceFillGaps as unknown as typeof NonceFillGaps);
 openapi.get("/nonce/history/:wallet/:nonce", NonceHistory as unknown as typeof NonceHistory);
 openapi.get("/nonce/surge-history", NonceSurgeHistory as unknown as typeof NonceSurgeHistory);
 openapi.post("/settle", Settle as unknown as typeof Settle);
