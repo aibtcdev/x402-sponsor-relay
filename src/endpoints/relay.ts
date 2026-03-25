@@ -432,25 +432,13 @@ export class Relay extends BaseEndpoint {
           });
         }
 
-        // Sponsor wallet hit TooMuchChaining — relay-side congestion, trigger resync
+        // Sponsor wallet hit TooMuchChaining — trigger resync, then delegate to
+        // clientRejectionResponse which already maps TooMuchChaining to 429/retryable.
         if (broadcastResult.tooMuchChaining) {
-          logger.warn("Sponsor wallet chaining limit hit, triggering resync", {
-            sponsorNonce,
-            walletIndex: sponsorWalletIndex,
-            details: broadcastResult.details,
-          });
           this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
-          return this.err(c, {
-            error: "Sponsor wallet congested — too many pending transactions. Back off and retry",
-            code: "TOO_MUCH_CHAINING",
-            status: 429,
-            details: broadcastResult.details,
-            retryable: true,
-            retryAfter: 30,
-          });
         }
 
-        // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
+        // Client rejections (NotEnoughFunds, FeeTooLow, TooMuchChaining, etc.)
         if (clientRejection) {
           logger.warn("Broadcast rejected by node (client error)", {
             clientRejection,

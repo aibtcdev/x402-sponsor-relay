@@ -2768,7 +2768,8 @@ export class NonceDO {
     const gapFillFilled: number[] = [];
     if (gapFillNonces.length > 0) {
       const currentInFlight = this.ledgerInFlightCount(walletIndex);
-      if (currentInFlight >= CHAINING_LIMIT) {
+      const gapFillBudget = Math.max(0, CHAINING_LIMIT - currentInFlight);
+      if (gapFillBudget === 0) {
         this.log("info", "gap_fill_throttled", {
           walletIndex,
           currentInFlight,
@@ -2776,7 +2777,6 @@ export class NonceDO {
           gapCount: gapFillNonces.length,
         });
       }
-      const gapFillBudget = Math.max(0, CHAINING_LIMIT - currentInFlight);
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
       const gapsToFill = gapFillNonces
         .slice()
