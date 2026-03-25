@@ -975,8 +975,8 @@ export class NonceDO {
 
       // Check if ALL wallets are above the scale-up threshold
       for (let wi = 0; wi < initializedCount; wi++) {
-        const reserved = this.ledgerInFlightCount(wi);
-        const pressure = reserved / CHAINING_LIMIT;
+        const inFlight = this.ledgerInFlightCount(wi);
+        const pressure = inFlight / CHAINING_LIMIT;
         if (pressure < SCALE_UP_THRESHOLD) {
           return; // At least one wallet has capacity — no scale-up needed
         }
@@ -1335,15 +1335,16 @@ export class NonceDO {
   }
 
   /**
-   * Count all in-flight nonces for a wallet: assigned (handed out, not yet broadcast)
-   * + broadcasted (in the Stacks mempool awaiting confirmation).
+   * Count all in-flight nonces for a wallet: assigned (handed out, not yet broadcast),
+   * broadcasted (accepted by node, in mempool), and confirmed (release recorded, but
+   * still pending on-chain — 'confirmed' here means "broadcast accepted", not on-chain).
    * The Stacks node's TooMuchChaining limit (25) counts ALL pending txs from a sender,
-   * so chaining-limit decisions must count both states, not just 'assigned'.
+   * so chaining-limit decisions must count all three states.
    */
   private ledgerInFlightCount(walletIndex: number): number {
     const rows = this.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted')",
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')",
         walletIndex
       )
       .toArray();
@@ -1357,7 +1358,7 @@ export class NonceDO {
   private ledgerTotalInFlightForWallets(walletCount: number): number {
     const rows = this.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index < ? AND state IN ('assigned', 'broadcasted')",
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index < ? AND state IN ('assigned', 'broadcasted', 'confirmed')",
         walletCount
       )
       .toArray();
@@ -2763,7 +2764,8 @@ export class NonceDO {
     // -------------------------------------------------------------------------
     // Execute gap-fills for nonces not in our ledger or in failed state.
     // Throttle against mempool depth: each gap-fill adds a pending tx, so stop
-    // when the wallet would hit TooMuchChaining (25 node limit, CHAINING_LIMIT=20).
+    // before hitting the relay's CHAINING_LIMIT (20), which is set below the node's
+    // TooMuchChaining limit of 25 pending transactions.
     // -------------------------------------------------------------------------
     const gapFillFilled: number[] = [];
     if (gapFillNonces.length > 0) {

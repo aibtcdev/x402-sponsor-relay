@@ -800,6 +800,7 @@ export class SettlementService {
 
             // TooMuchChaining: the sender (sponsor or client) has too many pending txs.
             // On sponsor-side this is relay congestion — retryable after backoff.
+            // clientRejection is intentionally omitted so stats don't attribute this to the client.
             // On self-pay this falls through to clientRejection handling below.
             if (matchedReason === "TooMuchChaining" && sponsorNonceForLog !== null) {
               this.logger.warn("Sponsor wallet chaining limit hit (TooMuchChaining)", {
@@ -813,7 +814,6 @@ export class SettlementService {
                 details: errorDetails,
                 retryable: true,
                 tooMuchChaining: true,
-                clientRejection: matchedReason,
                 nodeUrl: target.baseUrl,
                 httpStatus: broadcastResponse.status,
               };

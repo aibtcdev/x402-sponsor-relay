@@ -315,28 +315,37 @@ export class Settle extends BaseEndpoint {
         }
 
         const clientRejection = broadcastResult.clientRejection;
-        const isClientError = clientRejection !== undefined;
+        const isSponsorCongestion = broadcastResult.tooMuchChaining && sponsorNonce !== null;
+        // Sponsor-side TooMuchChaining is relay congestion, not a client error
+        const isClientError = clientRejection !== undefined && !isSponsorCongestion;
 
         // Record stats once for all error branches
         c.executionCtx.waitUntil(
           statsService.logFailure("settle", isClientError, failureCtx).catch(() => {})
         );
 
+        // Sponsor-side issues (nonce conflict or TooMuchChaining) → trigger resync
+        if (sponsorNonce !== null && (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining)) {
+          const reason = broadcastResult.nonceConflict ? "nonce_conflict" : "too_much_chaining";
+          logger.warn("Sponsor wallet issue on auto-sponsored settle", {
+            reason,
+            sponsorNonce,
+            walletIndex: sponsorWalletIndex,
+          });
+          this.scheduleNonceResync(c, new SponsorService(c.env, logger).resyncNonceDODelayed(), logger);
+          return v2Error(
+            broadcastResult.nonceConflict
+              ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
+              : X402_V2_ERROR_CODES.BROADCAST_FAILED,
+            200
+          );
+        }
+
         if (clientRejection) {
           logger.warn("Broadcast rejected by node (client error)", {
             error: broadcastResult.error,
             clientRejection,
           });
-          // Sponsor-side nonce/chaining issues on auto-sponsored settle → trigger resync
-          const isSponsorIssue = (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining) && sponsorNonce !== null;
-          if (isSponsorIssue) {
-            logger.warn("Sponsor wallet issue on auto-sponsored settle", {
-              reason: broadcastResult.nonceConflict ? "nonce_conflict" : "too_much_chaining",
-              sponsorNonce,
-              walletIndex: sponsorWalletIndex,
-            });
-            this.scheduleNonceResync(c, new SponsorService(c.env, logger).resyncNonceDODelayed(), logger);
-          }
           return v2Error(mapClientRejectionToV2Code(clientRejection), 200);
         } else {
           logger.warn("Broadcast/confirm failed", {

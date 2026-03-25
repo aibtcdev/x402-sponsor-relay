@@ -338,12 +338,21 @@ export class Sponsor extends BaseEndpoint {
           });
         }
 
-        // TooMuchChaining: sponsor wallet congested, trigger resync before returning
+        // TooMuchChaining: sponsor wallet congested — relay-side, not a client error.
+        // Trigger resync and return a dedicated 429 so stats don't misattribute.
         if (clientRejection === "TooMuchChaining") {
           this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
+          return this.err(c, {
+            error: "Sponsor wallet congested — too many pending transactions. Back off and retry",
+            code: "TOO_MUCH_CHAINING",
+            status: 429,
+            details: errorDetails,
+            retryable: true,
+            retryAfter: 30,
+          });
         }
 
-        // Client rejections (NotEnoughFunds, FeeTooLow, TooMuchChaining, etc.)
+        // Client rejections (NotEnoughFunds, FeeTooLow, etc.)
         if (clientRejection) {
           return this.clientRejectionResponse(c, clientRejection, errorDetails);
         }
