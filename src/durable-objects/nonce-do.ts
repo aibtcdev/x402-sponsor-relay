@@ -1351,11 +1351,12 @@ export class NonceDO {
   }
 
   /**
-   * Count all in-flight nonces for a wallet: assigned (handed out, not yet broadcast),
-   * broadcasted (accepted by node, in mempool), and confirmed (release recorded, but
-   * still pending on-chain — 'confirmed' here means "broadcast accepted", not on-chain).
+   * Count all in-flight nonces for a wallet: 'assigned' (handed out, awaiting broadcast),
+   * 'broadcasted' (accepted by node, in mempool), and 'confirmed' (broadcast succeeded,
+   * nonce consumed — still pending on-chain despite the ledger state name).
    * The Stacks node's TooMuchChaining limit (25) counts ALL pending txs from a sender,
    * so chaining-limit decisions must count all three states.
+   * Used as the fallback when chain frontier is not yet available (cold start).
    */
   private ledgerInFlightCount(walletIndex: number): number {
     const rows = this.sql
@@ -2040,7 +2041,7 @@ export class NonceDO {
           eligibleWallets.push({ walletIndex, headroom });
         } else {
           // This wallet is at its chaining limit; accumulate depth for error reporting
-          totalMempoolDepth += CHAINING_LIMIT - headroom; // headroom ≤ 0 → overshoot
+          totalMempoolDepth += CHAINING_LIMIT - headroom; // headroom is 0 (or negative on fallback path)
         }
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
         attempts++;

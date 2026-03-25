@@ -315,9 +315,9 @@ export class Settle extends BaseEndpoint {
         }
 
         const clientRejection = broadcastResult.clientRejection;
-        const isSponsorCongestion = broadcastResult.tooMuchChaining && sponsorNonce !== null;
-        // Sponsor-side TooMuchChaining is relay congestion, not a client error
-        const isClientError = clientRejection !== undefined && !isSponsorCongestion;
+        // Sponsor-side TooMuchChaining omits clientRejection in settlement service,
+        // so isClientError is naturally false for relay congestion.
+        const isClientError = clientRejection !== undefined;
 
         // Record stats once for all error branches
         c.executionCtx.waitUntil(
