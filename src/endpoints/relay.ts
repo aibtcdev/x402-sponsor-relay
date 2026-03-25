@@ -421,9 +421,6 @@ export class Relay extends BaseEndpoint {
             walletIndex: sponsorWalletIndex,
             broadcastDetails: broadcastResult.details,
           });
-          // Trigger async nonce resync — the DO alarm will reconcile within 60s.
-          // Clients should back off for at least 30s and check GET /nonce/stats for pool state
-          // before retrying. Rapid retries during nonce drift amplify the cascade.
           this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
           return this.err(c, {
             error: "Nonce conflict — back off and retry. Check GET /nonce/stats for nonce pool state",
@@ -435,7 +432,21 @@ export class Relay extends BaseEndpoint {
           });
         }
 
-        // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
+        // Sponsor wallet hit TooMuchChaining — relay-side congestion, not a client error.
+        // Trigger resync and return a dedicated 429 so it's not misattributed in stats.
+        if (broadcastResult.tooMuchChaining) {
+          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
+          return this.err(c, {
+            error: "Sponsor wallet congested — too many pending transactions. Back off and retry",
+            code: "TOO_MUCH_CHAINING",
+            status: 429,
+            details: broadcastResult.details,
+            retryable: true,
+            retryAfter: 30,
+          });
+        }
+
+        // Client rejections (NotEnoughFunds, FeeTooLow, TooMuchChaining on self-pay, etc.)
         if (clientRejection) {
           logger.warn("Broadcast rejected by node (client error)", {
             clientRejection,

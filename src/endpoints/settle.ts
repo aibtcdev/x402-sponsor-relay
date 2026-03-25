@@ -315,6 +315,8 @@ export class Settle extends BaseEndpoint {
         }
 
         const clientRejection = broadcastResult.clientRejection;
+        // Sponsor-side TooMuchChaining omits clientRejection in settlement service,
+        // so isClientError is naturally false for relay congestion.
         const isClientError = clientRejection !== undefined;
 
         // Record stats once for all error branches
@@ -322,19 +324,28 @@ export class Settle extends BaseEndpoint {
           statsService.logFailure("settle", isClientError, failureCtx).catch(() => {})
         );
 
+        // Sponsor-side issues (nonce conflict or TooMuchChaining) → trigger resync
+        if (sponsorNonce !== null && (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining)) {
+          const reason = broadcastResult.nonceConflict ? "nonce_conflict" : "too_much_chaining";
+          logger.warn("Sponsor wallet issue on auto-sponsored settle", {
+            reason,
+            sponsorNonce,
+            walletIndex: sponsorWalletIndex,
+          });
+          this.scheduleNonceResync(c, new SponsorService(c.env, logger).resyncNonceDODelayed(), logger);
+          return v2Error(
+            broadcastResult.nonceConflict
+              ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
+              : X402_V2_ERROR_CODES.BROADCAST_FAILED,
+            200
+          );
+        }
+
         if (clientRejection) {
           logger.warn("Broadcast rejected by node (client error)", {
             error: broadcastResult.error,
             clientRejection,
           });
-          // Nonce conflicts when auto-sponsoring → trigger resync via CONFLICTING_NONCE
-          if (broadcastResult.nonceConflict && sponsorNonce !== null) {
-            logger.warn("Nonce conflict on auto-sponsored settle", {
-              sponsorNonce,
-              walletIndex: sponsorWalletIndex,
-            });
-            return v2Error(X402_V2_ERROR_CODES.CONFLICTING_NONCE, 200);
-          }
           return v2Error(mapClientRejectionToV2Code(clientRejection), 200);
         } else {
           logger.warn("Broadcast/confirm failed", {

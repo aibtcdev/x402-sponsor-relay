@@ -556,6 +556,7 @@ export type RelayErrorCode =
   | "SETTLEMENT_VERIFICATION_FAILED"
   | "SETTLEMENT_BROADCAST_FAILED"
   | "NONCE_CONFLICT"
+  | "TOO_MUCH_CHAINING"
   | "SETTLEMENT_FAILED"
   | "CLIENT_INSUFFICIENT_FUNDS"
   | "CLIENT_BAD_NONCE"
@@ -1149,6 +1150,8 @@ export type BroadcastAndConfirmResult =
       details: string;
       retryable: boolean;
       nonceConflict?: boolean;
+      /** Sponsor wallet hit TooMuchChaining — relay-side congestion, retryable after backoff */
+      tooMuchChaining?: boolean;
       /** Matched Stacks node rejection reason (e.g. "NotEnoughFunds") when the 4xx
        *  rejection was caused by the client submitting an invalid transaction. */
       clientRejection?: string;
@@ -1167,6 +1170,7 @@ export type BroadcastOnlyResult =
       details: string;
       retryable: boolean;
       nonceConflict?: boolean;
+      tooMuchChaining?: boolean;
       clientRejection?: string;
       nodeUrl?: string;
       httpStatus?: number;

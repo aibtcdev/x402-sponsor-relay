@@ -20,6 +20,7 @@ export const CLIENT_REJECTION_REASONS = [
   "FeeTooLow",
   "BadNonce",
   "ConflictingNonceInMempool",
+  "TooMuchChaining",
   "TransferAmountMustBePositive",
   "NoSuchContract",
   "ContractAlreadyExists",
