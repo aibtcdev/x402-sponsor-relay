@@ -798,6 +798,27 @@ export class SettlementService {
               };
             }
 
+            // TooMuchChaining: the sender (sponsor or client) has too many pending txs.
+            // On sponsor-side this is relay congestion — retryable after backoff.
+            // On self-pay this falls through to clientRejection handling below.
+            if (matchedReason === "TooMuchChaining" && sponsorNonceForLog !== null) {
+              this.logger.warn("Sponsor wallet chaining limit hit (TooMuchChaining)", {
+                status: broadcastResponse.status,
+                details: errorDetails,
+                sponsorNonce: sponsorNonceForLog,
+                nodeUrl: target.baseUrl,
+              });
+              return {
+                error: "Sponsor wallet congested — too many pending transactions",
+                details: errorDetails,
+                retryable: true,
+                tooMuchChaining: true,
+                clientRejection: matchedReason,
+                nodeUrl: target.baseUrl,
+                httpStatus: broadcastResponse.status,
+              };
+            }
+
             if (matchedReason) {
               this.logger.warn("Broadcast rejected by node (client error), not retrying", {
                 status: broadcastResponse.status,

@@ -338,6 +338,17 @@ export class Sponsor extends BaseEndpoint {
           });
         }
 
+        // TooMuchChaining: sponsor wallet congested, trigger resync and return retryable
+        if (clientRejection === "TooMuchChaining") {
+          logger.warn("Sponsor wallet chaining limit hit (TooMuchChaining)", {
+            sponsorNonce,
+            walletIndex: sponsorWalletIndex,
+            details: errorDetails,
+          });
+          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
+          return this.clientRejectionResponse(c, clientRejection, errorDetails);
+        }
+
         // Non-nonce client rejections (NotEnoughFunds, FeeTooLow, etc.)
         if (clientRejection) {
           return this.clientRejectionResponse(c, clientRejection, errorDetails);

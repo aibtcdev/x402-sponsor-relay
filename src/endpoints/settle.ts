@@ -327,13 +327,23 @@ export class Settle extends BaseEndpoint {
             error: broadcastResult.error,
             clientRejection,
           });
-          // Nonce conflicts when auto-sponsoring → trigger resync via CONFLICTING_NONCE
+          // Nonce conflicts when auto-sponsoring → trigger resync
           if (broadcastResult.nonceConflict && sponsorNonce !== null) {
             logger.warn("Nonce conflict on auto-sponsored settle", {
               sponsorNonce,
               walletIndex: sponsorWalletIndex,
             });
+            this.scheduleNonceResync(c, new SponsorService(c.env, logger).resyncNonceDODelayed(), logger);
             return v2Error(X402_V2_ERROR_CODES.CONFLICTING_NONCE, 200);
+          }
+          // TooMuchChaining on auto-sponsored settle → trigger resync
+          if (broadcastResult.tooMuchChaining && sponsorNonce !== null) {
+            logger.warn("Sponsor chaining limit hit on auto-sponsored settle", {
+              sponsorNonce,
+              walletIndex: sponsorWalletIndex,
+            });
+            this.scheduleNonceResync(c, new SponsorService(c.env, logger).resyncNonceDODelayed(), logger);
+            return v2Error(X402_V2_ERROR_CODES.BROADCAST_FAILED, 200);
           }
           return v2Error(mapClientRejectionToV2Code(clientRejection), 200);
         } else {
