@@ -2857,12 +2857,13 @@ export class NonceDO {
     // -------------------------------------------------------------------------
     const gapFillFilled: number[] = [];
     if (gapFillNonces.length > 0) {
-      const currentInFlight = this.ledgerInFlightCount(walletIndex);
-      const gapFillBudget = Math.max(0, CHAINING_LIMIT - currentInFlight);
+      // Use walletHeadroom (chain-gap preferred, SQL fallback) — same as assignment path.
+      const headroom = this.walletHeadroom(walletIndex);
+      const gapFillBudget = Math.max(0, headroom);
       if (gapFillBudget === 0) {
         this.log("info", "gap_fill_throttled", {
           walletIndex,
-          currentInFlight,
+          headroom,
           chainingLimit: CHAINING_LIMIT,
           gapCount: gapFillNonces.length,
         });
@@ -3270,7 +3271,10 @@ export class NonceDO {
         gapSet.delete(row.nonce);
       }
 
-      const gaps = [...gapSet].sort((a, b) => a - b);
+      const MAX_ADMIN_GAP_FILLS = 50;
+      const allGaps = [...gapSet].sort((a, b) => a - b);
+      const truncated = allGaps.length > MAX_ADMIN_GAP_FILLS;
+      const gaps = allGaps.slice(0, MAX_ADMIN_GAP_FILLS);
 
       if (gaps.length === 0) {
         return this.jsonResponse({
@@ -3321,6 +3325,7 @@ export class NonceDO {
         head,
         filled,
         failed,
+        ...(truncated && { truncated: true, totalGaps: allGaps.length }),
       });
     } catch (error) {
       return this.internalError(error);

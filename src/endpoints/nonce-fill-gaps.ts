@@ -130,7 +130,7 @@ export class NonceFillGaps extends BaseEndpoint {
         });
       }
 
-      const result = await response.json() as Record<string, unknown>;
+      const result = await response.json();
       logger.info("Admin gap-fill completed", { walletIndex, keyId, result });
       return this.ok(c, result as object);
     } catch (e) {
