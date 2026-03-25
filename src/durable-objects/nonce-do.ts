@@ -1915,7 +1915,7 @@ export class NonceDO {
     // Clamp gap to [0, ∞) — frontier can exceed head if Hiro advances
     // before the ledger head is forward-bumped, making gap negative.
     const gap = Math.max(0, head - frontier);
-    return Math.min(CHAINING_LIMIT, CHAINING_LIMIT - gap);
+    return Math.max(0, Math.min(CHAINING_LIMIT, CHAINING_LIMIT - gap));
   }
 
   /**
@@ -3241,6 +3241,7 @@ export class NonceDO {
       }
 
       const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+      this.advanceChainFrontier(walletIndex, possible_next_nonce);
       const head = this.ledgerGetWalletHead(walletIndex);
 
       // Compute gaps: Hiro-reported missing nonces + any range between
@@ -3306,6 +3307,7 @@ export class NonceDO {
           filled.push({ nonce: gapNonce, txid });
           this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
           this.incrementCounter(STATE_KEYS.gapsFilled);
+          await this.recordGapFillFee(walletIndex, GAP_FILL_FEE.toString());
         } else {
           failed.push({ nonce: gapNonce, reason: "broadcast rejected or already occupied" });
         }
