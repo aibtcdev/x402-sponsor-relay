@@ -2838,23 +2838,47 @@ export class NonceDO {
         };
       }
 
-      this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
+      // Guard: don't reset past nonces that were actually broadcast and may still
+      // be pending in the mempool. Hiro's possible_next_nonce can lag behind the
+      // mempool, so resetting to it would re-assign nonces that are still in-flight,
+      // causing ConflictingNonceInMempool on the next broadcast.
+      const highestInFlight = this.sql
+        .exec<{ max_nonce: number | null }>(
+          `SELECT MAX(nonce) as max_nonce FROM nonce_intents
+           WHERE wallet_index = ? AND nonce >= ? AND nonce < ?
+             AND state IN ('broadcasted', 'assigned')`,
+          walletIndex,
+          possible_next_nonce,
+          previousNonce
+        )
+        .toArray()[0]?.max_nonce ?? null;
+
+      // If there are in-flight nonces above Hiro's value, reset to just past
+      // the highest one instead of blindly trusting Hiro.
+      const guarded = highestInFlight !== null;
+      const safeResetTarget = guarded
+        ? Math.max(possible_next_nonce, highestInFlight + 1)
+        : possible_next_nonce;
+
+      this.ledgerAdvanceWalletHead(walletIndex, safeResetTarget);
       this.incrementCounter(STATE_KEYS.conflictsDetected);
 
+      const idleSeconds = Math.round(idleMs / 1000);
       this.log("warn", "nonce_reconcile_stale", {
         walletIndex,
         previousNonce,
-        newNonce: possible_next_nonce,
-        idleSeconds: Math.round(idleMs / 1000),
+        newNonce: safeResetTarget,
+        idleSeconds,
         hiroNextNonce: possible_next_nonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
+        ...(guarded && { highestInFlight }),
       });
 
       return {
         previousNonce,
-        newNonce: possible_next_nonce,
+        newNonce: safeResetTarget,
         changed: true,
-        reason: `STALE DETECTION: idle ${Math.round(idleMs / 1000)}s, reset to chain nonce ${possible_next_nonce}`,
+        reason: `STALE DETECTION: idle ${idleSeconds}s, reset to ${guarded ? "guarded" : "chain"} nonce ${safeResetTarget}`,
       };
     }
 
