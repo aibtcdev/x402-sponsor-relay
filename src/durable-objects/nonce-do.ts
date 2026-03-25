@@ -871,13 +871,7 @@ export class NonceDO {
       if (walletCount === 0) return;
 
       const poolCapacity = walletCount * CHAINING_LIMIT;
-      // Sum headroom across all wallets using chain gap where available
-      let totalHeadroom = 0;
-      for (let wi = 0; wi < walletCount; wi++) {
-        const h = this.headroomFromChainGap(wi);
-        totalHeadroom += h ?? (CHAINING_LIMIT - this.ledgerInFlightCount(wi));
-      }
-      const totalReserved = poolCapacity - totalHeadroom;
+      const totalReserved = this.poolTotalReserved(walletCount);
       const overallPressure = poolCapacity > 0 ? totalReserved / poolCapacity : 0;
       const pressurePct = Math.round(overallPressure * 100);
       const now = new Date().toISOString();
@@ -996,8 +990,7 @@ export class NonceDO {
 
       // Check if ALL wallets are above the scale-up threshold
       for (let wi = 0; wi < initializedCount; wi++) {
-        const h = this.headroomFromChainGap(wi);
-        const headroom = h ?? (CHAINING_LIMIT - this.ledgerInFlightCount(wi));
+        const headroom = this.walletHeadroom(wi);
         const pressure = 1 - (headroom / CHAINING_LIMIT);
         if (pressure < SCALE_UP_THRESHOLD) {
           return; // At least one wallet has capacity — no scale-up needed
@@ -1923,6 +1916,28 @@ export class NonceDO {
   }
 
   /**
+   * Effective headroom for a wallet — how many more nonces it can accept.
+   * Prefers the O(1) chain-gap calculation; falls back to SQL-based
+   * ledgerInFlightCount on cold start (no frontier yet).
+   */
+  private walletHeadroom(walletIndex: number): number {
+    return this.headroomFromChainGap(walletIndex) ?? (CHAINING_LIMIT - this.ledgerInFlightCount(walletIndex));
+  }
+
+  /**
+   * Sum effective headroom across `walletCount` wallets and derive the
+   * aggregate reserved count (poolCapacity - totalHeadroom).
+   * Used for pool-pressure signaling in both assignNonce and checkAndRecordSurge.
+   */
+  private poolTotalReserved(walletCount: number): number {
+    let totalHeadroom = 0;
+    for (let wi = 0; wi < walletCount; wi++) {
+      totalHeadroom += this.walletHeadroom(wi);
+    }
+    return (walletCount * CHAINING_LIMIT) - totalHeadroom;
+  }
+
+  /**
    * Initialize the per-wallet nonce head from Hiro if not yet seeded.
    * Returns the head nonce to use for the first assignment.
    */
@@ -2019,10 +2034,7 @@ export class NonceDO {
           continue;
         }
 
-        // Headroom from chain gap (O(1), no SQL) — preferred.
-        // Falls back to SQL-based ledgerInFlightCount on cold start (no frontier yet).
-        const chainGapHeadroom = this.headroomFromChainGap(walletIndex);
-        const headroom = chainGapHeadroom ?? (CHAINING_LIMIT - this.ledgerInFlightCount(walletIndex));
+        const headroom = this.walletHeadroom(walletIndex);
         if (headroom > 0) {
           // Collect all eligible wallets; select by headroom after full scan
           eligibleWallets.push({ walletIndex, headroom });
@@ -2056,10 +2068,9 @@ export class NonceDO {
         // All wallets are either at chaining limit or degraded.
         // If there are degraded-but-not-full wallets, use the least-degraded one as fallback
         // rather than failing with a misleading CHAINING_LIMIT_EXCEEDED error.
-        const degradedNotFull = degradedWallets.filter((d) => {
-          const h = this.headroomFromChainGap(d.walletIndex);
-          return (h ?? (CHAINING_LIMIT - this.ledgerInFlightCount(d.walletIndex))) > 0;
-        });
+        const degradedNotFull = degradedWallets.filter(
+          (d) => this.walletHeadroom(d.walletIndex) > 0
+        );
         if (degradedNotFull.length > 0) {
           // Sort ascending by cycleCount, pick least-degraded wallet
           degradedNotFull.sort((a, b) => a.cycleCount - b.cycleCount);
@@ -2136,13 +2147,7 @@ export class NonceDO {
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
       // Compute totalReserved across all wallets for pool pressure signaling.
-      // Prefer chain gap (O(1), no SQL) where available.
-      let totalHeadroomSum = 0;
-      for (let wi = 0; wi < effectiveWalletCount; wi++) {
-        const h = this.headroomFromChainGap(wi);
-        totalHeadroomSum += h ?? (CHAINING_LIMIT - this.ledgerInFlightCount(wi));
-      }
-      const totalReserved = (effectiveWalletCount * CHAINING_LIMIT) - totalHeadroomSum;
+      const totalReserved = this.poolTotalReserved(effectiveWalletCount);
 
       this.log("debug", "nonce_pool_pressure", {
         walletIndex,
