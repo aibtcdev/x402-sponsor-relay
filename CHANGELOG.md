@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.22.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.22.1...x402-sponsor-relay-v1.22.2) (2026-03-25)
+
+
+### Bug Fixes
+
+* **nonce-do:** guard stale reconciliation against in-flight nonces ([#215](https://github.com/aibtcdev/x402-sponsor-relay/issues/215)) ([8296e49](https://github.com/aibtcdev/x402-sponsor-relay/commit/8296e495e2bb87e5da57c5093dd11c92721897f6))
+* **nonce:** count in-flight nonces correctly, make TooMuchChaining retryable ([#219](https://github.com/aibtcdev/x402-sponsor-relay/issues/219)) ([5fa6a9b](https://github.com/aibtcdev/x402-sponsor-relay/commit/5fa6a9bb4950262394938693d9874e7d7adba54e))
+
 ## [1.22.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.22.0...x402-sponsor-relay-v1.22.1) (2026-03-24)
 
 
