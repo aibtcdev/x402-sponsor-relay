@@ -508,6 +508,9 @@ export class SponsorService {
           status: response.status,
           mempoolDepth: errorBody.mempoolDepth,
           estimatedDrainSeconds: errorBody.estimatedDrainSeconds,
+          retryAfterSeconds: errorBody.retryAfterSeconds,
+          totalReserved: errorBody.totalReserved,
+          totalCapacity: errorBody.totalCapacity,
         };
       }
 
