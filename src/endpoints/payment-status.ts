@@ -28,7 +28,7 @@ export class PaymentStatus extends BaseEndpoint {
                 paymentId: { type: "string" as const },
                 status: {
                   type: "string" as const,
-                  enum: ["submitted", "queued", "broadcasting", "mempool", "confirmed", "failed"],
+                  enum: ["submitted", "queued", "broadcasting", "mempool", "confirmed", "failed", "replaced"],
                 },
                 txid: { type: "string" as const },
                 blockHeight: { type: "number" as const },
@@ -44,6 +44,10 @@ export class PaymentStatus extends BaseEndpoint {
                 mempoolAt: { type: "string" as const },
                 confirmedAt: { type: "string" as const },
                 failedAt: { type: "string" as const },
+                replacedAt: { type: "string" as const },
+                replacedReason: { type: "string" as const },
+                replacementTxid: { type: "string" as const },
+                resubmittable: { type: "boolean" as const },
                 senderNonceInfo: { type: "object" as const },
               },
             },
@@ -110,6 +114,12 @@ export class PaymentStatus extends BaseEndpoint {
       ...(record.queuedAt && { queuedAt: record.queuedAt }),
       ...(record.mempoolAt && { mempoolAt: record.mempoolAt }),
       ...(record.failedAt && { failedAt: record.failedAt }),
+      ...(record.replacedAt && { replacedAt: record.replacedAt }),
+      ...(record.replacedReason && { replacedReason: record.replacedReason }),
+      ...(record.replacementTxid && { replacementTxid: record.replacementTxid }),
+      ...(record.resubmittable !== undefined && {
+        resubmittable: record.resubmittable,
+      }),
     });
   }
 }

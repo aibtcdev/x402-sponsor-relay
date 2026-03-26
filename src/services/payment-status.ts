@@ -21,6 +21,7 @@ const PAYMENT_TTL_SECONDS = 86_400; // 24 hours
  * - mempool: broadcast succeeded, tx is in the mempool
  * - confirmed: tx confirmed on-chain (set by chainhook or polling)
  * - failed: terminal failure (abort_*, invalid tx, etc.)
+ * - replaced: sponsor replaced the transaction via RBF or head-bump; agent should resubmit
  */
 export type PaymentStatus =
   | "submitted"
@@ -28,7 +29,8 @@ export type PaymentStatus =
   | "broadcasting"
   | "mempool"
   | "confirmed"
-  | "failed";
+  | "failed"
+  | "replaced";
 
 /**
  * Sender nonce health info returned alongside payment status.
@@ -86,6 +88,14 @@ export interface PaymentRecord {
   confirmedAt?: string;
   /** ISO timestamp when failed */
   failedAt?: string;
+  /** ISO timestamp when replaced (RBF or head-bump) */
+  replacedAt?: string;
+  /** Reason the transaction was replaced: "rbf" | "head_bump" */
+  replacedReason?: string;
+  /** Txid of the replacement transaction that took this nonce slot */
+  replacementTxid?: string;
+  /** Whether the agent can safely resubmit its original transaction */
+  resubmittable?: boolean;
   /** Sender nonce health at submission time */
   senderNonceInfo?: SenderNonceInfo;
   /** Network (mainnet or testnet) */
@@ -190,6 +200,9 @@ export function transitionPayment(
       break;
     case "failed":
       updated.failedAt = now;
+      break;
+    case "replaced":
+      updated.replacedAt = now;
       break;
   }
 
