@@ -8,6 +8,11 @@ import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
 import type { Env, LogsRPC, PoolHealthResponse, WalletHealthSnapshot } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
+import {
+  getPaymentRecord,
+  putPaymentRecord,
+  transitionPayment,
+} from "../services/payment-status";
 
 const APP_ID = "x402-relay";
 
@@ -3484,6 +3489,88 @@ export class NonceDO {
     return { success: true, action: "reset", wallets };
   }
 
+  /**
+   * Scan for replaced_tx:* KV entries written by RBF/head-bump handlers and
+   * transition matching payment records to "replaced" status.
+   *
+   * Called from alarm() after reconciliation so agents can detect replacements
+   * via GET /payment/:id without polling the NonceDO directly.
+   *
+   * Fail-open: errors are logged but never rethrown so the alarm cycle continues.
+   */
+  private async processReplacementNotifications(): Promise<void> {
+    if (!this.env.RELAY_KV) {
+      this.log("warn", "replacement_notifications_skipped", {
+        reason: "RELAY_KV binding not available",
+      });
+      return;
+    }
+    try {
+      const listResult = await this.env.RELAY_KV.list({ prefix: "replaced_tx:" });
+      const total = listResult.keys.length;
+      let matchedCount = 0;
+
+      for (const kvKey of listResult.keys) {
+        const keyName = kvKey.name; // e.g. "replaced_tx:0xabc123..."
+        const originalTxid = keyName.slice("replaced_tx:".length);
+
+        // Read the replacement metadata
+        const raw = await this.env.RELAY_KV.get(keyName, "text");
+        let metadata: {
+          replacementTxid: string;
+          reason: string;
+          walletIndex: number;
+          nonce: number;
+          replacedAt: string;
+        } | null = null;
+        if (raw) {
+          try {
+            metadata = JSON.parse(raw);
+          } catch {
+            // Unparseable metadata — still delete the entry
+          }
+        }
+
+        if (metadata) {
+          // Look up paymentId from the txid→paymentId mapping
+          const paymentId = await this.env.RELAY_KV.get(
+            `txid_map:${originalTxid}`,
+            "text"
+          );
+
+          if (paymentId) {
+            const record = await getPaymentRecord(this.env.RELAY_KV, paymentId);
+            if (record && record.status !== "replaced") {
+              const updated = transitionPayment(record, "replaced");
+              updated.replacementTxid = metadata.replacementTxid;
+              updated.replacedReason = metadata.reason;
+              updated.resubmittable = true;
+              await putPaymentRecord(this.env.RELAY_KV, updated);
+              matchedCount++;
+            }
+          }
+        }
+
+        // Delete the replaced_tx entry regardless — it has served its purpose
+        await this.env.RELAY_KV.delete(keyName).catch(() => {
+          /* fail-open */
+        });
+      }
+
+      if (total > 0) {
+        this.log("info", "replacement_notifications_processed", {
+          total,
+          matched: matchedCount,
+          unmatched: total - matchedCount,
+        });
+      }
+    } catch (e) {
+      this.log("warn", "replacement_notifications_error", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
@@ -3534,6 +3621,10 @@ export class NonceDO {
         // Dynamic scaling: add a wallet if ALL initialized wallets are above 75% pressure
         // and we haven't hit SPONSOR_WALLET_MAX. Runs in the alarm cycle (not request path).
         await this.checkAndScaleUp(initializedWallets.length);
+
+        // Replacement notifications: scan replaced_tx:* KV entries and transition payment
+        // records to "replaced" status so agents can detect via GET /payment/:id.
+        await this.processReplacementNotifications();
 
         // Dynamic alarm interval: use active (60s) when any wallet has in-flight nonces,
         // idle (5min) when all wallets are drained. This ensures rapid reconciliation
