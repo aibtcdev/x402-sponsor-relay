@@ -600,10 +600,9 @@ export class SponsorService {
       };
     }
 
-    // Extract sender address for rate limiting
-    const senderAddress = Buffer.from(
-      transaction.auth.spendingCondition.signer
-    ).toString("hex");
+    // Extract sender address for rate limiting.
+    // signer is already a 40-char hex hash160 string — use directly.
+    const senderAddress = transaction.auth.spendingCondition.signer;
 
     return {
       valid: true,
