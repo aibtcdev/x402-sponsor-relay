@@ -86,6 +86,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `POST /access` - Access protected resource with receipt token
 - `GET /fees` - Get clamped fee estimates (no auth required)
 - `POST /fees/config` - Update fee clamps (admin, requires API key)
+- `GET /nonce/state` - Observable nonce state for client diagnostics (pending txs, gaps, health)
 - `GET /stats` - Relay statistics (JSON API)
 - `GET /dashboard` - Public dashboard (HTML)
 - `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast; auto-sponsors transactions with empty sponsor slot)
@@ -420,6 +421,7 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
 - `src/endpoints/settle.ts` - x402 V2 settle endpoint (verify + broadcast, spec section 7.2)
 - `src/endpoints/verify-v2.ts` - x402 V2 verify endpoint (local validation only, spec section 7.1)
 - `src/endpoints/supported.ts` - x402 V2 supported payment kinds (spec section 7.3)
+- `src/endpoints/nonce-state.ts` - Observable nonce state for client diagnostics (GET /nonce/state)
 - `src/endpoints/verify-receipt.ts` - Receipt verification endpoint (GET /verify/:receiptId)
 - `src/endpoints/access.ts` - Protected resource access endpoint
 - `src/endpoints/provision.ts` - API key provisioning via BTC signature (BIP-137/BIP-322)
