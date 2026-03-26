@@ -2090,16 +2090,18 @@ export class NonceDO {
       }
 
       if (selectedWalletIndex === null) {
-        // All wallets are either at chaining limit or degraded.
+        // No healthy wallet with capacity was found. Remaining wallets are either:
+        // - At chaining limit (healthy but full)
+        // - Circuit-broken (degraded, may have capacity)
         // Reject instead of falling back to a degraded wallet — feeding transactions
         // into a broken pool amplifies contention (see #226).
         const degradedNotFull = degradedWallets.filter(
           (d) => this.walletHeadroom(d.walletIndex) > 0
         );
         if (degradedNotFull.length > 0) {
-          // Wallets have capacity but are circuit-broken — reject with specific error
-          // so callers can distinguish this from chaining limit exhaustion.
-          const totalReservedAll = this.ledgerTotalReservedForWallets(effectiveWalletCount);
+          // The only wallets with capacity are circuit-broken — reject so callers
+          // can distinguish this from pure chaining limit exhaustion.
+          const totalReservedAll = this.poolTotalReserved(effectiveWalletCount);
           this.log("warn", "all_wallets_degraded_rejecting", {
             degradedCount: degradedWallets.length,
             degradedNotFullCount: degradedNotFull.length,
@@ -2311,9 +2313,10 @@ export class NonceDO {
 
   /**
    * Lightweight pool health check — returns per-wallet circuit breaker state
-   * and aggregate availability. Used by SponsorService as a pre-flight gate
-   * before attempting nonce assignment, preventing requests from entering
-   * known-degraded pools.
+   * and aggregate availability so callers can perform pre-flight gating
+   * before attempting nonce assignment and avoid sending traffic into
+   * known-degraded pools. Exposed via GET /pool-health for observability
+   * and the /health endpoint.
    *
    * Much cheaper than getStats() — only reads quarantine lists and reserved counts,
    * no heavy SQL joins or utilization queries.
