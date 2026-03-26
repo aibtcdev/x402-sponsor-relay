@@ -856,6 +856,32 @@ export class NonceDO {
         state.lastRbfTxid = result.txid;
         await this.state.storage.put(key, state);
         this.incrementCounter(STATE_KEYS.stuckTxRbfBroadcast);
+        // Update the ledger txid so reconciliation tracks the replacement
+        try {
+          this.sql.exec(
+            `UPDATE nonce_intents SET txid = ? WHERE wallet_index = ? AND nonce = ?`,
+            result.txid,
+            walletIndex,
+            nonce
+          );
+        } catch { /* fail-open */ }
+        // Write replaced_tx KV entry so agents can detect the replacement.
+        // Only write when originalTxid is non-null — gap-fills have no original tx.
+        if (state.originalTxid) {
+          try {
+            await this.env.RELAY_KV?.put(
+              `replaced_tx:${state.originalTxid}`,
+              JSON.stringify({
+                replacementTxid: result.txid,
+                reason: "rbf",
+                walletIndex,
+                nonce,
+                replacedAt: new Date().toISOString(),
+              }),
+              { expirationTtl: 3600 }
+            );
+          } catch { /* fail-open */ }
+        }
         this.log("info", "rbf_broadcast_success", {
           walletIndex,
           nonce,
@@ -3182,48 +3208,85 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
-    // Head bump: after gap-fills, RBF the LAST gap-fill tx with a higher fee
-    // to signal miners to re-evaluate the pending nonce sequence. We target a
-    // gap-fill (throwaway 1 uSTX self-transfer) instead of a real sponsored tx
-    // to avoid clobbering a user's actual transaction. (Issue #229 P0)
+    // Head bump: after gap-fills, RBF the first real pending (non-gap-fill)
+    // broadcasted tx with a higher fee to signal miners to re-evaluate the
+    // pending nonce sequence. We target the real sponsored tx (not a gap-fill)
+    // so agents can detect the replacement via the replaced_tx KV entry and
+    // resubmit their original transaction. (Issue #229 P0)
     // -------------------------------------------------------------------------
     let headBumpNonce: number | null = null;
     let headBumpTxid: string | null = null;
     if (gapFillFilled.length > 0) {
-      // Re-broadcast the highest gap-fill at a higher fee to signal miners.
-      // We ONLY bump gap-fill nonces (safe self-transfers) — never real
-      // sponsored txs, which would cancel the user's transaction.
-      const bumpNonce = Math.max(...gapFillFilled);
-      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
-      if (privateKey) {
-        const { network, recipient } = this.getFlushRecipient();
-        try {
-          const tx = await makeSTXTokenTransfer({
-            recipient,
-            amount: GAP_FILL_AMOUNT,
-            senderKey: privateKey,
-            network,
-            nonce: BigInt(bumpNonce),
-            fee: HEAD_BUMP_FEE,
-            memo: `head-bump-${bumpNonce}`,
-          });
-          const result = await this.broadcastRawTx(tx, "head_bump");
-          if (result.ok) {
-            headBumpNonce = bumpNonce;
-            headBumpTxid = result.txid;
-            this.log("info", "head_bump_after_gap_fill", {
+      // Find the lowest broadcasted nonce that is NOT a gap-fill
+      const gapFillSet = new Set(gapFillFilled);
+      const bumpCandidate = this.sql
+        .exec<{ nonce: number; txid: string | null }>(
+          `SELECT nonce, txid FROM nonce_intents
+           WHERE wallet_index = ? AND state = 'broadcasted' AND txid IS NOT NULL
+           ORDER BY nonce ASC`,
+          walletIndex
+        )
+        .toArray()
+        .find((row) => !gapFillSet.has(row.nonce));
+
+      if (bumpCandidate) {
+        const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+        if (privateKey) {
+          const { network, recipient } = this.getFlushRecipient();
+          try {
+            const tx = await makeSTXTokenTransfer({
+              recipient,
+              amount: GAP_FILL_AMOUNT,
+              senderKey: privateKey,
+              network,
+              nonce: BigInt(bumpCandidate.nonce),
+              fee: HEAD_BUMP_FEE,
+              memo: `head-bump-${bumpCandidate.nonce}`,
+            });
+            const result = await this.broadcastRawTx(tx, "head_bump");
+            if (result.ok) {
+              headBumpNonce = bumpCandidate.nonce;
+              headBumpTxid = result.txid;
+              // Update the ledger txid so reconciliation tracks the replacement
+              try {
+                this.sql.exec(
+                  `UPDATE nonce_intents SET txid = ? WHERE wallet_index = ? AND nonce = ?`,
+                  result.txid,
+                  walletIndex,
+                  bumpCandidate.nonce
+                );
+              } catch { /* fail-open */ }
+              // Write replaced_tx KV entry so agents can detect the replacement
+              if (bumpCandidate.txid) {
+                try {
+                  await this.env.RELAY_KV?.put(
+                    `replaced_tx:${bumpCandidate.txid}`,
+                    JSON.stringify({
+                      replacementTxid: result.txid,
+                      reason: "head_bump",
+                      walletIndex,
+                      nonce: bumpCandidate.nonce,
+                      replacedAt: new Date().toISOString(),
+                    }),
+                    { expirationTtl: 3600 }
+                  );
+                } catch { /* fail-open */ }
+              }
+              this.log("info", "head_bump_after_gap_fill", {
+                walletIndex,
+                nonce: bumpCandidate.nonce,
+                originalTxid: bumpCandidate.txid,
+                bumpTxid: result.txid,
+                gapsFilled: gapFillFilled,
+              });
+            }
+          } catch (e) {
+            this.log("warn", "head_bump_error", {
               walletIndex,
-              nonce: bumpNonce,
-              bumpTxid: result.txid,
-              gapsFilled: gapFillFilled,
+              nonce: bumpCandidate.nonce,
+              error: e instanceof Error ? e.message : String(e),
             });
           }
-        } catch (e) {
-          this.log("warn", "head_bump_error", {
-            walletIndex,
-            nonce: bumpNonce,
-            error: e instanceof Error ? e.message : String(e),
-          });
         }
       }
     }
