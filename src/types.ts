@@ -74,6 +74,10 @@ export interface Env {
   NONCE_DO?: DurableObjectNamespace;
   // Durable Object namespace for atomic stats (replaces KV read-modify-write)
   STATS_DO?: DurableObjectNamespace;
+  // Queue for serial payment processing (eliminates nonce contention)
+  PAYMENT_QUEUE?: Queue;
+  // Auth token for Hiro chainhook webhooks
+  CHAINHOOK_AUTH_TOKEN?: string;
 }
 
 /**

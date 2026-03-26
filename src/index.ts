@@ -3,13 +3,16 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
 import { SettlementHealthService } from "./services";
+import { handlePaymentQueue } from "./queue-consumer";
+import type { PaymentQueueMessage } from "./services/payment-status";
 export { NonceDO } from "./durable-objects/nonce-do";
 export { StatsDO } from "./durable-objects/stats-do";
+export { RelayRPC } from "./rpc";
 
 // Create Hono app with type safety
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>();
@@ -105,6 +108,8 @@ openapi.get("/settle/status/:txid", SettleStatus as unknown as typeof SettleStat
 openapi.post("/verify", VerifyV2 as unknown as typeof VerifyV2);
 openapi.get("/supported", Supported as unknown as typeof Supported);
 openapi.get("/wallets", Wallets as unknown as typeof Wallets);
+openapi.get("/payment/:id", PaymentStatus as unknown as typeof PaymentStatus);
+openapi.post("/webhook/chainhook", Chainhook as unknown as typeof Chainhook);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
 app.route("/dashboard", dashboard);
@@ -142,6 +147,8 @@ app.get("/", (c) => {
       nonceSurgeHistory: "GET /nonce/surge-history - Surge event history for capacity planning",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
       wallets: "GET /wallets - Sponsor wallet status (balance, fees, pool)",
+      paymentStatus: "GET /payment/:id - Check queue-based payment status",
+      chainhook: "POST /webhook/chainhook - Hiro chainhook transaction webhook",
       settle: "POST /settle - x402 V2 facilitator settle",
       settleStatus: "GET /settle/status/:txid - Transaction settlement status",
       verifyV2: "POST /verify - x402 V2 facilitator verify",
@@ -222,5 +229,17 @@ export default {
     const logger = createNoOpLogger();
     const healthService = new SettlementHealthService(env, logger);
     ctx.waitUntil(healthService.checkHealth());
+  },
+
+  /**
+   * Queue consumer — processes PAYMENT_QUEUE messages serially.
+   * Each message: sponsor tx → assign nonce via NonceDO → broadcast → update status.
+   * Serial consumption eliminates nonce contention by design.
+   */
+  async queue(
+    batch: MessageBatch<PaymentQueueMessage>,
+    env: Env
+  ): Promise<void> {
+    await handlePaymentQueue(batch, env);
   },
 };
