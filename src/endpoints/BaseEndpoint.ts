@@ -90,7 +90,12 @@ export class BaseEndpoint extends OpenAPIRoute {
     let retryable: boolean;
     let retryAfter: number | undefined;
 
-    if (failure.code === "LOW_HEADROOM") {
+    if (failure.code === "SERVICE_DEGRADED") {
+      code = "SERVICE_DEGRADED";
+      status = 503;
+      retryable = true;
+      retryAfter = failure.retryAfter ?? 30;
+    } else if (failure.code === "LOW_HEADROOM") {
       code = "LOW_HEADROOM";
       status = 503;
       retryable = true;
