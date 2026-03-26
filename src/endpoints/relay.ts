@@ -13,7 +13,7 @@ import {
 } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import { stripHexPrefix } from "../utils";
-import type { AppContext, RelayRequest, SettlementResult, Logger } from "../types";
+import type { AppContext, RelayRequest, SettlementResult, Logger, PoolHealthResponse, Env } from "../types";
 import {
   Error400Response,
   Error401Response,
@@ -298,7 +298,6 @@ export class Relay extends BaseEndpoint {
       // last retryAfter seconds, return the cached error without assigning a nonce or hitting
       // the mempool. This prevents the assign→broadcast→conflict→quarantine cycle from
       // repeating on every agent retry during a nonce storm.
-      const CONFLICT_CACHE_TTL_S = 30;
       const senderConflictKey = `conflict:${validation.senderAddress}`;
       const cachedConflict = c.env.RELAY_KV ? await c.env.RELAY_KV.get(senderConflictKey, "text") : null;
       if (cachedConflict) {
@@ -624,6 +623,8 @@ export class Relay extends BaseEndpoint {
           // Retry did not succeed — schedule a delayed resync so the pool self-heals,
           // then return the appropriate error code.
           this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
+          // Compute dynamic retryAfter based on current pool pressure before writing KV entry.
+          const conflictTtl = await this.getPoolPressureRetryAfter(c.env, logger);
           if (broadcastResult.nonceConflict) {
             // Write sender conflict record so subsequent retries short-circuit immediately
             const conflictCode = "NONCE_CONFLICT" as const;
@@ -631,8 +632,8 @@ export class Relay extends BaseEndpoint {
               c.executionCtx.waitUntil(
                 c.env.RELAY_KV.put(
                   `conflict:${validation.senderAddress}`,
-                  JSON.stringify({ code: conflictCode, retryAfter: CONFLICT_CACHE_TTL_S, setAt: Date.now() }),
-                  { expirationTtl: CONFLICT_CACHE_TTL_S }
+                  JSON.stringify({ code: conflictCode, retryAfter: conflictTtl, setAt: Date.now() }),
+                  { expirationTtl: conflictTtl }
                 ).catch((e) => {
                   logger.warn("Failed to write sender conflict record", { error: String(e) });
                 })
@@ -644,7 +645,7 @@ export class Relay extends BaseEndpoint {
               status: 409,
               details: broadcastResult.details,
               retryable: true,
-              retryAfter: CONFLICT_CACHE_TTL_S,
+              retryAfter: conflictTtl,
             });
           }
           // Write sender conflict record for too-much-chaining as well
@@ -653,8 +654,8 @@ export class Relay extends BaseEndpoint {
             c.executionCtx.waitUntil(
               c.env.RELAY_KV.put(
                 `conflict:${validation.senderAddress}`,
-                JSON.stringify({ code: chainingCode, retryAfter: CONFLICT_CACHE_TTL_S, setAt: Date.now() }),
-                { expirationTtl: CONFLICT_CACHE_TTL_S }
+                JSON.stringify({ code: chainingCode, retryAfter: conflictTtl, setAt: Date.now() }),
+                { expirationTtl: conflictTtl }
               ).catch((e) => {
                 logger.warn("Failed to write sender conflict record", { error: String(e) });
               })
@@ -666,7 +667,7 @@ export class Relay extends BaseEndpoint {
             status: 429,
             details: broadcastResult.details,
             retryable: true,
-            retryAfter: CONFLICT_CACHE_TTL_S,
+            retryAfter: conflictTtl,
           });
         }
 
@@ -823,6 +824,52 @@ export class Relay extends BaseEndpoint {
    * Response format is identical to the sponsored path. sponsoredTx is null
    * since no sponsor signature was applied.
    */
+  /**
+   * Query NonceDO /pool-health and derive a tiered retryAfter value based on how many
+   * wallets have their circuit breaker open:
+   *   0-2 → 10s  (low contention)
+   *   3-5 → 30s  (medium contention)
+   *   6+ or allWalletsDegraded → 60s  (high contention / cascade)
+   *
+   * Returns 30 (neutral default) if NonceDO is not configured or the call fails,
+   * so this never blocks the error path.
+   */
+  private async getPoolPressureRetryAfter(env: Env, logger: Logger): Promise<number> {
+    if (!env.NONCE_DO) {
+      return 30;
+    }
+    try {
+      const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+      const res = await stub.fetch("https://nonce-do/pool-health", { method: "GET" });
+      if (!res.ok) {
+        return 30;
+      }
+      const health = (await res.json()) as PoolHealthResponse;
+      const circuitBrokenCount = health.wallets.filter((w) => w.circuitBreakerOpen).length;
+      let retryAfter: number;
+      if (health.allWalletsDegraded || circuitBrokenCount >= 6) {
+        retryAfter = 60;
+      } else if (circuitBrokenCount >= 3) {
+        retryAfter = 30;
+      } else {
+        retryAfter = 10;
+      }
+      logger.info("Pool pressure computed", {
+        circuitBrokenCount,
+        allWalletsDegraded: health.allWalletsDegraded,
+        totalReserved: health.totalReserved,
+        totalCapacity: health.totalCapacity,
+        retryAfter,
+      });
+      return retryAfter;
+    } catch (e) {
+      logger.warn("Failed to fetch pool health for dynamic retryAfter", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return 30;
+    }
+  }
+
   private async handleSelfPay(
     c: AppContext,
     body: RelayRequest,
