@@ -213,8 +213,16 @@ export class Health extends BaseEndpoint {
         lastConflictAt !== null &&
         Date.now() - new Date(lastConflictAt).getTime() <= RECENT_CONFLICT_WINDOW_MS;
 
+      // Pool exhausted by conflicts: both available and reserved are 0 but conflicts
+      // were detected — this means the pool drained without recovering (e.g. all
+      // wallets hit conflict state and nonces flushed). Phase 1 auto-resets
+      // conflictsDetected when resync finds all wallets consistent, so this
+      // condition only fires during genuinely unresolved conflict windows.
+      const poolExhaustedByConflicts =
+        raw.poolAvailable === 0 && raw.poolReserved === 0 && raw.conflictsDetected > 0;
+
       const circuitBreakerOpen =
-        recentConflict || (raw.poolAvailable === 0 && raw.poolReserved > 0);
+        recentConflict || (raw.poolAvailable === 0 && raw.poolReserved > 0) || poolExhaustedByConflicts;
 
       const totalPool = raw.poolAvailable + raw.poolReserved;
       // When pool is idle (nothing reserved), treat as fully available
