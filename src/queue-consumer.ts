@@ -21,7 +21,7 @@ import {
   type PaymentQueueMessage,
   type PaymentRecord,
 } from "./services/payment-status";
-import { updateSenderNonceOnBroadcast } from "./services/sender-nonce";
+import { clearInFlight, updateSenderNonceOnBroadcast } from "./services/sender-nonce";
 import { SponsorService, extractSponsorNonce, recordNonceTxid, releaseNonceDO, recordBroadcastOutcomeDO, SettlementService } from "./services";
 
 /** Max retries before dead-lettering */
@@ -85,6 +85,20 @@ async function processPaymentMessage(
     return;
   }
 
+  // Guard: if txid already set, a prior attempt broadcast this tx successfully.
+  // Skip re-sponsoring to avoid burning a fresh nonce slot.
+  if (record.txid) {
+    logger.warn("Payment already has txid, skipping re-sponsor", {
+      paymentId,
+      txid: record.txid,
+      status: record.status,
+    });
+    record = transitionPayment(record, "mempool", { txid: record.txid });
+    await putPaymentRecord(kv, record);
+    message.ack();
+    return;
+  }
+
   // Transition to broadcasting — clear any transient error from prior attempt
   record = transitionPayment(record, "broadcasting", TRANSIENT_ERROR_FIELDS);
   await putPaymentRecord(kv, record);
@@ -103,6 +117,9 @@ async function processPaymentMessage(
     message.ack();
     return;
   }
+
+  // Extract signer hash once — used for in-flight markers and sender nonce cache
+  const signerHash = transaction.auth.spendingCondition.signer;
 
   // Sponsor the transaction (assigns nonce from NonceDO, signs with sponsor key)
   const sponsorService = new SponsorService(env, logger);
@@ -135,7 +152,13 @@ async function processPaymentMessage(
       return;
     }
 
-    // Terminal sponsor failure
+    // Terminal sponsor failure — clear in-flight marker so the sender can retry
+    if (record.senderNonce !== undefined) {
+      await clearInFlight(kv, signerHash, record.senderNonce).catch(
+        (e) => logger.warn("Failed to clear in-flight marker on sponsor fail", { error: String(e) })
+      );
+    }
+
     record = transitionPayment(record, "failed", {
       error: sponsorResult.error,
       errorCode: code ?? "SPONSOR_FAILED",
@@ -186,9 +209,15 @@ async function processPaymentMessage(
       return;
     }
 
-    // Terminal broadcast failure — release nonce
+    // Terminal broadcast failure — release nonce and clear in-flight marker
     if (sponsorNonce !== null) {
       await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
+    }
+
+    if (record.senderNonce !== undefined) {
+      await clearInFlight(kv, signerHash, record.senderNonce).catch(
+        (e) => logger.warn("Failed to clear in-flight marker on broadcast fail", { error: String(e) })
+      );
     }
 
     record = transitionPayment(record, "failed", {
@@ -234,8 +263,16 @@ async function processPaymentMessage(
       logger.warn("Failed to write txid mapping", { error: String(e) })
     );
 
-  // Update sender nonce cache
-  const signerHash = transaction.auth.spendingCondition.signer;
+  // Clear in-flight marker unconditionally when senderNonce is set — the marker
+  // key only depends on signerHash + nonce, not senderAddress. Clearing here
+  // prevents stuck markers if senderAddress is missing for any reason.
+  if (record.senderNonce !== undefined) {
+    await clearInFlight(kv, signerHash, record.senderNonce).catch((e) =>
+      logger.warn("Failed to clear in-flight marker on broadcast success", { error: String(e) })
+    );
+  }
+
+  // Update sender nonce cache (requires senderAddress for the cache key)
   if (record.senderNonce !== undefined && record.senderAddress) {
     await updateSenderNonceOnBroadcast(
       kv,

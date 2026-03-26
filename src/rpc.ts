@@ -32,6 +32,8 @@ import {
 } from "./services/payment-status";
 import {
   checkSenderNonce,
+  clearInFlight,
+  markInFlight,
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
 
@@ -267,6 +269,11 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
 
+    // Write in-flight marker before enqueuing so concurrent requests for the
+    // same sender/nonce are rejected by checkSenderNonce() (#234).
+    // TTL of 5 minutes is self-healing if the consumer crashes.
+    await markInFlight(kv, signerHash, senderNonce);
+
     // Generate paymentId and write initial status
     const paymentId = generatePaymentId();
     let record = createPaymentRecord(paymentId, network, senderNonceInfo);
@@ -280,7 +287,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     // Enqueue to PAYMENT_QUEUE
     const queue = this.env.PAYMENT_QUEUE;
     if (!queue) {
-      // Queue not configured — mark as failed
+      // Queue not configured — clear in-flight marker so the sender can retry immediately
+      await clearInFlight(kv, signerHash, senderNonce).catch(() => {});
       record = transitionPayment(record, "failed", {
         error: "Payment queue not configured",
         errorCode: "INTERNAL_ERROR",
@@ -307,6 +315,9 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     } catch (err) {
       const errorMessage =
         err instanceof Error ? err.message : "Failed to enqueue payment";
+
+      // Enqueue failed — clear in-flight marker so the sender can retry immediately
+      await clearInFlight(kv, signerHash, senderNonce).catch(() => {});
 
       // Queue send failed — mark payment as failed so status reflects reality
       record = transitionPayment(record, "failed", {
