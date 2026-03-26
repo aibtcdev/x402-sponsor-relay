@@ -101,9 +101,14 @@ async function putCache(
 
 /**
  * Build the Hiro nonce help URL for a given Stacks address.
+ * Uses mainnet URL as a reference — testnet agents can swap the base URL.
  */
-export function hiroNonceUrl(address: string): string {
-  return `https://api.hiro.so/extended/v1/address/${address}/nonces`;
+export function hiroNonceUrl(
+  address: string,
+  network: "mainnet" | "testnet" = "mainnet"
+): string {
+  const base = getHiroBaseUrl(network);
+  return `${base}/extended/v1/address/${address}/nonces`;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,12 +122,14 @@ export function hiroNonceUrl(address: string): string {
  * @param signerHash - Sender's hash160 hex (from tx.auth.spendingCondition.signer)
  * @param providedNonce - Nonce from the sender's transaction
  * @param senderAddress - Human-readable Stacks address (for help URLs)
+ * @param network - Network for help URL generation (default: mainnet)
  */
 export async function checkSenderNonce(
   kv: KVNamespace,
   signerHash: string,
   providedNonce: number,
-  senderAddress: string
+  senderAddress: string,
+  network: "mainnet" | "testnet" = "mainnet"
 ): Promise<SenderNonceCheckResult> {
   const cache = await getCache(kv, signerHash);
 
@@ -130,7 +137,7 @@ export async function checkSenderNonce(
     return { outcome: "unknown", provided: providedNonce };
   }
 
-  const help = hiroNonceUrl(senderAddress);
+  const help = hiroNonceUrl(senderAddress, network);
 
   // Stale: nonce already confirmed on-chain
   if (providedNonce <= cache.lastConfirmed) {
@@ -153,8 +160,21 @@ export async function checkSenderNonce(
     };
   }
 
-  // Gap: nonce is more than 1 ahead of last seen
   const expected = cache.lastSeen + 1;
+
+  // Out-of-order: nonce is between lastConfirmed and lastSeen (already in-flight)
+  if (providedNonce < expected) {
+    return {
+      outcome: "stale",
+      provided: providedNonce,
+      lastConfirmed: cache.lastConfirmed,
+      currentNonce: expected,
+      help,
+      action: `Nonce ${providedNonce} is already in-flight. Re-sign with nonce ${expected} and resubmit.`,
+    };
+  }
+
+  // Gap: nonce is more than 1 ahead of last seen
   if (providedNonce > expected) {
     return {
       outcome: "gap",
@@ -238,15 +258,14 @@ export async function seedSenderNonceFromHiro(
   const url = `${baseUrl}/extended/v1/address/${senderAddress}/nonces`;
   const headers = getHiroHeaders(hiroApiKey);
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), HIRO_NONCE_SEED_TIMEOUT_MS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HIRO_NONCE_SEED_TIMEOUT_MS);
 
+  try {
     const res = await fetch(url, {
       headers,
       signal: controller.signal,
     });
-    clearTimeout(timeout);
 
     if (!res.ok) return null;
 
@@ -270,5 +289,7 @@ export async function seedSenderNonceFromHiro(
     return cache;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timeout);
   }
 }

@@ -27,14 +27,12 @@ import {
   transitionPayment,
   putPaymentRecord,
   getPaymentRecord,
-  type PaymentRecord,
   type PaymentQueueMessage,
   type SenderNonceInfo,
 } from "./services/payment-status";
 import {
   checkSenderNonce,
   seedSenderNonceFromHiro,
-  hiroNonceUrl,
 } from "./services/sender-nonce";
 
 /**
@@ -124,11 +122,9 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
 
-    // Deserialize and validate the transaction
-    let cleanHex: string;
-    try {
-      cleanHex = stripHexPrefix(txHex);
-    } catch {
+    // Validate and deserialize the transaction
+    const cleanHex = stripHexPrefix(txHex);
+    if (!/^[0-9a-fA-F]+$/.test(cleanHex)) {
       return {
         accepted: false,
         error: "Invalid transaction hex",
@@ -180,7 +176,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       kv,
       signerHash,
       senderNonce,
-      senderAddress
+      senderAddress,
+      network
     );
 
     // Cold cache — seed from Hiro and re-check
@@ -297,11 +294,12 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
 
     await queue.send(message);
 
-    // Build the status check URL
+    // Build the status check URL from env or default by network
     const baseUrl =
-      network === "mainnet"
+      this.env.RELAY_BASE_URL ??
+      (network === "mainnet"
         ? "https://x402-relay.aibtc.com"
-        : "https://x402-relay.aibtc.dev";
+        : "https://x402-relay.aibtc.dev");
     const checkStatusUrl = `${baseUrl}/payment/${paymentId}`;
 
     return {

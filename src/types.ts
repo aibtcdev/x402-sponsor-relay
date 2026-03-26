@@ -78,6 +78,8 @@ export interface Env {
   PAYMENT_QUEUE?: Queue;
   // Auth token for Hiro chainhook webhooks
   CHAINHOOK_AUTH_TOKEN?: string;
+  // Base URL for payment status check URLs (e.g. "https://x402-relay.aibtc.dev")
+  RELAY_BASE_URL?: string;
 }
 
 /**

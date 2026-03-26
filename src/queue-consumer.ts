@@ -19,12 +19,20 @@ import {
   putPaymentRecord,
   transitionPayment,
   type PaymentQueueMessage,
+  type PaymentRecord,
 } from "./services/payment-status";
 import { updateSenderNonceOnBroadcast } from "./services/sender-nonce";
-import { SponsorService, extractSponsorNonce, recordNonceTxid, releaseNonceDO, SettlementService } from "./services";
+import { SponsorService, extractSponsorNonce, recordNonceTxid, releaseNonceDO, recordBroadcastOutcomeDO, SettlementService } from "./services";
 
 /** Max retries before dead-lettering */
 const MAX_ATTEMPTS = 5;
+
+/** Fields set during retryable contention — cleared on next attempt */
+const TRANSIENT_ERROR_FIELDS: Partial<PaymentRecord> = {
+  error: undefined,
+  errorCode: undefined,
+  retryable: undefined,
+};
 
 /**
  * Create a minimal logger that writes to console (queue context has no LOGS binding easily).
@@ -48,7 +56,9 @@ async function processPaymentMessage(
   logger: Logger
 ): Promise<void> {
   const body = message.body;
-  const { paymentId, txHex, network, attempt } = body;
+  const { paymentId, txHex, network } = body;
+  // Use queue-provided attempt count — message.body.attempt is never incremented by retry()
+  const attempt = message.attempts;
 
   const kv = env.RELAY_KV;
   if (!kv) {
@@ -75,8 +85,8 @@ async function processPaymentMessage(
     return;
   }
 
-  // Transition to broadcasting
-  record = transitionPayment(record, "broadcasting");
+  // Transition to broadcasting — clear any transient error from prior attempt
+  record = transitionPayment(record, "broadcasting", TRANSIENT_ERROR_FIELDS);
   await putPaymentRecord(kv, record);
 
   // Deserialize the transaction
@@ -104,6 +114,7 @@ async function processPaymentMessage(
     const isRetryable =
       code === "RATE_LIMIT_EXCEEDED" ||
       code === "LOW_HEADROOM" ||
+      code === "SERVICE_DEGRADED" ||
       code === "NONCE_DO_UNAVAILABLE";
 
     if (isRetryable && attempt < MAX_ATTEMPTS) {
@@ -195,11 +206,19 @@ async function processPaymentMessage(
   // Broadcast succeeded — tx is in mempool
   const txid = broadcastResult.txid;
 
-  // Record txid with NonceDO for tracking
+  // Record txid with NonceDO and release the reserved nonce slot
   if (sponsorNonce !== null) {
-    await recordNonceTxid(env, logger, txid, sponsorNonce).catch(
-      (e) => logger.warn("Failed to record nonce txid", { error: String(e) })
-    );
+    await Promise.all([
+      recordNonceTxid(env, logger, txid, sponsorNonce).catch(
+        (e) => logger.warn("Failed to record nonce txid", { error: String(e) })
+      ),
+      releaseNonceDO(env, logger, sponsorNonce, txid, walletIndex, sponsorResult.fee).catch(
+        (e) => logger.warn("Failed to release nonce", { error: String(e) })
+      ),
+      recordBroadcastOutcomeDO(env, logger, sponsorNonce, walletIndex, txid, 200, undefined, undefined).catch(
+        (e) => logger.warn("Failed to record broadcast outcome", { error: String(e) })
+      ),
+    ]);
   }
 
   // Update payment record
@@ -268,7 +287,7 @@ export async function handlePaymentQueue(
         paymentId: message.body.paymentId,
       });
       // Retry on unexpected errors if under attempt limit
-      if (message.body.attempt < MAX_ATTEMPTS) {
+      if (message.attempts < MAX_ATTEMPTS) {
         message.retry({ delaySeconds: 5 });
       } else {
         message.ack(); // dead letter

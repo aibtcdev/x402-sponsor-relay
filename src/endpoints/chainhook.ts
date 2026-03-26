@@ -94,14 +94,23 @@ export class Chainhook extends BaseEndpoint {
     }
 
     const authHeader = c.req.header("Authorization");
-    const providedToken = authHeader?.startsWith("Bearer ")
+    if (!authHeader) {
+      return this.err(c, {
+        error: "Missing Authorization header",
+        code: "MISSING_API_KEY",
+        status: 401,
+        retryable: false,
+      });
+    }
+
+    const providedToken = authHeader.startsWith("Bearer ")
       ? authHeader.slice(7)
       : authHeader;
 
-    if (!providedToken || providedToken !== authToken) {
+    if (providedToken !== authToken) {
       return this.err(c, {
-        error: "Invalid authentication",
-        code: "MISSING_API_KEY",
+        error: "Invalid authentication token",
+        code: "INVALID_API_KEY",
         status: 401,
         retryable: false,
       });
