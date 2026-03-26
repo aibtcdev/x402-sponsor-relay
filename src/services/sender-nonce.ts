@@ -16,6 +16,10 @@ import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 const SENDER_NONCE_KEY_PREFIX = "sender_nonce:";
 const SENDER_NONCE_TTL_SECONDS = 86_400; // 24 hours
 
+// In-flight marker key prefix and TTL
+const SENDER_INFLIGHT_KEY_PREFIX = "sender_inflight:";
+const SENDER_INFLIGHT_TTL_SECONDS = 300; // 5 minutes — self-healing if consumer crashes
+
 /** Timeout for Hiro nonce seed query (ms) */
 const HIRO_NONCE_SEED_TIMEOUT_MS = 8_000;
 
@@ -74,6 +78,42 @@ export type SenderNonceCheckResult =
 
 function senderNonceKey(signerHash: string): string {
   return `${SENDER_NONCE_KEY_PREFIX}${signerHash}`;
+}
+
+function inFlightKey(signerHash: string, nonce: number): string {
+  return `${SENDER_INFLIGHT_KEY_PREFIX}${signerHash}:${nonce}`;
+}
+
+// ---------------------------------------------------------------------------
+// In-flight marker helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Write a short-lived KV marker indicating this sender/nonce is in-flight.
+ * Called at RPC acceptance time, before the payment is enqueued.
+ * TTL of 5 minutes is self-healing: if the queue consumer crashes without
+ * calling clearInFlight, the marker expires automatically.
+ */
+export async function markInFlight(
+  kv: KVNamespace,
+  signerHash: string,
+  nonce: number
+): Promise<void> {
+  await kv.put(inFlightKey(signerHash, nonce), "1", {
+    expirationTtl: SENDER_INFLIGHT_TTL_SECONDS,
+  });
+}
+
+/**
+ * Delete the in-flight marker for a sender/nonce.
+ * Called by the queue consumer after broadcast succeeds or a terminal failure occurs.
+ */
+export async function clearInFlight(
+  kv: KVNamespace,
+  signerHash: string,
+  nonce: number
+): Promise<void> {
+  await kv.delete(inFlightKey(signerHash, nonce));
 }
 
 async function getCache(
@@ -148,6 +188,18 @@ export async function checkSenderNonce(
       currentNonce: cache.lastConfirmed + 1,
       help,
       action: `Re-sign your transaction with nonce ${cache.lastConfirmed + 1} and resubmit.`,
+    };
+  }
+
+  // In-flight marker: a concurrent RPC request already accepted this nonce but
+  // the queue consumer hasn't broadcast yet (and therefore hasn't updated lastSeen).
+  // Reject to prevent duplicate transactions reaching the queue.
+  const inFlight = await kv.get(inFlightKey(signerHash, providedNonce), "text");
+  if (inFlight !== null) {
+    return {
+      outcome: "duplicate",
+      provided: providedNonce,
+      lastSeen: providedNonce,
     };
   }
 

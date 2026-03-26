@@ -57,8 +57,8 @@ export class NonceHistory extends BaseEndpoint {
     const wallet = c.req.param("wallet");
     const nonce = c.req.param("nonce");
 
-    const walletIdx = parseInt(wallet, 10);
-    const nonceVal = parseInt(nonce, 10);
+    const walletIdx = parseInt(wallet ?? "", 10);
+    const nonceVal = parseInt(nonce ?? "", 10);
 
     if (!Number.isInteger(walletIdx) || walletIdx < 0) {
       return this.err(c, {

@@ -32,6 +32,7 @@ import {
 } from "./services/payment-status";
 import {
   checkSenderNonce,
+  markInFlight,
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
 
@@ -266,6 +267,11 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
         healthy: true,
       };
     }
+
+    // Write in-flight marker before enqueuing so concurrent requests for the
+    // same sender/nonce are rejected by checkSenderNonce() (#234).
+    // TTL of 5 minutes is self-healing if the consumer crashes.
+    await markInFlight(kv, signerHash, senderNonce);
 
     // Generate paymentId and write initial status
     const paymentId = generatePaymentId();

@@ -21,7 +21,7 @@ import {
   type PaymentQueueMessage,
   type PaymentRecord,
 } from "./services/payment-status";
-import { updateSenderNonceOnBroadcast } from "./services/sender-nonce";
+import { clearInFlight, updateSenderNonceOnBroadcast } from "./services/sender-nonce";
 import { SponsorService, extractSponsorNonce, recordNonceTxid, releaseNonceDO, recordBroadcastOutcomeDO, SettlementService } from "./services";
 
 /** Max retries before dead-lettering */
@@ -149,7 +149,14 @@ async function processPaymentMessage(
       return;
     }
 
-    // Terminal sponsor failure
+    // Terminal sponsor failure — clear in-flight marker so the sender can retry
+    const signerHashSponsorFail = transaction.auth.spendingCondition.signer;
+    if (record.senderNonce !== undefined) {
+      await clearInFlight(kv, signerHashSponsorFail, record.senderNonce).catch(
+        (e) => logger.warn("Failed to clear in-flight marker on sponsor fail", { error: String(e) })
+      );
+    }
+
     record = transitionPayment(record, "failed", {
       error: sponsorResult.error,
       errorCode: code ?? "SPONSOR_FAILED",
@@ -200,9 +207,16 @@ async function processPaymentMessage(
       return;
     }
 
-    // Terminal broadcast failure — release nonce
+    // Terminal broadcast failure — release nonce and clear in-flight marker
     if (sponsorNonce !== null) {
       await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
+    }
+
+    const signerHashBroadcastFail = transaction.auth.spendingCondition.signer;
+    if (record.senderNonce !== undefined) {
+      await clearInFlight(kv, signerHashBroadcastFail, record.senderNonce).catch(
+        (e) => logger.warn("Failed to clear in-flight marker on broadcast fail", { error: String(e) })
+      );
     }
 
     record = transitionPayment(record, "failed", {
@@ -248,7 +262,7 @@ async function processPaymentMessage(
       logger.warn("Failed to write txid mapping", { error: String(e) })
     );
 
-  // Update sender nonce cache
+  // Update sender nonce cache and clear in-flight marker
   const signerHash = transaction.auth.spendingCondition.signer;
   if (record.senderNonce !== undefined && record.senderAddress) {
     await updateSenderNonceOnBroadcast(
@@ -258,6 +272,12 @@ async function processPaymentMessage(
       txid
     ).catch((e) =>
       logger.warn("Failed to update sender nonce cache", { error: String(e) })
+    );
+
+    // Clear in-flight marker now that the broadcast is recorded in the sender nonce cache.
+    // The cache's lastSeen will block duplicates going forward; the marker is no longer needed.
+    await clearInFlight(kv, signerHash, record.senderNonce).catch((e) =>
+      logger.warn("Failed to clear in-flight marker on broadcast success", { error: String(e) })
     );
 
     // Write sender address → signer hash mapping for chainhook lookup (24h TTL)
