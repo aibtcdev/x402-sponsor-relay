@@ -42,8 +42,8 @@ export class NonceState extends BaseEndpoint {
                         properties: {
                           walletIndex: { type: "number" as const },
                           sponsorAddress: { type: "string" as const },
-                          chainFrontier: { type: "number" as const, description: "Monotonic high-water mark of Hiro's possible_next_nonce — the next nonce expected on-chain (not the last confirmed nonce)" },
-                          assignmentHead: { type: "number" as const, description: "Next nonce to be assigned by the pool (one past the highest assigned/broadcasted nonce)" },
+                          chainFrontier: { type: "number" as const, description: "Next expected nonce on-chain (Hiro possible_next_nonce, monotonic high-water mark)" },
+                          assignmentHead: { type: "number" as const, description: "Next nonce the relay will assign (one past the highest assigned/broadcasted)" },
                           pendingTxs: {
                             type: "array" as const,
                             items: {
@@ -62,8 +62,8 @@ export class NonceState extends BaseEndpoint {
                             items: { type: "number" as const },
                             description: "Missing nonce values between chain frontier and assignment head",
                           },
-                          available: { type: "number" as const },
-                          reserved: { type: "number" as const },
+                          available: { type: "number" as const, description: "Effective headroom — how many more nonces this wallet can accept (same calc as assignment)" },
+                          reserved: { type: "number" as const, description: "In-flight nonces across all states (assigned + broadcasted + confirmed-pending)" },
                           circuitBreakerOpen: { type: "boolean" as const },
                           healthy: { type: "boolean" as const },
                         },

@@ -2590,9 +2590,9 @@ export class NonceDO {
         const circuitBreakerOpen =
           activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
 
-        // Use the same headroom calculation as the assignment path so that
-        // available/reserved are consistent with what assignNonce() sees.
-        // walletHeadroom() counts assigned+broadcasted+confirmed (all in-flight).
+        // Use walletHeadroom() — same calculation as the assignment path.
+        // Counts assigned + broadcasted + confirmed (all in-flight states),
+        // not just 'assigned' like ledgerReservedCount().
         const available = this.walletHeadroom(walletIndex);
         const reserved = CHAINING_LIMIT - available;
 
@@ -3182,10 +3182,10 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
-    // Head bump: after gap-fills, RBF the first real pending (non-gap-fill)
-    // broadcasted tx with a slightly higher fee to signal miners to re-evaluate
-    // the pending nonce sequence. Without this, gap-fills alone may sit in the
-    // mempool without triggering miners to process the chain. (Issue #229 P0)
+    // Head bump: after gap-fills, RBF the LAST gap-fill tx with a higher fee
+    // to signal miners to re-evaluate the pending nonce sequence. We target a
+    // gap-fill (throwaway 1 uSTX self-transfer) instead of a real sponsored tx
+    // to avoid clobbering a user's actual transaction. (Issue #229 P0)
     // -------------------------------------------------------------------------
     let headBumpNonce: number | null = null;
     let headBumpTxid: string | null = null;
