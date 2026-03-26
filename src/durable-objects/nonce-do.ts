@@ -1340,6 +1340,9 @@ export class NonceDO {
       this.cascadeQuarantineKey
     )) ?? [];
     const pruned = existing.filter((e) => new Date(e.ts).getTime() >= cutoff);
+    if (pruned.length !== existing.length) {
+      await this.state.storage.put(this.cascadeQuarantineKey, pruned);
+    }
     return pruned.length >= CASCADE_DETECTION_THRESHOLD;
   }
 

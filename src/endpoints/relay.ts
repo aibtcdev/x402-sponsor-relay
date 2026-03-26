@@ -293,11 +293,33 @@ export class Relay extends BaseEndpoint {
         });
       }
 
-      // Step A0 — Sender conflict dedup: short-circuit if sender is in a conflict cooldown.
-      // If the same sender got a 409/429 (nonce conflict or too-much-chaining) within the
-      // last retryAfter seconds, return the cached error without assigning a nonce or hitting
-      // the mempool. This prevents the assign→broadcast→conflict→quarantine cycle from
-      // repeating on every agent retry during a nonce storm.
+      // Step A — Dedup check on original tx (stable across retries with different sponsor nonces).
+      // Runs before the conflict cooldown so that idempotent retries of already-succeeded
+      // transactions return the cached success even if the sender is in a conflict window.
+      const dedupResult = await settlementService.checkDedup(body.transaction);
+      if (dedupResult) {
+        logger.info("Dedup hit, returning cached result", {
+          txid: dedupResult.txid,
+          status: dedupResult.status,
+        });
+        return this.okWithTx(c, {
+          txid: dedupResult.txid,
+          settlement: {
+            success: true,
+            status: dedupResult.status,
+            sender: dedupResult.sender,
+            recipient: dedupResult.recipient,
+            amount: dedupResult.amount,
+            blockHeight: dedupResult.blockHeight,
+          },
+          sponsoredTx: dedupResult.sponsoredTx,
+          receiptId: dedupResult.receiptId,
+        });
+      }
+
+      // Step A1 — Sender conflict cooldown: short-circuit if sender recently hit a nonce
+      // conflict or too-much-chaining error. Prevents the assign→broadcast→conflict→quarantine
+      // cycle from repeating on every agent retry during a nonce storm.
       const senderConflictKey = `conflict:${validation.senderAddress}`;
       const cachedConflict = c.env.RELAY_KV ? await c.env.RELAY_KV.get(senderConflictKey, "text") : null;
       if (cachedConflict) {
@@ -326,28 +348,6 @@ export class Relay extends BaseEndpoint {
         } catch {
           // Malformed KV value — ignore and proceed normally
         }
-      }
-
-      // Step A — Dedup check on original tx (stable across retries with different sponsor nonces)
-      const dedupResult = await settlementService.checkDedup(body.transaction);
-      if (dedupResult) {
-        logger.info("Dedup hit, returning cached result", {
-          txid: dedupResult.txid,
-          status: dedupResult.status,
-        });
-        return this.okWithTx(c, {
-          txid: dedupResult.txid,
-          settlement: {
-            success: true,
-            status: dedupResult.status,
-            sender: dedupResult.sender,
-            recipient: dedupResult.recipient,
-            amount: dedupResult.amount,
-            blockHeight: dedupResult.blockHeight,
-          },
-          sponsoredTx: dedupResult.sponsoredTx,
-          receiptId: dedupResult.receiptId,
-        });
       }
 
       // Step B — Sponsor the transaction
@@ -619,7 +619,7 @@ export class Relay extends BaseEndpoint {
           // Retry did not succeed — schedule a delayed resync so the pool self-heals,
           // then return the appropriate error code.
           this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
-          const conflictTtl = await this.getPoolPressureRetryAfter(c.env, logger);
+          const conflictTtl = await this.getPoolPressureRetryAfter(c.env);
           const conflictCode = broadcastResult.nonceConflict ? "NONCE_CONFLICT" as const : "TOO_MUCH_CHAINING" as const;
           this.writeSenderConflict(c, validation.senderAddress, conflictCode, conflictTtl, logger);
           const isConflict = conflictCode === "NONCE_CONFLICT";
@@ -774,21 +774,6 @@ export class Relay extends BaseEndpoint {
   }
 
   /**
-   * Handle self-pay settlement (X-Settlement: self-pay).
-   *
-   * The caller provides a fully-signed standard (non-sponsored) transaction and
-   * covers their own network fees. The relay skips sponsoring and only:
-   *   1. Validates and deserializes the transaction (must NOT be sponsored)
-   *   2. Applies rate limiting by sender
-   *   3. Checks the dedup cache for idempotent retries
-   *   4. Verifies payment parameters (recipient, amount, token type)
-   *   5. Broadcasts and polls for confirmation
-   *   6. Records stats and dedup entry
-   *
-   * Response format is identical to the sponsored path. sponsoredTx is null
-   * since no sponsor signature was applied.
-   */
-  /**
    * Write a sender conflict record to KV so subsequent retries from the same sender
    * short-circuit without assigning a nonce or hitting the mempool.
    */
@@ -811,6 +796,21 @@ export class Relay extends BaseEndpoint {
     );
   }
 
+  /**
+   * Handle self-pay settlement (X-Settlement: self-pay).
+   *
+   * The caller provides a fully-signed standard (non-sponsored) transaction and
+   * covers their own network fees. The relay skips sponsoring and only:
+   *   1. Validates and deserializes the transaction (must NOT be sponsored)
+   *   2. Applies rate limiting by sender
+   *   3. Checks the dedup cache for idempotent retries
+   *   4. Verifies payment parameters (recipient, amount, token type)
+   *   5. Broadcasts and polls for confirmation
+   *   6. Records stats and dedup entry
+   *
+   * Response format is identical to the sponsored path. sponsoredTx is null
+   * since no sponsor signature was applied.
+   */
   private async handleSelfPay(
     c: AppContext,
     body: RelayRequest,

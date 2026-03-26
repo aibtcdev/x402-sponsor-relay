@@ -256,7 +256,7 @@ export class BaseEndpoint extends OpenAPIRoute {
    * wallets have their circuit breaker open. Returns 30 (neutral default) if NonceDO
    * is not configured or the call fails, so this never blocks the error path.
    */
-  protected async getPoolPressureRetryAfter(env: Env, logger: Logger): Promise<number> {
+  protected async getPoolPressureRetryAfter(env: Env): Promise<number> {
     if (!env.NONCE_DO) {
       return 30;
     }
