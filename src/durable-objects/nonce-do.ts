@@ -2181,6 +2181,75 @@ export class NonceDO {
     return rows[0].nonce;
   }
 
+  /**
+   * Lightweight pool health check — returns per-wallet circuit breaker state
+   * and aggregate availability. Used by SponsorService as a pre-flight gate
+   * before attempting nonce assignment, preventing requests from entering
+   * known-degraded pools.
+   *
+   * Much cheaper than getStats() — only reads quarantine lists and reserved counts,
+   * no heavy SQL joins or utilization queries.
+   */
+  async getPoolHealth(): Promise<{
+    /** True when ALL wallets are circuit-broken (no healthy wallet available) */
+    allWalletsDegraded: boolean;
+    /** Total in-flight nonces across all initialized wallets */
+    totalReserved: number;
+    /** Total capacity across all initialized wallets (walletCount * CHAINING_LIMIT) */
+    totalCapacity: number;
+    /** Per-wallet health snapshot */
+    wallets: Array<{
+      walletIndex: number;
+      circuitBreakerOpen: boolean;
+      reserved: number;
+      available: number;
+      quarantineCount: number;
+    }>;
+  }> {
+    const initializedWallets = await this.getInitializedWallets();
+    const now = Date.now();
+    const cutoff = now - CIRCUIT_BREAKER_WINDOW_MS;
+    let totalReserved = 0;
+    let degradedCount = 0;
+
+    const wallets: Array<{
+      walletIndex: number;
+      circuitBreakerOpen: boolean;
+      reserved: number;
+      available: number;
+      quarantineCount: number;
+    }> = [];
+
+    for (const { walletIndex } of initializedWallets) {
+      const recentQuarantines =
+        (await this.state.storage.get<string[]>(
+          this.walletQuarantineRecentKey(walletIndex)
+        )) ?? [];
+      const activeQuarantines = recentQuarantines.filter(
+        (ts) => new Date(ts).getTime() >= cutoff
+      );
+      const cbOpen = activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
+      const reserved = this.ledgerReservedCount(walletIndex);
+      const available = Math.max(0, CHAINING_LIMIT - reserved);
+      totalReserved += reserved;
+      if (cbOpen) degradedCount++;
+
+      wallets.push({
+        walletIndex,
+        circuitBreakerOpen: cbOpen,
+        reserved,
+        available,
+        quarantineCount: activeQuarantines.length,
+      });
+    }
+
+    const totalCapacity = initializedWallets.length * CHAINING_LIMIT;
+    const allWalletsDegraded =
+      initializedWallets.length > 0 && degradedCount === initializedWallets.length;
+
+    return { allWalletsDegraded, totalReserved, totalCapacity, wallets };
+  }
+
   async getStats(): Promise<NonceStatsResponse> {
     const totalAssigned = this.getStoredCount(STATE_KEYS.totalAssigned);
     const conflictsDetected = this.getStoredCount(STATE_KEYS.conflictsDetected);
@@ -3194,6 +3263,15 @@ export class NonceDO {
         const response: LookupTxidResponse =
           nonce === null ? { found: false } : { found: true, nonce };
         return this.jsonResponse(response);
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/pool-health") {
+      try {
+        const health = await this.getPoolHealth();
+        return this.jsonResponse(health);
       } catch (error) {
         return this.internalError(error);
       }
