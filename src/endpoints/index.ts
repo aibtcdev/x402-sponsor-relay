@@ -20,3 +20,5 @@ export { SettleStatus } from "./settle-status";
 export { VerifyV2 } from "./verify-v2";
 export { Supported } from "./supported";
 export { Wallets } from "./wallets";
+export { PaymentStatus } from "./payment-status";
+export { Chainhook } from "./chainhook";

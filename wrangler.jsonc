@@ -30,6 +30,20 @@
     { "binding": "RELAY_KV", "id": "5de48f1c8a1746e49d09fbf1c7072a5f" },
     { "binding": "API_KEYS_KV", "id": "3ce8d9d710884370873c561bfb98d6cf" }
   ],
+  // Queue for serial payment processing (eliminates nonce contention)
+  "queues": {
+    "producers": [
+      { "binding": "PAYMENT_QUEUE", "queue": "x402-payment-queue-dev" }
+    ],
+    "consumers": [
+      {
+        "queue": "x402-payment-queue-dev",
+        "max_batch_size": 1,
+        "max_retries": 5,
+        "dead_letter_queue": "x402-payment-dlq-dev"
+      }
+    ]
+  },
   "vars": {
     "STACKS_NETWORK": "testnet",
     "SPONSOR_WALLET_COUNT": "10",
@@ -81,6 +95,20 @@
         { "binding": "RELAY_KV", "id": "3851254fa8f9494189689ce5a726b773" },
         { "binding": "API_KEYS_KV", "id": "20be33ef450a4c31a128dd80a1ff3bd9" }
       ],
+      // Queue for serial payment processing
+      "queues": {
+        "producers": [
+          { "binding": "PAYMENT_QUEUE", "queue": "x402-payment-queue-staging" }
+        ],
+        "consumers": [
+          {
+            "queue": "x402-payment-queue-staging",
+            "max_batch_size": 1,
+            "max_retries": 5,
+            "dead_letter_queue": "x402-payment-dlq-staging"
+          }
+        ]
+      },
       // Cron trigger: run health check every 5 minutes
       "triggers": {
         "crons": ["*/5 * * * *"]
@@ -116,6 +144,20 @@
         { "binding": "RELAY_KV", "id": "56f3b1596357434291161238d40cbd81" },
         { "binding": "API_KEYS_KV", "id": "307c3134a46e4d5a94e2d0b7f1d97cbf" }
       ],
+      // Queue for serial payment processing
+      "queues": {
+        "producers": [
+          { "binding": "PAYMENT_QUEUE", "queue": "x402-payment-queue-production" }
+        ],
+        "consumers": [
+          {
+            "queue": "x402-payment-queue-production",
+            "max_batch_size": 1,
+            "max_retries": 5,
+            "dead_letter_queue": "x402-payment-dlq-production"
+          }
+        ]
+      },
       // Cron trigger: run health check every 5 minutes
       "triggers": {
         "crons": ["*/5 * * * *"]
