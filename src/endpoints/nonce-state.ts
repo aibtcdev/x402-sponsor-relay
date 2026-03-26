@@ -7,7 +7,12 @@ import { Error500Response } from "../schemas";
  * Returns per-wallet pending txs, gaps, and health status so MCP clients
  * can correlate sender nonces with sponsor nonces.
  *
- * GET /nonce-state
+ * Intentionally unauthenticated — matches the pattern of public /health and
+ * /nonce/stats. Exposed data (sponsor addresses, txids, gap positions) is
+ * already on-chain or mempool-visible. MCP clients need access without
+ * API keys for pre-flight diagnostics.
+ *
+ * GET /nonce/state
  */
 export class NonceState extends BaseEndpoint {
   schema = {
@@ -123,28 +128,10 @@ export class NonceState extends BaseEndpoint {
         });
       }
 
-      const state = await response.json() as {
-        wallets: Array<{
-          gaps: number[];
-          circuitBreakerOpen: boolean;
-          available: number;
-        }>;
-        healthy: boolean;
-        healInProgress: boolean;
-        [key: string]: unknown;
-      };
+      // recommendation is derived inside the DO (single source of truth)
+      const state = await response.json();
 
-      // Add recommendation field for clients
-      const anyGaps = state.wallets.some((w) => w.gaps.length > 0);
-      const allDegraded =
-        state.wallets.length > 0 &&
-        state.wallets.every((w) => w.circuitBreakerOpen || w.available === 0);
-      const recommendation =
-        !state.healthy && (anyGaps || allDegraded)
-          ? "fallback_to_direct"
-          : null;
-
-      return this.ok(c, { state: { ...state, recommendation } });
+      return this.ok(c, { state });
     } catch (e) {
       logger.error("Nonce state request failed", {
         error: e instanceof Error ? e.message : "Unknown error",

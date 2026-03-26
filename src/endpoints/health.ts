@@ -192,12 +192,7 @@ export class Health extends BaseEndpoint {
 
     try {
       const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
-
-      // Fetch both stats and nonce-state in parallel
-      const [statsResponse, nonceStateResponse] = await Promise.all([
-        stub.fetch("https://nonce-do/stats"),
-        stub.fetch("https://nonce-do/nonce-state"),
-      ]);
+      const statsResponse = await stub.fetch("https://nonce-do/stats");
 
       if (!statsResponse.ok) {
         logger.warn("Nonce DO stats unavailable for health check", {
@@ -227,27 +222,22 @@ export class Health extends BaseEndpoint {
         totalPool === 0 ? 1.0 : Math.round((raw.poolAvailable / totalPool) * 100) / 100;
       const poolStatus = derivePoolStatus(effectiveCapacity, circuitBreakerOpen);
 
-      // Derive recommendation from nonce-state (best-effort).
-      // Only the recommendation is surfaced — raw gaps/circuit-breaker data
-      // stays on GET /nonce/state for diagnostic tools.
+      // Only fetch nonce-state when pool looks unhealthy — avoids adding
+      // two SQL queries + Promise.all to every pre-flight health check.
+      // recommendation is derived inside the DO (single source of truth).
       let recommendation: "fallback_to_direct" | null = null;
 
-      if (nonceStateResponse.ok) {
-        const nonceState = (await nonceStateResponse.json()) as {
-          wallets: Array<{
-            gaps: number[];
-            circuitBreakerOpen: boolean;
-            available: number;
-          }>;
-          healthy: boolean;
-        };
-
-        const hasGaps = nonceState.wallets.some((w) => w.gaps.length > 0);
-        const allDegraded =
-          nonceState.wallets.length > 0 &&
-          nonceState.wallets.every((w) => w.circuitBreakerOpen || w.available === 0);
-        if (!nonceState.healthy && (hasGaps || allDegraded)) {
-          recommendation = "fallback_to_direct";
+      if (poolStatus !== "healthy") {
+        try {
+          const nonceStateResponse = await stub.fetch("https://nonce-do/nonce-state");
+          if (nonceStateResponse.ok) {
+            const nonceState = (await nonceStateResponse.json()) as {
+              recommendation: "fallback_to_direct" | null;
+            };
+            recommendation = nonceState.recommendation;
+          }
+        } catch {
+          // best-effort — don't block health response
         }
       }
 

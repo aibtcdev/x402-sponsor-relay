@@ -198,6 +198,9 @@ interface ObservableWalletState {
  * Full observable nonce state returned by GET /nonce-state.
  * Designed for MCP tools like tx_status_deep to cross-reference
  * sender nonces with sponsor nonces.
+ *
+ * `recommendation` is derived here (single source of truth) so that
+ * endpoints don't duplicate the fallback decision logic.
  */
 interface ObservableNonceState {
   wallets: ObservableWalletState[];
@@ -208,6 +211,8 @@ interface ObservableNonceState {
   totalReserved: number;
   totalCapacity: number;
   lastGapDetected: string | null;
+  /** When non-null, clients should bypass sponsored submission */
+  recommendation: "fallback_to_direct" | null;
   timestamp: string;
 }
 
@@ -2552,11 +2557,11 @@ export class NonceDO {
         const chainFrontier = this.getChainFrontier(walletIndex);
         const head = this.ledgerGetWalletHead(walletIndex);
 
-        // Detect gaps: nonces between chain frontier and head that are not in-flight
+        // Detect gaps: nonces between chain frontier and head with no ledger entry.
+        // occupiedNonces covers ALL states (assigned, broadcasted, confirmed, failed)
+        // so inFlightNonces (a subset) is redundant.
         const gaps: number[] = [];
         if (chainFrontier !== null && head !== null && head > chainFrontier) {
-          const inFlightNonces = new Set(pendingRows.map((r) => r.nonce));
-          // Also check for confirmed/failed nonces that fill the range
           const occupiedRows = this.sql
             .exec<{ nonce: number }>(
               `SELECT nonce FROM nonce_intents
@@ -2568,7 +2573,7 @@ export class NonceDO {
             .toArray();
           const occupiedNonces = new Set(occupiedRows.map((r) => r.nonce));
           for (let n = chainFrontier; n < head; n++) {
-            if (!occupiedNonces.has(n) && !inFlightNonces.has(n)) {
+            if (!occupiedNonces.has(n)) {
               gaps.push(n);
             }
           }
@@ -2613,9 +2618,15 @@ export class NonceDO {
     const healInProgress = lastGapDetectedMs !== null &&
       Date.now() - lastGapDetectedMs < ALARM_INTERVAL_ACTIVE_MS * 2;
 
+    const healthy = !anyGaps && !allDegraded && totalAvailable > 0;
+    // recommendation is derived here (single source of truth) so endpoints
+    // don't duplicate the fallback decision logic.
+    const recommendation: "fallback_to_direct" | null =
+      !healthy && (anyGaps || allDegraded) ? "fallback_to_direct" : null;
+
     return {
       wallets,
-      healthy: !anyGaps && !allDegraded && totalAvailable > 0,
+      healthy,
       healInProgress,
       gapsFilled,
       totalAvailable,
@@ -2624,6 +2635,7 @@ export class NonceDO {
       lastGapDetected: lastGapDetectedMs
         ? new Date(lastGapDetectedMs).toISOString()
         : null,
+      recommendation,
       timestamp: new Date().toISOString(),
     };
   }
