@@ -289,6 +289,12 @@ const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 const ALARM_INTERVAL_ACTIVE_MS = 60 * 1000;
 /** Alias for readability: idle wallets revert to the standard 5-minute cadence. */
 const ALARM_INTERVAL_IDLE_MS = ALARM_INTERVAL_MS;
+/**
+ * Alarm interval used when a cross-wallet cascade is active AND there are in-flight nonces.
+ * 20s fires much more often than the normal 60s active cadence, accelerating RBF and gap-fill
+ * cycles during nonce storms so the DO self-heals without waiting for agent retries.
+ */
+const ALARM_INTERVAL_CASCADE_MS = 20 * 1000;
 /** Reset to possible_next_nonce if no assignment in this window and we are ahead */
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 /** Maximum number of sponsor wallets supported */
@@ -312,6 +318,10 @@ const MAX_ADMIN_GAP_FILLS = 50;
  * probability and are candidates for RBF replacement.
  */
 const STUCK_TX_AGE_MS = 15 * 60 * 1000;
+/** Reduced stuck-tx age when a cross-wallet cascade is active (5 min) */
+const STUCK_TX_AGE_CASCADE_MS = 5 * 60 * 1000;
+/** Most aggressive stuck-tx age when a wallet's circuit breaker is open (3 min) */
+const STUCK_TX_AGE_CIRCUIT_OPEN_MS = 3 * 60 * 1000;
 /**
  * Fee for RBF replacement self-transfers (3× GAP_FILL_FEE).
  * Must exceed the original stuck tx fee to guarantee replacement acceptance
@@ -1315,6 +1325,40 @@ export class NonceDO {
         detectedAt: ts,
       });
     }
+  }
+
+  /**
+   * Return true when a cross-wallet cascade is currently active.
+   * A cascade is active when >= CASCADE_DETECTION_THRESHOLD quarantine events have
+   * been recorded across any wallets within the CIRCUIT_BREAKER_WINDOW_MS window.
+   * Reads the same KV key that checkCascadeThreshold() writes so the signal is
+   * consistent without adding a separate flag.
+   */
+  private async isCascadeActive(): Promise<boolean> {
+    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+    const existing = (await this.state.storage.get<Array<{ walletIndex: number; ts: string }>>(
+      this.cascadeQuarantineKey
+    )) ?? [];
+    const pruned = existing.filter((e) => new Date(e.ts).getTime() >= cutoff);
+    if (pruned.length !== existing.length) {
+      await this.state.storage.put(this.cascadeQuarantineKey, pruned);
+    }
+    return pruned.length >= CASCADE_DETECTION_THRESHOLD;
+  }
+
+  /**
+   * Return the effective "stuck tx" age threshold for RBF eligibility.
+   * During a cascade the relay needs to RBF stuck transactions sooner so the
+   * nonce pipeline can drain before the situation worsens.
+   *
+   * - circuitOpen (any wallet): 3 min — most aggressive, wallet already skipped
+   * - cascadeActive:            5 min — multiple wallets affected, speed up RBF
+   * - normal:                  15 min (STUCK_TX_AGE_MS)
+   */
+  private getEffectiveStuckTxAge(cascadeActive: boolean, circuitOpen: boolean): number {
+    if (circuitOpen) return STUCK_TX_AGE_CIRCUIT_OPEN_MS;
+    if (cascadeActive) return STUCK_TX_AGE_CASCADE_MS;
+    return STUCK_TX_AGE_MS;
   }
 
   /**
@@ -2777,7 +2821,8 @@ export class NonceDO {
    */
   private async reconcileNonceForWallet(
     walletIndex: number,
-    sponsorAddress: string
+    sponsorAddress: string,
+    cascadeActive = false
   ): Promise<ReconcileResult | null> {
     let nonceInfo: HiroNonceInfo;
     try {
@@ -2859,6 +2904,20 @@ export class NonceDO {
     ]);
 
     // -------------------------------------------------------------------------
+    // Cascade-aware RBF threshold: when a cross-wallet cascade is active or this
+    // wallet's circuit breaker is open, reduce the stuck-tx age so RBF fires sooner
+    // and the nonce pipeline drains faster without waiting for agent retries.
+    // -------------------------------------------------------------------------
+    const cutoffForCircuitBreaker = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+    const recentQuarantinesForWallet =
+      (await this.state.storage.get<string[]>(this.walletQuarantineRecentKey(walletIndex))) ?? [];
+    const activeQuarantinesForWallet = recentQuarantinesForWallet.filter(
+      (ts) => new Date(ts).getTime() >= cutoffForCircuitBreaker
+    );
+    const walletCircuitOpen = activeQuarantinesForWallet.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
+    const effectiveStuckTxAge = this.getEffectiveStuckTxAge(cascadeActive, walletCircuitOpen);
+
+    // -------------------------------------------------------------------------
     // Cross-reference: broadcasted nonces (have a txid recorded in ledger)
     // -------------------------------------------------------------------------
     for (const [nonce, intent] of broadcastedByNonce) {
@@ -2882,7 +2941,7 @@ export class NonceDO {
         verdict = "pending_agree";
         reason = "ledger_and_hiro_both_pending";
         verdictPendingAgree++;
-      } else if (missingNonceSet.has(nonce) && ageMs < STUCK_TX_AGE_MS) {
+      } else if (missingNonceSet.has(nonce) && ageMs < effectiveStuckTxAge) {
         // Hiro lost sight of tx we know we sent — tx is young, wait for Hiro to catch up
         verdict = "pending_diverge";
         reason = "hiro_missing_but_tx_young";
@@ -2894,7 +2953,7 @@ export class NonceDO {
           ageMs,
           reason: "hiro_reports_missing_but_we_broadcasted_recently",
         });
-      } else if (missingNonceSet.has(nonce) && ageMs >= STUCK_TX_AGE_MS) {
+      } else if (missingNonceSet.has(nonce) && ageMs >= effectiveStuckTxAge) {
         // Hiro and time both say trouble — RBF candidate (tx status check in RBF section)
         verdict = "rbf_candidate";
         reason = "hiro_missing_and_tx_old";
@@ -2903,7 +2962,7 @@ export class NonceDO {
       } else if (
         !mempoolNonceSet.has(nonce) &&
         (last_executed_tx_nonce === null || nonce > last_executed_tx_nonce) &&
-        ageMs >= STUCK_TX_AGE_MS
+        ageMs >= effectiveStuckTxAge
       ) {
         // Not in mempool AND not confirmed AND old — likely evicted from all mempools
         verdict = "rbf_candidate";
@@ -3257,10 +3316,13 @@ export class NonceDO {
         });
       }
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      // During a cascade, allow more gap-fills per cycle (15 vs 5) to drain stuck nonces faster.
+      // Gap-fills are cheap (1 uSTX + 30k fee) so the cost increase is negligible.
+      const effectiveMaxGapFills = cascadeActive ? 15 : MAX_GAP_FILLS_PER_ALARM;
       const gapsToFill = gapFillNonces
         .slice()
         .sort((a, b) => a - b)
-        .slice(0, Math.min(MAX_GAP_FILLS_PER_ALARM, gapFillBudget));
+        .slice(0, Math.min(effectiveMaxGapFills, gapFillBudget));
       if (privateKey) {
         for (const gapNonce of gapsToFill) {
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
@@ -3650,9 +3712,13 @@ export class NonceDO {
       try {
         const initializedWallets = await this.getInitializedWallets();
 
+        // Read cascade state once per alarm cycle so we don't repeat the KV read
+        // inside every wallet's reconcileNonceForWallet call.
+        const cascadeActive = await this.isCascadeActive();
+
         for (const { walletIndex, address } of initializedWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
-          await this.reconcileNonceForWallet(walletIndex, address);
+          await this.reconcileNonceForWallet(walletIndex, address, cascadeActive);
 
           // Clean up StuckTxState entries for nonces that have been confirmed on-chain.
           // Use the ledger to find recently-confirmed nonces below Hiro's possible_next_nonce - 1.
@@ -3700,19 +3766,23 @@ export class NonceDO {
         // records to "replaced" status so agents can detect via GET /payment/:id.
         await this.processReplacementNotifications();
 
-        // Dynamic alarm interval: use active (60s) when any wallet has in-flight nonces,
-        // idle (5min) when all wallets are drained. This ensures rapid reconciliation
-        // during traffic bursts and doesn't hammer Hiro unnecessarily when idle.
+        // Dynamic alarm interval: use cascade (20s) when cascade is active + in-flight nonces,
+        // active (60s) when in-flight nonces present, idle (5min) when all wallets are drained.
+        // The cascade interval ensures the DO self-heals rapidly during nonce storms without
+        // waiting for agent retries between each reconciliation cycle.
         const totalReservedAfterCycle = this.ledgerTotalAssigned();
         const isActive = totalReservedAfterCycle > 0;
-        const intervalMs = isActive ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
+        const intervalMs = cascadeActive && isActive
+          ? ALARM_INTERVAL_CASCADE_MS
+          : isActive ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
         this.log("info", "nonce_alarm_scheduled", {
           intervalMs,
           activeWallets: initializedWallets.length,
           totalReserved: totalReservedAfterCycle,
           isActive,
+          cascadeActive,
         });
-        await this.scheduleAlarm(isActive);
+        await this.state.storage.setAlarm(Date.now() + intervalMs);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         const stack = error instanceof Error ? error.stack : undefined;

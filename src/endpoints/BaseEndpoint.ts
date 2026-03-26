@@ -2,7 +2,9 @@ import { OpenAPIRoute } from "chanfana";
 import { SERVICE_DEGRADED_RETRY_AFTER_S } from "../types";
 import type {
   AppContext,
+  Env,
   Logger,
+  PoolHealthResponse,
   RelayErrorCode,
   RelayErrorResponse,
   RelaySuccessResponse,
@@ -247,5 +249,30 @@ export class BaseEndpoint extends OpenAPIRoute {
     }
 
     return c.json(response, opts.status as 400 | 401 | 402 | 404 | 409 | 422 | 429 | 500 | 502 | 503 | 504);
+  }
+
+  /**
+   * Query NonceDO /pool-health and derive a tiered retryAfter value based on how many
+   * wallets have their circuit breaker open. Returns 30 (neutral default) if NonceDO
+   * is not configured or the call fails, so this never blocks the error path.
+   */
+  protected async getPoolPressureRetryAfter(env: Env): Promise<number> {
+    if (!env.NONCE_DO) {
+      return 30;
+    }
+    try {
+      const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+      const res = await stub.fetch("https://nonce-do/pool-health", { method: "GET" });
+      if (!res.ok) {
+        return 30;
+      }
+      const health = (await res.json()) as PoolHealthResponse;
+      const circuitBrokenCount = health.wallets.filter((w) => w.circuitBreakerOpen).length;
+      if (health.allWalletsDegraded || circuitBrokenCount >= 6) return 60;
+      if (circuitBrokenCount >= 3) return 30;
+      return 10;
+    } catch {
+      return 30;
+    }
   }
 }
