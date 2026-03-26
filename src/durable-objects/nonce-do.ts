@@ -3501,7 +3501,7 @@ export class NonceDO {
     // When all wallets are consistent with chain state, reset cumulative conflict counters.
     // This prevents stale conflict state from permanently poisoning health checks.
     const allClean = wallets.every(w => !w.changed);
-    if (allClean) {
+    if (allClean && this.getStoredCount(STATE_KEYS.conflictsDetected) > 0) {
       this.clearConflictCounters("all_wallets_consistent_with_chain");
     }
 
