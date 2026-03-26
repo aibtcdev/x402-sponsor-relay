@@ -610,10 +610,13 @@ export class SponsorService {
       };
     }
 
-    // Extract sender address for rate limiting
-    const senderAddress = Buffer.from(
-      transaction.auth.spendingCondition.signer
-    ).toString("hex");
+    // Derive a proper c32check-encoded Stacks address from the signer hash160.
+    // Uses the same hashMode-aware derivation as validateNonSponsoredTransaction()
+    // so the address format is consistent across sponsored and self-pay paths.
+    const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+    const { hashMode, signer } = transaction.auth.spendingCondition;
+    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
+    const senderAddress = addressToString(addressFromVersionHash(version, signer));
 
     return {
       valid: true,

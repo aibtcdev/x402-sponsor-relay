@@ -198,7 +198,11 @@ export class Settle extends BaseEndpoint {
         parsedTx = deserializeTransaction(stripHexPrefix(txHex));
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        logger.warn("Failed to deserialize transaction for sponsor-slot inspection", { error: errMsg });
+        logger.warn("Failed to deserialize transaction for sponsor-slot inspection", {
+          error: errMsg,
+          txHexLength: txHex.length,
+          txHexPrefix: stripHexPrefix(txHex).slice(0, 20),
+        });
         c.executionCtx.waitUntil(
           Promise.all([
             statsService.recordError("validation"),
