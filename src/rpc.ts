@@ -214,6 +214,21 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
 
+    // Duplicate nonce — reject to avoid wasting a sponsor slot
+    if (nonceCheck.outcome === "duplicate") {
+      return {
+        accepted: false,
+        error: `Your transaction uses nonce ${nonceCheck.provided}, which is already in-flight (last seen: ${nonceCheck.lastSeen}). Wait for the previous transaction to confirm or expire before resubmitting.`,
+        code: "SENDER_NONCE_DUPLICATE",
+        retryable: false,
+        senderNonce: {
+          provided: nonceCheck.provided,
+          expected: nonceCheck.lastSeen + 1,
+          healthy: false,
+        },
+      };
+    }
+
     // Build sender nonce info for the response
     let senderNonceInfo: SenderNonceInfo;
     let warning: SubmitPaymentResult["warning"];
@@ -236,16 +251,10 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
         help: nonceCheck.help,
         action: nonceCheck.action,
       };
-    } else if (
-      nonceCheck.outcome === "healthy" ||
-      nonceCheck.outcome === "duplicate"
-    ) {
+    } else if (nonceCheck.outcome === "healthy") {
       senderNonceInfo = {
         provided: nonceCheck.provided,
-        expected:
-          nonceCheck.outcome === "healthy"
-            ? nonceCheck.expected
-            : nonceCheck.provided,
+        expected: nonceCheck.expected,
         healthy: true,
       };
     } else {

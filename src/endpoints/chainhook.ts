@@ -107,7 +107,15 @@ export class Chainhook extends BaseEndpoint {
       ? authHeader.slice(7)
       : authHeader;
 
-    if (providedToken !== authToken) {
+    // Timing-safe comparison to prevent side-channel attacks
+    const encoder = new TextEncoder();
+    const aBytes = encoder.encode(providedToken);
+    const bBytes = encoder.encode(authToken);
+    const isValid =
+      aBytes.byteLength === bBytes.byteLength &&
+      crypto.subtle.timingSafeEqual(aBytes, bBytes);
+
+    if (!isValid) {
       return this.err(c, {
         error: "Invalid authentication token",
         code: "INVALID_API_KEY",
