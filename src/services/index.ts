@@ -36,3 +36,29 @@ export { SettlementService } from "./settlement";
 export { SettlementHealthService } from "./settlement-health";
 
 export { PaymentIdService } from "./payment-identifier";
+
+export {
+  generatePaymentId,
+  createPaymentRecord,
+  transitionPayment,
+  getPaymentRecord,
+  putPaymentRecord,
+} from "./payment-status";
+export type {
+  PaymentStatus,
+  PaymentRecord,
+  PaymentQueueMessage,
+  SenderNonceInfo,
+} from "./payment-status";
+
+export {
+  checkSenderNonce,
+  updateSenderNonceOnBroadcast,
+  updateSenderNonceOnConfirm,
+  seedSenderNonceFromHiro,
+  hiroNonceUrl,
+} from "./sender-nonce";
+export type {
+  SenderNonceCache,
+  SenderNonceCheckResult,
+} from "./sender-nonce";

@@ -74,6 +74,12 @@ export interface Env {
   NONCE_DO?: DurableObjectNamespace;
   // Durable Object namespace for atomic stats (replaces KV read-modify-write)
   STATS_DO?: DurableObjectNamespace;
+  // Queue for serial payment processing (eliminates nonce contention)
+  PAYMENT_QUEUE?: Queue;
+  // Auth token for Hiro chainhook webhooks
+  CHAINHOOK_AUTH_TOKEN?: string;
+  // Base URL for payment status check URLs (e.g. "https://x402-relay.aibtc.dev")
+  RELAY_BASE_URL?: string;
 }
 
 /**
@@ -564,6 +570,7 @@ export type RelayErrorCode =
   | "SIGNATURE_VALIDATION_FAILED"
   | "NOT_FOUND"
   | "INTERNAL_ERROR"
+  | "INVALID_PAYLOAD"
   | "MISSING_API_KEY"
   | "INVALID_API_KEY"
   | "EXPIRED_API_KEY"
