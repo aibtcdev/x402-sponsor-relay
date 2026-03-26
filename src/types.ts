@@ -556,6 +556,7 @@ export type RelayErrorCode =
   | "SETTLEMENT_VERIFICATION_FAILED"
   | "SETTLEMENT_BROADCAST_FAILED"
   | "NONCE_CONFLICT"
+  | "TOO_MUCH_CHAINING"
   | "SETTLEMENT_FAILED"
   | "CLIENT_INSUFFICIENT_FUNDS"
   | "CLIENT_BAD_NONCE"
@@ -1150,9 +1151,57 @@ export type BroadcastAndConfirmResult =
       details: string;
       retryable: boolean;
       nonceConflict?: boolean;
+      /** Sponsor wallet hit TooMuchChaining — relay-side congestion, retryable after backoff */
+      tooMuchChaining?: boolean;
       /** Matched Stacks node rejection reason (e.g. "NotEnoughFunds") when the 4xx
        *  rejection was caused by the client submitting an invalid transaction. */
       clientRejection?: string;
       nodeUrl?: string;
       httpStatus?: number;
     };
+
+/**
+ * Result from broadcast-only (no polling).
+ * Success case returns txid; error case matches the error arm of BroadcastAndConfirmResult.
+ */
+export type BroadcastOnlyResult =
+  | { txid: string }
+  | {
+      error: string;
+      details: string;
+      retryable: boolean;
+      nonceConflict?: boolean;
+      tooMuchChaining?: boolean;
+      clientRejection?: string;
+      nodeUrl?: string;
+      httpStatus?: number;
+    };
+
+/**
+ * Transaction status record stored in KV for the /settle/status/:txid endpoint.
+ * Written after broadcast, updated by background polling in waitUntil().
+ */
+export interface TxStatusRecord {
+  /** On-chain transaction ID */
+  txid: string;
+  /** Current settlement status */
+  status: "broadcast" | "pending" | "confirmed" | "failed";
+  /** Payer Stacks address */
+  payer?: string;
+  /** CAIP-2 network identifier */
+  network: string;
+  /** Sponsor wallet index (if auto-sponsored) */
+  walletIndex?: number;
+  /** Sponsor nonce used (if auto-sponsored) */
+  sponsorNonce?: number | null;
+  /** Sponsor fee in microSTX (if auto-sponsored) */
+  sponsorFee?: string;
+  /** ISO timestamp of broadcast */
+  broadcastAt: string;
+  /** ISO timestamp of confirmation */
+  confirmedAt?: string;
+  /** Block height (if confirmed) */
+  blockHeight?: number;
+  /** Error reason (if failed) */
+  errorReason?: string;
+}

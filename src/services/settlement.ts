@@ -20,6 +20,8 @@ import type {
   SettlementVerifyResult,
   DedupResult,
   BroadcastAndConfirmResult,
+  BroadcastOnlyResult,
+  TxStatusRecord,
 } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, CLIENT_REJECTION_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
@@ -75,6 +77,11 @@ const DEDUP_TTL_SECONDS = 300;
 const DEDUP_KEY_PREFIX = "dedup:";
 /** Only verify liveness of pending dedup entries older than this (ms) */
 const DEDUP_LIVENESS_AGE_MS = 60_000;
+
+// KV tx status configuration (for /settle/status/:txid)
+const TX_STATUS_KEY_PREFIX = "txstatus:";
+/** TTL for tx status records — 24 hours, long enough for callers to poll */
+const TX_STATUS_TTL_SECONDS = 86_400;
 
 /** Shape of Hiro GET /extended/v1/tx/{txid} response (subset) */
 interface HiroTxResponse {
@@ -545,10 +552,65 @@ export class SettlementService {
    *   "pending" response before their own timeout fires, avoiding 500 empty-body errors.
    *   Capped at MAX_POLL_TIME_MS (300s) to prevent unbounded waits.
    */
+  /**
+   * Broadcast a transaction without polling for confirmation.
+   * Returns immediately after the Stacks node accepts (or rejects) the transaction.
+   * Use this when the caller will handle confirmation polling separately (e.g. via waitUntil).
+   */
+  async broadcastOnly(
+    transaction: StacksTransactionWire,
+  ): Promise<BroadcastOnlyResult> {
+    // Pass 0 to skip polling entirely — broadcastAndConfirm returns {txid, status:"pending"}
+    const result = await this.broadcastAndConfirm(transaction, 0);
+    if ("error" in result) return result;
+    return { txid: result.txid };
+  }
+
+  /**
+   * Poll a previously-broadcast transaction for confirmation.
+   * Public wrapper around the private pollForConfirmation method.
+   * Used by waitUntil() background tasks after broadcastOnly() returns.
+   */
+  async pollForConfirmationPublic(
+    txid: string,
+    maxPollTimeMs?: number,
+  ): Promise<BroadcastAndConfirmResult> {
+    const effectivePollTimeMs = maxPollTimeMs != null && maxPollTimeMs > 0
+      ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
+      : DEFAULT_POLL_TIME_MS;
+
+    const hiroHeaders = getHiroHeaders(this.env.HIRO_API_KEY);
+    const hiroPollBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
+    const pollUrl = `${hiroPollBaseUrl}/extended/v1/tx/${txid}`;
+    const perRoundBudgetMs = Math.floor(effectivePollTimeMs / POLL_RETRY_ROUNDS);
+    const overallStartTime = Date.now();
+
+    for (let round = 1; round <= POLL_RETRY_ROUNDS; round++) {
+      const overallRemaining = effectivePollTimeMs - (Date.now() - overallStartTime);
+      if (overallRemaining <= 0) break;
+      const roundBudgetMs = Math.min(perRoundBudgetMs, overallRemaining);
+      const delay = round === 1 ? 0 : INITIAL_POLL_DELAY_MS;
+
+      if (round > 1) {
+        this.logger.info("Retrying confirmation polling (background)", {
+          txid, round, maxRounds: POLL_RETRY_ROUNDS, roundBudgetMs,
+        });
+      }
+
+      const roundResult = await this.pollForConfirmation(txid, pollUrl, hiroHeaders, roundBudgetMs, delay);
+      if (roundResult !== null) return roundResult;
+    }
+
+    return { txid, status: "pending" };
+  }
+
   async broadcastAndConfirm(
     transaction: StacksTransactionWire,
     maxPollTimeMs?: number
   ): Promise<BroadcastAndConfirmResult> {
+    // When maxPollTimeMs is explicitly 0, skip polling entirely (broadcast-only mode).
+    const skipPolling = maxPollTimeMs === 0;
+
     // Resolve effective poll time: caller override (capped at ceiling) or default
     const effectivePollTimeMs = maxPollTimeMs != null && maxPollTimeMs > 0
       ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
@@ -736,6 +798,27 @@ export class SettlementService {
               };
             }
 
+            // TooMuchChaining: the sender (sponsor or client) has too many pending txs.
+            // On sponsor-side this is relay congestion — retryable after backoff.
+            // clientRejection is intentionally omitted so stats don't attribute this to the client.
+            // On self-pay this falls through to clientRejection handling below.
+            if (matchedReason === "TooMuchChaining" && sponsorNonceForLog !== null) {
+              this.logger.warn("Sponsor wallet chaining limit hit (TooMuchChaining)", {
+                status: broadcastResponse.status,
+                details: errorDetails,
+                sponsorNonce: sponsorNonceForLog,
+                nodeUrl: target.baseUrl,
+              });
+              return {
+                error: "Sponsor wallet congested — too many pending transactions",
+                details: errorDetails,
+                retryable: true,
+                tooMuchChaining: true,
+                nodeUrl: target.baseUrl,
+                httpStatus: broadcastResponse.status,
+              };
+            }
+
             if (matchedReason) {
               this.logger.warn("Broadcast rejected by node (client error), not retrying", {
                 status: broadcastResponse.status,
@@ -842,6 +925,11 @@ export class SettlementService {
         lastError: "error" in lastBroadcastError ? lastBroadcastError.details : "unknown",
       });
       return lastBroadcastError;
+    }
+
+    // Skip polling if caller requested broadcast-only mode (maxPollTimeMs === 0)
+    if (skipPolling) {
+      return { txid, status: "pending" };
     }
 
     // Poll for confirmation with exponential backoff and retry rounds.
@@ -1208,6 +1296,92 @@ export class SettlementService {
       this.logger.warn("Error recording dedup in KV", {
         error: e instanceof Error ? e.message : String(e),
       });
+    }
+  }
+
+  // ===========================================================================
+  // Transaction status KV methods (for GET /settle/status/:txid)
+  // ===========================================================================
+
+  /**
+   * Store a transaction status record in KV.
+   * Called immediately after broadcast, then updated by background polling.
+   */
+  async recordTxStatus(record: TxStatusRecord): Promise<void> {
+    if (!this.env.RELAY_KV) return;
+    try {
+      const key = `${TX_STATUS_KEY_PREFIX}${record.txid}`;
+      await this.env.RELAY_KV.put(key, JSON.stringify(record), {
+        expirationTtl: TX_STATUS_TTL_SECONDS,
+      });
+    } catch (e) {
+      this.logger.warn("Error recording tx status in KV", {
+        error: e instanceof Error ? e.message : String(e),
+        txid: record.txid,
+      });
+    }
+  }
+
+  /**
+   * Retrieve a transaction status record from KV.
+   */
+  async getTxStatus(txid: string): Promise<TxStatusRecord | null> {
+    if (!this.env.RELAY_KV) return null;
+    try {
+      const key = `${TX_STATUS_KEY_PREFIX}${txid}`;
+      const raw = await this.env.RELAY_KV.get(key);
+      if (!raw) return null;
+      return JSON.parse(raw) as TxStatusRecord;
+    } catch (e) {
+      this.logger.warn("Error reading tx status from KV", {
+        error: e instanceof Error ? e.message : String(e),
+        txid,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Update a transaction status record in KV (partial update).
+   */
+  async updateTxStatus(txid: string, update: Partial<TxStatusRecord>): Promise<void> {
+    if (!this.env.RELAY_KV) return;
+    try {
+      const existing = await this.getTxStatus(txid);
+      if (!existing) return;
+      const updated = { ...existing, ...update };
+      const key = `${TX_STATUS_KEY_PREFIX}${txid}`;
+      await this.env.RELAY_KV.put(key, JSON.stringify(updated), {
+        expirationTtl: TX_STATUS_TTL_SECONDS,
+      });
+    } catch (e) {
+      this.logger.warn("Error updating tx status in KV", {
+        error: e instanceof Error ? e.message : String(e),
+        txid,
+      });
+    }
+  }
+
+  /**
+   * Fetch current transaction status from Hiro API.
+   * Returns the tx_status string and optional block_height, or null on failure.
+   */
+  async fetchHiroTxStatus(txid: string): Promise<{ txStatus: string; blockHeight?: number } | null> {
+    try {
+      const hiroBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
+      const url = `${hiroBaseUrl}/extended/v1/tx/${txid}`;
+      const response = await fetch(url, {
+        headers: getHiroHeaders(this.env.HIRO_API_KEY),
+        signal: AbortSignal.timeout(HIRO_LIVENESS_TIMEOUT_MS),
+      });
+      if (!response.ok) return null;
+      const data = (await response.json()) as HiroTxResponse;
+      return {
+        txStatus: data.tx_status ?? "unknown",
+        blockHeight: data.block_height,
+      };
+    } catch {
+      return null;
     }
   }
 }

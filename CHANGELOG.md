@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.22.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.22.1...x402-sponsor-relay-v1.22.2) (2026-03-25)
+
+
+### Bug Fixes
+
+* **nonce-do:** guard stale reconciliation against in-flight nonces ([#215](https://github.com/aibtcdev/x402-sponsor-relay/issues/215)) ([8296e49](https://github.com/aibtcdev/x402-sponsor-relay/commit/8296e495e2bb87e5da57c5093dd11c92721897f6))
+* **nonce:** count in-flight nonces correctly, make TooMuchChaining retryable ([#219](https://github.com/aibtcdev/x402-sponsor-relay/issues/219)) ([5fa6a9b](https://github.com/aibtcdev/x402-sponsor-relay/commit/5fa6a9bb4950262394938693d9874e7d7adba54e))
+
+## [1.22.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.22.0...x402-sponsor-relay-v1.22.1) (2026-03-24)
+
+
+### Bug Fixes
+
+* **sponsor:** add broadcast retry with backoff and raw response logging ([#212](https://github.com/aibtcdev/x402-sponsor-relay/issues/212)) ([bc0e49f](https://github.com/aibtcdev/x402-sponsor-relay/commit/bc0e49f4b8252af2f0920943557dd6ecf8cda068))
+
+## [1.22.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.21.1...x402-sponsor-relay-v1.22.0) (2026-03-24)
+
+
+### Features
+
+* increase sponsor wallet pool from 5 to 10 ([#209](https://github.com/aibtcdev/x402-sponsor-relay/issues/209)) ([0ce4475](https://github.com/aibtcdev/x402-sponsor-relay/commit/0ce44757198761573837cd5df428b1f399dcdd54))
+* **settle:** auto-detect and sponsor transactions with empty sponsor auth ([#205](https://github.com/aibtcdev/x402-sponsor-relay/issues/205)) ([f0fe7ce](https://github.com/aibtcdev/x402-sponsor-relay/commit/f0fe7ce4382477b3630f48afb000f650b938744c))
+* **settle:** return after broadcast, add GET /settle/status/:txid ([#208](https://github.com/aibtcdev/x402-sponsor-relay/issues/208)) ([a2fa247](https://github.com/aibtcdev/x402-sponsor-relay/commit/a2fa247beb8e94b0469a2e068060f85313fbd893))
+
 ## [1.21.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.21.0...x402-sponsor-relay-v1.21.1) (2026-03-24)
 
 

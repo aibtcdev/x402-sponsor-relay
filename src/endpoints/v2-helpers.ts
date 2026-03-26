@@ -355,6 +355,8 @@ export function mapClientRejectionToV2Code(clientRejection: string): string {
       return X402_V2_ERROR_CODES.CLIENT_BAD_NONCE;
     case "ConflictingNonceInMempool":
       return X402_V2_ERROR_CODES.CONFLICTING_NONCE;
+    case "TooMuchChaining":
+      return X402_V2_ERROR_CODES.BROADCAST_FAILED;
     default:
       return X402_V2_ERROR_CODES.TRANSACTION_FAILED;
   }

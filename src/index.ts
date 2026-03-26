@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, NonceHistory, NonceSurgeHistory, Settle, VerifyV2, Supported, Wallets } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -27,6 +27,8 @@ app.use("/fees/config", authMiddleware);
 app.use("/fees/config", requireAuthMiddleware);
 app.use("/nonce/reset", authMiddleware);
 app.use("/nonce/reset", requireAuthMiddleware);
+app.use("/nonce/fill-gaps/:wallet", authMiddleware);
+app.use("/nonce/fill-gaps/:wallet", requireAuthMiddleware);
 
 // Initialize Chanfana for OpenAPI documentation
 const openapi = fromHono(app, {
@@ -93,9 +95,11 @@ openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 openapi.get("/stats/transactions", TransactionLog as unknown as typeof TransactionLog);
 openapi.get("/nonce/stats", NonceStatsEndpoint as unknown as typeof NonceStatsEndpoint);
 openapi.post("/nonce/reset", NonceReset as unknown as typeof NonceReset);
+openapi.post("/nonce/fill-gaps/:wallet", NonceFillGaps as unknown as typeof NonceFillGaps);
 openapi.get("/nonce/history/:wallet/:nonce", NonceHistory as unknown as typeof NonceHistory);
 openapi.get("/nonce/surge-history", NonceSurgeHistory as unknown as typeof NonceSurgeHistory);
 openapi.post("/settle", Settle as unknown as typeof Settle);
+openapi.get("/settle/status/:txid", SettleStatus as unknown as typeof SettleStatus);
 // Note: POST /verify (V2 facilitator) and GET /verify/:receiptId (receipt check)
 // share the /verify path but use different HTTP methods — no route collision.
 openapi.post("/verify", VerifyV2 as unknown as typeof VerifyV2);
@@ -134,10 +138,12 @@ app.get("/", (c) => {
       transactionLog: "GET /stats/transactions - Recent individual transactions",
       nonceStats: "GET /nonce/stats - Nonce coordinator stats",
       nonceReset: "POST /nonce/reset - Trigger on-demand nonce recovery (admin, requires API key)",
+      nonceFillGaps: "POST /nonce/fill-gaps/:wallet - Fill gaps for a specific wallet (admin, requires API key)",
       nonceSurgeHistory: "GET /nonce/surge-history - Surge event history for capacity planning",
       dashboard: "GET /dashboard - Public dashboard (HTML)",
       wallets: "GET /wallets - Sponsor wallet status (balance, fees, pool)",
       settle: "POST /settle - x402 V2 facilitator settle",
+      settleStatus: "GET /settle/status/:txid - Transaction settlement status",
       verifyV2: "POST /verify - x402 V2 facilitator verify",
       supported: "GET /supported - x402 V2 supported payment kinds",
     },

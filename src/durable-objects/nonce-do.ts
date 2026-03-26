@@ -161,6 +161,10 @@ interface WalletUtilization {
   failed_count: number;
   /** Time window in hours */
   window_hours: number;
+  /** Chain gap headroom (CHAINING_LIMIT - (head - chainFrontier)), null if no frontier */
+  chain_gap_headroom: number | null;
+  /** Monotonic chain frontier (highest confirmed nonce from Hiro) */
+  chain_frontier: number | null;
 }
 
 interface NonceStatsResponse {
@@ -240,6 +244,8 @@ const DEFAULT_FLUSH_RECIPIENT_MAINNET = "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTA
 const DEFAULT_FLUSH_RECIPIENT_TESTNET = "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB";
 /** Maximum number of gap-fill broadcasts per alarm cycle per wallet */
 const MAX_GAP_FILLS_PER_ALARM = 5;
+/** Maximum gap-fills per admin /fill-gaps call (prevents DO stall on degenerate ranges) */
+const MAX_ADMIN_GAP_FILLS = 50;
 /**
  * Age threshold for considering a mempool transaction "stuck" (15 minutes).
  * Transactions that remain pending beyond this window have a very low confirmation
@@ -357,6 +363,17 @@ export class NonceDO {
   private readonly env: Env;
   /** Per-wallet cache of Hiro possible_next_nonce to avoid redundant API calls */
   private readonly hiroNonceCache = new Map<number, { value: number; expiresAt: number }>();
+
+  /**
+   * Monotonic chain frontier per wallet — the highest `possible_next_nonce` ever
+   * observed from Hiro for each wallet. Only advances forward (Math.max), so
+   * load-balanced Hiro nodes returning stale/inconsistent values can never regress it.
+   *
+   * Used for O(1) headroom calculation: headroom = CHAINING_LIMIT - (head - chainFrontier).
+   * Stored in nonce_state as `chain_frontier:{walletIndex}` for persistence across restarts.
+   * Also cached in-memory for fast reads during nonce assignment.
+   */
+  private readonly chainFrontierCache = new Map<number, number>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.state = ctx;
@@ -856,7 +873,7 @@ export class NonceDO {
       if (walletCount === 0) return;
 
       const poolCapacity = walletCount * CHAINING_LIMIT;
-      const totalReserved = this.ledgerTotalReservedForWallets(walletCount);
+      const totalReserved = this.poolTotalReserved(walletCount);
       const overallPressure = poolCapacity > 0 ? totalReserved / poolCapacity : 0;
       const pressurePct = Math.round(overallPressure * 100);
       const now = new Date().toISOString();
@@ -975,8 +992,8 @@ export class NonceDO {
 
       // Check if ALL wallets are above the scale-up threshold
       for (let wi = 0; wi < initializedCount; wi++) {
-        const reserved = this.ledgerReservedCount(wi);
-        const pressure = reserved / CHAINING_LIMIT;
+        const headroom = this.walletHeadroom(wi);
+        const pressure = 1 - (headroom / CHAINING_LIMIT);
         if (pressure < SCALE_UP_THRESHOLD) {
           return; // At least one wallet has capacity — no scale-up needed
         }
@@ -1297,6 +1314,7 @@ export class NonceDO {
         value: info.possible_next_nonce,
         expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
       });
+      this.advanceChainFrontier(walletIndex, info.possible_next_nonce);
       return info.possible_next_nonce;
     } catch (_e) {
       this.log("debug", "nonce_lookahead_check_skipped", {
@@ -1321,9 +1339,8 @@ export class NonceDO {
   // ---------------------------------------------------------------------------
 
   /**
-   * Count in-flight nonces for a specific wallet from the ledger.
-   * 'assigned' state = nonce was handed out but not yet released.
-   * Used for chaining-limit checks and pool-pressure calculations.
+   * Count nonces in 'assigned' state only (handed out, not yet broadcast).
+   * Used for diagnostics/logging — NOT for chaining-limit decisions.
    */
   private ledgerReservedCount(walletIndex: number): number {
     const rows = this.sql
@@ -1336,14 +1353,18 @@ export class NonceDO {
   }
 
   /**
-   * Count in-flight nonces across all wallets with index < walletCount.
-   * Used to compute totalReserved (pool pressure signal) in assignNonce().
+   * Count all in-flight nonces for a wallet: 'assigned' (handed out, awaiting broadcast),
+   * 'broadcasted' (accepted by node, in mempool), and 'confirmed' (broadcast succeeded,
+   * nonce consumed — still pending on-chain despite the ledger state name).
+   * The Stacks node's TooMuchChaining limit (25) counts ALL pending txs from a sender,
+   * so chaining-limit decisions must count all three states.
+   * Used as the fallback when chain frontier is not yet available (cold start).
    */
-  private ledgerTotalReservedForWallets(walletCount: number): number {
+  private ledgerInFlightCount(walletIndex: number): number {
     const rows = this.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index < ? AND state = 'assigned'",
-        walletCount
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')",
+        walletIndex
       )
       .toArray();
     return rows[0]?.count ?? 0;
@@ -1841,6 +1862,86 @@ export class NonceDO {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Chain frontier — monotonic high-water mark of Hiro's possible_next_nonce.
+  // Used for O(1) headroom calculation without SQL or API calls.
+  // ---------------------------------------------------------------------------
+
+  private chainFrontierKey(walletIndex: number): string {
+    return `chain_frontier:${walletIndex}`;
+  }
+
+  /**
+   * Read the chain frontier for a wallet. Checks in-memory cache first,
+   * falls back to persistent nonce_state. Returns null if never observed.
+   */
+  private getChainFrontier(walletIndex: number): number | null {
+    const cached = this.chainFrontierCache.get(walletIndex);
+    if (cached !== undefined) return cached;
+    const stored = this.getStateValue(this.chainFrontierKey(walletIndex));
+    if (stored !== null) this.chainFrontierCache.set(walletIndex, stored);
+    return stored;
+  }
+
+  /**
+   * Advance the chain frontier for a wallet. Only moves forward (monotonic).
+   * Called on every Hiro observation to absorb the highest confirmed nonce,
+   * filtering out load-balanced inconsistency where a stale node returns a
+   * lower value.
+   */
+  private advanceChainFrontier(walletIndex: number, hiroNextNonce: number): void {
+    const current = this.getChainFrontier(walletIndex);
+    const next = current !== null ? Math.max(current, hiroNextNonce) : hiroNextNonce;
+    if (current === next) return; // no change
+    this.chainFrontierCache.set(walletIndex, next);
+    this.setStateValue(this.chainFrontierKey(walletIndex), next);
+  }
+
+  /**
+   * Compute headroom for a wallet using the chain frontier (O(1), no SQL).
+   * headroom = CHAINING_LIMIT - (assignmentHead - chainFrontier)
+   *
+   * The gap (head - frontier) represents all nonces that are outstanding:
+   * assigned, broadcasted, confirmed-but-pending, and silently-failed.
+   * This naturally errs conservative — failed broadcasts inflate the gap
+   * until reconciliation cleans them up.
+   *
+   * Returns null if no chain frontier exists (cold start) — caller should
+   * fall back to ledgerInFlightCount().
+   */
+  private headroomFromChainGap(walletIndex: number): number | null {
+    const frontier = this.getChainFrontier(walletIndex);
+    if (frontier === null) return null;
+    const head = this.ledgerGetWalletHead(walletIndex);
+    if (head === null) return null;
+    // Clamp gap to [0, ∞) — frontier can exceed head if Hiro advances
+    // before the ledger head is forward-bumped, making gap negative.
+    const gap = Math.max(0, head - frontier);
+    return Math.max(0, Math.min(CHAINING_LIMIT, CHAINING_LIMIT - gap));
+  }
+
+  /**
+   * Effective headroom for a wallet — how many more nonces it can accept.
+   * Prefers the O(1) chain-gap calculation; falls back to SQL-based
+   * ledgerInFlightCount on cold start (no frontier yet).
+   */
+  private walletHeadroom(walletIndex: number): number {
+    return this.headroomFromChainGap(walletIndex) ?? (CHAINING_LIMIT - this.ledgerInFlightCount(walletIndex));
+  }
+
+  /**
+   * Sum effective headroom across `walletCount` wallets and derive the
+   * aggregate reserved count (poolCapacity - totalHeadroom).
+   * Used for pool-pressure signaling in both assignNonce and checkAndRecordSurge.
+   */
+  private poolTotalReserved(walletCount: number): number {
+    let totalHeadroom = 0;
+    for (let wi = 0; wi < walletCount; wi++) {
+      totalHeadroom += this.walletHeadroom(wi);
+    }
+    return (walletCount * CHAINING_LIMIT) - totalHeadroom;
+  }
+
   /**
    * Initialize the per-wallet nonce head from Hiro if not yet seeded.
    * Returns the head nonce to use for the first assignment.
@@ -1854,6 +1955,7 @@ export class NonceDO {
     const nonceInfo = await this.fetchNonceInfo(sponsorAddress);
     const seedNonce = nonceInfo.possible_next_nonce;
     this.ledgerAdvanceWalletHead(walletIndex, seedNonce);
+    this.advanceChainFrontier(walletIndex, seedNonce);
     return seedNonce;
   }
 
@@ -1937,13 +2039,13 @@ export class NonceDO {
           continue;
         }
 
-        const reserved = this.ledgerReservedCount(walletIndex);
-        if (reserved < CHAINING_LIMIT) {
+        const headroom = this.walletHeadroom(walletIndex);
+        if (headroom > 0) {
           // Collect all eligible wallets; select by headroom after full scan
-          eligibleWallets.push({ walletIndex, headroom: CHAINING_LIMIT - reserved });
+          eligibleWallets.push({ walletIndex, headroom });
         } else {
           // This wallet is at its chaining limit; accumulate depth for error reporting
-          totalMempoolDepth += reserved;
+          totalMempoolDepth += CHAINING_LIMIT - headroom; // headroom is 0 (or negative on fallback path)
         }
         walletIndex = (walletIndex + 1) % effectiveWalletCount;
         attempts++;
@@ -1972,7 +2074,7 @@ export class NonceDO {
         // If there are degraded-but-not-full wallets, use the least-degraded one as fallback
         // rather than failing with a misleading CHAINING_LIMIT_EXCEEDED error.
         const degradedNotFull = degradedWallets.filter(
-          (d) => this.ledgerReservedCount(d.walletIndex) < CHAINING_LIMIT
+          (d) => this.walletHeadroom(d.walletIndex) > 0
         );
         if (degradedNotFull.length > 0) {
           // Sort ascending by cycleCount, pick least-degraded wallet
@@ -2018,16 +2120,16 @@ export class NonceDO {
       // nonces ahead of Hiro's possible_next_nonce. This prevents runaway pre-assignment.
       // Fail-open when Hiro is unreachable (hiroNextNonce === null).
       if (hiroNextNonce !== null && assignedNonce > hiroNextNonce + LOOKAHEAD_GUARD_BUFFER) {
-        const reservedCount = this.ledgerReservedCount(walletIndex);
+        const inFlightCount = this.ledgerInFlightCount(walletIndex);
         this.log("warn", "nonce_lookahead_capped", {
           walletIndex,
           assignedNonce,
           hiroNextNonce,
           limit: hiroNextNonce + LOOKAHEAD_GUARD_BUFFER,
-          reservedCount,
+          inFlightCount,
         });
         // Treat this the same as chaining limit — caller returns 429 so agent can retry
-        throw new ChainingLimitError(reservedCount);
+        throw new ChainingLimitError(inFlightCount);
       }
 
       // Advance the stored head to assignedNonce + 1 (next wallet assignment)
@@ -2042,6 +2144,7 @@ export class NonceDO {
         walletIndex,
         nonce: assignedNonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
+        chainGapHeadroom: this.headroomFromChainGap(walletIndex),
         nextHead: assignedNonce + 1,
       });
 
@@ -2049,7 +2152,7 @@ export class NonceDO {
       await this.setNextWalletIndex((walletIndex + 1) % effectiveWalletCount);
 
       // Compute totalReserved across all wallets for pool pressure signaling.
-      const totalReserved = this.ledgerTotalReservedForWallets(effectiveWalletCount);
+      const totalReserved = this.poolTotalReserved(effectiveWalletCount);
 
       this.log("debug", "nonce_pool_pressure", {
         walletIndex,
@@ -2328,6 +2431,8 @@ export class NonceDO {
         confirmed_count: counts.confirmed,
         failed_count: counts.failed + counts.conflict,
         window_hours: 1,
+        chain_gap_headroom: this.headroomFromChainGap(walletIndex),
+        chain_frontier: this.getChainFrontier(walletIndex),
       });
     }
 
@@ -2416,6 +2521,7 @@ export class NonceDO {
       value: nonceInfo.possible_next_nonce,
       expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
     });
+    this.advanceChainFrontier(walletIndex, nonceInfo.possible_next_nonce);
 
     const previousNonce = this.ledgerGetWalletHead(walletIndex);
 
@@ -2815,15 +2921,29 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
-    // Execute gap-fills for nonces not in our ledger or in failed state
+    // Execute gap-fills for nonces not in our ledger or in failed state.
+    // Throttle against mempool depth: each gap-fill adds a pending tx, so stop
+    // before hitting the relay's CHAINING_LIMIT (20), which is set below the node's
+    // TooMuchChaining limit of 25 pending transactions.
     // -------------------------------------------------------------------------
     const gapFillFilled: number[] = [];
     if (gapFillNonces.length > 0) {
+      // Use walletHeadroom (chain-gap preferred, SQL fallback) — same as assignment path.
+      const headroom = this.walletHeadroom(walletIndex);
+      const gapFillBudget = Math.max(0, headroom);
+      if (gapFillBudget === 0) {
+        this.log("info", "gap_fill_throttled", {
+          walletIndex,
+          headroom,
+          chainingLimit: CHAINING_LIMIT,
+          gapCount: gapFillNonces.length,
+        });
+      }
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
       const gapsToFill = gapFillNonces
         .slice()
         .sort((a, b) => a - b)
-        .slice(0, MAX_GAP_FILLS_PER_ALARM);
+        .slice(0, Math.min(MAX_GAP_FILLS_PER_ALARM, gapFillBudget));
       if (privateKey) {
         for (const gapNonce of gapsToFill) {
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
@@ -2907,23 +3027,47 @@ export class NonceDO {
         };
       }
 
-      this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
+      // Guard: don't reset past nonces that were actually broadcast and may still
+      // be pending in the mempool. Hiro's possible_next_nonce can lag behind the
+      // mempool, so resetting to it would re-assign nonces that are still in-flight,
+      // causing ConflictingNonceInMempool on the next broadcast.
+      const highestInFlight = this.sql
+        .exec<{ max_nonce: number | null }>(
+          `SELECT MAX(nonce) as max_nonce FROM nonce_intents
+           WHERE wallet_index = ? AND nonce >= ? AND nonce < ?
+             AND state IN ('broadcasted', 'assigned')`,
+          walletIndex,
+          possible_next_nonce,
+          previousNonce
+        )
+        .toArray()[0]?.max_nonce ?? null;
+
+      // If there are in-flight nonces above Hiro's value, reset to just past
+      // the highest one instead of blindly trusting Hiro.
+      const guarded = highestInFlight !== null;
+      const safeResetTarget = guarded
+        ? Math.max(possible_next_nonce, highestInFlight + 1)
+        : possible_next_nonce;
+
+      this.ledgerAdvanceWalletHead(walletIndex, safeResetTarget);
       this.incrementCounter(STATE_KEYS.conflictsDetected);
 
+      const idleSeconds = Math.round(idleMs / 1000);
       this.log("warn", "nonce_reconcile_stale", {
         walletIndex,
         previousNonce,
-        newNonce: possible_next_nonce,
-        idleSeconds: Math.round(idleMs / 1000),
+        newNonce: safeResetTarget,
+        idleSeconds,
         hiroNextNonce: possible_next_nonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
+        ...(guarded && { highestInFlight }),
       });
 
       return {
         previousNonce,
-        newNonce: possible_next_nonce,
+        newNonce: safeResetTarget,
         changed: true,
-        reason: `STALE DETECTION: idle ${Math.round(idleMs / 1000)}s, reset to chain nonce ${possible_next_nonce}`,
+        reason: `STALE DETECTION: idle ${idleSeconds}s, reset to ${guarded ? "guarded" : "chain"} nonce ${safeResetTarget}`,
       };
     }
 
@@ -3117,8 +3261,10 @@ export class NonceDO {
         } else {
           this.sql.exec("DELETE FROM nonce_state WHERE key = ?", `wallet_next_nonce:${walletIndex}`);
         }
-        // Clear nonce_intents for this wallet
+        // Clear nonce_intents and chain frontier for this wallet
         this.sql.exec("DELETE FROM nonce_intents WHERE wallet_index = ?", walletIndex);
+        this.sql.exec("DELETE FROM nonce_state WHERE key = ?", this.chainFrontierKey(walletIndex));
+        this.chainFrontierCache.delete(walletIndex);
       }
       // Reset round-robin index
       await this.state.storage.put(NEXT_WALLET_INDEX_KEY, 0);
@@ -3138,6 +3284,124 @@ export class NonceDO {
       this.log("info", "clear_pools", { action: result.action, changed: result.changed, reason: result.reason });
       return this.jsonResponse(result);
     });
+  }
+
+  /**
+   * Admin: fill all nonce gaps for a specific wallet by querying Hiro for the
+   * gap range and broadcasting 1 uSTX transfers. Bypasses MAX_GAP_FILLS_PER_ALARM
+   * and gap-fill throttle — intended for manual intervention on stuck wallets.
+   */
+  private async handleFillGaps(walletIndex: number): Promise<Response> {
+    try {
+      const address = await this.getStoredSponsorAddressForWallet(walletIndex);
+      if (!address) {
+        return this.badRequest(`Wallet ${walletIndex} not initialized`);
+      }
+
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      if (!privateKey) {
+        return this.badRequest(`Cannot derive key for wallet ${walletIndex}`);
+      }
+
+      // Fetch current chain state
+      let nonceInfo: HiroNonceInfo;
+      try {
+        nonceInfo = await this.fetchNonceInfo(address);
+      } catch (_e) {
+        return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
+      }
+
+      const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+      this.advanceChainFrontier(walletIndex, possible_next_nonce);
+      const head = this.ledgerGetWalletHead(walletIndex);
+
+      // Compute gaps: Hiro-reported missing nonces + any range between
+      // last_executed and head that Hiro doesn't see (ledger-only gaps)
+      const gapSet = new Set(detected_missing_nonces);
+
+      // Also check contiguous range from possible_next_nonce to head for
+      // nonces not in the mempool (Hiro won't report these as "missing"
+      // if it doesn't know about them)
+      if (head !== null && head > possible_next_nonce) {
+        for (let n = possible_next_nonce; n < head; n++) {
+          gapSet.add(n);
+        }
+      }
+
+      // Remove nonces that are already in the mempool (assigned/broadcasted/confirmed).
+      // 'confirmed' = broadcast accepted, still pending on-chain — same as ledgerInFlightCount.
+      const inFlightRows = this.sql
+        .exec<{ nonce: number }>(
+          `SELECT nonce FROM nonce_intents
+           WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')
+             AND nonce >= ?`,
+          walletIndex,
+          possible_next_nonce
+        )
+        .toArray();
+      for (const row of inFlightRows) {
+        gapSet.delete(row.nonce);
+      }
+
+      const allGaps = [...gapSet].sort((a, b) => a - b);
+      const truncated = allGaps.length > MAX_ADMIN_GAP_FILLS;
+      const gaps = allGaps.slice(0, MAX_ADMIN_GAP_FILLS);
+
+      if (gaps.length === 0) {
+        return this.jsonResponse({
+          success: true,
+          walletIndex,
+          address,
+          message: "No gaps found",
+          possible_next_nonce,
+          head,
+          filled: [],
+          failed: [],
+        });
+      }
+
+      this.log("info", "admin_fill_gaps_start", {
+        walletIndex,
+        gapCount: gaps.length,
+        gaps,
+        possible_next_nonce,
+        head,
+      });
+
+      const filled: Array<{ nonce: number; txid: string }> = [];
+      const failed: Array<{ nonce: number; reason: string }> = [];
+
+      for (const gapNonce of gaps) {
+        const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
+        if (txid) {
+          filled.push({ nonce: gapNonce, txid });
+          this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
+          this.incrementCounter(STATE_KEYS.gapsFilled);
+          await this.recordGapFillFee(walletIndex, GAP_FILL_FEE.toString());
+        } else {
+          failed.push({ nonce: gapNonce, reason: "broadcast rejected or already occupied" });
+        }
+      }
+
+      this.log("info", "admin_fill_gaps_complete", {
+        walletIndex,
+        filledCount: filled.length,
+        failedCount: failed.length,
+      });
+
+      return this.jsonResponse({
+        success: true,
+        walletIndex,
+        address,
+        possible_next_nonce,
+        head,
+        filled,
+        failed,
+        ...(truncated && { truncated: true, totalGaps: allGaps.length }),
+      });
+    } catch (error) {
+      return this.internalError(error);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -3332,6 +3596,14 @@ export class NonceDO {
       } catch (error) {
         return this.internalError(error);
       }
+    }
+
+    // POST /fill-gaps/:wallet — admin: immediately fill all gaps for a specific wallet.
+    // Bypasses MAX_GAP_FILLS_PER_ALARM and RBF logic — just broadcasts gap-fill txs.
+    const fillGapsMatch = url.pathname.match(/^\/fill-gaps\/(\d+)$/);
+    if (request.method === "POST" && fillGapsMatch) {
+      const walletIdx = parseInt(fillGapsMatch[1], 10);
+      return this.state.blockConcurrencyWhile(() => this.handleFillGaps(walletIdx));
     }
 
     // GET /history/:wallet/:nonce — diagnostic endpoint for full nonce event trail.

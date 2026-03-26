@@ -185,6 +185,15 @@ export class BaseEndpoint extends OpenAPIRoute {
           retryable: true,
           retryAfter: 30,
         });
+      case "TooMuchChaining":
+        return this.err(c, {
+          error: "Too many pending transactions from sender — wait for confirmations and retry",
+          code: "TOO_MUCH_CHAINING",
+          status: 429,
+          details: `${details} (node reason: ${clientRejection})`,
+          retryable: true,
+          retryAfter: 30,
+        });
       case "SignatureValidation":
         return this.err(c, {
           error: "Transaction rejected: invalid signature. Ensure the transaction targets the correct network, is signed with the correct key, and post-conditions are properly signed",
