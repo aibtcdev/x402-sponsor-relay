@@ -318,6 +318,10 @@ const MAX_ADMIN_GAP_FILLS = 50;
  * probability and are candidates for RBF replacement.
  */
 const STUCK_TX_AGE_MS = 15 * 60 * 1000;
+/** Reduced stuck-tx age when a cross-wallet cascade is active (5 min) */
+const STUCK_TX_AGE_CASCADE_MS = 5 * 60 * 1000;
+/** Most aggressive stuck-tx age when a wallet's circuit breaker is open (3 min) */
+const STUCK_TX_AGE_CIRCUIT_OPEN_MS = 3 * 60 * 1000;
 /**
  * Fee for RBF replacement self-transfers (3× GAP_FILL_FEE).
  * Must exceed the original stuck tx fee to guarantee replacement acceptance
@@ -1349,8 +1353,8 @@ export class NonceDO {
    * - normal:                  15 min (STUCK_TX_AGE_MS)
    */
   private getEffectiveStuckTxAge(cascadeActive: boolean, circuitOpen: boolean): number {
-    if (circuitOpen) return 3 * 60 * 1000;
-    if (cascadeActive) return 5 * 60 * 1000;
+    if (circuitOpen) return STUCK_TX_AGE_CIRCUIT_OPEN_MS;
+    if (cascadeActive) return STUCK_TX_AGE_CASCADE_MS;
     return STUCK_TX_AGE_MS;
   }
 
