@@ -3497,6 +3497,23 @@ export class NonceDO {
       }
       wallets.push({ walletIndex, ...result });
     }
+
+    // When all wallets are consistent with chain state, reset cumulative conflict counters.
+    // This prevents stale conflict state from permanently poisoning health checks.
+    const allClean = wallets.every(w => !w.changed);
+    if (allClean) {
+      const previousConflicts = this.getStoredCount(STATE_KEYS.conflictsDetected);
+      if (previousConflicts > 0) {
+        this.setStateValue(STATE_KEYS.conflictsDetected, 0);
+        this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.lastGapDetected);
+        this.log("info", "conflict_counters_cleared", {
+          previousConflicts,
+          reason: "all_wallets_consistent_with_chain",
+          walletCount: wallets.length,
+        });
+      }
+    }
+
     return { success: true, action: "resync", wallets };
   }
 
