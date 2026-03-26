@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.23.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.22.2...x402-sponsor-relay-v1.23.0) (2026-03-26)
+
+
+### Features
+
+* circuit breaker gate before nonce assignment ([#226](https://github.com/aibtcdev/x402-sponsor-relay/issues/226)) ([#227](https://github.com/aibtcdev/x402-sponsor-relay/issues/227)) ([d8aab0b](https://github.com/aibtcdev/x402-sponsor-relay/commit/d8aab0b6341c286259f8a5f3db29b6fa17755862))
+* **nonce:** per-wallet gap-fill admin endpoint ([#222](https://github.com/aibtcdev/x402-sponsor-relay/issues/222)) ([75d7136](https://github.com/aibtcdev/x402-sponsor-relay/commit/75d71364bde4958b4bef04a797f0e4efb425ea10))
+* observable nonce state and degraded health signal ([#229](https://github.com/aibtcdev/x402-sponsor-relay/issues/229)) ([#231](https://github.com/aibtcdev/x402-sponsor-relay/issues/231)) ([0868b97](https://github.com/aibtcdev/x402-sponsor-relay/commit/0868b973e06eb0e34a582e8917cfa6994cc5fbc8))
+* **queue:** RPC gateway, payment queue, sender nonce cache, chainhook webhook ([#228](https://github.com/aibtcdev/x402-sponsor-relay/issues/228)) ([671c6ae](https://github.com/aibtcdev/x402-sponsor-relay/commit/671c6aeee6211c960ebc4f4749a4eaef722400c4))
+
+
+### Bug Fixes
+
+* nonce cascade — queue guard, in-flight dedup, settle retry ([#237](https://github.com/aibtcdev/x402-sponsor-relay/issues/237)) ([7b2aee1](https://github.com/aibtcdev/x402-sponsor-relay/commit/7b2aee1462a07db55105184ffb911c72c219e6fb))
+* **sponsor:** stop double-encoding sender address ([#225](https://github.com/aibtcdev/x402-sponsor-relay/issues/225)) ([863cea7](https://github.com/aibtcdev/x402-sponsor-relay/commit/863cea7a4f32b9bc57f53cfed5a0337bb1f54c9c))
+
 ## [1.22.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.22.1...x402-sponsor-relay-v1.22.2) (2026-03-25)
 
 
