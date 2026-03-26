@@ -249,7 +249,7 @@ export class Health extends BaseEndpoint {
         lastConflictAt,
         effectiveCapacity,
         poolStatus,
-        ...(recommendation && { recommendation }),
+        recommendation,
       };
     } catch (e) {
       logger.warn("Failed to fetch nonce state for health check", {

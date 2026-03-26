@@ -181,6 +181,8 @@ interface ObservablePendingTx {
   txid?: string;
   assignedAt: string;
   broadcastedAt?: string;
+  /** Original txid of the sponsored tx that was replaced (only when state is "replaced"). */
+  originalTxid?: string;
   /** Replacement txid when state is "replaced" (RBF or head-bump replacement). */
   replacementTxid?: string;
   /** Contention reason string from error_reason column (e.g. "contention:dropped_replace_by_fee"). */
@@ -204,7 +206,7 @@ interface ObservableWalletState {
 }
 
 /**
- * Full observable nonce state returned by GET /nonce-state.
+ * Full observable nonce state returned by GET /nonce/state (public) and DO GET /nonce-state (internal).
  * Designed for MCP tools like tx_status_deep to cross-reference
  * sender nonces with sponsor nonces.
  *
@@ -311,20 +313,25 @@ const MAX_ADMIN_GAP_FILLS = 50;
  */
 const STUCK_TX_AGE_MS = 15 * 60 * 1000;
 /**
- * Fee for RBF replacement self-transfers (90,000 uSTX = 3× GAP_FILL_FEE).
+ * Fee for RBF replacement self-transfers (3× GAP_FILL_FEE).
  * Must exceed the original stuck tx fee to guarantee replacement acceptance
  * by the Stacks node's mempool eviction policy.
  */
-const RBF_FEE = 90_000n;
+const RBF_FEE = GAP_FILL_FEE * 3n;
 /** Maximum RBF broadcast attempts per nonce to prevent runaway fee escalation */
 const MAX_RBF_ATTEMPTS = 3;
 /**
- * Fee for head-bump RBF after gap-fill (60,000 uSTX = 2× GAP_FILL_FEE).
+ * Fee for head-bump RBF after gap-fill (2× GAP_FILL_FEE).
  * Applied to the first real pending tx after gap-fills to signal miners to
  * re-evaluate the pending nonce sequence. Lower than RBF_FEE because the
  * original tx may still have a valid fee — we just need priority.
+ *
+ * NOTE: Head-bump replaces a real agent-sponsored tx with a self-transfer.
+ * Agents are notified via replaced_tx KV → GET /payment/:id (status: "replaced",
+ * resubmittable: true). Time-sensitive contract calls may fail if the
+ * replacement + resubmission window exceeds the call's deadline.
  */
-const HEAD_BUMP_FEE = 60_000n;
+const HEAD_BUMP_FEE = GAP_FILL_FEE * 2n;
 /**
  * Per-wallet circuit breaker: if a wallet accumulates this many quarantines
  * within CIRCUIT_BREAKER_WINDOW_MS, it is skipped during nonce assignment
@@ -805,6 +812,32 @@ export class NonceDO {
   }
 
   /**
+   * Write a replaced_tx:{originalTxid} KV entry so agents can detect the replacement.
+   * Fail-open — agents lose notification but relay keeps functioning.
+   */
+  private async writeReplacedTxEntry(
+    originalTxid: string,
+    replacementTxid: string,
+    reason: "rbf" | "head_bump",
+    walletIndex: number,
+    nonce: number
+  ): Promise<void> {
+    try {
+      await this.env.RELAY_KV?.put(
+        `replaced_tx:${originalTxid}`,
+        JSON.stringify({
+          replacementTxid,
+          reason,
+          walletIndex,
+          nonce,
+          replacedAt: new Date().toISOString(),
+        }),
+        { expirationTtl: 3600 }
+      );
+    } catch { /* fail-open */ }
+  }
+
+  /**
    * Broadcast a replace-by-fee (RBF) self-transfer for a nonce that is stuck in the mempool.
    * Uses RBF_FEE (90,000 uSTX = 3× GAP_FILL_FEE) to guarantee eviction of the stuck tx.
    * Tracks attempt count in DO storage to cap retries at MAX_RBF_ATTEMPTS.
@@ -874,22 +907,9 @@ export class NonceDO {
             nonce
           );
         } catch { /* fail-open */ }
-        // Write replaced_tx KV entry so agents can detect the replacement.
-        // Only write when originalTxid is non-null — gap-fills have no original tx.
+        // Notify agents when a real sponsored tx is replaced (gap-fills have no original tx)
         if (state.originalTxid) {
-          try {
-            await this.env.RELAY_KV?.put(
-              `replaced_tx:${state.originalTxid}`,
-              JSON.stringify({
-                replacementTxid: result.txid,
-                reason: "rbf",
-                walletIndex,
-                nonce,
-                replacedAt: new Date().toISOString(),
-              }),
-              { expirationTtl: 3600 }
-            );
-          } catch { /* fail-open */ }
+          await this.writeReplacedTxEntry(state.originalTxid, result.txid, "rbf", walletIndex, nonce);
         }
         this.log("info", "rbf_broadcast_success", {
           walletIndex,
@@ -2611,8 +2631,9 @@ export class NonceDO {
         const replacedTxs: ObservablePendingTx[] = replacedRows.map((row) => ({
           sponsorNonce: row.nonce,
           state: "replaced" as const,
-          // txid column holds the replacement txid (updated by Phase 2 RBF/head-bump logic)
-          replacementTxid: row.txid ?? undefined,
+          // For contention, txid holds the original sponsored txid (the relay didn't
+          // do the replacement — an external party did). Surface it as originalTxid.
+          originalTxid: row.txid ?? undefined,
           replacedReason: row.error_reason ?? undefined,
           assignedAt: row.assigned_at,
           broadcastedAt: row.broadcasted_at ?? undefined,
@@ -3180,7 +3201,10 @@ export class NonceDO {
             // Clean up stuck-tx state
             const contentionStuckKey = this.walletStuckTxKey(walletIndex, nonce);
             await this.state.storage.delete(contentionStuckKey);
-            // Gap-fill this nonce in the current cycle if budget allows
+            // Gap-fill this nonce in the current cycle if budget allows.
+            // Note: contention nonces share the gap-fill budget with structural gaps.
+            // The gap-fill broadcast will return ConflictingNonceInMempool if the
+            // replacement tx still occupies the slot — harmless, handled gracefully.
             gapFillNonces.push(nonce);
             verdictRbfCandidate--;
             continue;
@@ -3291,30 +3315,20 @@ export class NonceDO {
             if (result.ok) {
               headBumpNonce = bumpCandidate.nonce;
               headBumpTxid = result.txid;
-              // Update the ledger txid so reconciliation tracks the replacement
+              // Update the ledger: new txid + mark as head-bump so reconciliation
+              // knows this is now a self-transfer (prevents phantom contention detection)
               try {
                 this.sql.exec(
-                  `UPDATE nonce_intents SET txid = ? WHERE wallet_index = ? AND nonce = ?`,
+                  `UPDATE nonce_intents SET txid = ?, error_reason = 'head_bump_replaced'
+                   WHERE wallet_index = ? AND nonce = ?`,
                   result.txid,
                   walletIndex,
                   bumpCandidate.nonce
                 );
               } catch { /* fail-open */ }
-              // Write replaced_tx KV entry so agents can detect the replacement
+              // Notify agents that their sponsored tx was replaced
               if (bumpCandidate.txid) {
-                try {
-                  await this.env.RELAY_KV?.put(
-                    `replaced_tx:${bumpCandidate.txid}`,
-                    JSON.stringify({
-                      replacementTxid: result.txid,
-                      reason: "head_bump",
-                      walletIndex,
-                      nonce: bumpCandidate.nonce,
-                      replacedAt: new Date().toISOString(),
-                    }),
-                    { expirationTtl: 3600 }
-                  );
-                } catch { /* fail-open */ }
+                await this.writeReplacedTxEntry(bumpCandidate.txid, result.txid, "head_bump", walletIndex, bumpCandidate.nonce);
               }
               this.log("info", "head_bump_after_gap_fill", {
                 walletIndex,
@@ -3545,11 +3559,22 @@ export class NonceDO {
       return;
     }
     try {
-      const listResult = await this.env.RELAY_KV.list({ prefix: "replaced_tx:" });
-      const total = listResult.keys.length;
+      // Paginate through all replaced_tx:* entries (KV list returns max 1000 per call)
+      const allKeys: KVNamespaceListKey<unknown>[] = [];
+      let cursor: string | undefined;
+      do {
+        const listResult = await this.env.RELAY_KV.list({
+          prefix: "replaced_tx:",
+          ...(cursor && { cursor }),
+        });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor);
+
+      const total = allKeys.length;
       let matchedCount = 0;
 
-      for (const kvKey of listResult.keys) {
+      for (const kvKey of allKeys) {
         const keyName = kvKey.name; // e.g. "replaced_tx:0xabc123..."
         const originalTxid = keyName.slice("replaced_tx:".length);
 
@@ -3579,7 +3604,9 @@ export class NonceDO {
 
           if (paymentId) {
             const record = await getPaymentRecord(this.env.RELAY_KV, paymentId);
-            if (record && record.status !== "replaced") {
+            // Skip terminal states — don't regress confirmed/failed records
+            const TERMINAL_STATUSES = new Set(["confirmed", "failed", "replaced"]);
+            if (record && !TERMINAL_STATUSES.has(record.status)) {
               const updated = transitionPayment(record, "replaced");
               updated.replacementTxid = metadata.replacementTxid;
               updated.replacedReason = metadata.reason;
