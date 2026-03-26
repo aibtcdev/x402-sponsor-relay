@@ -278,11 +278,20 @@ export class Relay extends BaseEndpoint {
         }
       }
 
-
       // Queue mode: serialize batch sends through PAYMENT_QUEUE to avoid nonce contention.
       // When queue=true, the relay creates a payment record, enqueues to PAYMENT_QUEUE,
       // and returns 202 Accepted with a paymentId for polling via GET /payment/:id
-      if (body.queue && c.env.PAYMENT_QUEUE) {
+      if (body.queue) {
+        if (!c.env.PAYMENT_QUEUE) {
+          return this.err(c, {
+            error: "Queue mode unavailable — PAYMENT_QUEUE not configured",
+            code: "SPONSOR_CONFIG_ERROR",
+            status: 503,
+            details: "Server is not configured for queued processing",
+            retryable: false,
+          });
+        }
+
         const kv = c.env.RELAY_KV;
         if (!kv) {
           return this.err(c, {
@@ -312,7 +321,7 @@ export class Relay extends BaseEndpoint {
         }
 
         // Generate payment ID and create initial record
-        const paymentId = crypto.randomUUID();
+        const paymentId = `pay_${crypto.randomUUID()}`;
         const network = c.env.STACKS_NETWORK as "mainnet" | "testnet";
 
         const record = {
@@ -325,13 +334,18 @@ export class Relay extends BaseEndpoint {
         await putPaymentRecord(kv, record);
 
         // Enqueue for serial processing
-        await c.env.PAYMENT_QUEUE.send({
-          paymentId,
-          txHex: body.transaction,
-          network,
-          settle: body.settle,
-          attempt: 0,
-        });
+        try {
+          await c.env.PAYMENT_QUEUE.send({
+            paymentId,
+            txHex: body.transaction,
+            network,
+            settle: body.settle,
+            attempt: 0,
+          });
+        } catch (sendErr) {
+          await putPaymentRecord(kv, { ...record, status: "failed", error: "Failed to enqueue", errorCode: "QUEUE_SEND_FAILED", retryable: true });
+          throw sendErr;
+        }
 
         logger.info("Queued relay request for serial processing", { paymentId });
         c.executionCtx.waitUntil(statsService.logTransaction({
