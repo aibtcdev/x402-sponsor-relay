@@ -50,10 +50,12 @@ export class NonceState extends BaseEndpoint {
                               type: "object" as const,
                               properties: {
                                 sponsorNonce: { type: "number" as const },
-                                state: { type: "string" as const, enum: ["assigned", "broadcasted"] },
+                                state: { type: "string" as const, enum: ["assigned", "broadcasted", "replaced"] },
                                 txid: { type: "string" as const },
                                 assignedAt: { type: "string" as const },
                                 broadcastedAt: { type: "string" as const },
+                                replacementTxid: { type: "string" as const, description: "Txid of the replacement transaction (present when state is 'replaced')" },
+                                replacedReason: { type: "string" as const, description: "Contention reason string, e.g. 'contention:dropped_replace_by_fee' (present when state is 'replaced')" },
                               },
                             },
                           },
