@@ -167,6 +167,50 @@ interface WalletUtilization {
   chain_frontier: number | null;
 }
 
+/**
+ * A single pending transaction visible to MCP clients.
+ */
+interface ObservablePendingTx {
+  sponsorNonce: number;
+  state: "assigned" | "broadcasted";
+  txid?: string;
+  assignedAt: string;
+  broadcastedAt?: string;
+}
+
+/**
+ * Per-wallet observable state for MCP client diagnostics (issue #229).
+ */
+interface ObservableWalletState {
+  walletIndex: number;
+  sponsorAddress: string;
+  chainFrontier?: number;
+  assignmentHead?: number;
+  pendingTxs: ObservablePendingTx[];
+  gaps: number[];
+  available: number;
+  reserved: number;
+  circuitBreakerOpen: boolean;
+  healthy: boolean;
+}
+
+/**
+ * Full observable nonce state returned by GET /nonce-state.
+ * Designed for MCP tools like tx_status_deep to cross-reference
+ * sender nonces with sponsor nonces.
+ */
+interface ObservableNonceState {
+  wallets: ObservableWalletState[];
+  healthy: boolean;
+  healInProgress: boolean;
+  gapsFilled: number;
+  totalAvailable: number;
+  totalReserved: number;
+  totalCapacity: number;
+  lastGapDetected: string | null;
+  timestamp: string;
+}
+
 interface NonceStatsResponse {
   totalAssigned: number;
   conflictsDetected: number;
@@ -2461,6 +2505,123 @@ export class NonceDO {
   }
 
   /**
+   * Build the client-observable nonce state for MCP diagnostics (issue #229).
+   * Returns per-wallet pending txs, detected gaps, and health metadata.
+   */
+  async getObservableNonceState(): Promise<ObservableNonceState> {
+    const initializedWallets = await this.getInitializedWallets();
+    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+    const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
+    const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled);
+
+    const wallets: ObservableWalletState[] = await Promise.all(
+      initializedWallets.map(async ({ walletIndex, address }) => {
+        // Pending txs: assigned or broadcasted nonce_intents
+        const pendingRows = this.sql
+          .exec<{
+            nonce: number;
+            state: string;
+            txid: string | null;
+            assigned_at: string;
+            broadcasted_at: string | null;
+          }>(
+            `SELECT nonce, state, txid, assigned_at, broadcasted_at
+             FROM nonce_intents
+             WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted')
+             ORDER BY nonce ASC`,
+            walletIndex
+          )
+          .toArray();
+
+        const pendingTxs: ObservablePendingTx[] = pendingRows.map((row) => ({
+          sponsorNonce: row.nonce,
+          state: row.state as "assigned" | "broadcasted",
+          txid: row.txid ?? undefined,
+          assignedAt: row.assigned_at,
+          broadcastedAt: row.broadcasted_at ?? undefined,
+        }));
+
+        // Chain frontier and head for gap detection
+        const chainFrontier = this.getChainFrontier(walletIndex);
+        const head = this.ledgerGetWalletHead(walletIndex);
+
+        // Detect gaps: nonces between chain frontier and head that are not in-flight
+        const gaps: number[] = [];
+        if (chainFrontier !== null && head !== null && head > chainFrontier) {
+          const inFlightNonces = new Set(pendingRows.map((r) => r.nonce));
+          // Also check for confirmed/failed nonces that fill the range
+          const occupiedRows = this.sql
+            .exec<{ nonce: number }>(
+              `SELECT nonce FROM nonce_intents
+               WHERE wallet_index = ? AND nonce >= ? AND nonce < ?`,
+              walletIndex,
+              chainFrontier,
+              head
+            )
+            .toArray();
+          const occupiedNonces = new Set(occupiedRows.map((r) => r.nonce));
+          for (let n = chainFrontier; n < head; n++) {
+            if (!occupiedNonces.has(n) && !inFlightNonces.has(n)) {
+              gaps.push(n);
+            }
+          }
+        }
+
+        // Circuit breaker state
+        const recentQuarantines =
+          (await this.state.storage.get<string[]>(
+            this.walletQuarantineRecentKey(walletIndex)
+          )) ?? [];
+        const activeQuarantines = recentQuarantines.filter(
+          (ts) => new Date(ts).getTime() >= cutoff
+        );
+        const circuitBreakerOpen =
+          activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
+
+        const reserved = this.ledgerReservedCount(walletIndex);
+        const available = Math.max(0, CHAINING_LIMIT - reserved);
+
+        return {
+          walletIndex,
+          sponsorAddress: address,
+          chainFrontier: chainFrontier ?? undefined,
+          assignmentHead: head ?? undefined,
+          pendingTxs,
+          gaps,
+          available,
+          reserved,
+          circuitBreakerOpen,
+          healthy: gaps.length === 0 && !circuitBreakerOpen && available > 0,
+        };
+      })
+    );
+
+    const anyGaps = wallets.some((w) => w.gaps.length > 0);
+    const allDegraded = wallets.length > 0 && wallets.every((w) => w.circuitBreakerOpen);
+    const totalAvailable = wallets.reduce((s, w) => s + w.available, 0);
+    const totalReserved = wallets.reduce((s, w) => s + w.reserved, 0);
+    const totalCapacity = initializedWallets.length * CHAINING_LIMIT;
+
+    // healInProgress: gap was detected recently (within last alarm cycle + buffer)
+    const healInProgress = lastGapDetectedMs !== null &&
+      Date.now() - lastGapDetectedMs < ALARM_INTERVAL_ACTIVE_MS * 2;
+
+    return {
+      wallets,
+      healthy: !anyGaps && !allDegraded && totalAvailable > 0,
+      healInProgress,
+      gapsFilled,
+      totalAvailable,
+      totalReserved,
+      totalCapacity,
+      lastGapDetected: lastGapDetectedMs
+        ? new Date(lastGapDetectedMs).toISOString()
+        : null,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
    * Fetch transaction status from Hiro for a specific txid.
    * Returns the tx_status string ("success", "pending", "abort_*", "dropped_*") or null on error.
    * Used by reconcileNonceForWallet to distinguish terminal abort from transient drops.
@@ -3671,6 +3832,18 @@ export class NonceDO {
           intentCounts,
           timestamp: new Date().toISOString(),
         });
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    // GET /nonce-state — client-observable nonce state for diagnostics.
+    // Returns per-wallet pending txs, gaps, and health status so MCP clients
+    // can correlate sender nonces with sponsor nonces (issue #229).
+    if (request.method === "GET" && url.pathname === "/nonce-state") {
+      try {
+        const state = await this.getObservableNonceState();
+        return this.jsonResponse(state);
       } catch (error) {
         return this.internalError(error);
       }
