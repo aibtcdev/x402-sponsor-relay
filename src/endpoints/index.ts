@@ -9,6 +9,7 @@ export { ProvisionStx } from "./provision-stx";
 export { Fees } from "./fees";
 export { FeesConfig } from "./fees-config";
 export { NonceStatsEndpoint } from "./nonce-stats";
+export { NonceState } from "./nonce-state";
 export { NonceReset } from "./nonce-reset";
 export { NonceFillGaps } from "./nonce-fill-gaps";
 export { NonceHistory } from "./nonce-history";

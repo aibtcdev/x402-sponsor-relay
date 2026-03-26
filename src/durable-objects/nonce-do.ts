@@ -8,6 +8,11 @@ import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
 import type { Env, LogsRPC, PoolHealthResponse, WalletHealthSnapshot } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
+import {
+  getPaymentRecord,
+  putPaymentRecord,
+  transitionPayment,
+} from "../services/payment-status";
 
 const APP_ID = "x402-relay";
 
@@ -167,6 +172,61 @@ interface WalletUtilization {
   chain_frontier: number | null;
 }
 
+/**
+ * A single pending transaction visible to MCP clients.
+ */
+interface ObservablePendingTx {
+  sponsorNonce: number;
+  state: "assigned" | "broadcasted" | "replaced";
+  txid?: string;
+  assignedAt: string;
+  broadcastedAt?: string;
+  /** Original txid of the sponsored tx that was replaced (only when state is "replaced"). */
+  originalTxid?: string;
+  /** Replacement txid when state is "replaced" (RBF or head-bump replacement). */
+  replacementTxid?: string;
+  /** Contention reason string from error_reason column (e.g. "contention:dropped_replace_by_fee"). */
+  replacedReason?: string;
+}
+
+/**
+ * Per-wallet observable state for MCP client diagnostics (issue #229).
+ */
+interface ObservableWalletState {
+  walletIndex: number;
+  sponsorAddress: string;
+  chainFrontier?: number;
+  assignmentHead?: number;
+  pendingTxs: ObservablePendingTx[];
+  gaps: number[];
+  available: number;
+  reserved: number;
+  circuitBreakerOpen: boolean;
+  healthy: boolean;
+}
+
+/**
+ * Full observable nonce state returned by GET /nonce/state (public) and DO GET /nonce-state (internal).
+ * Designed for MCP tools like tx_status_deep to cross-reference
+ * sender nonces with sponsor nonces.
+ *
+ * `recommendation` is derived here (single source of truth) so that
+ * endpoints don't duplicate the fallback decision logic.
+ */
+interface ObservableNonceState {
+  wallets: ObservableWalletState[];
+  healthy: boolean;
+  healInProgress: boolean;
+  gapsFilled: number;
+  totalAvailable: number;
+  totalReserved: number;
+  totalCapacity: number;
+  lastGapDetected: string | null;
+  /** When non-null, clients should bypass sponsored submission */
+  recommendation: "fallback_to_direct" | null;
+  timestamp: string;
+}
+
 interface NonceStatsResponse {
   totalAssigned: number;
   conflictsDetected: number;
@@ -253,13 +313,25 @@ const MAX_ADMIN_GAP_FILLS = 50;
  */
 const STUCK_TX_AGE_MS = 15 * 60 * 1000;
 /**
- * Fee for RBF replacement self-transfers (90,000 uSTX = 3× GAP_FILL_FEE).
+ * Fee for RBF replacement self-transfers (3× GAP_FILL_FEE).
  * Must exceed the original stuck tx fee to guarantee replacement acceptance
  * by the Stacks node's mempool eviction policy.
  */
-const RBF_FEE = 90_000n;
+const RBF_FEE = GAP_FILL_FEE * 3n;
 /** Maximum RBF broadcast attempts per nonce to prevent runaway fee escalation */
 const MAX_RBF_ATTEMPTS = 3;
+/**
+ * Fee for head-bump RBF after gap-fill (2× GAP_FILL_FEE).
+ * Applied to the first real pending tx after gap-fills to signal miners to
+ * re-evaluate the pending nonce sequence. Lower than RBF_FEE because the
+ * original tx may still have a valid fee — we just need priority.
+ *
+ * NOTE: Head-bump replaces a real agent-sponsored tx with a self-transfer.
+ * Agents are notified via replaced_tx KV → GET /payment/:id (status: "replaced",
+ * resubmittable: true). Time-sensitive contract calls may fail if the
+ * replacement + resubmission window exceeds the call's deadline.
+ */
+const HEAD_BUMP_FEE = GAP_FILL_FEE * 2n;
 /**
  * Per-wallet circuit breaker: if a wallet accumulates this many quarantines
  * within CIRCUIT_BREAKER_WINDOW_MS, it is skipped during nonce assignment
@@ -740,6 +812,32 @@ export class NonceDO {
   }
 
   /**
+   * Write a replaced_tx:{originalTxid} KV entry so agents can detect the replacement.
+   * Fail-open — agents lose notification but relay keeps functioning.
+   */
+  private async writeReplacedTxEntry(
+    originalTxid: string,
+    replacementTxid: string,
+    reason: "rbf" | "head_bump",
+    walletIndex: number,
+    nonce: number
+  ): Promise<void> {
+    try {
+      await this.env.RELAY_KV?.put(
+        `replaced_tx:${originalTxid}`,
+        JSON.stringify({
+          replacementTxid,
+          reason,
+          walletIndex,
+          nonce,
+          replacedAt: new Date().toISOString(),
+        }),
+        { expirationTtl: 3600 }
+      );
+    } catch { /* fail-open */ }
+  }
+
+  /**
    * Broadcast a replace-by-fee (RBF) self-transfer for a nonce that is stuck in the mempool.
    * Uses RBF_FEE (90,000 uSTX = 3× GAP_FILL_FEE) to guarantee eviction of the stuck tx.
    * Tracks attempt count in DO storage to cap retries at MAX_RBF_ATTEMPTS.
@@ -800,6 +898,19 @@ export class NonceDO {
         state.lastRbfTxid = result.txid;
         await this.state.storage.put(key, state);
         this.incrementCounter(STATE_KEYS.stuckTxRbfBroadcast);
+        // Update the ledger txid so reconciliation tracks the replacement
+        try {
+          this.sql.exec(
+            `UPDATE nonce_intents SET txid = ? WHERE wallet_index = ? AND nonce = ?`,
+            result.txid,
+            walletIndex,
+            nonce
+          );
+        } catch { /* fail-open */ }
+        // Notify agents when a real sponsored tx is replaced (gap-fills have no original tx)
+        if (state.originalTxid) {
+          await this.writeReplacedTxEntry(state.originalTxid, result.txid, "rbf", walletIndex, nonce);
+        }
         this.log("info", "rbf_broadcast_success", {
           walletIndex,
           nonce,
@@ -2461,6 +2572,169 @@ export class NonceDO {
   }
 
   /**
+   * Build the client-observable nonce state for MCP diagnostics (issue #229).
+   * Returns per-wallet pending txs, detected gaps, and health metadata.
+   */
+  async getObservableNonceState(): Promise<ObservableNonceState> {
+    const initializedWallets = await this.getInitializedWallets();
+    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+    const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
+    const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled);
+
+    const wallets: ObservableWalletState[] = await Promise.all(
+      initializedWallets.map(async ({ walletIndex, address }) => {
+        // Pending txs: assigned or broadcasted nonce_intents
+        const pendingRows = this.sql
+          .exec<{
+            nonce: number;
+            state: string;
+            txid: string | null;
+            assigned_at: string;
+            broadcasted_at: string | null;
+          }>(
+            `SELECT nonce, state, txid, assigned_at, broadcasted_at
+             FROM nonce_intents
+             WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted')
+             ORDER BY nonce ASC`,
+            walletIndex
+          )
+          .toArray();
+
+        const pendingTxs: ObservablePendingTx[] = pendingRows.map((row) => ({
+          sponsorNonce: row.nonce,
+          state: row.state as "assigned" | "broadcasted",
+          txid: row.txid ?? undefined,
+          assignedAt: row.assigned_at,
+          broadcastedAt: row.broadcasted_at ?? undefined,
+        }));
+
+        // Replaced txs: failed intents where error_reason starts with 'contention:'
+        // These are sponsor txs that were dropped because a direct submission claimed
+        // the same nonce slot (contention detection in reconcileNonceForWallet).
+        const replacedRows = this.sql
+          .exec<{
+            nonce: number;
+            state: string;
+            txid: string | null;
+            error_reason: string | null;
+            assigned_at: string;
+            broadcasted_at: string | null;
+          }>(
+            `SELECT nonce, state, txid, error_reason, assigned_at, broadcasted_at
+             FROM nonce_intents
+             WHERE wallet_index = ? AND state = 'failed' AND error_reason LIKE 'contention:%'
+             ORDER BY nonce ASC`,
+            walletIndex
+          )
+          .toArray();
+
+        const replacedTxs: ObservablePendingTx[] = replacedRows.map((row) => ({
+          sponsorNonce: row.nonce,
+          state: "replaced" as const,
+          // For contention, txid holds the original sponsored txid (the relay didn't
+          // do the replacement — an external party did). Surface it as originalTxid.
+          originalTxid: row.txid ?? undefined,
+          replacedReason: row.error_reason ?? undefined,
+          assignedAt: row.assigned_at,
+          broadcastedAt: row.broadcasted_at ?? undefined,
+        }));
+
+        // Merge and sort by sponsorNonce ascending
+        const allTxs = [...pendingTxs, ...replacedTxs].sort(
+          (a, b) => a.sponsorNonce - b.sponsorNonce
+        );
+
+        // Chain frontier and head for gap detection
+        const chainFrontier = this.getChainFrontier(walletIndex);
+        const head = this.ledgerGetWalletHead(walletIndex);
+
+        // Detect gaps: nonces between chain frontier and head with no ledger entry.
+        // occupiedNonces covers ALL states (assigned, broadcasted, confirmed, failed)
+        // so inFlightNonces (a subset) is redundant.
+        const gaps: number[] = [];
+        if (chainFrontier !== null && head !== null && head > chainFrontier) {
+          const occupiedRows = this.sql
+            .exec<{ nonce: number }>(
+              `SELECT nonce FROM nonce_intents
+               WHERE wallet_index = ? AND nonce >= ? AND nonce < ?`,
+              walletIndex,
+              chainFrontier,
+              head
+            )
+            .toArray();
+          const occupiedNonces = new Set(occupiedRows.map((r) => r.nonce));
+          for (let n = chainFrontier; n < head; n++) {
+            if (!occupiedNonces.has(n)) {
+              gaps.push(n);
+            }
+          }
+        }
+
+        // Circuit breaker state
+        const recentQuarantines =
+          (await this.state.storage.get<string[]>(
+            this.walletQuarantineRecentKey(walletIndex)
+          )) ?? [];
+        const activeQuarantines = recentQuarantines.filter(
+          (ts) => new Date(ts).getTime() >= cutoff
+        );
+        const circuitBreakerOpen =
+          activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
+
+        // Use walletHeadroom() — same calculation as the assignment path.
+        // Counts assigned + broadcasted + confirmed (all in-flight states),
+        // not just 'assigned' like ledgerReservedCount().
+        const available = this.walletHeadroom(walletIndex);
+        const reserved = CHAINING_LIMIT - available;
+
+        return {
+          walletIndex,
+          sponsorAddress: address,
+          chainFrontier: chainFrontier ?? undefined,
+          assignmentHead: head ?? undefined,
+          pendingTxs: allTxs,
+          gaps,
+          available,
+          reserved,
+          circuitBreakerOpen,
+          healthy: gaps.length === 0 && !circuitBreakerOpen && available > 0,
+        };
+      })
+    );
+
+    const anyGaps = wallets.some((w) => w.gaps.length > 0);
+    const allDegraded = wallets.length > 0 && wallets.every((w) => w.circuitBreakerOpen);
+    const totalAvailable = wallets.reduce((s, w) => s + w.available, 0);
+    const totalReserved = wallets.reduce((s, w) => s + w.reserved, 0);
+    const totalCapacity = initializedWallets.length * CHAINING_LIMIT;
+
+    // healInProgress: gap was detected recently (within last alarm cycle + buffer)
+    const healInProgress = lastGapDetectedMs !== null &&
+      Date.now() - lastGapDetectedMs < ALARM_INTERVAL_ACTIVE_MS * 2;
+
+    const healthy = !anyGaps && !allDegraded && totalAvailable > 0;
+    // recommendation is derived here (single source of truth) so endpoints
+    // don't duplicate the fallback decision logic.
+    const recommendation: "fallback_to_direct" | null =
+      !healthy && (anyGaps || allDegraded) ? "fallback_to_direct" : null;
+
+    return {
+      wallets,
+      healthy,
+      healInProgress,
+      gapsFilled,
+      totalAvailable,
+      totalReserved,
+      totalCapacity,
+      lastGapDetected: lastGapDetectedMs
+        ? new Date(lastGapDetectedMs).toISOString()
+        : null,
+      recommendation,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  /**
    * Fetch transaction status from Hiro for a specific txid.
    * Returns the tx_status string ("success", "pending", "abort_*", "dropped_*") or null on error.
    * Used by reconcileNonceForWallet to distinguish terminal abort from transient drops.
@@ -2890,6 +3164,51 @@ export class NonceDO {
             verdictRbfCandidate--;
             continue;
           }
+          // P2 contention awareness (issue #229): if the tx was replaced by a
+          // direct submission (dropped_replace_by_fee or dropped_replace_across_fork),
+          // someone else (likely the sender via self-pay) settled this nonce slot.
+          // Gap-fill immediately instead of wasting an RBF attempt.
+          if (txStatus !== null && (
+            txStatus === "dropped_replace_by_fee" ||
+            txStatus === "dropped_replace_across_fork"
+          )) {
+            this.log("info", "contention_detected", {
+              walletIndex,
+              nonce,
+              txid,
+              txStatus,
+              reason: "sponsor_tx_replaced_by_direct_submission",
+            });
+            // Mark as failed with contention reason and queue for gap-fill
+            try {
+              const now = new Date().toISOString();
+              this.sql.exec(
+                `UPDATE nonce_intents SET state = 'failed', error_reason = ?
+                 WHERE wallet_index = ? AND nonce = ?`,
+                `contention:${txStatus}`,
+                walletIndex,
+                nonce
+              );
+              this.sql.exec(
+                `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+                 VALUES (?, ?, 'contention_detected', ?, ?)`,
+                walletIndex,
+                nonce,
+                JSON.stringify({ txid, txStatus, reason: "replaced_by_direct" }),
+                now
+              );
+            } catch { /* fail-open */ }
+            // Clean up stuck-tx state
+            const contentionStuckKey = this.walletStuckTxKey(walletIndex, nonce);
+            await this.state.storage.delete(contentionStuckKey);
+            // Gap-fill this nonce in the current cycle if budget allows.
+            // Note: contention nonces share the gap-fill budget with structural gaps.
+            // The gap-fill broadcast will return ConflictingNonceInMempool if the
+            // replacement tx still occupies the slot — harmless, handled gracefully.
+            gapFillNonces.push(nonce);
+            verdictRbfCandidate--;
+            continue;
+          }
           // Tx is dropped/not found/null — proceed with RBF
           const rbfTxid = await this.broadcastRbfForNonce(walletIndex, nonce, privateKey, txid);
           if (rbfTxid) {
@@ -2957,6 +3276,80 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
+    // Head bump: after gap-fills, RBF the first real pending (non-gap-fill)
+    // broadcasted tx with a higher fee to signal miners to re-evaluate the
+    // pending nonce sequence. We target the real sponsored tx (not a gap-fill)
+    // so agents can detect the replacement via the replaced_tx KV entry and
+    // resubmit their original transaction. (Issue #229 P0)
+    // -------------------------------------------------------------------------
+    let headBumpNonce: number | null = null;
+    let headBumpTxid: string | null = null;
+    if (gapFillFilled.length > 0) {
+      // Find the lowest broadcasted nonce that is NOT a gap-fill
+      const gapFillSet = new Set(gapFillFilled);
+      const bumpCandidate = this.sql
+        .exec<{ nonce: number; txid: string | null }>(
+          `SELECT nonce, txid FROM nonce_intents
+           WHERE wallet_index = ? AND state = 'broadcasted' AND txid IS NOT NULL
+           ORDER BY nonce ASC`,
+          walletIndex
+        )
+        .toArray()
+        .find((row) => !gapFillSet.has(row.nonce));
+
+      if (bumpCandidate) {
+        const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+        if (privateKey) {
+          const { network, recipient } = this.getFlushRecipient();
+          try {
+            const tx = await makeSTXTokenTransfer({
+              recipient,
+              amount: GAP_FILL_AMOUNT,
+              senderKey: privateKey,
+              network,
+              nonce: BigInt(bumpCandidate.nonce),
+              fee: HEAD_BUMP_FEE,
+              memo: `head-bump-${bumpCandidate.nonce}`,
+            });
+            const result = await this.broadcastRawTx(tx, "head_bump");
+            if (result.ok) {
+              headBumpNonce = bumpCandidate.nonce;
+              headBumpTxid = result.txid;
+              // Update the ledger: new txid + mark as head-bump so reconciliation
+              // knows this is now a self-transfer (prevents phantom contention detection)
+              try {
+                this.sql.exec(
+                  `UPDATE nonce_intents SET txid = ?, error_reason = 'head_bump_replaced'
+                   WHERE wallet_index = ? AND nonce = ?`,
+                  result.txid,
+                  walletIndex,
+                  bumpCandidate.nonce
+                );
+              } catch { /* fail-open */ }
+              // Notify agents that their sponsored tx was replaced
+              if (bumpCandidate.txid) {
+                await this.writeReplacedTxEntry(bumpCandidate.txid, result.txid, "head_bump", walletIndex, bumpCandidate.nonce);
+              }
+              this.log("info", "head_bump_after_gap_fill", {
+                walletIndex,
+                nonce: bumpCandidate.nonce,
+                originalTxid: bumpCandidate.txid,
+                bumpTxid: result.txid,
+                gapsFilled: gapFillFilled,
+              });
+            }
+          } catch (e) {
+            this.log("warn", "head_bump_error", {
+              walletIndex,
+              nonce: bumpCandidate.nonce,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
     // Log reconciliation_summary for this wallet
     // -------------------------------------------------------------------------
     this.log("info", "reconciliation_summary", {
@@ -2974,6 +3367,7 @@ export class NonceDO {
       ignore_stale_hiro: verdictIgnoreStaleHiro,
       hiro_missing_count: detected_missing_nonces.length,
       hiro_mempool_count: detected_mempool_nonces.length,
+      head_bump_nonce: headBumpNonce,
       possible_next_nonce,
       last_executed_tx_nonce,
     });
@@ -3075,11 +3469,14 @@ export class NonceDO {
     const rbfSummary = rbfAttempted.length > 0
       ? ` rbf [${rbfAttempted.join(",")}]`
       : "";
+    const headBumpSummary = headBumpNonce !== null
+      ? ` head_bump [${headBumpNonce}]`
+      : "";
     return {
       previousNonce,
       newNonce: previousNonce,
-      changed: gapFillFilled.length > 0 || rbfAttempted.length > 0,
-      reason: `nonce is consistent with chain state${gapFilledSummary}${rbfSummary}`,
+      changed: gapFillFilled.length > 0 || rbfAttempted.length > 0 || headBumpNonce !== null,
+      reason: `nonce is consistent with chain state${gapFilledSummary}${rbfSummary}${headBumpSummary}`,
     };
   }
 
@@ -3145,6 +3542,101 @@ export class NonceDO {
     return { success: true, action: "reset", wallets };
   }
 
+  /**
+   * Scan for replaced_tx:* KV entries written by RBF/head-bump handlers and
+   * transition matching payment records to "replaced" status.
+   *
+   * Called from alarm() after reconciliation so agents can detect replacements
+   * via GET /payment/:id without polling the NonceDO directly.
+   *
+   * Fail-open: errors are logged but never rethrown so the alarm cycle continues.
+   */
+  private async processReplacementNotifications(): Promise<void> {
+    if (!this.env.RELAY_KV) {
+      this.log("warn", "replacement_notifications_skipped", {
+        reason: "RELAY_KV binding not available",
+      });
+      return;
+    }
+    try {
+      // Paginate through all replaced_tx:* entries (KV list returns max 1000 per call)
+      const allKeys: KVNamespaceListKey<unknown>[] = [];
+      let cursor: string | undefined;
+      do {
+        const listResult = await this.env.RELAY_KV.list({
+          prefix: "replaced_tx:",
+          ...(cursor && { cursor }),
+        });
+        allKeys.push(...listResult.keys);
+        cursor = listResult.list_complete ? undefined : listResult.cursor;
+      } while (cursor);
+
+      const total = allKeys.length;
+      let matchedCount = 0;
+
+      for (const kvKey of allKeys) {
+        const keyName = kvKey.name; // e.g. "replaced_tx:0xabc123..."
+        const originalTxid = keyName.slice("replaced_tx:".length);
+
+        // Read the replacement metadata
+        const raw = await this.env.RELAY_KV.get(keyName, "text");
+        let metadata: {
+          replacementTxid: string;
+          reason: string;
+          walletIndex: number;
+          nonce: number;
+          replacedAt: string;
+        } | null = null;
+        if (raw) {
+          try {
+            metadata = JSON.parse(raw);
+          } catch {
+            // Unparseable metadata — still delete the entry
+          }
+        }
+
+        if (metadata) {
+          // Look up paymentId from the txid→paymentId mapping
+          const paymentId = await this.env.RELAY_KV.get(
+            `txid_map:${originalTxid}`,
+            "text"
+          );
+
+          if (paymentId) {
+            const record = await getPaymentRecord(this.env.RELAY_KV, paymentId);
+            // Skip terminal states — don't regress confirmed/failed records
+            const TERMINAL_STATUSES = new Set(["confirmed", "failed", "replaced"]);
+            if (record && !TERMINAL_STATUSES.has(record.status)) {
+              const updated = transitionPayment(record, "replaced");
+              updated.replacementTxid = metadata.replacementTxid;
+              updated.replacedReason = metadata.reason;
+              updated.resubmittable = true;
+              await putPaymentRecord(this.env.RELAY_KV, updated);
+              matchedCount++;
+            }
+          }
+        }
+
+        // Delete the replaced_tx entry regardless — it has served its purpose
+        await this.env.RELAY_KV.delete(keyName).catch(() => {
+          /* fail-open */
+        });
+      }
+
+      if (total > 0) {
+        this.log("info", "replacement_notifications_processed", {
+          total,
+          matched: matchedCount,
+          unmatched: total - matchedCount,
+        });
+      }
+    } catch (e) {
+      this.log("warn", "replacement_notifications_error", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
@@ -3195,6 +3687,10 @@ export class NonceDO {
         // Dynamic scaling: add a wallet if ALL initialized wallets are above 75% pressure
         // and we haven't hit SPONSOR_WALLET_MAX. Runs in the alarm cycle (not request path).
         await this.checkAndScaleUp(initializedWallets.length);
+
+        // Replacement notifications: scan replaced_tx:* KV entries and transition payment
+        // records to "replaced" status so agents can detect via GET /payment/:id.
+        await this.processReplacementNotifications();
 
         // Dynamic alarm interval: use active (60s) when any wallet has in-flight nonces,
         // idle (5min) when all wallets are drained. This ensures rapid reconciliation
@@ -3671,6 +4167,18 @@ export class NonceDO {
           intentCounts,
           timestamp: new Date().toISOString(),
         });
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    // GET /nonce-state — client-observable nonce state for diagnostics.
+    // Returns per-wallet pending txs, gaps, and health status so MCP clients
+    // can correlate sender nonces with sponsor nonces (issue #229).
+    if (request.method === "GET" && url.pathname === "/nonce-state") {
+      try {
+        const state = await this.getObservableNonceState();
+        return this.jsonResponse(state);
       } catch (error) {
         return this.internalError(error);
       }

@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceState, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -97,6 +97,7 @@ openapi.post("/fees/config", FeesConfig as unknown as typeof FeesConfig);
 openapi.get("/stats", DashboardStats as unknown as typeof DashboardStats);
 openapi.get("/stats/transactions", TransactionLog as unknown as typeof TransactionLog);
 openapi.get("/nonce/stats", NonceStatsEndpoint as unknown as typeof NonceStatsEndpoint);
+openapi.get("/nonce/state", NonceState as unknown as typeof NonceState);
 openapi.post("/nonce/reset", NonceReset as unknown as typeof NonceReset);
 openapi.post("/nonce/fill-gaps/:wallet", NonceFillGaps as unknown as typeof NonceFillGaps);
 openapi.get("/nonce/history/:wallet/:nonce", NonceHistory as unknown as typeof NonceHistory);
@@ -142,6 +143,7 @@ app.get("/", (c) => {
       stats: "GET /stats - Relay statistics (JSON)",
       transactionLog: "GET /stats/transactions - Recent individual transactions",
       nonceStats: "GET /nonce/stats - Nonce coordinator stats",
+      nonceState: "GET /nonce/state - Observable nonce state for client diagnostics",
       nonceReset: "POST /nonce/reset - Trigger on-demand nonce recovery (admin, requires API key)",
       nonceFillGaps: "POST /nonce/fill-gaps/:wallet - Fill gaps for a specific wallet (admin, requires API key)",
       nonceSurgeHistory: "GET /nonce/surge-history - Surge event history for capacity planning",

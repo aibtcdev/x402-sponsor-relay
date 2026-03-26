@@ -59,6 +59,14 @@ interface NonceHealthState {
    * "healthy" ≥60% capacity, "degraded" <60%, "critical" <20% or circuit open.
    */
   poolStatus: PoolStatus;
+  /**
+   * When non-null, clients should take this action instead of submitting sponsored txs.
+   * "fallback_to_direct" means the relay's sponsor nonce pool is unhealthy (gaps or
+   * all wallets degraded). Clients should not parse gaps/circuitBreakerOpen/available
+   * themselves — this field summarizes the decision. Use GET /nonce/state for raw
+   * diagnostic data.
+   */
+  recommendation?: "fallback_to_direct" | null;
 }
 
 /**
@@ -139,6 +147,15 @@ export class Health extends BaseEndpoint {
                         "'critical' <20% or circuit breaker open.",
                       example: "healthy",
                     },
+                    recommendation: {
+                      type: "string" as const,
+                      nullable: true,
+                      enum: ["fallback_to_direct"],
+                      description:
+                        "When non-null, clients should bypass sponsored submission. " +
+                        "Summarizes the gap/circuit-breaker decision — clients should not " +
+                        "parse raw fields themselves. Use GET /nonce/state for diagnostics.",
+                    },
                   },
                 },
               },
@@ -175,16 +192,16 @@ export class Health extends BaseEndpoint {
 
     try {
       const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
-      const response = await stub.fetch("https://nonce-do/stats");
+      const statsResponse = await stub.fetch("https://nonce-do/stats");
 
-      if (!response.ok) {
+      if (!statsResponse.ok) {
         logger.warn("Nonce DO stats unavailable for health check", {
-          status: response.status,
+          status: statsResponse.status,
         });
         return null;
       }
 
-      const raw = (await response.json()) as {
+      const raw = (await statsResponse.json()) as {
         poolAvailable: number;
         poolReserved: number;
         conflictsDetected: number;
@@ -205,6 +222,25 @@ export class Health extends BaseEndpoint {
         totalPool === 0 ? 1.0 : Math.round((raw.poolAvailable / totalPool) * 100) / 100;
       const poolStatus = derivePoolStatus(effectiveCapacity, circuitBreakerOpen);
 
+      // Only fetch nonce-state when pool looks unhealthy — avoids adding
+      // two SQL queries + Promise.all to every pre-flight health check.
+      // recommendation is derived inside the DO (single source of truth).
+      let recommendation: "fallback_to_direct" | null = null;
+
+      if (poolStatus !== "healthy") {
+        try {
+          const nonceStateResponse = await stub.fetch("https://nonce-do/nonce-state");
+          if (nonceStateResponse.ok) {
+            const nonceState = (await nonceStateResponse.json()) as {
+              recommendation: "fallback_to_direct" | null;
+            };
+            recommendation = nonceState.recommendation;
+          }
+        } catch {
+          // best-effort — don't block health response
+        }
+      }
+
       return {
         poolAvailable: raw.poolAvailable,
         poolReserved: raw.poolReserved,
@@ -213,6 +249,7 @@ export class Health extends BaseEndpoint {
         lastConflictAt,
         effectiveCapacity,
         poolStatus,
+        recommendation,
       };
     } catch (e) {
       logger.warn("Failed to fetch nonce state for health check", {
