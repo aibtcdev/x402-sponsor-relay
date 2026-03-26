@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.23.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.23.0...x402-sponsor-relay-v1.23.1) (2026-03-26)
+
+
+### Bug Fixes
+
+* stale conflict state — auto-clear, health degradation, admin reset ([#239](https://github.com/aibtcdev/x402-sponsor-relay/issues/239)) ([6c3efd6](https://github.com/aibtcdev/x402-sponsor-relay/commit/6c3efd6335381f49314bc819a384dc695ea0a53f)), closes [#238](https://github.com/aibtcdev/x402-sponsor-relay/issues/238)
+
 ## [1.23.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.22.2...x402-sponsor-relay-v1.23.0) (2026-03-26)
 
 
