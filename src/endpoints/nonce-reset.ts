@@ -9,6 +9,8 @@ import {
 
 type NonceResetAction = "resync" | "reset" | "clear-pools" | "clear-conflicts";
 
+const VALID_ACTIONS = new Set<string>(["resync", "reset", "clear-pools", "clear-conflicts"]);
+
 /**
  * Nonce reset endpoint - trigger on-demand nonce recovery
  * POST /nonce/reset
@@ -22,6 +24,8 @@ type NonceResetAction = "resync" | "reset" | "clear-pools" | "clear-conflicts";
  * - reset: hard reset to last_executed_tx_nonce + 1 (safe floor)
  * - clear-pools: wipe all per-wallet pool state and stored addresses;
  *   pools reinitialize from Hiro on next /assign (use after derivation changes)
+ * - clear-conflicts: zero out conflictsDetected and clear lastGapDetected
+ *   without touching nonce pool state (manual circuit-breaker escape hatch)
  */
 export class NonceReset extends BaseEndpoint {
   schema = {
@@ -136,12 +140,12 @@ export class NonceReset extends BaseEndpoint {
     try {
       const body = await c.req.json() as Record<string, unknown>;
       if (body.action !== undefined) {
-        if (body.action !== "resync" && body.action !== "reset" && body.action !== "clear-pools" && body.action !== "clear-conflicts") {
+        if (!VALID_ACTIONS.has(body.action as string)) {
           return this.err(c, {
             error: "Invalid action",
             code: "NONCE_RESET_FAILED",
             status: 400,
-            details: `action must be 'resync', 'reset', 'clear-pools', or 'clear-conflicts', got '${body.action}'`,
+            details: `action must be one of ${[...VALID_ACTIONS].join(", ")}; got '${body.action}'`,
             retryable: false,
           });
         }

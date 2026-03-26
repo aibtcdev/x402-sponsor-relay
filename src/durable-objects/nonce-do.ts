@@ -3502,16 +3502,7 @@ export class NonceDO {
     // This prevents stale conflict state from permanently poisoning health checks.
     const allClean = wallets.every(w => !w.changed);
     if (allClean) {
-      const previousConflicts = this.getStoredCount(STATE_KEYS.conflictsDetected);
-      if (previousConflicts > 0) {
-        this.setStateValue(STATE_KEYS.conflictsDetected, 0);
-        this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.lastGapDetected);
-        this.log("info", "conflict_counters_cleared", {
-          previousConflicts,
-          reason: "all_wallets_consistent_with_chain",
-          walletCount: wallets.length,
-        });
-      }
+      this.clearConflictCounters("all_wallets_consistent_with_chain");
     }
 
     return { success: true, action: "resync", wallets };
@@ -3756,26 +3747,34 @@ export class NonceDO {
   }
 
   /**
-   * Clear all per-wallet state and stored addresses.
-   * Wallets will reinitialize from Hiro on the next /assign call.
-   * Also resets nonce heads and clears the nonce_intents ledger for each wallet.
+   * Zero out conflictsDetected and clear lastGapDetected.
+   * Shared by auto-clear (after clean resync) and manual clear-conflicts action.
+   * Returns the previous conflict count (0 if already clean).
    */
+  private clearConflictCounters(reason: string): number {
+    const previousConflicts = this.getStoredCount(STATE_KEYS.conflictsDetected);
+    if (previousConflicts === 0) return 0;
+    this.setStateValue(STATE_KEYS.conflictsDetected, 0);
+    this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.lastGapDetected);
+    this.log("info", "conflict_counters_cleared", { previousConflicts, reason });
+    return previousConflicts;
+  }
+
   /**
    * Manual escape hatch: zero out conflictsDetected and clear lastGapDetected
    * without touching any nonce pool state. Used when auto-clear hasn't fired yet
    * and operators need to unblock the health circuit breaker immediately.
    */
   private handleClearConflicts(): Response {
-    const previousConflicts = this.getStoredCount(STATE_KEYS.conflictsDetected);
-    this.setStateValue(STATE_KEYS.conflictsDetected, 0);
-    this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.lastGapDetected);
-    this.log("info", "clear_conflicts", {
-      previousConflicts,
-      reason: "manual_operator_clear",
-    });
+    const previousConflicts = this.clearConflictCounters("manual_operator_clear");
     return this.jsonResponse({ cleared: true, previousConflicts });
   }
 
+  /**
+   * Clear all per-wallet state and stored addresses.
+   * Wallets will reinitialize from Hiro on the next /assign call.
+   * Also resets nonce heads and clears the nonce_intents ledger for each wallet.
+   */
   private async handleClearPools(): Promise<Response> {
     return this.state.blockConcurrencyWhile(async () => {
       const initializedWallets = await this.getInitializedWallets();
