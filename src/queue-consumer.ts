@@ -263,7 +263,16 @@ async function processPaymentMessage(
       logger.warn("Failed to write txid mapping", { error: String(e) })
     );
 
-  // Update sender nonce cache and clear in-flight marker
+  // Clear in-flight marker unconditionally when senderNonce is set — the marker
+  // key only depends on signerHash + nonce, not senderAddress. Clearing here
+  // prevents stuck markers if senderAddress is missing for any reason.
+  if (record.senderNonce !== undefined) {
+    await clearInFlight(kv, signerHash, record.senderNonce).catch((e) =>
+      logger.warn("Failed to clear in-flight marker on broadcast success", { error: String(e) })
+    );
+  }
+
+  // Update sender nonce cache (requires senderAddress for the cache key)
   if (record.senderNonce !== undefined && record.senderAddress) {
     await updateSenderNonceOnBroadcast(
       kv,
@@ -272,12 +281,6 @@ async function processPaymentMessage(
       txid
     ).catch((e) =>
       logger.warn("Failed to update sender nonce cache", { error: String(e) })
-    );
-
-    // Clear in-flight marker now that the broadcast is recorded in the sender nonce cache.
-    // The cache's lastSeen will block duplicates going forward; the marker is no longer needed.
-    await clearInFlight(kv, signerHash, record.senderNonce).catch((e) =>
-      logger.warn("Failed to clear in-flight marker on broadcast success", { error: String(e) })
     );
 
     // Write sender address → signer hash mapping for chainhook lookup (24h TTL)

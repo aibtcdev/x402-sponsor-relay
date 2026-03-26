@@ -143,7 +143,7 @@ export class Settle extends BaseEndpoint {
    * Records nonce lifecycle, dedup, tx status, stats, schedules background polling,
    * and returns the V2 settlement response.
    */
-  private handleBroadcastSuccess(params: BroadcastSuccessParams): Response {
+  private async handleBroadcastSuccess(params: BroadcastSuccessParams): Promise<Response> {
     const {
       c, logger, txid, txHex, network,
       sponsorNonce, sponsorWalletIndex, sponsorFee,
@@ -170,44 +170,42 @@ export class Settle extends BaseEndpoint {
 
     const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
 
-    // Record dedup, tx status, and stats in background (non-blocking)
+    // Await dedup + tx status before returning — these must be visible to subsequent
+    // requests for idempotency (dedup) and for the background poller (tx status).
+    await settlementService.recordDedup(txHex, {
+      txid,
+      status: "pending",
+      sender: payer,
+      recipient,
+      amount,
+    });
+
+    const txStatusRecord: TxStatusRecord = {
+      txid,
+      status: "broadcast",
+      payer,
+      network,
+      walletIndex: sponsorNonce !== null ? sponsorWalletIndex : undefined,
+      sponsorNonce,
+      sponsorFee,
+      broadcastAt: new Date().toISOString(),
+    };
+    await settlementService.recordTxStatus(txStatusRecord);
+
+    // Record stats in background (non-blocking)
     c.executionCtx.waitUntil(
-      (async () => {
-        await settlementService.recordDedup(txHex, {
-          txid,
-          status: "pending",
-          sender: payer,
-          recipient,
-          amount,
-        });
-
-        const txStatusRecord: TxStatusRecord = {
-          txid,
-          status: "broadcast",
-          payer,
-          network,
-          walletIndex: sponsorNonce !== null ? sponsorWalletIndex : undefined,
-          sponsorNonce,
-          sponsorFee,
-          broadcastAt: new Date().toISOString(),
-        };
-        await settlementService.recordTxStatus(txStatusRecord);
-
-        await statsService.logTransaction({
-          timestamp: new Date().toISOString(),
-          endpoint: "settle",
-          success: true,
-          tokenType: settleOptions.tokenType ?? "STX",
-          amount: settleOptions.minAmount,
-          txid,
-          sender: payer,
-          recipient,
-          status: "pending",
-          fee: sponsorFee,
-        }).catch(() => {});
-      })().catch((e) => {
-        logger.warn("Failed to record broadcast success metadata", { error: String(e) });
-      })
+      statsService.logTransaction({
+        timestamp: new Date().toISOString(),
+        endpoint: "settle",
+        success: true,
+        tokenType: settleOptions.tokenType ?? "STX",
+        amount: settleOptions.minAmount,
+        txid,
+        sender: payer,
+        recipient,
+        status: "pending",
+        fee: sponsorFee,
+      }).catch(() => {})
     );
 
     // Background: poll for confirmation and update KV records
@@ -544,26 +542,34 @@ export class Settle extends BaseEndpoint {
                   logger.warn("Retry broadcast after inline resync also failed", {
                     error: retryBroadcastResult.error,
                   });
-                  c.executionCtx.waitUntil(
-                    Promise.all([
-                      recordBroadcastOutcomeDO(
-                        c.env, logger, retryNonce!, retryWalletIndex,
-                        undefined, retryBroadcastResult.httpStatus, retryBroadcastResult.nodeUrl, retryBroadcastResult.details
-                      ),
-                      releaseNonceDO(c.env, logger, retryNonce!, undefined, retryWalletIndex),
-                    ]).catch((e) => {
-                      logger.warn("Failed nonce lifecycle after retry broadcast failure", { error: String(e) });
-                    })
-                  );
+                  if (retryNonce !== null) {
+                    c.executionCtx.waitUntil(
+                      Promise.all([
+                        recordBroadcastOutcomeDO(
+                          c.env, logger, retryNonce, retryWalletIndex,
+                          undefined, retryBroadcastResult.httpStatus, retryBroadcastResult.nodeUrl, retryBroadcastResult.details
+                        ),
+                        releaseNonceDO(c.env, logger, retryNonce, undefined, retryWalletIndex),
+                      ]).catch((e) => {
+                        logger.warn("Failed nonce lifecycle after retry broadcast failure", { error: String(e) });
+                      })
+                    );
+                  } else {
+                    logger.warn("Retry broadcast failed but sponsor nonce was null; skipping nonce lifecycle");
+                  }
                 }
               } else {
                 // Retry verify failed — release retry nonce, fall through to error
                 logger.warn("Retry verify failed after inline resync", { error: retryVerifyResult.error });
-                c.executionCtx.waitUntil(
-                  releaseNonceDO(c.env, logger, retryNonce!, undefined, retryWalletIndex).catch((e) => {
-                    logger.warn("Failed to release retry nonce after verify failure", { error: String(e) });
-                  })
-                );
+                if (retryNonce !== null) {
+                  c.executionCtx.waitUntil(
+                    releaseNonceDO(c.env, logger, retryNonce, undefined, retryWalletIndex).catch((e) => {
+                      logger.warn("Failed to release retry nonce after verify failure", { error: String(e) });
+                    })
+                  );
+                } else {
+                  logger.warn("Retry verify failed but sponsor nonce was null; skipping nonce release");
+                }
               }
             } else {
               logger.warn("Retry sponsor failed after inline resync", {

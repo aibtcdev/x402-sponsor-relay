@@ -171,6 +171,18 @@ export async function checkSenderNonce(
   senderAddress: string,
   network: "mainnet" | "testnet" = "mainnet"
 ): Promise<SenderNonceCheckResult> {
+  // In-flight marker check runs first — must reject concurrent requests even when
+  // the sender cache is cold (first-contact sender or failed seed). Without this,
+  // first-contact senders can bypass the duplicate gate entirely.
+  const inFlight = await kv.get(inFlightKey(signerHash, providedNonce), "text");
+  if (inFlight !== null) {
+    return {
+      outcome: "duplicate",
+      provided: providedNonce,
+      lastSeen: providedNonce,
+    };
+  }
+
   const cache = await getCache(kv, signerHash);
 
   if (!cache) {
@@ -188,18 +200,6 @@ export async function checkSenderNonce(
       currentNonce: cache.lastConfirmed + 1,
       help,
       action: `Re-sign your transaction with nonce ${cache.lastConfirmed + 1} and resubmit.`,
-    };
-  }
-
-  // In-flight marker: a concurrent RPC request already accepted this nonce but
-  // the queue consumer hasn't broadcast yet (and therefore hasn't updated lastSeen).
-  // Reject to prevent duplicate transactions reaching the queue.
-  const inFlight = await kv.get(inFlightKey(signerHash, providedNonce), "text");
-  if (inFlight !== null) {
-    return {
-      outcome: "duplicate",
-      provided: providedNonce,
-      lastSeen: providedNonce,
     };
   }
 
