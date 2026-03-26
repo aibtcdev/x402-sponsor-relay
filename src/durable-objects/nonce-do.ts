@@ -3051,6 +3051,48 @@ export class NonceDO {
             verdictRbfCandidate--;
             continue;
           }
+          // P2 contention awareness (issue #229): if the tx was replaced by a
+          // direct submission (dropped_replace_by_fee or dropped_replace_across_fork),
+          // someone else (likely the sender via self-pay) settled this nonce slot.
+          // Gap-fill immediately instead of wasting an RBF attempt.
+          if (txStatus !== null && (
+            txStatus === "dropped_replace_by_fee" ||
+            txStatus === "dropped_replace_across_fork"
+          )) {
+            this.log("info", "contention_detected", {
+              walletIndex,
+              nonce,
+              txid,
+              txStatus,
+              reason: "sponsor_tx_replaced_by_direct_submission",
+            });
+            // Mark as failed with contention reason and queue for gap-fill
+            try {
+              const now = new Date().toISOString();
+              this.sql.exec(
+                `UPDATE nonce_intents SET state = 'failed', error_reason = ?
+                 WHERE wallet_index = ? AND nonce = ?`,
+                `contention:${txStatus}`,
+                walletIndex,
+                nonce
+              );
+              this.sql.exec(
+                `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+                 VALUES (?, ?, 'contention_detected', ?, ?)`,
+                walletIndex,
+                nonce,
+                JSON.stringify({ txid, txStatus, reason: "replaced_by_direct" }),
+                now
+              );
+            } catch { /* fail-open */ }
+            // Clean up stuck-tx state
+            const contentionStuckKey = this.walletStuckTxKey(walletIndex, nonce);
+            await this.state.storage.delete(contentionStuckKey);
+            // Gap-fill this nonce in the current cycle if budget allows
+            gapFillNonces.push(nonce);
+            verdictRbfCandidate--;
+            continue;
+          }
           // Tx is dropped/not found/null — proceed with RBF
           const rbfTxid = await this.broadcastRbfForNonce(walletIndex, nonce, privateKey, txid);
           if (rbfTxid) {
