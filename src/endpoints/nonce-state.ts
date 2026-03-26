@@ -42,8 +42,8 @@ export class NonceState extends BaseEndpoint {
                         properties: {
                           walletIndex: { type: "number" as const },
                           sponsorAddress: { type: "string" as const },
-                          chainFrontier: { type: "number" as const, description: "Highest confirmed nonce (monotonic)" },
-                          assignmentHead: { type: "number" as const, description: "Next nonce to assign" },
+                          chainFrontier: { type: "number" as const, description: "Monotonic high-water mark of Hiro's possible_next_nonce — the next nonce expected on-chain (not the last confirmed nonce)" },
+                          assignmentHead: { type: "number" as const, description: "Next nonce to be assigned by the pool (one past the highest assigned/broadcasted nonce)" },
                           pendingTxs: {
                             type: "array" as const,
                             items: {

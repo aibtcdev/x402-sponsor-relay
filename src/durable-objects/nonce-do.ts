@@ -2590,8 +2590,11 @@ export class NonceDO {
         const circuitBreakerOpen =
           activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
 
-        const reserved = this.ledgerReservedCount(walletIndex);
-        const available = Math.max(0, CHAINING_LIMIT - reserved);
+        // Use the same headroom calculation as the assignment path so that
+        // available/reserved are consistent with what assignNonce() sees.
+        // walletHeadroom() counts assigned+broadcasted+confirmed (all in-flight).
+        const available = this.walletHeadroom(walletIndex);
+        const reserved = CHAINING_LIMIT - available;
 
         return {
           walletIndex,
@@ -3187,51 +3190,40 @@ export class NonceDO {
     let headBumpNonce: number | null = null;
     let headBumpTxid: string | null = null;
     if (gapFillFilled.length > 0) {
-      // Find the lowest broadcasted nonce that is NOT a gap-fill
-      const gapFillSet = new Set(gapFillFilled);
-      const bumpCandidate = this.sql
-        .exec<{ nonce: number; txid: string | null }>(
-          `SELECT nonce, txid FROM nonce_intents
-           WHERE wallet_index = ? AND state = 'broadcasted' AND txid IS NOT NULL
-           ORDER BY nonce ASC`,
-          walletIndex
-        )
-        .toArray()
-        .find((row) => !gapFillSet.has(row.nonce));
-
-      if (bumpCandidate) {
-        const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
-        if (privateKey) {
-          const { network, recipient } = this.getFlushRecipient();
-          try {
-            const tx = await makeSTXTokenTransfer({
-              recipient,
-              amount: GAP_FILL_AMOUNT,
-              senderKey: privateKey,
-              network,
-              nonce: BigInt(bumpCandidate.nonce),
-              fee: HEAD_BUMP_FEE,
-              memo: `head-bump-${bumpCandidate.nonce}`,
-            });
-            const result = await this.broadcastRawTx(tx, "head_bump");
-            if (result.ok) {
-              headBumpNonce = bumpCandidate.nonce;
-              headBumpTxid = result.txid;
-              this.log("info", "head_bump_after_gap_fill", {
-                walletIndex,
-                nonce: bumpCandidate.nonce,
-                originalTxid: bumpCandidate.txid,
-                bumpTxid: result.txid,
-                gapsFilled: gapFillFilled,
-              });
-            }
-          } catch (e) {
-            this.log("warn", "head_bump_error", {
+      // Re-broadcast the highest gap-fill at a higher fee to signal miners.
+      // We ONLY bump gap-fill nonces (safe self-transfers) — never real
+      // sponsored txs, which would cancel the user's transaction.
+      const bumpNonce = Math.max(...gapFillFilled);
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      if (privateKey) {
+        const { network, recipient } = this.getFlushRecipient();
+        try {
+          const tx = await makeSTXTokenTransfer({
+            recipient,
+            amount: GAP_FILL_AMOUNT,
+            senderKey: privateKey,
+            network,
+            nonce: BigInt(bumpNonce),
+            fee: HEAD_BUMP_FEE,
+            memo: `head-bump-${bumpNonce}`,
+          });
+          const result = await this.broadcastRawTx(tx, "head_bump");
+          if (result.ok) {
+            headBumpNonce = bumpNonce;
+            headBumpTxid = result.txid;
+            this.log("info", "head_bump_after_gap_fill", {
               walletIndex,
-              nonce: bumpCandidate.nonce,
-              error: e instanceof Error ? e.message : String(e),
+              nonce: bumpNonce,
+              bumpTxid: result.txid,
+              gapsFilled: gapFillFilled,
             });
           }
+        } catch (e) {
+          this.log("warn", "head_bump_error", {
+            walletIndex,
+            nonce: bumpNonce,
+            error: e instanceof Error ? e.message : String(e),
+          });
         }
       }
     }
