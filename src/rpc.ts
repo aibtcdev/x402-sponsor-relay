@@ -290,17 +290,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     const message: PaymentQueueMessage = {
       paymentId,
       txHex: cleanHex,
-      settle: settle
-        ? {
-            expectedRecipient: settle.expectedRecipient,
-            minAmount: settle.minAmount,
-            tokenType: settle.tokenType,
-            expectedSender: settle.expectedSender,
-            resource: settle.resource,
-            method: settle.method,
-            maxTimeoutSeconds: settle.maxTimeoutSeconds,
-          }
-        : undefined,
+      settle,
       network,
       attempt: 1,
     };

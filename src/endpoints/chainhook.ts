@@ -9,7 +9,7 @@
  */
 
 import { BaseEndpoint } from "./BaseEndpoint";
-import type { AppContext, Env } from "../types";
+import type { AppContext } from "../types";
 import {
   getPaymentRecord,
   putPaymentRecord,
@@ -82,8 +82,7 @@ export class Chainhook extends BaseEndpoint {
     const logger = this.getLogger(c);
 
     // Authenticate with CHAINHOOK_AUTH_TOKEN
-    const authToken = (c.env as Env & { CHAINHOOK_AUTH_TOKEN?: string })
-      .CHAINHOOK_AUTH_TOKEN;
+    const authToken = c.env.CHAINHOOK_AUTH_TOKEN;
     if (!authToken) {
       logger.error("CHAINHOOK_AUTH_TOKEN not configured");
       return this.err(c, {
@@ -126,7 +125,7 @@ export class Chainhook extends BaseEndpoint {
     } catch {
       return this.err(c, {
         error: "Invalid JSON payload",
-        code: "INVALID_SETTLE_OPTIONS",
+        code: "INVALID_TRANSACTION",
         status: 400,
         retryable: false,
       });

@@ -5,6 +5,7 @@
  * Status flows: submitted → queued → broadcasting → mempool → confirmed | failed
  */
 
+import type { SettleOptions } from "../types";
 import { buildExplorerUrl } from "../utils";
 
 // KV key prefix and TTL
@@ -101,15 +102,7 @@ export interface PaymentQueueMessage {
   /** Hex-encoded signed sponsored transaction */
   txHex: string;
   /** Settlement options (optional, for /relay path) */
-  settle?: {
-    expectedRecipient: string;
-    minAmount: string;
-    tokenType?: string;
-    expectedSender?: string;
-    resource?: string;
-    method?: string;
-    maxTimeoutSeconds?: number;
-  };
+  settle?: SettleOptions;
   /** Network at time of submission */
   network: "mainnet" | "testnet";
   /** Attempt counter (incremented on retry) */

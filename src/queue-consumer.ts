@@ -21,8 +21,7 @@ import {
   type PaymentQueueMessage,
 } from "./services/payment-status";
 import { updateSenderNonceOnBroadcast } from "./services/sender-nonce";
-import { SponsorService, extractSponsorNonce, recordNonceTxid, releaseNonceDO } from "./services";
-import { SettlementService } from "./services/settlement";
+import { SponsorService, extractSponsorNonce, recordNonceTxid, releaseNonceDO, SettlementService } from "./services";
 
 /** Max retries before dead-lettering */
 const MAX_ATTEMPTS = 5;
