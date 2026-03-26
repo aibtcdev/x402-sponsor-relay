@@ -201,7 +201,7 @@ export class Settle extends BaseEndpoint {
         logger.warn("Failed to deserialize transaction for sponsor-slot inspection", {
           error: errMsg,
           txHexLength: txHex.length,
-          txHexPrefix: txHex.slice(0, 20),
+          txHexPrefix: stripHexPrefix(txHex).slice(0, 20),
         });
         c.executionCtx.waitUntil(
           Promise.all([
