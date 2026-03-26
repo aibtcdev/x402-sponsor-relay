@@ -193,7 +193,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
         kv,
         signerHash,
         senderNonce,
-        senderAddress
+        senderAddress,
+        network
       );
     }
 
@@ -301,7 +302,27 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       attempt: 1,
     };
 
-    await queue.send(message);
+    try {
+      await queue.send(message);
+    } catch (err) {
+      const errorMessage =
+        err instanceof Error ? err.message : "Failed to enqueue payment";
+
+      // Queue send failed — mark payment as failed so status reflects reality
+      record = transitionPayment(record, "failed", {
+        error: `Payment queue send failed: ${errorMessage}`,
+        errorCode: "INTERNAL_ERROR",
+        retryable: true,
+      });
+      await putPaymentRecord(kv, record);
+
+      return {
+        accepted: false,
+        error: "Failed to enqueue payment",
+        code: "INTERNAL_ERROR",
+        retryable: true,
+      };
+    }
 
     // Build the status check URL from env or default by network
     const baseUrl =

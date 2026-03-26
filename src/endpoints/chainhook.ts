@@ -142,7 +142,7 @@ export class Chainhook extends BaseEndpoint {
     } catch {
       return this.err(c, {
         error: "Invalid JSON payload",
-        code: "INVALID_TRANSACTION",
+        code: "INVALID_PAYLOAD",
         status: 400,
         retryable: false,
       });

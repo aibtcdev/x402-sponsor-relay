@@ -124,7 +124,7 @@ async function processPaymentMessage(
         code,
         attempt,
       });
-      // Update record but keep in broadcasting state for next attempt
+      // Update record and move back to queued state for next attempt
       record = transitionPayment(record, "queued", {
         error: `Sponsor contention: ${sponsorResult.error}`,
       });
