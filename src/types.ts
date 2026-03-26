@@ -595,6 +595,39 @@ export type RelayErrorCode =
   | "INVALID_BTC_ADDRESS";
 
 /**
+ * Default retry-after for SERVICE_DEGRADED responses (seconds).
+ * All sponsor wallets are circuit-broken — agents should back off
+ * and let the quarantine window (10min) drain before retrying.
+ */
+export const SERVICE_DEGRADED_RETRY_AFTER_S = 30;
+
+/**
+ * Per-wallet health snapshot returned by NonceDO GET /pool-health.
+ */
+export interface WalletHealthSnapshot {
+  walletIndex: number;
+  circuitBreakerOpen: boolean;
+  reserved: number;
+  available: number;
+  quarantineCount: number;
+}
+
+/**
+ * Pool-wide health response returned by NonceDO GET /pool-health.
+ * Used as a pre-flight check and for the /health endpoint.
+ */
+export interface PoolHealthResponse {
+  /** True when ALL wallets are circuit-broken (no healthy wallet available) */
+  allWalletsDegraded: boolean;
+  /** Total in-flight nonces across all initialized wallets */
+  totalReserved: number;
+  /** Total capacity across all initialized wallets (walletCount * CHAINING_LIMIT) */
+  totalCapacity: number;
+  /** Per-wallet health snapshot */
+  wallets: WalletHealthSnapshot[];
+}
+
+/**
  * Structured error response with retry guidance
  */
 export interface RelayErrorResponse {
