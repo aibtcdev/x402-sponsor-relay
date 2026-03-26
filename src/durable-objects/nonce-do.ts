@@ -177,10 +177,14 @@ interface WalletUtilization {
  */
 interface ObservablePendingTx {
   sponsorNonce: number;
-  state: "assigned" | "broadcasted";
+  state: "assigned" | "broadcasted" | "replaced";
   txid?: string;
   assignedAt: string;
   broadcastedAt?: string;
+  /** Replacement txid when state is "replaced" (RBF or head-bump replacement). */
+  replacementTxid?: string;
+  /** Contention reason string from error_reason column (e.g. "contention:dropped_replace_by_fee"). */
+  replacedReason?: string;
 }
 
 /**
@@ -2584,6 +2588,41 @@ export class NonceDO {
           broadcastedAt: row.broadcasted_at ?? undefined,
         }));
 
+        // Replaced txs: failed intents where error_reason starts with 'contention:'
+        // These are sponsor txs that were dropped because a direct submission claimed
+        // the same nonce slot (contention detection in reconcileNonceForWallet).
+        const replacedRows = this.sql
+          .exec<{
+            nonce: number;
+            state: string;
+            txid: string | null;
+            error_reason: string | null;
+            assigned_at: string;
+            broadcasted_at: string | null;
+          }>(
+            `SELECT nonce, state, txid, error_reason, assigned_at, broadcasted_at
+             FROM nonce_intents
+             WHERE wallet_index = ? AND state = 'failed' AND error_reason LIKE 'contention:%'
+             ORDER BY nonce ASC`,
+            walletIndex
+          )
+          .toArray();
+
+        const replacedTxs: ObservablePendingTx[] = replacedRows.map((row) => ({
+          sponsorNonce: row.nonce,
+          state: "replaced" as const,
+          // txid column holds the replacement txid (updated by Phase 2 RBF/head-bump logic)
+          replacementTxid: row.txid ?? undefined,
+          replacedReason: row.error_reason ?? undefined,
+          assignedAt: row.assigned_at,
+          broadcastedAt: row.broadcasted_at ?? undefined,
+        }));
+
+        // Merge and sort by sponsorNonce ascending
+        const allTxs = [...pendingTxs, ...replacedTxs].sort(
+          (a, b) => a.sponsorNonce - b.sponsorNonce
+        );
+
         // Chain frontier and head for gap detection
         const chainFrontier = this.getChainFrontier(walletIndex);
         const head = this.ledgerGetWalletHead(walletIndex);
@@ -2632,7 +2671,7 @@ export class NonceDO {
           sponsorAddress: address,
           chainFrontier: chainFrontier ?? undefined,
           assignmentHead: head ?? undefined,
-          pendingTxs,
+          pendingTxs: allTxs,
           gaps,
           available,
           reserved,
