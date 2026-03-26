@@ -3760,6 +3760,22 @@ export class NonceDO {
    * Wallets will reinitialize from Hiro on the next /assign call.
    * Also resets nonce heads and clears the nonce_intents ledger for each wallet.
    */
+  /**
+   * Manual escape hatch: zero out conflictsDetected and clear lastGapDetected
+   * without touching any nonce pool state. Used when auto-clear hasn't fired yet
+   * and operators need to unblock the health circuit breaker immediately.
+   */
+  private handleClearConflicts(): Response {
+    const previousConflicts = this.getStoredCount(STATE_KEYS.conflictsDetected);
+    this.setStateValue(STATE_KEYS.conflictsDetected, 0);
+    this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.lastGapDetected);
+    this.log("info", "clear_conflicts", {
+      previousConflicts,
+      reason: "manual_operator_clear",
+    });
+    return this.jsonResponse({ cleared: true, previousConflicts });
+  }
+
   private async handleClearPools(): Promise<Response> {
     return this.state.blockConcurrencyWhile(async () => {
       const initializedWallets = await this.getInitializedWallets();
@@ -4096,6 +4112,10 @@ export class NonceDO {
 
     if (request.method === "POST" && url.pathname === "/clear-pools") {
       return this.handleClearPools();
+    }
+
+    if (request.method === "POST" && url.pathname === "/clear-conflicts") {
+      return this.handleClearConflicts();
     }
 
     if (request.method === "POST" && url.pathname === "/broadcast-outcome") {
