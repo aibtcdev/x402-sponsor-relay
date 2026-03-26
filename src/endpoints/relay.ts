@@ -10,6 +10,7 @@ import {
   recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
+  putPaymentRecord,
 } from "../services";
 import { checkRateLimit, RATE_LIMIT } from "../middleware";
 import { stripHexPrefix } from "../utils";
@@ -46,6 +47,12 @@ export class Relay extends BaseEndpoint {
                   type: "string" as const,
                   description: "Hex-encoded signed sponsored transaction",
                   example: "0x00000001...",
+                },
+                queue: {
+                  type: "boolean" as const,
+                  description:
+                    "Queue for serial processing instead of synchronous handling. Eliminates nonce contention in batch sends. Returns 202 with paymentId for polling.",
+                  example: true,
                 },
                 settle: {
                   type: "object" as const,
@@ -181,6 +188,40 @@ export class Relay extends BaseEndpoint {
           },
         },
       },
+      "202": {
+        description: "Transaction queued for serial processing",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object" as const,
+              properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                },
+                paymentId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Payment ID for polling status via GET /payment/:id",
+                },
+                status: {
+                  type: "string" as const,
+                  example: "queued",
+                },
+                pollUrl: {
+                  type: "string" as const,
+                  description: "URL to poll for payment status",
+                },
+                message: {
+                  type: "string" as const,
+                },
+              },
+            },
+          },
+        },
+      },
       "400": Error400Response,
       "401": { ...Error401Response, description: "Authentication failed (invalid or expired SIP-018 signature)" },
       "409": { ...Error409Response, description: "Nonce conflict — resubmit with a new transaction" },
@@ -235,6 +276,81 @@ export class Relay extends BaseEndpoint {
             retryable: false,
           });
         }
+      }
+
+
+      // Queue mode: serialize batch sends through PAYMENT_QUEUE to avoid nonce contention.
+      // When queue=true, the relay creates a payment record, enqueues to PAYMENT_QUEUE,
+      // and returns 202 Accepted with a paymentId for polling via GET /payment/:id
+      if (body.queue && c.env.PAYMENT_QUEUE) {
+        const kv = c.env.RELAY_KV;
+        if (!kv) {
+          return this.err(c, {
+            error: "RELAY_KV not configured",
+            code: "SPONSOR_CONFIG_ERROR",
+            status: 503,
+            details: "Payment queue requires RELAY_KV for payment records",
+            retryable: true,
+          });
+        }
+
+        // Validate the transaction before queuing
+        const queueSponsorService = new SponsorService(c.env, logger);
+        const txValidation = queueSponsorService.validateTransaction(body.transaction);
+        if (txValidation.valid === false) {
+          c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+          const code = txValidation.error === "Transaction must be sponsored"
+            ? "NOT_SPONSORED"
+            : "INVALID_TRANSACTION";
+          return this.err(c, {
+            error: txValidation.error,
+            code,
+            status: 400,
+            details: txValidation.details,
+            retryable: false,
+          });
+        }
+
+        // Generate payment ID and create initial record
+        const paymentId = crypto.randomUUID();
+        const network = c.env.STACKS_NETWORK as "mainnet" | "testnet";
+
+        const record = {
+          paymentId,
+          status: "queued" as const,
+          submittedAt: new Date().toISOString(),
+          network,
+          attempts: 0,
+        };
+        await putPaymentRecord(kv, record);
+
+        // Enqueue for serial processing
+        await c.env.PAYMENT_QUEUE.send({
+          paymentId,
+          txHex: body.transaction,
+          network,
+          settle: body.settle,
+          attempt: 0,
+        });
+
+        logger.info("Queued relay request for serial processing", { paymentId });
+        c.executionCtx.waitUntil(statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "relay",
+          success: true,
+          tokenType: body.settle.tokenType || "STX",
+          amount: body.settle.minAmount,
+          fee: "0",
+        }).catch(() => {}));
+
+        return c.json({
+          success: true,
+          requestId: this.getRequestId(c),
+          paymentId,
+          status: "queued",
+          pollUrl: `${c.env.RELAY_BASE_URL ?? ""}/payment/${paymentId}`,
+          message: "Transaction queued for serial processing. Poll paymentId for status.",
+        }, 202);
       }
 
       const sponsorService = new SponsorService(c.env, logger);

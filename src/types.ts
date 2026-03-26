@@ -482,6 +482,8 @@ export interface RelayRequest {
   settle: SettleOptions;
   /** Optional SIP-018 authentication */
   auth?: Sip018Auth;
+  /** Queue for serial processing (eliminates nonce contention in batch sends) */
+  queue?: boolean;
 }
 
 /**
