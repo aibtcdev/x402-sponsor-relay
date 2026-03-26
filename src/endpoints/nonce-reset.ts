@@ -7,7 +7,9 @@ import {
   Error502Response,
 } from "../schemas";
 
-type NonceResetAction = "resync" | "reset" | "clear-pools";
+type NonceResetAction = "resync" | "reset" | "clear-pools" | "clear-conflicts";
+
+const VALID_ACTIONS = new Set<string>(["resync", "reset", "clear-pools", "clear-conflicts"]);
 
 /**
  * Nonce reset endpoint - trigger on-demand nonce recovery
@@ -22,6 +24,8 @@ type NonceResetAction = "resync" | "reset" | "clear-pools";
  * - reset: hard reset to last_executed_tx_nonce + 1 (safe floor)
  * - clear-pools: wipe all per-wallet pool state and stored addresses;
  *   pools reinitialize from Hiro on next /assign (use after derivation changes)
+ * - clear-conflicts: zero out conflictsDetected and clear lastGapDetected
+ *   without touching nonce pool state (manual circuit-breaker escape hatch)
  */
 export class NonceReset extends BaseEndpoint {
   schema = {
@@ -31,7 +35,8 @@ export class NonceReset extends BaseEndpoint {
       "Immediately trigger nonce gap recovery on the Nonce Durable Object without waiting for the 5-minute alarm cycle. Requires API key authentication.\n\n" +
       "**resync** (default): Applies the same gap-aware logic as the alarm — GAP RECOVERY resets to lowest missing nonce, FORWARD BUMP advances to chain's possible_next_nonce, STALE DETECTION resets if idle and ahead of chain.\n\n" +
       "**reset**: Hard resets the counter to `last_executed_tx_nonce + 1` — the safe floor that cannot conflict with any confirmed transaction.\n\n" +
-      "**clear-pools**: Wipes all per-wallet pool state and stored addresses. Pools reinitialize from Hiro on the next request. Use after wallet derivation changes.",
+      "**clear-pools**: Wipes all per-wallet pool state and stored addresses. Pools reinitialize from Hiro on the next request. Use after wallet derivation changes.\n\n" +
+      "**clear-conflicts**: Zeroes out `conflictsDetected` and clears `lastGapDetected` without touching nonce pool state. Manual escape hatch when auto-clear hasn't fired yet and the health circuit breaker is blocking traffic.",
     security: [{ bearerAuth: [] }],
     request: {
       body: {
@@ -42,10 +47,10 @@ export class NonceReset extends BaseEndpoint {
               properties: {
                 action: {
                   type: "string" as const,
-                  enum: ["resync", "reset", "clear-pools"],
+                  enum: ["resync", "reset", "clear-pools", "clear-conflicts"],
                   default: "resync",
                   description:
-                    "Recovery action to perform. 'resync' applies gap-aware reconciliation; 'reset' hard resets to last_executed_tx_nonce + 1; 'clear-pools' wipes all wallet pools for reinitialization.",
+                    "Recovery action to perform. 'resync' applies gap-aware reconciliation; 'reset' hard resets to last_executed_tx_nonce + 1; 'clear-pools' wipes all wallet pools for reinitialization; 'clear-conflicts' zeroes conflictsDetected and clears lastGapDetected without touching pool state.",
                   example: "resync",
                 },
               },
@@ -71,32 +76,40 @@ export class NonceReset extends BaseEndpoint {
                 },
                 action: {
                   type: "string" as const,
-                  enum: ["resync", "reset", "clear-pools"],
+                  enum: ["resync", "reset", "clear-pools", "clear-conflicts"],
                   description: "Action that was performed",
                 },
                 result: {
                   type: "object" as const,
-                  description: "Result from the Nonce Durable Object",
+                  description: "Result from the Nonce Durable Object (shape varies by action)",
                   properties: {
                     success: { type: "boolean" as const },
                     action: { type: "string" as const },
                     previousNonce: {
                       type: "number" as const,
                       nullable: true,
-                      description: "Nonce counter value before recovery",
+                      description: "Nonce counter value before recovery (resync/reset)",
                     },
                     newNonce: {
                       type: "number" as const,
                       nullable: true,
-                      description: "Nonce counter value after recovery",
+                      description: "Nonce counter value after recovery (resync/reset)",
                     },
                     changed: {
                       type: "boolean" as const,
-                      description: "Whether the nonce counter was modified",
+                      description: "Whether the nonce counter was modified (resync/reset)",
                     },
                     reason: {
                       type: "string" as const,
                       description: "Human-readable reason for the change (resync only)",
+                    },
+                    cleared: {
+                      type: "boolean" as const,
+                      description: "Whether conflict counters were cleared (clear-conflicts)",
+                    },
+                    previousConflicts: {
+                      type: "number" as const,
+                      description: "Conflict count before clearing (clear-conflicts)",
                     },
                   },
                 },
@@ -135,12 +148,12 @@ export class NonceReset extends BaseEndpoint {
     try {
       const body = await c.req.json() as Record<string, unknown>;
       if (body.action !== undefined) {
-        if (body.action !== "resync" && body.action !== "reset" && body.action !== "clear-pools") {
+        if (!VALID_ACTIONS.has(body.action as string)) {
           return this.err(c, {
             error: "Invalid action",
             code: "NONCE_RESET_FAILED",
             status: 400,
-            details: `action must be 'resync', 'reset', or 'clear-pools', got '${body.action}'`,
+            details: `action must be one of ${[...VALID_ACTIONS].join(", ")}; got '${body.action}'`,
             retryable: false,
           });
         }

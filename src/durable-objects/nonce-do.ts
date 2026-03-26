@@ -3497,6 +3497,14 @@ export class NonceDO {
       }
       wallets.push({ walletIndex, ...result });
     }
+
+    // When all wallets are consistent with chain state, reset cumulative conflict counters.
+    // This prevents stale conflict state from permanently poisoning health checks.
+    const allClean = wallets.every(w => !w.changed);
+    if (allClean && this.getStoredCount(STATE_KEYS.conflictsDetected) > 0) {
+      this.clearConflictCounters("all_wallets_consistent_with_chain");
+    }
+
     return { success: true, action: "resync", wallets };
   }
 
@@ -3736,6 +3744,38 @@ export class NonceDO {
       }
       return this.internalError(error);
     }
+  }
+
+  /**
+   * Zero out conflictsDetected and clear lastGapDetected.
+   * Shared by auto-clear (after clean resync) and manual clear-conflicts action.
+   * Returns the previous conflict count (0 if already clean).
+   */
+  private clearConflictCounters(reason: string): number {
+    const previousConflicts = this.getStoredCount(STATE_KEYS.conflictsDetected);
+
+    // Always clear lastGapDetected so the health circuit breaker can recover,
+    // even if conflictsDetected is already zero.
+    this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.lastGapDetected);
+
+    if (previousConflicts === 0) {
+      this.log("info", "conflict_counters_already_clear", { reason });
+      return 0;
+    }
+
+    this.setStateValue(STATE_KEYS.conflictsDetected, 0);
+    this.log("info", "conflict_counters_cleared", { previousConflicts, reason });
+    return previousConflicts;
+  }
+
+  /**
+   * Manual escape hatch: zero out conflictsDetected and clear lastGapDetected
+   * without touching any nonce pool state. Used when auto-clear hasn't fired yet
+   * and operators need to unblock the health circuit breaker immediately.
+   */
+  private handleClearConflicts(): Response {
+    const previousConflicts = this.clearConflictCounters("manual_operator_clear");
+    return this.jsonResponse({ cleared: true, previousConflicts });
   }
 
   /**
@@ -4079,6 +4119,10 @@ export class NonceDO {
 
     if (request.method === "POST" && url.pathname === "/clear-pools") {
       return this.handleClearPools();
+    }
+
+    if (request.method === "POST" && url.pathname === "/clear-conflicts") {
+      return this.handleClearConflicts();
     }
 
     if (request.method === "POST" && url.pathname === "/broadcast-outcome") {
