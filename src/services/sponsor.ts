@@ -522,6 +522,48 @@ export class SponsorService {
   }
 
   /**
+   * Lightweight pool health check — pre-flight gate before nonce assignment.
+   * Returns null if NonceDO is unavailable or the check fails (fail-open).
+   */
+  private async fetchPoolHealth(): Promise<{
+    allWalletsDegraded: boolean;
+    totalReserved: number;
+    totalCapacity: number;
+    wallets: Array<{
+      walletIndex: number;
+      circuitBreakerOpen: boolean;
+      reserved: number;
+      available: number;
+      quarantineCount: number;
+    }>;
+  } | null> {
+    if (!this.env.NONCE_DO) return null;
+
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch("https://nonce-do/pool-health");
+      if (!response.ok) return null;
+      return (await response.json()) as {
+        allWalletsDegraded: boolean;
+        totalReserved: number;
+        totalCapacity: number;
+        wallets: Array<{
+          walletIndex: number;
+          circuitBreakerOpen: boolean;
+          reserved: number;
+          available: number;
+          quarantineCount: number;
+        }>;
+      };
+    } catch (e) {
+      this.logger.debug("Pool health check failed (fail-open)", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
+  }
+
+  /**
    * Validate and deserialize a non-sponsored (standard auth) transaction for self-pay settlement.
    * Rejects sponsored transactions — callers that want to sponsor should use validateTransaction().
    */
@@ -622,6 +664,38 @@ export class SponsorService {
   async sponsorTransaction(
     transaction: StacksTransactionWire
   ): Promise<SponsorResult> {
+    // ── Circuit breaker gate ──────────────────────────────────────────────
+    // Check pool health BEFORE attempting nonce assignment. When all sponsor
+    // wallets are circuit-broken, reject immediately rather than feeding
+    // transactions into a known-degraded pool. Fail-open: if the health
+    // check itself fails, proceed with normal nonce assignment.
+    const poolHealth = await this.fetchPoolHealth();
+    if (poolHealth?.allWalletsDegraded) {
+      const degradedWallets = poolHealth.wallets
+        .filter((w) => w.circuitBreakerOpen)
+        .map((w) => ({
+          wallet: w.walletIndex,
+          quarantines: w.quarantineCount,
+          reserved: w.reserved,
+        }));
+      this.logger.warn("All sponsor wallets degraded — rejecting before nonce assignment", {
+        walletCount: poolHealth.wallets.length,
+        totalReserved: poolHealth.totalReserved,
+        totalCapacity: poolHealth.totalCapacity,
+        degradedWallets,
+      });
+      return {
+        success: false,
+        error: "Sponsor nonce pool is degraded",
+        details:
+          `All ${poolHealth.wallets.length} sponsor wallets are circuit-broken due to nonce contention. ` +
+          `${poolHealth.totalReserved} nonces in-flight out of ${poolHealth.totalCapacity} capacity. ` +
+          "Retry in 30s after the pool recovers.",
+        code: "SERVICE_DEGRADED",
+        retryAfter: 30,
+      };
+    }
+
     const network = this.getNetwork();
 
     // Pre-fetch the sponsor nonce from NonceDO (authoritative coordinator).
