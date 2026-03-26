@@ -3753,9 +3753,17 @@ export class NonceDO {
    */
   private clearConflictCounters(reason: string): number {
     const previousConflicts = this.getStoredCount(STATE_KEYS.conflictsDetected);
-    if (previousConflicts === 0) return 0;
-    this.setStateValue(STATE_KEYS.conflictsDetected, 0);
+
+    // Always clear lastGapDetected so the health circuit breaker can recover,
+    // even if conflictsDetected is already zero.
     this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.lastGapDetected);
+
+    if (previousConflicts === 0) {
+      this.log("info", "conflict_counters_already_clear", { reason });
+      return 0;
+    }
+
+    this.setStateValue(STATE_KEYS.conflictsDetected, 0);
     this.log("info", "conflict_counters_cleared", { previousConflicts, reason });
     return previousConflicts;
   }

@@ -81,27 +81,35 @@ export class NonceReset extends BaseEndpoint {
                 },
                 result: {
                   type: "object" as const,
-                  description: "Result from the Nonce Durable Object",
+                  description: "Result from the Nonce Durable Object (shape varies by action)",
                   properties: {
                     success: { type: "boolean" as const },
                     action: { type: "string" as const },
                     previousNonce: {
                       type: "number" as const,
                       nullable: true,
-                      description: "Nonce counter value before recovery",
+                      description: "Nonce counter value before recovery (resync/reset)",
                     },
                     newNonce: {
                       type: "number" as const,
                       nullable: true,
-                      description: "Nonce counter value after recovery",
+                      description: "Nonce counter value after recovery (resync/reset)",
                     },
                     changed: {
                       type: "boolean" as const,
-                      description: "Whether the nonce counter was modified",
+                      description: "Whether the nonce counter was modified (resync/reset)",
                     },
                     reason: {
                       type: "string" as const,
                       description: "Human-readable reason for the change (resync only)",
+                    },
+                    cleared: {
+                      type: "boolean" as const,
+                      description: "Whether conflict counters were cleared (clear-conflicts)",
+                    },
+                    previousConflicts: {
+                      type: "number" as const,
+                      description: "Conflict count before clearing (clear-conflicts)",
                     },
                   },
                 },
