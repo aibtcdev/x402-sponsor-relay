@@ -15,6 +15,7 @@ import {
   generateNewAccount,
   generateWallet,
 } from "@stacks/wallet-sdk";
+import { SERVICE_DEGRADED_RETRY_AFTER_S } from "../types";
 import type { Env, Logger, FeeTransactionType, FeePriority, WalletStatus, WalletsResponse } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix } from "../utils";
 import { FeeService } from "./fee";
@@ -112,6 +113,12 @@ interface NonceDOErrorBody {
   mempoolDepth?: number;
   estimatedDrainSeconds?: number;
   retryAfterSeconds?: number;
+  /** From ALL_WALLETS_DEGRADED — number of circuit-broken wallets */
+  degradedCount?: number;
+  /** From ALL_WALLETS_DEGRADED — total in-flight nonces */
+  totalReserved?: number;
+  /** From ALL_WALLETS_DEGRADED — total pool capacity */
+  totalCapacity?: number;
 }
 
 /**
@@ -501,6 +508,9 @@ export class SponsorService {
           status: response.status,
           mempoolDepth: errorBody.mempoolDepth,
           estimatedDrainSeconds: errorBody.estimatedDrainSeconds,
+          retryAfterSeconds: errorBody.retryAfterSeconds,
+          totalReserved: errorBody.totalReserved,
+          totalCapacity: errorBody.totalCapacity,
         };
       }
 
@@ -666,11 +676,14 @@ export class SponsorService {
           totalReserved,
         });
       } else {
-        // Propagate specific error codes from NonceDO (e.g. 429 CHAINING_LIMIT_EXCEEDED, 503 LOW_HEADROOM)
+        // Propagate specific error codes from NonceDO
         const isChainingLimit = doResult.code === "CHAINING_LIMIT_EXCEEDED";
         const isLowHeadroom = doResult.code === "LOW_HEADROOM";
+        const isAllDegraded = doResult.code === "ALL_WALLETS_DEGRADED";
         let code: string;
-        if (isChainingLimit) {
+        if (isAllDegraded) {
+          code = "SERVICE_DEGRADED";
+        } else if (isChainingLimit) {
           code = "RATE_LIMIT_EXCEEDED";
         } else if (isLowHeadroom) {
           code = "LOW_HEADROOM";
@@ -687,12 +700,22 @@ export class SponsorService {
         });
 
         let details: string;
-        if (isChainingLimit && doResult.mempoolDepth !== undefined && doResult.estimatedDrainSeconds !== undefined) {
+        let retryAfter: number | undefined;
+        if (isAllDegraded) {
+          const totalReserved = doResult.totalReserved ?? 0;
+          const totalCapacity = doResult.totalCapacity ?? 0;
+          details =
+            `All sponsor wallets are circuit-broken due to nonce contention. ` +
+            `${totalReserved} nonces in-flight out of ${totalCapacity} capacity. ` +
+            `Retry in ${SERVICE_DEGRADED_RETRY_AFTER_S}s after the pool recovers.`;
+          retryAfter = SERVICE_DEGRADED_RETRY_AFTER_S;
+        } else if (isChainingLimit && doResult.mempoolDepth !== undefined && doResult.estimatedDrainSeconds !== undefined) {
           details = `All sponsor wallets at chaining limit (mempool depth: ${doResult.mempoolDepth}); retry in ~${doResult.estimatedDrainSeconds}s`;
         } else if (isChainingLimit) {
           details = "All sponsor wallets at chaining limit; retry in a few seconds";
         } else if (isLowHeadroom && doResult.retryAfterSeconds !== undefined) {
           details = `Nonce pool headroom is low; retry in ~${doResult.retryAfterSeconds}s`;
+          retryAfter = doResult.retryAfterSeconds;
         } else if (isLowHeadroom) {
           details = "Nonce pool headroom is low; retry in a few seconds";
         } else {
@@ -704,7 +727,7 @@ export class SponsorService {
           error: doResult.error,
           details,
           code,
-          retryAfter: isLowHeadroom ? doResult.retryAfterSeconds : undefined,
+          retryAfter,
         };
       }
     } else {

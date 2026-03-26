@@ -247,11 +247,15 @@ export class Settle extends BaseEndpoint {
               statsService.logFailure("settle", false, failureCtx),
             ]).catch(() => {})
           );
-          // LOW_HEADROOM / CHAINING_LIMIT_EXCEEDED are transient — signal retryable
-          const errorReason =
-            sponsorResult.code === "LOW_HEADROOM" || sponsorResult.code === "CHAINING_LIMIT_EXCEEDED"
-              ? X402_V2_ERROR_CODES.BROADCAST_FAILED
-              : X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE;
+          // Transient sponsor failures — signal retryable via BROADCAST_FAILED
+          // Note: SponsorService maps CHAINING_LIMIT_EXCEEDED → RATE_LIMIT_EXCEEDED
+          const isTransient =
+            sponsorResult.code === "LOW_HEADROOM" ||
+            sponsorResult.code === "RATE_LIMIT_EXCEEDED" ||
+            sponsorResult.code === "SERVICE_DEGRADED";
+          const errorReason = isTransient
+            ? X402_V2_ERROR_CODES.BROADCAST_FAILED
+            : X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE;
           return v2Error(errorReason, 200);
         }
 

@@ -1,4 +1,5 @@
 import { OpenAPIRoute } from "chanfana";
+import { SERVICE_DEGRADED_RETRY_AFTER_S } from "../types";
 import type {
   AppContext,
   Logger,
@@ -90,7 +91,12 @@ export class BaseEndpoint extends OpenAPIRoute {
     let retryable: boolean;
     let retryAfter: number | undefined;
 
-    if (failure.code === "LOW_HEADROOM") {
+    if (failure.code === "SERVICE_DEGRADED") {
+      code = "SERVICE_DEGRADED";
+      status = 503;
+      retryable = true;
+      retryAfter = failure.retryAfter ?? SERVICE_DEGRADED_RETRY_AFTER_S;
+    } else if (failure.code === "LOW_HEADROOM") {
       code = "LOW_HEADROOM";
       status = 503;
       retryable = true;

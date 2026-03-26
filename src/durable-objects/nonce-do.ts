@@ -6,7 +6,7 @@ import type { StacksTransactionWire } from "@stacks/transactions";
 import { hexToBytes } from "@stacks/common";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
-import type { Env, LogsRPC } from "../types";
+import type { Env, LogsRPC, PoolHealthResponse, WalletHealthSnapshot } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 
 const APP_ID = "x402-relay";
@@ -340,6 +340,26 @@ class LowHeadroomError extends Error {
     // Estimate: each confirmed tx frees one nonce slot. ~2 txs/s drain rate.
     // Backoff scales with pool pressure: more reserved nonces → longer wait.
     this.retryAfterSeconds = Math.ceil((CHAINING_LIMIT - maxHeadroom) / 2) + 5;
+  }
+}
+
+/**
+ * Thrown when ALL wallets are circuit-broken (degraded) but at least one has
+ * headroom. Previously the code fell back to the "least degraded" wallet,
+ * which fed transactions into a broken pool and amplified contention.
+ * Now we reject immediately with a retry hint.
+ */
+class AllWalletsDegradedError extends Error {
+  readonly degradedCount: number;
+  readonly totalReserved: number;
+  readonly totalCapacity: number;
+
+  constructor(degradedCount: number, totalReserved: number, totalCapacity: number) {
+    super("ALL_WALLETS_DEGRADED");
+    this.name = "AllWalletsDegradedError";
+    this.degradedCount = degradedCount;
+    this.totalReserved = totalReserved;
+    this.totalCapacity = totalCapacity;
   }
 }
 
@@ -2070,22 +2090,29 @@ export class NonceDO {
       }
 
       if (selectedWalletIndex === null) {
-        // All wallets are either at chaining limit or degraded.
-        // If there are degraded-but-not-full wallets, use the least-degraded one as fallback
-        // rather than failing with a misleading CHAINING_LIMIT_EXCEEDED error.
+        // No healthy wallet with capacity was found. Remaining wallets are either:
+        // - At chaining limit (healthy but full)
+        // - Circuit-broken (degraded, may have capacity)
+        // Reject instead of falling back to a degraded wallet — feeding transactions
+        // into a broken pool amplifies contention (see #226).
         const degradedNotFull = degradedWallets.filter(
           (d) => this.walletHeadroom(d.walletIndex) > 0
         );
         if (degradedNotFull.length > 0) {
-          // Sort ascending by cycleCount, pick least-degraded wallet
-          degradedNotFull.sort((a, b) => a.cycleCount - b.cycleCount);
-          const fallback = degradedNotFull[0];
-          selectedWalletIndex = fallback.walletIndex;
-          this.log("warn", "all_wallets_degraded_using_least_degraded", {
-            walletIndex: selectedWalletIndex,
-            cycleCount: fallback.cycleCount,
+          // The only wallets with capacity are circuit-broken — reject so callers
+          // can distinguish this from pure chaining limit exhaustion.
+          const totalReservedAll = this.poolTotalReserved(effectiveWalletCount);
+          this.log("warn", "all_wallets_degraded_rejecting", {
             degradedCount: degradedWallets.length,
+            degradedNotFullCount: degradedNotFull.length,
+            totalReserved: totalReservedAll,
+            totalCapacity: effectiveWalletCount * CHAINING_LIMIT,
           });
+          throw new AllWalletsDegradedError(
+            degradedWallets.length,
+            totalReservedAll,
+            effectiveWalletCount * CHAINING_LIMIT,
+          );
         } else {
           throw new ChainingLimitError(totalMempoolDepth);
         }
@@ -2282,6 +2309,46 @@ export class NonceDO {
     }
 
     return rows[0].nonce;
+  }
+
+  /**
+   * Lightweight pool health check — returns per-wallet circuit breaker state
+   * and aggregate availability so callers can perform pre-flight gating
+   * before attempting nonce assignment and avoid sending traffic into
+   * known-degraded pools. Exposed via GET /pool-health for observability
+   * and the /health endpoint.
+   *
+   * Much cheaper than getStats() — only reads quarantine lists and reserved counts,
+   * no heavy SQL joins or utilization queries.
+   */
+  async getPoolHealth(): Promise<PoolHealthResponse> {
+    const initializedWallets = await this.getInitializedWallets();
+    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+
+    // Parallelize KV reads across wallets — avoids N serial awaits as the pool grows
+    const wallets: WalletHealthSnapshot[] = await Promise.all(
+      initializedWallets.map(async ({ walletIndex }) => {
+        const recentQuarantines =
+          (await this.state.storage.get<string[]>(
+            this.walletQuarantineRecentKey(walletIndex)
+          )) ?? [];
+        const activeQuarantines = recentQuarantines.filter(
+          (ts) => new Date(ts).getTime() >= cutoff
+        );
+        const cbOpen = activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
+        const reserved = this.ledgerReservedCount(walletIndex);
+        const available = Math.max(0, CHAINING_LIMIT - reserved);
+        return { walletIndex, circuitBreakerOpen: cbOpen, reserved, available, quarantineCount: activeQuarantines.length };
+      })
+    );
+
+    const totalReserved = wallets.reduce((s, w) => s + w.reserved, 0);
+    const degradedCount = wallets.filter((w) => w.circuitBreakerOpen).length;
+    const totalCapacity = initializedWallets.length * CHAINING_LIMIT;
+    const allWalletsDegraded =
+      initializedWallets.length > 0 && degradedCount === initializedWallets.length;
+
+    return { allWalletsDegraded, totalReserved, totalCapacity, wallets };
   }
 
   async getStats(): Promise<NonceStatsResponse> {
@@ -3379,6 +3446,18 @@ export class NonceDO {
             }
           );
         }
+        if (error instanceof AllWalletsDegradedError) {
+          return this.jsonResponse(
+            {
+              error: "All sponsor wallets are circuit-broken; retry after recovery",
+              code: "ALL_WALLETS_DEGRADED",
+              degradedCount: error.degradedCount,
+              totalReserved: error.totalReserved,
+              totalCapacity: error.totalCapacity,
+            },
+            503
+          );
+        }
         if (error instanceof ChainingLimitError) {
           const mempoolDepth = error.mempoolDepth;
           // Assume ~2 txs/s drain rate (conservative estimate for Stacks testnet/mainnet)
@@ -3458,6 +3537,15 @@ export class NonceDO {
         const response: LookupTxidResponse =
           nonce === null ? { found: false } : { found: true, nonce };
         return this.jsonResponse(response);
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/pool-health") {
+      try {
+        const health = await this.getPoolHealth();
+        return this.jsonResponse(health);
       } catch (error) {
         return this.internalError(error);
       }
