@@ -85,6 +85,20 @@ async function processPaymentMessage(
     return;
   }
 
+  // Guard: if txid already set, a prior attempt broadcast this tx successfully.
+  // Skip re-sponsoring to avoid burning a fresh nonce slot.
+  if (record.txid) {
+    logger.warn("Payment already has txid, skipping re-sponsor", {
+      paymentId,
+      txid: record.txid,
+      status: record.status,
+    });
+    record = transitionPayment(record, "mempool", { txid: record.txid });
+    await putPaymentRecord(kv, record);
+    message.ack();
+    return;
+  }
+
   // Transition to broadcasting — clear any transient error from prior attempt
   record = transitionPayment(record, "broadcasting", TRANSIENT_ERROR_FIELDS);
   await putPaymentRecord(kv, record);
