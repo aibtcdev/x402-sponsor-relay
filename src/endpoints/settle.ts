@@ -223,10 +223,15 @@ export class Settle extends BaseEndpoint {
       // Shared context for failure stats (used by auto-sponsor, verify, and broadcast paths)
       const failureCtx = { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount };
 
+      // Keep sponsorService and validated tx in outer scope so the nonce-conflict retry path
+      // can re-sponsor the original transaction after an inline resync.
+      let sponsorService: SponsorService | null = null;
+      let validatedTxForRetry: ReturnType<SponsorService["validateTransaction"]> | null = null;
+
       if (!hasSponsorSignature(parsedTx)) {
         logger.info("Sponsor slot is empty — auto-sponsoring transaction");
 
-        const sponsorService = new SponsorService(c.env, logger);
+        sponsorService = new SponsorService(c.env, logger);
 
         // Validate the transaction is sponsorable
         const validateResult = sponsorService.validateTransaction(txHex);
@@ -240,6 +245,9 @@ export class Settle extends BaseEndpoint {
           );
           return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
         }
+
+        // Stash for retry path
+        validatedTxForRetry = validateResult;
 
         // Sponsor the transaction (reserves nonce from NonceDO, adds fee + sponsor sig)
         const sponsorResult = await sponsorService.sponsorTransaction(validateResult.transaction);
@@ -332,21 +340,209 @@ export class Settle extends BaseEndpoint {
           statsService.logFailure("settle", isClientError, failureCtx).catch(() => {})
         );
 
-        // Sponsor-side issues (nonce conflict or TooMuchChaining) → trigger resync
+        // Sponsor-side issues (nonce conflict or TooMuchChaining) → inline resync + single retry
         if (sponsorNonce !== null && (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining)) {
           const reason = broadcastResult.nonceConflict ? "nonce_conflict" : "too_much_chaining";
-          logger.warn("Sponsor wallet issue on auto-sponsored settle", {
+          logger.warn("Sponsor wallet issue on auto-sponsored settle — attempting inline resync + retry", {
             reason,
             sponsorNonce,
             walletIndex: sponsorWalletIndex,
           });
-          this.scheduleNonceResync(c, new SponsorService(c.env, logger).resyncNonceDODelayed(), logger);
-          return v2Error(
-            broadcastResult.nonceConflict
-              ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
-              : X402_V2_ERROR_CODES.BROADCAST_FAILED,
-            200
-          );
+
+          // Inline resync: await directly so the DO is consistent before we re-sponsor.
+          // No delay needed — the conflicting tx was already broadcast before this error,
+          // so Hiro's mempool index has already indexed it.
+          const retrySponsorService = sponsorService ?? new SponsorService(c.env, logger);
+          await retrySponsorService.resyncNonceDO();
+
+          // Re-sponsor with a fresh nonce if we have the validated transaction
+          let retrySucceeded = false;
+          if (validatedTxForRetry?.valid) {
+            logger.info("Retrying sponsor + broadcast after inline resync", { reason });
+            const retrySponsorResult = await retrySponsorService.sponsorTransaction(validatedTxForRetry.transaction);
+            if (retrySponsorResult.success) {
+              // Re-extract nonce lifecycle values for the retry attempt
+              const retryTx = deserializeTransaction(stripHexPrefix(retrySponsorResult.sponsoredTxHex));
+              const retryNonce = extractSponsorNonce(retryTx);
+              const retryWalletIndex = retrySponsorResult.walletIndex;
+              const retryFee = retrySponsorResult.fee;
+              const retryHex = retrySponsorResult.sponsoredTxHex;
+
+              // Verify payment params on the re-sponsored tx
+              const retryVerifyResult = settlementService.verifyPaymentParams(retryHex, settleOptions);
+              if (retryVerifyResult.valid) {
+                const retryBroadcastResult = await settlementService.broadcastOnly(retryVerifyResult.data.transaction);
+                if (!("error" in retryBroadcastResult)) {
+                  // Retry broadcast succeeded — update outer variables and continue success path
+                  sponsorNonce = retryNonce;
+                  sponsorWalletIndex = retryWalletIndex;
+                  sponsorFee = retryFee;
+                  activeHex = retryHex;
+                  retrySucceeded = true;
+                  logger.info("Retry after inline resync succeeded", {
+                    txid: retryBroadcastResult.txid,
+                    retryNonce,
+                    retryWalletIndex,
+                  });
+
+                  // Release original failed nonce already handled above; consume retry nonce
+                  const retryTxid = retryBroadcastResult.txid;
+                  const retryPayer = settlementService.senderToAddress(
+                    retryVerifyResult.data.transaction,
+                    c.env.STACKS_NETWORK
+                  );
+
+                  c.executionCtx.waitUntil(
+                    Promise.all([
+                      releaseNonceDO(c.env, logger, retryNonce!, retryTxid, retryWalletIndex, retryFee),
+                      recordNonceTxid(c.env, logger, retryTxid, retryNonce!),
+                      recordBroadcastOutcomeDO(
+                        c.env, logger, retryNonce!, retryWalletIndex,
+                        retryTxid, 200, undefined, undefined
+                      ),
+                    ]).catch((e) => {
+                      logger.warn("Failed nonce lifecycle after retry broadcast success", { error: String(e) });
+                    })
+                  );
+
+                  await settlementService.recordDedup(txHex, {
+                    txid: retryTxid,
+                    status: "pending",
+                    sender: retryPayer,
+                    recipient: retryVerifyResult.data.recipient,
+                    amount: retryVerifyResult.data.amount,
+                  });
+
+                  const retryTxStatusRecord: TxStatusRecord = {
+                    txid: retryTxid,
+                    status: "broadcast",
+                    payer: retryPayer,
+                    network,
+                    walletIndex: retryWalletIndex,
+                    sponsorNonce: retryNonce,
+                    sponsorFee: retryFee,
+                    broadcastAt: new Date().toISOString(),
+                  };
+                  await settlementService.recordTxStatus(retryTxStatusRecord);
+
+                  c.executionCtx.waitUntil(
+                    statsService.logTransaction({
+                      timestamp: new Date().toISOString(),
+                      endpoint: "settle",
+                      success: true,
+                      tokenType: settleOptions.tokenType ?? "STX",
+                      amount: settleOptions.minAmount,
+                      txid: retryTxid,
+                      sender: retryPayer,
+                      recipient: retryVerifyResult.data.recipient,
+                      status: "pending",
+                      fee: retryFee,
+                    }).catch(() => {})
+                  );
+
+                  c.executionCtx.waitUntil(
+                    (async () => {
+                      try {
+                        const pollResult = await settlementService.pollForConfirmationPublic(retryTxid);
+                        if ("error" in pollResult) {
+                          await settlementService.updateTxStatus(retryTxid, {
+                            status: "failed",
+                            errorReason: pollResult.details,
+                          });
+                        } else if (pollResult.status === "confirmed") {
+                          await Promise.all([
+                            settlementService.updateTxStatus(retryTxid, {
+                              status: "confirmed",
+                              confirmedAt: new Date().toISOString(),
+                              blockHeight: pollResult.blockHeight,
+                            }),
+                            settlementService.recordDedup(txHex, {
+                              txid: retryTxid,
+                              status: "confirmed",
+                              sender: retryPayer,
+                              recipient: retryVerifyResult.data.recipient,
+                              amount: retryVerifyResult.data.amount,
+                              blockHeight: pollResult.blockHeight,
+                            }),
+                          ]);
+                        } else {
+                          await settlementService.updateTxStatus(retryTxid, { status: "pending" });
+                        }
+                      } catch (e) {
+                        logger.warn("Background confirmation polling failed (retry path)", {
+                          txid: retryTxid,
+                          error: e instanceof Error ? e.message : String(e),
+                        });
+                      }
+                    })()
+                  );
+
+                  logger.info("x402 V2 settle retry broadcast accepted, returning immediately", {
+                    txid: retryTxid,
+                    payer: retryPayer,
+                  });
+
+                  const retryResponse: X402SettlementResponseV2 = {
+                    success: true,
+                    payer: retryPayer,
+                    transaction: retryTxid,
+                    network,
+                    ...(paymentIdentifier
+                      ? { extensions: { "payment-identifier": { info: { id: paymentIdentifier } } } }
+                      : {}),
+                  };
+
+                  if (paymentIdentifier && paymentIdPayloadHash) {
+                    c.executionCtx.waitUntil(
+                      paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, retryResponse, "settle").catch(() => {})
+                    );
+                  }
+
+                  return c.json(retryResponse, 200);
+                } else {
+                  // Retry broadcast also failed — release retry nonce, fall through to error
+                  logger.warn("Retry broadcast after inline resync also failed", {
+                    error: retryBroadcastResult.error,
+                  });
+                  c.executionCtx.waitUntil(
+                    Promise.all([
+                      recordBroadcastOutcomeDO(
+                        c.env, logger, retryNonce!, retryWalletIndex,
+                        undefined, retryBroadcastResult.httpStatus, retryBroadcastResult.nodeUrl, retryBroadcastResult.details
+                      ),
+                      releaseNonceDO(c.env, logger, retryNonce!, undefined, retryWalletIndex),
+                    ]).catch((e) => {
+                      logger.warn("Failed nonce lifecycle after retry broadcast failure", { error: String(e) });
+                    })
+                  );
+                }
+              } else {
+                // Retry verify failed — release retry nonce, fall through to error
+                logger.warn("Retry verify failed after inline resync", { error: retryVerifyResult.error });
+                c.executionCtx.waitUntil(
+                  releaseNonceDO(c.env, logger, retryNonce!, undefined, retryWalletIndex).catch((e) => {
+                    logger.warn("Failed to release retry nonce after verify failure", { error: String(e) });
+                  })
+                );
+              }
+            } else {
+              logger.warn("Retry sponsor failed after inline resync", {
+                error: retrySponsorResult.error,
+                code: retrySponsorResult.code,
+              });
+            }
+          }
+
+          if (!retrySucceeded) {
+            // Fallback: schedule a delayed resync so the pool self-heals for the next request
+            this.scheduleNonceResync(c, retrySponsorService.resyncNonceDODelayed(), logger);
+            return v2Error(
+              broadcastResult.nonceConflict
+                ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
+                : X402_V2_ERROR_CODES.BROADCAST_FAILED,
+              200
+            );
+          }
         }
 
         if (clientRejection) {
