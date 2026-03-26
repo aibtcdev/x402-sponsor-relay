@@ -60,17 +60,11 @@ interface NonceHealthState {
    */
   poolStatus: PoolStatus;
   /**
-   * Per-wallet gap counts. Only present when gaps are detected.
-   * Keys are "wallet_N" strings, values are arrays of missing nonce numbers.
-   */
-  gaps?: Record<string, number[]>;
-  /**
-   * True when gap-fill is actively running (gap detected within last 2 alarm cycles).
-   */
-  healInProgress?: boolean;
-  /**
    * When non-null, clients should take this action instead of submitting sponsored txs.
-   * "fallback_to_direct" means the relay's sponsor nonce pool is unhealthy.
+   * "fallback_to_direct" means the relay's sponsor nonce pool is unhealthy (gaps or
+   * all wallets degraded). Clients should not parse gaps/circuitBreakerOpen/available
+   * themselves — this field summarizes the decision. Use GET /nonce/state for raw
+   * diagnostic data.
    */
   recommendation?: "fallback_to_direct" | null;
 }
@@ -153,24 +147,14 @@ export class Health extends BaseEndpoint {
                         "'critical' <20% or circuit breaker open.",
                       example: "healthy",
                     },
-                    gaps: {
-                      type: "object" as const,
-                      nullable: true,
-                      description:
-                        "Per-wallet gap arrays (e.g. {\"wallet_0\": [45]}). " +
-                        "Only present when gaps are detected.",
-                    },
-                    healInProgress: {
-                      type: "boolean" as const,
-                      description: "True when gap-fill was triggered recently",
-                    },
                     recommendation: {
                       type: "string" as const,
                       nullable: true,
                       enum: ["fallback_to_direct"],
                       description:
                         "When non-null, clients should bypass sponsored submission. " +
-                        "Set when nonce gaps or circuit breakers make sponsoring unreliable.",
+                        "Summarizes the gap/circuit-breaker decision — clients should not " +
+                        "parse raw fields themselves. Use GET /nonce/state for diagnostics.",
                     },
                   },
                 },
@@ -243,39 +227,22 @@ export class Health extends BaseEndpoint {
         totalPool === 0 ? 1.0 : Math.round((raw.poolAvailable / totalPool) * 100) / 100;
       const poolStatus = derivePoolStatus(effectiveCapacity, circuitBreakerOpen);
 
-      // Extract gap and heal data from nonce-state (best-effort)
-      let gaps: Record<string, number[]> | undefined;
-      let healInProgress: boolean | undefined;
+      // Derive recommendation from nonce-state (best-effort).
+      // Only the recommendation is surfaced — raw gaps/circuit-breaker data
+      // stays on GET /nonce/state for diagnostic tools.
       let recommendation: "fallback_to_direct" | null = null;
 
       if (nonceStateResponse.ok) {
         const nonceState = (await nonceStateResponse.json()) as {
           wallets: Array<{
-            walletIndex: number;
             gaps: number[];
             circuitBreakerOpen: boolean;
             available: number;
           }>;
           healthy: boolean;
-          healInProgress: boolean;
         };
 
-        // Build per-wallet gap map (only include wallets with gaps)
-        const gapMap: Record<string, number[]> = {};
-        let hasGaps = false;
-        for (const w of nonceState.wallets) {
-          if (w.gaps.length > 0) {
-            gapMap[`wallet_${w.walletIndex}`] = w.gaps;
-            hasGaps = true;
-          }
-        }
-        if (hasGaps) {
-          gaps = gapMap;
-        }
-
-        healInProgress = nonceState.healInProgress || undefined;
-
-        // Recommend fallback when unhealthy (gaps or all degraded)
+        const hasGaps = nonceState.wallets.some((w) => w.gaps.length > 0);
         const allDegraded =
           nonceState.wallets.length > 0 &&
           nonceState.wallets.every((w) => w.circuitBreakerOpen || w.available === 0);
@@ -292,8 +259,6 @@ export class Health extends BaseEndpoint {
         lastConflictAt,
         effectiveCapacity,
         poolStatus,
-        ...(gaps && { gaps }),
-        ...(healInProgress !== undefined && { healInProgress }),
         ...(recommendation && { recommendation }),
       };
     } catch (e) {
