@@ -596,8 +596,9 @@ export type RelayErrorCode =
 
 /**
  * Default retry-after for SERVICE_DEGRADED responses (seconds).
- * All sponsor wallets are circuit-broken — agents should back off
- * and let the quarantine window (10min) drain before retrying.
+ * All sponsor wallets are circuit-broken — agents should retry
+ * periodically at this interval while the quarantine window
+ * (~10 minutes) drains.
  */
 export const SERVICE_DEGRADED_RETRY_AFTER_S = 30;
 
@@ -619,7 +620,7 @@ export interface WalletHealthSnapshot {
 export interface PoolHealthResponse {
   /** True when ALL wallets are circuit-broken (no healthy wallet available) */
   allWalletsDegraded: boolean;
-  /** Total in-flight nonces across all initialized wallets */
+  /** Total reserved (assigned but not yet confirmed/failed) nonces across all initialized wallets */
   totalReserved: number;
   /** Total capacity across all initialized wallets (walletCount * CHAINING_LIMIT) */
   totalCapacity: number;
