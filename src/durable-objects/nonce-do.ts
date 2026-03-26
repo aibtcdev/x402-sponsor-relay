@@ -305,6 +305,13 @@ const RBF_FEE = 90_000n;
 /** Maximum RBF broadcast attempts per nonce to prevent runaway fee escalation */
 const MAX_RBF_ATTEMPTS = 3;
 /**
+ * Fee for head-bump RBF after gap-fill (60,000 uSTX = 2× GAP_FILL_FEE).
+ * Applied to the first real pending tx after gap-fills to signal miners to
+ * re-evaluate the pending nonce sequence. Lower than RBF_FEE because the
+ * original tx may still have a valid fee — we just need priority.
+ */
+const HEAD_BUMP_FEE = 60_000n;
+/**
  * Per-wallet circuit breaker: if a wallet accumulates this many quarantines
  * within CIRCUIT_BREAKER_WINDOW_MS, it is skipped during nonce assignment
  * and an eager resync is triggered for that wallet only.
@@ -3160,6 +3167,64 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
+    // Head bump: after gap-fills, RBF the first real pending (non-gap-fill)
+    // broadcasted tx with a slightly higher fee to signal miners to re-evaluate
+    // the pending nonce sequence. Without this, gap-fills alone may sit in the
+    // mempool without triggering miners to process the chain. (Issue #229 P0)
+    // -------------------------------------------------------------------------
+    let headBumpNonce: number | null = null;
+    let headBumpTxid: string | null = null;
+    if (gapFillFilled.length > 0) {
+      // Find the lowest broadcasted nonce that is NOT a gap-fill
+      const gapFillSet = new Set(gapFillFilled);
+      const bumpCandidate = this.sql
+        .exec<{ nonce: number; txid: string | null }>(
+          `SELECT nonce, txid FROM nonce_intents
+           WHERE wallet_index = ? AND state = 'broadcasted' AND txid IS NOT NULL
+           ORDER BY nonce ASC`,
+          walletIndex
+        )
+        .toArray()
+        .find((row) => !gapFillSet.has(row.nonce));
+
+      if (bumpCandidate) {
+        const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+        if (privateKey) {
+          const { network, recipient } = this.getFlushRecipient();
+          try {
+            const tx = await makeSTXTokenTransfer({
+              recipient,
+              amount: GAP_FILL_AMOUNT,
+              senderKey: privateKey,
+              network,
+              nonce: BigInt(bumpCandidate.nonce),
+              fee: HEAD_BUMP_FEE,
+              memo: `head-bump-${bumpCandidate.nonce}`,
+            });
+            const result = await this.broadcastRawTx(tx, "head_bump");
+            if (result.ok) {
+              headBumpNonce = bumpCandidate.nonce;
+              headBumpTxid = result.txid;
+              this.log("info", "head_bump_after_gap_fill", {
+                walletIndex,
+                nonce: bumpCandidate.nonce,
+                originalTxid: bumpCandidate.txid,
+                bumpTxid: result.txid,
+                gapsFilled: gapFillFilled,
+              });
+            }
+          } catch (e) {
+            this.log("warn", "head_bump_error", {
+              walletIndex,
+              nonce: bumpCandidate.nonce,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
     // Log reconciliation_summary for this wallet
     // -------------------------------------------------------------------------
     this.log("info", "reconciliation_summary", {
@@ -3177,6 +3242,7 @@ export class NonceDO {
       ignore_stale_hiro: verdictIgnoreStaleHiro,
       hiro_missing_count: detected_missing_nonces.length,
       hiro_mempool_count: detected_mempool_nonces.length,
+      head_bump_nonce: headBumpNonce,
       possible_next_nonce,
       last_executed_tx_nonce,
     });
@@ -3278,11 +3344,14 @@ export class NonceDO {
     const rbfSummary = rbfAttempted.length > 0
       ? ` rbf [${rbfAttempted.join(",")}]`
       : "";
+    const headBumpSummary = headBumpNonce !== null
+      ? ` head_bump [${headBumpNonce}]`
+      : "";
     return {
       previousNonce,
       newNonce: previousNonce,
-      changed: gapFillFilled.length > 0 || rbfAttempted.length > 0,
-      reason: `nonce is consistent with chain state${gapFilledSummary}${rbfSummary}`,
+      changed: gapFillFilled.length > 0 || rbfAttempted.length > 0 || headBumpNonce !== null,
+      reason: `nonce is consistent with chain state${gapFilledSummary}${rbfSummary}${headBumpSummary}`,
     };
   }
 
