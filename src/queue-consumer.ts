@@ -118,6 +118,9 @@ async function processPaymentMessage(
     return;
   }
 
+  // Extract signer hash once — used for in-flight markers and sender nonce cache
+  const signerHash = transaction.auth.spendingCondition.signer;
+
   // Sponsor the transaction (assigns nonce from NonceDO, signs with sponsor key)
   const sponsorService = new SponsorService(env, logger);
   const sponsorResult = await sponsorService.sponsorTransaction(transaction);
@@ -150,9 +153,8 @@ async function processPaymentMessage(
     }
 
     // Terminal sponsor failure — clear in-flight marker so the sender can retry
-    const signerHashSponsorFail = transaction.auth.spendingCondition.signer;
     if (record.senderNonce !== undefined) {
-      await clearInFlight(kv, signerHashSponsorFail, record.senderNonce).catch(
+      await clearInFlight(kv, signerHash, record.senderNonce).catch(
         (e) => logger.warn("Failed to clear in-flight marker on sponsor fail", { error: String(e) })
       );
     }
@@ -212,9 +214,8 @@ async function processPaymentMessage(
       await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
     }
 
-    const signerHashBroadcastFail = transaction.auth.spendingCondition.signer;
     if (record.senderNonce !== undefined) {
-      await clearInFlight(kv, signerHashBroadcastFail, record.senderNonce).catch(
+      await clearInFlight(kv, signerHash, record.senderNonce).catch(
         (e) => logger.warn("Failed to clear in-flight marker on broadcast fail", { error: String(e) })
       );
     }
@@ -263,7 +264,6 @@ async function processPaymentMessage(
     );
 
   // Update sender nonce cache and clear in-flight marker
-  const signerHash = transaction.auth.spendingCondition.signer;
   if (record.senderNonce !== undefined && record.senderAddress) {
     await updateSenderNonceOnBroadcast(
       kv,

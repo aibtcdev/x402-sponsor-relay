@@ -11,6 +11,7 @@ import {
   StatsService,
   PaymentIdService,
   SponsorService,
+  SettlementService,
   hasSponsorSignature,
   extractSponsorNonce,
   releaseNonceDO,
@@ -18,8 +19,29 @@ import {
   recordNonceTxid,
 } from "../services";
 import { stripHexPrefix } from "../utils";
-import type { AppContext, X402SettlementResponseV2, X402SettleRequestV2, TxStatusRecord } from "../types";
+import type { AppContext, SettleOptions, X402SettlementResponseV2, X402SettleRequestV2, TxStatusRecord, Logger } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
+
+/** Parameters for the shared post-broadcast success handler */
+interface BroadcastSuccessParams {
+  c: AppContext;
+  logger: Logger;
+  txid: string;
+  txHex: string;
+  network: string;
+  sponsorNonce: number | null;
+  sponsorWalletIndex: number;
+  sponsorFee: string | undefined;
+  verifiedTx: import("@stacks/transactions").StacksTransactionWire;
+  recipient: string;
+  amount: string;
+  settleOptions: SettleOptions;
+  settlementService: SettlementService;
+  statsService: StatsService;
+  paymentIdService: PaymentIdService;
+  paymentIdentifier: string | undefined;
+  paymentIdPayloadHash: string | undefined;
+}
 
 /**
  * Settle endpoint - x402 V2 facilitator settle
@@ -115,6 +137,137 @@ export class Settle extends BaseEndpoint {
       },
     },
   };
+
+  /**
+   * Shared post-broadcast success handler used by both the primary and retry paths.
+   * Records nonce lifecycle, dedup, tx status, stats, schedules background polling,
+   * and returns the V2 settlement response.
+   */
+  private handleBroadcastSuccess(params: BroadcastSuccessParams): Response {
+    const {
+      c, logger, txid, txHex, network,
+      sponsorNonce, sponsorWalletIndex, sponsorFee,
+      verifiedTx, recipient, amount,
+      settleOptions, settlementService, statsService,
+      paymentIdService, paymentIdentifier, paymentIdPayloadHash,
+    } = params;
+
+    // Consume the sponsor nonce on broadcast success (fire-and-forget)
+    if (sponsorNonce !== null) {
+      c.executionCtx.waitUntil(
+        Promise.all([
+          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex, sponsorFee),
+          recordNonceTxid(c.env, logger, txid, sponsorNonce),
+          recordBroadcastOutcomeDO(
+            c.env, logger, sponsorNonce, sponsorWalletIndex,
+            txid, 200, undefined, undefined
+          ),
+        ]).catch((e) => {
+          logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
+        })
+      );
+    }
+
+    const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
+
+    // Record dedup, tx status, and stats in background (non-blocking)
+    c.executionCtx.waitUntil(
+      (async () => {
+        await settlementService.recordDedup(txHex, {
+          txid,
+          status: "pending",
+          sender: payer,
+          recipient,
+          amount,
+        });
+
+        const txStatusRecord: TxStatusRecord = {
+          txid,
+          status: "broadcast",
+          payer,
+          network,
+          walletIndex: sponsorNonce !== null ? sponsorWalletIndex : undefined,
+          sponsorNonce,
+          sponsorFee,
+          broadcastAt: new Date().toISOString(),
+        };
+        await settlementService.recordTxStatus(txStatusRecord);
+
+        await statsService.logTransaction({
+          timestamp: new Date().toISOString(),
+          endpoint: "settle",
+          success: true,
+          tokenType: settleOptions.tokenType ?? "STX",
+          amount: settleOptions.minAmount,
+          txid,
+          sender: payer,
+          recipient,
+          status: "pending",
+          fee: sponsorFee,
+        }).catch(() => {});
+      })().catch((e) => {
+        logger.warn("Failed to record broadcast success metadata", { error: String(e) });
+      })
+    );
+
+    // Background: poll for confirmation and update KV records
+    c.executionCtx.waitUntil(
+      (async () => {
+        try {
+          const pollResult = await settlementService.pollForConfirmationPublic(txid);
+          if ("error" in pollResult) {
+            await settlementService.updateTxStatus(txid, {
+              status: "failed",
+              errorReason: pollResult.details,
+            });
+          } else if (pollResult.status === "confirmed") {
+            await Promise.all([
+              settlementService.updateTxStatus(txid, {
+                status: "confirmed",
+                confirmedAt: new Date().toISOString(),
+                blockHeight: pollResult.blockHeight,
+              }),
+              settlementService.recordDedup(txHex, {
+                txid,
+                status: "confirmed",
+                sender: payer,
+                recipient,
+                amount,
+                blockHeight: pollResult.blockHeight,
+              }),
+            ]);
+          } else {
+            await settlementService.updateTxStatus(txid, { status: "pending" });
+          }
+        } catch (e) {
+          logger.warn("Background confirmation polling failed", {
+            txid,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      })()
+    );
+
+    logger.info("x402 V2 settle broadcast accepted, returning immediately", { txid, payer });
+
+    const response: X402SettlementResponseV2 = {
+      success: true,
+      payer,
+      transaction: txid,
+      network,
+      ...(paymentIdentifier
+        ? { extensions: { "payment-identifier": { info: { id: paymentIdentifier } } } }
+        : {}),
+    };
+
+    if (paymentIdentifier && paymentIdPayloadHash) {
+      c.executionCtx.waitUntil(
+        paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, response, "settle").catch(() => {})
+      );
+    }
+
+    return c.json(response, 200);
+  }
 
   async handle(c: AppContext) {
     const logger = this.getLogger(c);
@@ -356,7 +509,6 @@ export class Settle extends BaseEndpoint {
           await retrySponsorService.resyncNonceDO();
 
           // Re-sponsor with a fresh nonce if we have the validated transaction
-          let retrySucceeded = false;
           if (validatedTxForRetry?.valid) {
             logger.info("Retrying sponsor + broadcast after inline resync", { reason });
             const retrySponsorResult = await retrySponsorService.sponsorTransaction(validatedTxForRetry.transaction);
@@ -373,132 +525,20 @@ export class Settle extends BaseEndpoint {
               if (retryVerifyResult.valid) {
                 const retryBroadcastResult = await settlementService.broadcastOnly(retryVerifyResult.data.transaction);
                 if (!("error" in retryBroadcastResult)) {
-                  // Retry broadcast succeeded — update outer variables and continue success path
-                  sponsorNonce = retryNonce;
-                  sponsorWalletIndex = retryWalletIndex;
-                  sponsorFee = retryFee;
-                  activeHex = retryHex;
-                  retrySucceeded = true;
                   logger.info("Retry after inline resync succeeded", {
                     txid: retryBroadcastResult.txid,
                     retryNonce,
                     retryWalletIndex,
                   });
-
-                  // Release original failed nonce already handled above; consume retry nonce
-                  const retryTxid = retryBroadcastResult.txid;
-                  const retryPayer = settlementService.senderToAddress(
-                    retryVerifyResult.data.transaction,
-                    c.env.STACKS_NETWORK
-                  );
-
-                  c.executionCtx.waitUntil(
-                    Promise.all([
-                      releaseNonceDO(c.env, logger, retryNonce!, retryTxid, retryWalletIndex, retryFee),
-                      recordNonceTxid(c.env, logger, retryTxid, retryNonce!),
-                      recordBroadcastOutcomeDO(
-                        c.env, logger, retryNonce!, retryWalletIndex,
-                        retryTxid, 200, undefined, undefined
-                      ),
-                    ]).catch((e) => {
-                      logger.warn("Failed nonce lifecycle after retry broadcast success", { error: String(e) });
-                    })
-                  );
-
-                  await settlementService.recordDedup(txHex, {
-                    txid: retryTxid,
-                    status: "pending",
-                    sender: retryPayer,
+                  return this.handleBroadcastSuccess({
+                    c, logger, txid: retryBroadcastResult.txid, txHex, network,
+                    sponsorNonce: retryNonce, sponsorWalletIndex: retryWalletIndex, sponsorFee: retryFee,
+                    verifiedTx: retryVerifyResult.data.transaction,
                     recipient: retryVerifyResult.data.recipient,
                     amount: retryVerifyResult.data.amount,
+                    settleOptions, settlementService, statsService,
+                    paymentIdService, paymentIdentifier, paymentIdPayloadHash,
                   });
-
-                  const retryTxStatusRecord: TxStatusRecord = {
-                    txid: retryTxid,
-                    status: "broadcast",
-                    payer: retryPayer,
-                    network,
-                    walletIndex: retryWalletIndex,
-                    sponsorNonce: retryNonce,
-                    sponsorFee: retryFee,
-                    broadcastAt: new Date().toISOString(),
-                  };
-                  await settlementService.recordTxStatus(retryTxStatusRecord);
-
-                  c.executionCtx.waitUntil(
-                    statsService.logTransaction({
-                      timestamp: new Date().toISOString(),
-                      endpoint: "settle",
-                      success: true,
-                      tokenType: settleOptions.tokenType ?? "STX",
-                      amount: settleOptions.minAmount,
-                      txid: retryTxid,
-                      sender: retryPayer,
-                      recipient: retryVerifyResult.data.recipient,
-                      status: "pending",
-                      fee: retryFee,
-                    }).catch(() => {})
-                  );
-
-                  c.executionCtx.waitUntil(
-                    (async () => {
-                      try {
-                        const pollResult = await settlementService.pollForConfirmationPublic(retryTxid);
-                        if ("error" in pollResult) {
-                          await settlementService.updateTxStatus(retryTxid, {
-                            status: "failed",
-                            errorReason: pollResult.details,
-                          });
-                        } else if (pollResult.status === "confirmed") {
-                          await Promise.all([
-                            settlementService.updateTxStatus(retryTxid, {
-                              status: "confirmed",
-                              confirmedAt: new Date().toISOString(),
-                              blockHeight: pollResult.blockHeight,
-                            }),
-                            settlementService.recordDedup(txHex, {
-                              txid: retryTxid,
-                              status: "confirmed",
-                              sender: retryPayer,
-                              recipient: retryVerifyResult.data.recipient,
-                              amount: retryVerifyResult.data.amount,
-                              blockHeight: pollResult.blockHeight,
-                            }),
-                          ]);
-                        } else {
-                          await settlementService.updateTxStatus(retryTxid, { status: "pending" });
-                        }
-                      } catch (e) {
-                        logger.warn("Background confirmation polling failed (retry path)", {
-                          txid: retryTxid,
-                          error: e instanceof Error ? e.message : String(e),
-                        });
-                      }
-                    })()
-                  );
-
-                  logger.info("x402 V2 settle retry broadcast accepted, returning immediately", {
-                    txid: retryTxid,
-                    payer: retryPayer,
-                  });
-
-                  const retryResponse: X402SettlementResponseV2 = {
-                    success: true,
-                    payer: retryPayer,
-                    transaction: retryTxid,
-                    network,
-                    ...(paymentIdentifier
-                      ? { extensions: { "payment-identifier": { info: { id: paymentIdentifier } } } }
-                      : {}),
-                  };
-
-                  if (paymentIdentifier && paymentIdPayloadHash) {
-                    c.executionCtx.waitUntil(
-                      paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, retryResponse, "settle").catch(() => {})
-                    );
-                  }
-
-                  return c.json(retryResponse, 200);
                 } else {
                   // Retry broadcast also failed — release retry nonce, fall through to error
                   logger.warn("Retry broadcast after inline resync also failed", {
@@ -533,16 +573,14 @@ export class Settle extends BaseEndpoint {
             }
           }
 
-          if (!retrySucceeded) {
-            // Fallback: schedule a delayed resync so the pool self-heals for the next request
-            this.scheduleNonceResync(c, retrySponsorService.resyncNonceDODelayed(), logger);
-            return v2Error(
-              broadcastResult.nonceConflict
-                ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
-                : X402_V2_ERROR_CODES.BROADCAST_FAILED,
-              200
-            );
-          }
+          // Retry did not succeed — schedule a delayed resync so the pool self-heals
+          this.scheduleNonceResync(c, retrySponsorService.resyncNonceDODelayed(), logger);
+          return v2Error(
+            broadcastResult.nonceConflict
+              ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
+              : X402_V2_ERROR_CODES.BROADCAST_FAILED,
+            200
+          );
         }
 
         if (clientRejection) {
@@ -563,132 +601,16 @@ export class Settle extends BaseEndpoint {
         }
       }
 
-      // Broadcast succeeded — build response immediately, poll in background.
-      const { txid } = broadcastResult;
-
-      // Consume the sponsor nonce on broadcast success (fire-and-forget)
-      if (sponsorNonce !== null) {
-        c.executionCtx.waitUntil(
-          Promise.all([
-            releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex, sponsorFee),
-            recordNonceTxid(c.env, logger, txid, sponsorNonce),
-            recordBroadcastOutcomeDO(
-              c.env, logger, sponsorNonce, sponsorWalletIndex,
-              txid, 200, undefined, undefined
-            ),
-          ]).catch((e) => {
-            logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
-          })
-        );
-      }
-
-      const payer = settlementService.senderToAddress(
-        verifyResult.data.transaction,
-        c.env.STACKS_NETWORK
-      );
-
-      // Record dedup immediately as "pending" — background polling will update if confirmed
-      await settlementService.recordDedup(txHex, {
-        txid,
-        status: "pending",
-        sender: payer,
+      // Broadcast succeeded — delegate to shared success handler
+      return this.handleBroadcastSuccess({
+        c, logger, txid: broadcastResult.txid, txHex, network,
+        sponsorNonce, sponsorWalletIndex, sponsorFee,
+        verifiedTx: verifyResult.data.transaction,
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
+        settleOptions, settlementService, statsService,
+        paymentIdService, paymentIdentifier, paymentIdPayloadHash,
       });
-
-      // Store tx status in KV for GET /settle/status/:txid
-      // Awaited (not waitUntil) to ensure the record exists before background polling starts
-      const txStatusRecord: TxStatusRecord = {
-        txid,
-        status: "broadcast",
-        payer,
-        network,
-        walletIndex: sponsorNonce !== null ? sponsorWalletIndex : undefined,
-        sponsorNonce,
-        sponsorFee,
-        broadcastAt: new Date().toISOString(),
-      };
-      await settlementService.recordTxStatus(txStatusRecord);
-
-      // Record successful transaction stats (fire-and-forget)
-      c.executionCtx.waitUntil(
-        statsService.logTransaction({
-          timestamp: new Date().toISOString(),
-          endpoint: "settle",
-          success: true,
-          tokenType: settleOptions.tokenType ?? "STX",
-          amount: settleOptions.minAmount,
-          txid,
-          sender: payer,
-          recipient: verifyResult.data.recipient,
-          status: "pending",
-          fee: sponsorFee,
-        }).catch(() => {})
-      );
-
-      // Background: poll for confirmation and update KV records
-      c.executionCtx.waitUntil(
-        (async () => {
-          try {
-            const pollResult = await settlementService.pollForConfirmationPublic(txid);
-            if ("error" in pollResult) {
-              // Terminal failure (abort)
-              await settlementService.updateTxStatus(txid, {
-                status: "failed",
-                errorReason: pollResult.details,
-              });
-            } else if (pollResult.status === "confirmed") {
-              await Promise.all([
-                settlementService.updateTxStatus(txid, {
-                  status: "confirmed",
-                  confirmedAt: new Date().toISOString(),
-                  blockHeight: pollResult.blockHeight,
-                }),
-                settlementService.recordDedup(txHex, {
-                  txid,
-                  status: "confirmed",
-                  sender: payer,
-                  recipient: verifyResult.data.recipient,
-                  amount: verifyResult.data.amount,
-                  blockHeight: pollResult.blockHeight,
-                }),
-              ]);
-            } else {
-              // Still pending after all polling rounds
-              await settlementService.updateTxStatus(txid, { status: "pending" });
-            }
-          } catch (e) {
-            logger.warn("Background confirmation polling failed", {
-              txid,
-              error: e instanceof Error ? e.message : String(e),
-            });
-          }
-        })()
-      );
-
-      logger.info("x402 V2 settle broadcast accepted, returning immediately", {
-        txid,
-        payer,
-      });
-
-      const response: X402SettlementResponseV2 = {
-        success: true,
-        payer,
-        transaction: txid,
-        network,
-        ...(paymentIdentifier
-          ? { extensions: { "payment-identifier": { info: { id: paymentIdentifier } } } }
-          : {}),
-      };
-
-      // Cache the result under the payment-identifier key for idempotent retries
-      if (paymentIdentifier && paymentIdPayloadHash) {
-        c.executionCtx.waitUntil(
-          paymentIdService.recordPaymentId(paymentIdentifier, paymentIdPayloadHash, response, "settle").catch(() => {})
-        );
-      }
-
-      return c.json(response, 200);
     } catch (e) {
       logger.error("Unexpected settle error", {
         error: e instanceof Error ? e.message : "Unknown error",
