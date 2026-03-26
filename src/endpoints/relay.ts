@@ -293,6 +293,42 @@ export class Relay extends BaseEndpoint {
         });
       }
 
+      // Step A0 — Sender conflict dedup: short-circuit if sender is in a conflict cooldown.
+      // If the same sender got a 409/429 (nonce conflict or too-much-chaining) within the
+      // last retryAfter seconds, return the cached error without assigning a nonce or hitting
+      // the mempool. This prevents the assign→broadcast→conflict→quarantine cycle from
+      // repeating on every agent retry during a nonce storm.
+      const CONFLICT_CACHE_TTL_S = 30;
+      const senderConflictKey = `conflict:${validation.senderAddress}`;
+      const cachedConflict = c.env.RELAY_KV ? await c.env.RELAY_KV.get(senderConflictKey, "text") : null;
+      if (cachedConflict) {
+        try {
+          const conflict = JSON.parse(cachedConflict) as { code: "NONCE_CONFLICT" | "TOO_MUCH_CHAINING"; retryAfter: number; setAt: number };
+          const remainingMs = conflict.retryAfter * 1000 - (Date.now() - conflict.setAt);
+          const remainingS = Math.ceil(remainingMs / 1000);
+          if (remainingS > 0) {
+            logger.warn("Sender in conflict cooldown — short-circuiting request", {
+              sender: validation.senderAddress,
+              code: conflict.code,
+              remainingS,
+            });
+            const isConflict = conflict.code === "NONCE_CONFLICT";
+            return this.err(c, {
+              error: isConflict
+                ? "Nonce conflict — back off and retry. Check GET /nonce/stats for nonce pool state"
+                : "Sponsor wallet congested — too many pending transactions. Back off and retry",
+              code: conflict.code,
+              status: isConflict ? 409 : 429,
+              details: `Sender is in a ${conflict.retryAfter}s conflict cooldown. Remaining: ${remainingS}s`,
+              retryable: true,
+              retryAfter: remainingS,
+            });
+          }
+        } catch {
+          // Malformed KV value — ignore and proceed normally
+        }
+      }
+
       // Step A — Dedup check on original tx (stable across retries with different sponsor nonces)
       const dedupResult = await settlementService.checkDedup(body.transaction);
       if (dedupResult) {
@@ -589,22 +625,48 @@ export class Relay extends BaseEndpoint {
           // then return the appropriate error code.
           this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
           if (broadcastResult.nonceConflict) {
+            // Write sender conflict record so subsequent retries short-circuit immediately
+            const conflictCode = "NONCE_CONFLICT" as const;
+            if (c.env.RELAY_KV) {
+              c.executionCtx.waitUntil(
+                c.env.RELAY_KV.put(
+                  `conflict:${validation.senderAddress}`,
+                  JSON.stringify({ code: conflictCode, retryAfter: CONFLICT_CACHE_TTL_S, setAt: Date.now() }),
+                  { expirationTtl: CONFLICT_CACHE_TTL_S }
+                ).catch((e) => {
+                  logger.warn("Failed to write sender conflict record", { error: String(e) });
+                })
+              );
+            }
             return this.err(c, {
               error: "Nonce conflict — back off and retry. Check GET /nonce/stats for nonce pool state",
-              code: "NONCE_CONFLICT",
+              code: conflictCode,
               status: 409,
               details: broadcastResult.details,
               retryable: true,
-              retryAfter: 30,
+              retryAfter: CONFLICT_CACHE_TTL_S,
             });
+          }
+          // Write sender conflict record for too-much-chaining as well
+          const chainingCode = "TOO_MUCH_CHAINING" as const;
+          if (c.env.RELAY_KV) {
+            c.executionCtx.waitUntil(
+              c.env.RELAY_KV.put(
+                `conflict:${validation.senderAddress}`,
+                JSON.stringify({ code: chainingCode, retryAfter: CONFLICT_CACHE_TTL_S, setAt: Date.now() }),
+                { expirationTtl: CONFLICT_CACHE_TTL_S }
+              ).catch((e) => {
+                logger.warn("Failed to write sender conflict record", { error: String(e) });
+              })
+            );
           }
           return this.err(c, {
             error: "Sponsor wallet congested — too many pending transactions. Back off and retry",
-            code: "TOO_MUCH_CHAINING",
+            code: chainingCode,
             status: 429,
             details: broadcastResult.details,
             retryable: true,
-            retryAfter: 30,
+            retryAfter: CONFLICT_CACHE_TTL_S,
           });
         }
 
