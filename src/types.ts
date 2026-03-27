@@ -1505,7 +1505,7 @@ export function buildQueueInfo(
     estimatedDispatchMs: reason === "gap" ? null : ALARM_CADENCE_ESTIMATE_MS,
     expiresAt: held.expiresAt,
     help: reason === "gap"
-      ? `Submit transactions with nonces ${held.missingNonces.join(", ")} to unblock dispatch`
+      ? `Verify your account nonce at /fees or via the Stacks API, then submit transactions with nonces ${held.missingNonces.join(", ")} to unblock dispatch`
       : "All wallet slots are at capacity — tx will be dispatched when headroom opens",
   };
 

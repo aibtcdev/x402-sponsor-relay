@@ -316,7 +316,7 @@ export class Sponsor extends BaseEndpoint {
             success: false,
             requestId: crypto.randomUUID(),
             code: "SENDER_NONCE_GAP",
-            error: `Sender nonce ${senderNonce} cannot be sponsored — nonces ${sponsorResult.missingNonces.join(", ")} must be submitted first`,
+            error: `Sender nonce ${senderNonce} cannot be sponsored — verify your account nonce via the Stacks API, then submit nonces ${sponsorResult.missingNonces.join(", ")} to unblock dispatch`,
             missingNonces: sponsorResult.missingNonces,
             nextExpectedNonce: sponsorResult.nextExpected,
             retryable: false,

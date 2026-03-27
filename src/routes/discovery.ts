@@ -1319,8 +1319,10 @@ All errors return JSON with this shape:
 | NONCE_CONFLICT                 | 409  | true      | Sponsor nonce conflict in mempool; resubmit with a new transaction |
 | SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but definitively aborted on-chain (abort_* status only) |
 | CLIENT_INSUFFICIENT_FUNDS      | 422  | false     | Sender had insufficient funds — top up wallet before re-signing and retrying |
-| CLIENT_BAD_NONCE               | 422  | true      | Sender nonce is invalid — re-sign with the correct account nonce and retry |
-| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender nonce conflicts in mempool — wait for pending tx, then re-sign and retry |
+| CLIENT_BAD_NONCE               | 422  | true      | Sender nonce is invalid — verify via Stacks API, re-sign with correct nonce, and retry |
+| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender nonce conflicts in mempool — verify nonce state, wait for pending tx, re-sign and retry |
+| SENDER_NONCE_GAP               | 400  | false     | Sender nonce has a gap — verify account nonce, submit missing nonces listed in response |
+| TRANSACTION_HELD               | 200  | true      | Transaction queued pending nonce gap fill — submit missing nonces or poll for dispatch |
 | SIGNATURE_VALIDATION_FAILED    | 422  | false     | Invalid signature — wrong network, mismatched key, or corrupted transaction bytes |
 | BROADCAST_REJECTED             | 422  | true      | Stacks node rejected the transaction for another client-caused reason |
 
@@ -1392,10 +1394,11 @@ Do NOT retry:
 - 422 CLIENT_INSUFFICIENT_FUNDS — fund the wallet first, then re-sign and submit
 - 422 SIGNATURE_VALIDATION_FAILED — wrong network, mismatched key, or corrupted bytes; rebuild the transaction
 
-Do retry (after fixing the transaction):
+Do retry (after verifying nonces):
 - 422 BROADCAST_REJECTED — inspect the details field, correct the transaction, and resubmit
-- 422 CLIENT_BAD_NONCE — re-fetch the sender's current nonce, re-sign, and resubmit
-- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; wait for pending mempool tx, re-sign and retry
+- 422 CLIENT_BAD_NONCE — verify your account nonce via the Stacks API (GET /extended/v1/address/{addr}/nonces), re-sign with the correct nonce, and resubmit
+- 400 SENDER_NONCE_GAP — verify your account nonce, then submit the missing nonces listed in the response to unblock dispatch
+- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; verify your account nonce, wait for any pending mempool tx, re-sign and retry
 - 409 NONCE_CONFLICT — relay sponsor nonce conflict; rebuild and resubmit a new transaction
 
 Do retry (after retryAfter):
