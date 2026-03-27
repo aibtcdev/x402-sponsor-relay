@@ -801,13 +801,19 @@ export class SponsorService {
             missingNonces: handResult.missingNonces,
             mode,
           });
-          return {
+          const heldResult: SponsorHeld = {
             success: false,
             held: true,
             nextExpected: handResult.nextExpected,
             missingNonces: handResult.missingNonces,
             expiresAt: handResult.expiresAt,
           };
+          // Forward recently-expired nonce info so agents can understand why their
+          // previously-submitted nonces disappeared from the queue after the 5-min timeout.
+          if (handResult.recentlyExpired) {
+            heldResult.recentlyExpired = handResult.recentlyExpired;
+          }
+          return heldResult;
         }
 
         // Dispatched — use the assigned nonce and wallet index from the DO

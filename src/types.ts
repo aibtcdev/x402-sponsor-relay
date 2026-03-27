@@ -1264,6 +1264,19 @@ export interface TxStatusRecord {
 // =============================================================================
 
 /**
+ * Info about recently expired hand entries for a sender.
+ * Included in HandSubmitResult (held branch) and QueueInfo to help agents
+ * understand why previously-submitted nonces disappeared from the queue
+ * after the 5-minute hold timeout expired.
+ */
+export interface RecentExpiryInfo {
+  /** Sender nonces that expired from the hand */
+  nonces: number[];
+  /** ISO timestamp when the expiry was recorded */
+  expiredAt: string;
+}
+
+/**
  * A single entry in a sender's hand queue (sender_hand table row).
  * Each entry represents an agent-submitted or replay transaction waiting
  * to be dispatched.
@@ -1386,6 +1399,11 @@ export type HandSubmitResult =
       handSize: number;
       /** ISO timestamp when the oldest hand entry expires */
       expiresAt: string;
+      /**
+       * Info about recently expired hand entries, if any expired before this submission.
+       * Helps agents understand why previously-submitted nonces are missing from the queue.
+       */
+      recentlyExpired?: RecentExpiryInfo;
     };
 
 /**
@@ -1422,6 +1440,11 @@ export interface SponsorHeld {
   missingNonces: number[];
   /** ISO timestamp when the held tx expires from the hand */
   expiresAt: string;
+  /**
+   * Info about recently expired hand entries, if any expired before this submission.
+   * Helps agents understand why previously-submitted nonces are missing from the queue.
+   */
+  recentlyExpired?: RecentExpiryInfo;
 }
 
 /**
@@ -1449,6 +1472,12 @@ export interface QueueInfo {
   expiresAt: string;
   /** Actionable instruction for the agent */
   help: string;
+  /**
+   * Recently expired nonces for this sender, if any expired before this submission.
+   * Helps agents understand why previously-submitted nonces are missing from the queue.
+   * Format: "Your nonces N, M expired after 5 minutes waiting for the gap to be filled."
+   */
+  recentlyExpired?: RecentExpiryInfo;
 }
 
 /**
@@ -1460,8 +1489,16 @@ const ALARM_CADENCE_ESTIMATE_MS = 10_000;
 /**
  * Build a QueueInfo object from a SponsorHeld result and the submitted sender nonce.
  * Suitable for inclusion in 202 responses (POST /relay) and V2 held responses (POST /settle).
+ *
+ * @param held - The SponsorHeld result from the sponsoring service
+ * @param senderNonce - The nonce of the submitted transaction
+ * @param recentlyExpired - Optional expiry info to surface to the agent
  */
-export function buildQueueInfo(held: SponsorHeld, senderNonce: number): QueueInfo {
+export function buildQueueInfo(
+  held: SponsorHeld,
+  senderNonce: number,
+  recentlyExpired?: RecentExpiryInfo
+): QueueInfo {
   const hasGaps = held.missingNonces.length > 0;
   const estimatedDispatchMs = hasGaps
     ? null
@@ -1472,7 +1509,7 @@ export function buildQueueInfo(held: SponsorHeld, senderNonce: number): QueueInf
     ? `Submit transactions with nonces ${helpNonces.join(", ")} to unblock dispatch`
     : "Waiting for dispatch — no gaps detected, tx will be processed on next alarm tick";
 
-  return {
+  const queueInfo: QueueInfo = {
     status: "held",
     senderNonce,
     nextExpectedNonce: held.nextExpected,
@@ -1482,4 +1519,12 @@ export function buildQueueInfo(held: SponsorHeld, senderNonce: number): QueueInf
     expiresAt: held.expiresAt,
     help,
   };
+
+  // Prefer explicitly passed recentlyExpired; fall back to value on the held object itself
+  const expiry = recentlyExpired ?? held.recentlyExpired;
+  if (expiry) {
+    queueInfo.recentlyExpired = expiry;
+  }
+
+  return queueInfo;
 }

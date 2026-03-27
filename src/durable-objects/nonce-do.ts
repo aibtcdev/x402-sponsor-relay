@@ -763,6 +763,17 @@ export class NonceDO {
       );
     `);
 
+    // sender_expiry_log: records recently expired sender_hand entries for agent feedback
+    // TTL: entries older than 30 minutes are pruned each alarm cycle
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS sender_expiry_log (
+        sender_address  TEXT NOT NULL,
+        expired_nonces  TEXT NOT NULL,
+        expired_at      TEXT NOT NULL,
+        PRIMARY KEY (sender_address, expired_at)
+      );
+    `);
+
     // wallet_hand: per-wallet sponsor nonce slot tracking (replaces dispatch_queue for decisions)
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS wallet_hand (
@@ -5655,6 +5666,101 @@ export class NonceDO {
   }
 
   /**
+   * Delete sender_hand entries whose expires_at timestamp has passed.
+   * Capped at 100 deletions per alarm tick to stay within CPU budget.
+   * Records expired nonces in sender_expiry_log so agents can receive feedback on their next submission.
+   * Returns the count of expired entries and the affected sender addresses.
+   */
+  private sweepExpiredHands(): { expiredCount: number; affectedSenders: string[] } {
+    const now = new Date().toISOString();
+    const EXPIRY_SWEEP_CAP = 100;
+
+    const expired = this.sql
+      .exec<{ sender_address: string; sender_nonce: number }>(
+        `SELECT sender_address, sender_nonce FROM sender_hand
+         WHERE expires_at < ?
+         ORDER BY expires_at ASC
+         LIMIT ?`,
+        now,
+        EXPIRY_SWEEP_CAP
+      )
+      .toArray();
+
+    if (expired.length === 0) return { expiredCount: 0, affectedSenders: [] };
+
+    // Group expired nonces by sender
+    const bySender = new Map<string, number[]>();
+    for (const row of expired) {
+      const list = bySender.get(row.sender_address) ?? [];
+      list.push(row.sender_nonce);
+      bySender.set(row.sender_address, list);
+    }
+
+    // Delete the expired entries from sender_hand
+    for (const row of expired) {
+      this.sql.exec(
+        "DELETE FROM sender_hand WHERE sender_address = ? AND sender_nonce = ?",
+        row.sender_address,
+        row.sender_nonce
+      );
+    }
+
+    // Record expirations in the log so agents see them on next submission
+    const expiredAtTs = now;
+    for (const [addr, nonces] of bySender.entries()) {
+      this.sql.exec(
+        `INSERT OR REPLACE INTO sender_expiry_log (sender_address, expired_nonces, expired_at)
+         VALUES (?, ?, ?)`,
+        addr,
+        JSON.stringify(nonces),
+        expiredAtTs
+      );
+    }
+
+    const affectedSenders = Array.from(bySender.keys());
+    this.log("info", "hand_entries_expired", {
+      expiredCount: expired.length,
+      affectedSenders,
+      noncesPerSender: Object.fromEntries(bySender),
+    });
+
+    return { expiredCount: expired.length, affectedSenders };
+  }
+
+  /**
+   * Delete sender_expiry_log entries older than 30 minutes.
+   * Runs once per alarm cycle to prevent unbounded log growth.
+   */
+  private pruneExpiryLog(): void {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    this.sql.exec("DELETE FROM sender_expiry_log WHERE expired_at < ?", cutoff);
+  }
+
+  /**
+   * Return the most recent expiry log entry for the given sender address, if any.
+   * Used by /hand-submit to attach recentlyExpired info to the response so agents
+   * understand why previously-submitted nonces disappeared from the queue.
+   */
+  private getRecentExpirationsForSender(
+    senderAddress: string
+  ): { nonces: number[]; expiredAt: string } | null {
+    const row = this.sql
+      .exec<{ expired_nonces: string; expired_at: string }>(
+        `SELECT expired_nonces, expired_at FROM sender_expiry_log
+         WHERE sender_address = ?
+         ORDER BY expired_at DESC LIMIT 1`,
+        senderAddress
+      )
+      .toArray()[0];
+
+    if (!row) return null;
+    return {
+      nonces: JSON.parse(row.expired_nonces) as number[],
+      expiredAt: row.expired_at,
+    };
+  }
+
+  /**
    * Broadcast up to MAX_BROADCASTS_PER_TICK queued dispatch_queue entries across all wallets.
    * Processes entries ordered by wallet_index ASC, sponsor_nonce ASC to maintain ordering.
    * For each queued entry: deserializes the sender tx, re-sponsors with the queued sponsor nonce,
@@ -5984,6 +6090,14 @@ export class NonceDO {
         // Sweep held sender hands: try to dispatch pending runs (bounded per tick)
         // ---------------------------------------------------------------------------
         this.sweepHeldHands();
+
+        // ---------------------------------------------------------------------------
+        // Expiry sweep: delete sender_hand entries past their 5-minute hold timeout.
+        // Capped at 100 deletions per tick; records to sender_expiry_log for feedback.
+        // ---------------------------------------------------------------------------
+        this.sweepExpiredHands();
+        // Prune expiry log entries older than 30 minutes to bound table growth.
+        this.pruneExpiryLog();
 
         // ---------------------------------------------------------------------------
         // Bounded broadcast: broadcast up to MAX_BROADCASTS_PER_TICK queued entries
@@ -6868,6 +6982,13 @@ export class NonceDO {
 
           // 5. Check for a gapless run and dispatch if found
           const result = this.checkAndDispatchRun(body.senderAddress);
+
+          // 6. Attach recentlyExpired info when entries expired before this submission.
+          //    Helps agents understand why previously-submitted nonces disappeared.
+          const recentExpiry = this.getRecentExpirationsForSender(body.senderAddress);
+          if (recentExpiry) {
+            return this.jsonResponse({ ...result, recentlyExpired: recentExpiry });
+          }
           return this.jsonResponse(result);
         } catch (error) {
           return this.internalError(error);
