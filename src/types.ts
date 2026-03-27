@@ -1255,3 +1255,104 @@ export interface TxStatusRecord {
   /** Error reason (if failed) */
   errorReason?: string;
 }
+
+// =============================================================================
+// Gin Rummy Dispatch Types (Phase 1 — data model)
+// =============================================================================
+
+/**
+ * A single entry in a sender's hand queue (sender_hand table row).
+ * Each entry represents an agent-submitted or replay transaction waiting
+ * to be dispatched.
+ */
+export interface SenderHandEntry {
+  /** Sender's Stacks address */
+  sender_address: string;
+  /** Sender's account nonce for this transaction */
+  sender_nonce: number;
+  /** Hex-encoded signed sponsored transaction (sponsor slot may be empty) */
+  tx_hex: string;
+  /** Origin of this entry: 'agent' = direct submission, 'replay' = re-queued after stuck slot */
+  source: "agent" | "replay";
+  /** ISO timestamp when the entry was received */
+  received_at: string;
+  /** ISO timestamp when the entry expires (received_at + HAND_HOLD_TIMEOUT_MS) */
+  expires_at: string;
+}
+
+/**
+ * Per-sender nonce tracking state (sender_state table row).
+ * Tracks the next expected nonce for each sender that has submitted transactions.
+ */
+export interface SenderState {
+  /** Sender's Stacks address */
+  sender_address: string;
+  /** The next nonce we expect this sender to use (gapless run start) */
+  next_expected_nonce: number;
+  /**
+   * Source of the initial seed:
+   * - 'hiro': seeded from Hiro possible_next_nonce (authoritative)
+   * - 'relay_cache': seeded from highest confirmed nonce in dispatch history
+   * - 'first_tx': seeded from the first observed tx nonce (Hiro was unreachable)
+   */
+  seeded_from: "hiro" | "relay_cache" | "first_tx";
+  /** ISO timestamp when the seed was first recorded */
+  seeded_at: string;
+  /** ISO timestamp of last advanceSenderNonce() call (null if never advanced) */
+  last_advanced_at: string | null;
+}
+
+/**
+ * A single slot in a sponsor wallet's nonce hand (wallet_hand table row).
+ * Tracks the lifecycle of each sponsor nonce slot from available to confirmed.
+ *
+ * State machine:
+ *   available → allocated → dispatched → confirmed
+ *                                     → stuck
+ *                                     → flushed
+ */
+export interface WalletSlot {
+  /** Sponsor wallet index (0-based) */
+  wallet_index: number;
+  /** Sponsor nonce for this slot */
+  sponsor_nonce: number;
+  /**
+   * Current slot state:
+   * - 'available': slot is free for allocation
+   * - 'allocated': slot reserved for a sender tx, not yet broadcast
+   * - 'dispatched': transaction broadcast to the network, awaiting confirmation
+   * - 'confirmed': transaction confirmed on-chain, slot is reusable
+   * - 'stuck': broadcast tx has not confirmed beyond stuck threshold
+   * - 'flushed': slot was gap-filled with a self-transfer (slot recycled)
+   */
+  state: "available" | "allocated" | "dispatched" | "confirmed" | "stuck" | "flushed";
+  /** Sender's Stacks address (null for available/flushed slots) */
+  sender_address: string | null;
+  /** Sender's account nonce (null for available/flushed slots) */
+  sender_nonce: number | null;
+  /** Sponsor fee paid for this slot in microSTX (null until dispatched) */
+  original_fee: string | null;
+  /** ISO timestamp when the transaction was dispatched (null until dispatched) */
+  dispatched_at: string | null;
+  /** ISO timestamp when the slot was confirmed (null until confirmed) */
+  confirmed_at: string | null;
+}
+
+/**
+ * Result of checking a sender's hand for a valid gapless nonce run.
+ * Used by the dispatch engine (Phase 2) to decide whether to dispatch.
+ */
+export interface RunCheckResult {
+  /** Sender's Stacks address */
+  senderAddress: string;
+  /** Whether the hand contains a valid run starting at next_expected_nonce */
+  hasRun: boolean;
+  /** The nonce at which the run starts (null if no run) */
+  runStart: number | null;
+  /** Length of the gapless run (0 if no run) */
+  runLength: number;
+  /** First missing nonce in the sequence (null if run is complete) */
+  missingAt: number | null;
+  /** Total number of entries in the sender's hand */
+  handSize: number;
+}
