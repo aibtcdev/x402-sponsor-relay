@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.24.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.23.1...x402-sponsor-relay-v1.24.0) (2026-03-27)
+
+
+### Features
+
+* improve nonce pool resilience under burst traffic ([#242](https://github.com/aibtcdev/x402-sponsor-relay/issues/242)) ([e9ba970](https://github.com/aibtcdev/x402-sponsor-relay/commit/e9ba9703a55f764679ab88c24039b17977328bbd))
+* nonce pool hardening — malformed payload rejection, dispatch queue, agent queue management ([#247](https://github.com/aibtcdev/x402-sponsor-relay/issues/247)) ([7248f2b](https://github.com/aibtcdev/x402-sponsor-relay/commit/7248f2baac053d3ce05f588d3b057b94ad59951e))
+
 ## [1.23.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.23.0...x402-sponsor-relay-v1.23.1) (2026-03-26)
 
 
