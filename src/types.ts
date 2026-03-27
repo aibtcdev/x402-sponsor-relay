@@ -599,7 +599,8 @@ export type RelayErrorCode =
   | "LOW_HEADROOM"
   | "SERVICE_DEGRADED"
   | "UNSUPPORTED_ADDRESS_TYPE"
-  | "INVALID_BTC_ADDRESS";
+  | "INVALID_BTC_ADDRESS"
+  | "MALFORMED_PAYLOAD";
 
 /**
  * Default retry-after for SERVICE_DEGRADED responses (seconds).

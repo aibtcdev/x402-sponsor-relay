@@ -19,6 +19,43 @@ import {
   Error502Response,
   Error503Response,
 } from "../schemas";
+
+// ---------------------------------------------------------------------------
+// Malformed-payload IP tracking
+// Senders who submit 3+ malformed payloads within MALFORMED_BLOCK_WINDOW_MS
+// are temporarily blocked for the remainder of the window (HTTP 429).
+// ---------------------------------------------------------------------------
+const MALFORMED_BLOCK_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const MALFORMED_BLOCK_THRESHOLD = 3;
+const malformedPayloadMap = new Map<string, { count: number; firstSeen: number }>();
+
+function pruneMalformedMap(): void {
+  const cutoff = Date.now() - MALFORMED_BLOCK_WINDOW_MS;
+  for (const [ip, entry] of malformedPayloadMap) {
+    if (entry.firstSeen < cutoff) malformedPayloadMap.delete(ip);
+  }
+}
+
+/**
+ * Record a malformed-payload attempt for this IP.
+ * Returns true if the IP is now blocked (threshold reached within the window).
+ */
+function checkAndRecordMalformed(ip: string): boolean {
+  pruneMalformedMap();
+  const now = Date.now();
+  const entry = malformedPayloadMap.get(ip);
+  if (entry) {
+    if (now - entry.firstSeen < MALFORMED_BLOCK_WINDOW_MS) {
+      entry.count += 1;
+      malformedPayloadMap.set(ip, entry);
+      return entry.count >= MALFORMED_BLOCK_THRESHOLD;
+    }
+    malformedPayloadMap.set(ip, { count: 1, firstSeen: now });
+    return false;
+  }
+  malformedPayloadMap.set(ip, { count: 1, firstSeen: now });
+  return false;
+}
 import type { AppContext, Env, Logger, SponsorRequest } from "../types";
 import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
@@ -189,11 +226,33 @@ export class Sponsor extends BaseEndpoint {
       }
 
       const sponsorService = new SponsorService(c.env, logger);
+      const clientIp = c.req.header("cf-connecting-ip") ?? "unknown";
 
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        if (validation.error === "Malformed transaction payload") {
+          const blocked = checkAndRecordMalformed(clientIp);
+          if (blocked) {
+            logger.warn("IP blocked for repeated malformed payloads", { ip: clientIp });
+            return this.err(c, {
+              error: "Too many malformed transaction payloads — try again later",
+              code: "RATE_LIMIT_EXCEEDED",
+              status: 429,
+              details: `Submitted ${MALFORMED_BLOCK_THRESHOLD}+ malformed payloads within 10 minutes`,
+              retryable: true,
+              retryAfter: 600,
+            });
+          }
+          return this.err(c, {
+            error: validation.error,
+            code: "MALFORMED_PAYLOAD",
+            status: 400,
+            details: validation.details,
+            retryable: false,
+          });
+        }
         const code =
           validation.error === "Transaction must be sponsored"
             ? "NOT_SPONSORED"

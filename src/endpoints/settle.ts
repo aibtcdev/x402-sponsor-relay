@@ -22,6 +22,45 @@ import { stripHexPrefix } from "../utils";
 import type { AppContext, SettleOptions, X402SettlementResponseV2, X402SettleRequestV2, TxStatusRecord, Logger } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
+// ---------------------------------------------------------------------------
+// Malformed-payload IP tracking
+// Senders who submit 3+ malformed payloads within MALFORMED_BLOCK_WINDOW_MS
+// are temporarily blocked for the remainder of the window.
+// For the /settle endpoint, a blocked IP receives an x402 V2 error response
+// (HTTP 200 with success:false) rather than a raw HTTP 429, to stay spec-compliant.
+// ---------------------------------------------------------------------------
+const MALFORMED_BLOCK_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
+const MALFORMED_BLOCK_THRESHOLD = 3;
+const malformedPayloadMap = new Map<string, { count: number; firstSeen: number }>();
+
+function pruneMalformedMap(): void {
+  const cutoff = Date.now() - MALFORMED_BLOCK_WINDOW_MS;
+  for (const [ip, entry] of malformedPayloadMap) {
+    if (entry.firstSeen < cutoff) malformedPayloadMap.delete(ip);
+  }
+}
+
+/**
+ * Record a malformed-payload attempt for this IP.
+ * Returns true if the IP is now blocked (threshold reached within the window).
+ */
+function checkAndRecordMalformed(ip: string): boolean {
+  pruneMalformedMap();
+  const now = Date.now();
+  const entry = malformedPayloadMap.get(ip);
+  if (entry) {
+    if (now - entry.firstSeen < MALFORMED_BLOCK_WINDOW_MS) {
+      entry.count += 1;
+      malformedPayloadMap.set(ip, entry);
+      return entry.count >= MALFORMED_BLOCK_THRESHOLD;
+    }
+    malformedPayloadMap.set(ip, { count: 1, firstSeen: now });
+    return false;
+  }
+  malformedPayloadMap.set(ip, { count: 1, firstSeen: now });
+  return false;
+}
+
 /** Parameters for the shared post-broadcast success handler */
 interface BroadcastSuccessParams {
   c: AppContext;
@@ -343,13 +382,16 @@ export class Settle extends BaseEndpoint {
         return c.json(response, 200);
       }
 
+      const clientIp = c.req.header("cf-connecting-ip") ?? "unknown";
+
       // Deserialize transaction to inspect sponsor slot
       let parsedTx: ReturnType<typeof deserializeTransaction>;
       try {
         parsedTx = deserializeTransaction(stripHexPrefix(txHex));
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        logger.warn("Failed to deserialize transaction for sponsor-slot inspection", {
+        checkAndRecordMalformed(clientIp);
+        logger.info("Failed to deserialize transaction for sponsor-slot inspection", {
           error: errMsg,
           txHexLength: txHex.length,
           txHexPrefix: stripHexPrefix(txHex).slice(0, 20),
@@ -387,7 +429,10 @@ export class Settle extends BaseEndpoint {
         // Validate the transaction is sponsorable
         const validateResult = sponsorService.validateTransaction(txHex);
         if (!validateResult.valid) {
-          logger.warn("Transaction failed sponsor validation", { error: validateResult.error });
+          if (validateResult.error === "Malformed transaction payload") {
+            checkAndRecordMalformed(clientIp);
+          }
+          logger.info("Transaction failed sponsor validation", { error: validateResult.error });
           c.executionCtx.waitUntil(
             Promise.all([
               statsService.recordError("validation"),
