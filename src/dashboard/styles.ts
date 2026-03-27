@@ -176,7 +176,6 @@ export const dashboardCss = `
   .h-8 { height: 2rem; }
   .h-10 { height: 2.5rem; }
   .h-16 { height: 4rem; }
-  .h-96 { height: 24rem; }
   .h-full { height: 100%; }
   .min-h-screen { min-height: 100vh; }
   .min-h-\\[32px\\] { min-height: 32px; }

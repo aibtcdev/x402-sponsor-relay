@@ -1,4 +1,4 @@
-import type { DashboardOverview, AggregateKeyStats, EndpointBreakdown } from "../../types";
+import type { DashboardOverview, EndpointBreakdown } from "../../types";
 import { htmlDocument, header, footer } from "../components/layout";
 import {
   statsCard,
@@ -57,37 +57,6 @@ function chartEmptyState(message: string): string {
 }
 
 
-/**
- * Render the API Keys statistics section for the dashboard.
- * Shows total active, 7-day registrations, expired, and revoked counts.
- */
-function apiKeysSection(apiKeys: AggregateKeyStats): string {
-  return `
-  <!-- API Keys Section -->
-  <div class="mb-6">
-    <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">API Keys</h3>
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div class="brand-card p-4">
-          <p class="text-sm text-gray-400">Total Active</p>
-          <p class="text-2xl font-bold text-white mt-2">${escapeHtml(String(apiKeys.totalActiveKeys))}</p>
-        </div>
-        <div class="brand-card p-4">
-          <p class="text-sm text-gray-400">Registered (7d)</p>
-          <p class="text-2xl font-bold text-green-400 mt-2">${escapeHtml(String(apiKeys.newKeysLast7Days))}</p>
-        </div>
-        <div class="brand-card p-4">
-          <p class="text-sm text-gray-400">Expired</p>
-          <p class="text-2xl font-bold text-yellow-400 mt-2">${escapeHtml(String(apiKeys.expiredKeys))}</p>
-        </div>
-        <div class="brand-card p-4">
-          <p class="text-sm text-gray-400">Revoked</p>
-          <p class="text-2xl font-bold text-red-400 mt-2">${escapeHtml(String(apiKeys.revokedKeys))}</p>
-        </div>
-      </div>
-    </div>
-  </div>`;
-}
 
 /**
  * Render just the grid of endpoint cards (no outer wrapper).
@@ -138,68 +107,6 @@ function endpointBreakdownCards(breakdown: EndpointBreakdown): string {
 </div>`;
 }
 
-/**
- * Render the endpoint breakdown section.
- * Only shown when at least one endpoint has recorded transactions today.
- */
-function endpointBreakdownSection(breakdown: EndpointBreakdown): string {
-  const totalAcrossEndpoints =
-    breakdown.relay.total +
-    breakdown.sponsor.total +
-    breakdown.settle.total +
-    breakdown.verify.total;
-
-  if (totalAcrossEndpoints === 0) return "";
-
-  function endpointCard(
-    name: string,
-    total: number,
-    success?: number,
-    failed?: number,
-    clientErrors?: number
-  ): string {
-    const hasDetail = success !== undefined && failed !== undefined;
-    const successColor = colors.status.healthy;
-    const failColor = colors.status.down;
-    const clientColor = colors.status.degraded;
-
-    return `
-<div class="brand-card p-4">
-  <p class="text-sm text-gray-400 font-medium">${escapeHtml(name)}</p>
-  <p class="text-2xl font-bold text-white mt-2">${formatNumber(total)}</p>
-  ${hasDetail ? `
-  <div class="mt-2">
-    <div class="flex items-center justify-between text-xs">
-      <span style="color: ${successColor}">Success</span>
-      <span style="color: ${successColor}">${formatNumber(success!)}</span>
-    </div>
-    <div class="flex items-center justify-between text-xs mt-1">
-      <span style="color: ${failColor}">Failed</span>
-      <span style="color: ${failColor}">${formatNumber(failed!)}</span>
-    </div>
-    ${clientErrors !== undefined && clientErrors > 0 ? `
-    <div class="flex items-center justify-between text-xs mt-1">
-      <span style="color: ${clientColor}">Client Err</span>
-      <span style="color: ${clientColor}">${formatNumber(clientErrors)}</span>
-    </div>` : ""}
-  </div>` : `<p class="text-xs text-gray-500 mt-2">verify-only (no settlement)</p>`}
-</div>`;
-  }
-
-  return `
-  <!-- Endpoint Breakdown Section -->
-  <div class="mb-6">
-    <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">Endpoint Breakdown (Today)</h3>
-      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-        ${endpointCard("/relay", breakdown.relay.total, breakdown.relay.success, breakdown.relay.failed)}
-        ${endpointCard("/sponsor", breakdown.sponsor.total, breakdown.sponsor.success, breakdown.sponsor.failed)}
-        ${endpointCard("/settle", breakdown.settle.total, breakdown.settle.success, breakdown.settle.failed, breakdown.settle.clientErrors)}
-        ${endpointCard("/verify", breakdown.verify.total)}
-      </div>
-    </div>
-  </div>`;
-}
 
 /**
  * Generate the main dashboard overview page
