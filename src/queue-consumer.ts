@@ -126,8 +126,27 @@ async function processPaymentMessage(
   const sponsorResult = await sponsorService.sponsorTransaction(transaction);
 
   if (!sponsorResult.success) {
+    // Gin rummy: held result — tx is queued in sender hand, not a failure
+    if ("held" in sponsorResult && sponsorResult.held) {
+      logger.info("Transaction held in sender hand (queue consumer)", {
+        paymentId,
+        nextExpected: sponsorResult.nextExpected,
+        missingNonces: sponsorResult.missingNonces,
+      });
+      // Treat as retryable — the sender needs to submit missing nonces first
+      record = transitionPayment(record, "queued", {
+        error: `Transaction held: nonce gap at ${sponsorResult.nextExpected}`,
+      });
+      await putPaymentRecord(kv, record);
+      message.retry({
+        delaySeconds: Math.min(30, Math.pow(2, attempt)),
+      });
+      return;
+    }
+
     // Check if this is a retryable contention error
-    const code = sponsorResult.code;
+    const failResult = sponsorResult as { code?: string; error: string };
+    const code = failResult.code;
     const isRetryable =
       code === "RATE_LIMIT_EXCEEDED" ||
       code === "LOW_HEADROOM" ||
@@ -143,7 +162,7 @@ async function processPaymentMessage(
       });
       // Update record and move back to queued state for next attempt
       record = transitionPayment(record, "queued", {
-        error: `Sponsor contention: ${sponsorResult.error}`,
+        error: `Sponsor contention: ${failResult.error}`,
       });
       await putPaymentRecord(kv, record);
       message.retry({
@@ -160,7 +179,7 @@ async function processPaymentMessage(
     }
 
     record = transitionPayment(record, "failed", {
-      error: sponsorResult.error,
+      error: failResult.error,
       errorCode: code ?? "SPONSOR_FAILED",
       retryable: false,
     });

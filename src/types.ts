@@ -1356,3 +1356,46 @@ export interface RunCheckResult {
   /** Total number of entries in the sender's hand */
   handSize: number;
 }
+
+/**
+ * Discriminated union returned by NonceDO POST /hand-submit.
+ * dispatched=true: a gapless run was found and txs are queued for broadcast.
+ * dispatched=false: the tx was held because a nonce gap exists.
+ */
+export type HandSubmitResult =
+  | {
+      dispatched: true;
+      /** Sponsor nonce assigned to the first tx in the dispatched run */
+      sponsorNonce: number;
+      /** Wallet index that owns this nonce slot */
+      walletIndex: number;
+      /** Sponsor wallet Stacks address */
+      sponsorAddress: string;
+    }
+  | {
+      dispatched: false;
+      held: true;
+      /** The next sender nonce we need before any dispatch can happen */
+      nextExpected: number;
+      /** Nonces that are missing to form a gapless run (gap between nextExpected and hand) */
+      missingNonces: number[];
+      /** Total entries currently in the sender's hand */
+      handSize: number;
+      /** ISO timestamp when the oldest hand entry expires */
+      expiresAt: string;
+    };
+
+/**
+ * Held sponsoring result — tx accepted but deferred until nonce gap is filled.
+ * The caller should return HTTP 202 and instruct the agent to submit the missing nonces.
+ */
+export interface SponsorHeld {
+  success: false;
+  held: true;
+  /** The next sender nonce we need before dispatch */
+  nextExpected: number;
+  /** Missing nonces that must be submitted to unblock dispatch */
+  missingNonces: number[];
+  /** ISO timestamp when the held tx expires from the hand */
+  expiresAt: string;
+}

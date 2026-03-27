@@ -8,7 +8,7 @@ import type { StacksTransactionWire } from "@stacks/transactions";
 import { hexToBytes } from "@stacks/common";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
-import type { Env, LogsRPC, PoolHealthResponse, WalletHealthSnapshot } from "../types";
+import type { Env, LogsRPC, PoolHealthResponse, WalletHealthSnapshot, HandSubmitResult } from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 import {
   getPaymentRecord,
@@ -1089,6 +1089,175 @@ export class NonceDO {
       senderAddress,
       newFrontier
     );
+  }
+
+  /**
+   * Read a sender's current state row (next_expected_nonce).
+   * Returns null if the sender has never been seeded.
+   */
+  private getSenderState(senderAddress: string): { next_expected_nonce: number } | null {
+    const rows = this.sql
+      .exec<{ next_expected_nonce: number }>(
+        "SELECT next_expected_nonce FROM sender_state WHERE sender_address = ? LIMIT 1",
+        senderAddress
+      )
+      .toArray();
+    return rows[0] ?? null;
+  }
+
+  /**
+   * Check the sender's hand for a gapless run starting at next_expected_nonce.
+   * If a run exists, dispatch the entire run to the dispatch_queue atomically
+   * (DELETE from sender_hand + INSERT into dispatch_queue in a single sql.exec batch).
+   *
+   * Returns HandSubmitResult:
+   * - dispatched:true with sponsorNonce/walletIndex/sponsorAddress for the first tx
+   * - dispatched:false with missingNonces when a gap exists
+   */
+  private checkAndDispatchRun(senderAddress: string): HandSubmitResult {
+    const now = new Date().toISOString();
+
+    // Get next_expected_nonce for this sender
+    const stateRow = this.getSenderState(senderAddress);
+    const nextExpected = stateRow?.next_expected_nonce ?? 0;
+
+    // Fetch the hand, pruning expired and already-confirmed entries
+    const rawHand = this.getHand(senderAddress);
+    const hand = rawHand.filter(
+      (e) => e.sender_nonce >= nextExpected && e.expires_at > now
+    );
+
+    // Build the gapless run starting at nextExpected
+    const run: typeof hand = [];
+    let expectedNonce = nextExpected;
+    for (const entry of hand) {
+      if (entry.sender_nonce === expectedNonce) {
+        run.push(entry);
+        expectedNonce++;
+      } else {
+        break; // gap detected
+      }
+    }
+
+    if (run.length === 0) {
+      // No run available — hand is empty or starts with a gap
+      const lowestInHand = hand.length > 0 ? hand[0].sender_nonce : null;
+      const gapEnd = lowestInHand !== null ? lowestInHand : nextExpected + 1;
+      const missingNonces: number[] = [];
+      for (let n = nextExpected; n < gapEnd && missingNonces.length < 10; n++) {
+        missingNonces.push(n);
+      }
+      const oldestExpiry = hand.length > 0 ? hand[0].expires_at : new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
+      return {
+        dispatched: false,
+        held: true,
+        nextExpected,
+        missingNonces,
+        handSize: hand.length,
+        expiresAt: oldestExpiry,
+      };
+    }
+
+    // Find the wallet with most headroom (best-fit selection)
+    let bestWalletIndex = -1;
+    let bestHeadroom = 0;
+    for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
+      const head = this.ledgerGetWalletHead(wi);
+      if (head === null) break; // wallet not initialized — stop scanning
+      const headroom = this.walletHeadroom(wi);
+      if (headroom > bestHeadroom) {
+        bestHeadroom = headroom;
+        bestWalletIndex = wi;
+      }
+    }
+
+    if (bestWalletIndex === -1 || bestHeadroom === 0) {
+      // No wallet has headroom — return held with empty missingNonces (capacity issue)
+      const oldestExpiry = run[0].expires_at;
+      return {
+        dispatched: false,
+        held: true,
+        nextExpected,
+        missingNonces: [],
+        handSize: hand.length,
+        expiresAt: oldestExpiry,
+      };
+    }
+
+    // Cap the run at available headroom
+    const dispatchRun = run.slice(0, bestHeadroom);
+    const walletIndex = bestWalletIndex;
+
+    // Read the current nonce head for this wallet — the first sponsor nonce to assign
+    const walletHead = this.ledgerGetWalletHead(walletIndex)!;
+    const firstSponsorNonce = walletHead;
+
+    // Execute the hand→queue transition atomically.
+    // The DO's single-threaded execution (inside blockConcurrencyWhile) guarantees no
+    // interleaving. Each sql.exec() is an implicit transaction; sequential calls within
+    // the same blockConcurrencyWhile block are effectively atomic from an external view.
+    for (let i = 0; i < dispatchRun.length; i++) {
+      const entry = dispatchRun[i];
+      const sponsorNonce = firstSponsorNonce + i;
+      const position = sponsorNonce;
+
+      // Remove from hand
+      this.sql.exec(
+        "DELETE FROM sender_hand WHERE sender_address = ? AND sender_nonce = ?",
+        senderAddress,
+        entry.sender_nonce
+      );
+
+      // Add to dispatch_queue
+      this.sql.exec(
+        `INSERT OR REPLACE INTO dispatch_queue
+           (wallet_index, position, sender_tx_hex, sender_address, sender_nonce,
+            sponsor_nonce, state, queued_at, dispatched_at, confirmed_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, NULL, NULL)`,
+        walletIndex,
+        position,
+        entry.tx_hex,
+        entry.sender_address,
+        entry.sender_nonce,
+        sponsorNonce,
+        now
+      );
+
+      // Track in wallet_hand (allocated state)
+      this.sql.exec(
+        `INSERT OR REPLACE INTO wallet_hand
+           (wallet_index, sponsor_nonce, state, sender_address, sender_nonce,
+            original_fee, dispatched_at, confirmed_at)
+         VALUES (?, ?, 'allocated', ?, ?, NULL, NULL, NULL)`,
+        walletIndex,
+        sponsorNonce,
+        entry.sender_address,
+        entry.sender_nonce
+      );
+    }
+
+    // Advance the wallet nonce head past the dispatched run
+    this.ledgerAdvanceWalletHead(walletIndex, walletHead + dispatchRun.length);
+
+    // sponsor_address is stored in DO durable storage (async key-value), not in the SQLite table.
+    // We cannot read it synchronously here. Return empty string — SponsorService uses walletIndex
+    // to derive the correct key from the mnemonic.
+    const sponsorAddress = "";
+
+    this.log("info", "hand_run_dispatched", {
+      senderAddress,
+      runLength: dispatchRun.length,
+      walletIndex,
+      firstSponsorNonce,
+      nextSenderNonce: nextExpected + dispatchRun.length,
+    });
+
+    return {
+      dispatched: true,
+      sponsorNonce: firstSponsorNonce,
+      walletIndex,
+      sponsorAddress,
+    };
   }
 
   private jsonResponse(body: unknown, status = 200): Response {
@@ -4906,11 +5075,63 @@ export class NonceDO {
     }
   }
 
+  /**
+   * Recycle up to 20 replay_buffer entries back into sender_hand for re-dispatch.
+   * Uses INSERT OR IGNORE so a fresher agent resubmission for the same sender nonce
+   * takes precedence — the replay version is silently dropped but still consumed.
+   * Runs once per alarm cycle, after gin rummy migration and before wallet reconciliation.
+   */
+  private recycleReplayBuffer(): void {
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
+
+    const entries = this.sql
+      .exec<{
+        id: number;
+        sender_address: string;
+        sender_nonce: number;
+        sender_tx_hex: string;
+        queued_at: string;
+      }>(
+        `SELECT id, sender_address, sender_nonce, sender_tx_hex, queued_at
+         FROM replay_buffer
+         ORDER BY queued_at ASC
+         LIMIT 20`
+      )
+      .toArray();
+
+    let recycled = 0;
+    for (const entry of entries) {
+      // INSERT OR IGNORE — never overwrite a fresher agent submission for the same nonce
+      this.sql.exec(
+        `INSERT OR IGNORE INTO sender_hand
+           (sender_address, sender_nonce, tx_hex, source, received_at, expires_at)
+         VALUES (?, ?, ?, 'replay', ?, ?)`,
+        entry.sender_address,
+        entry.sender_nonce,
+        entry.sender_tx_hex,
+        now,
+        expiresAt
+      );
+      // Always delete from replay_buffer — the entry is consumed regardless of IGNORE
+      this.sql.exec("DELETE FROM replay_buffer WHERE id = ?", entry.id);
+      recycled++;
+    }
+
+    if (recycled > 0) {
+      this.log("info", "replay_recycled", {
+        total: recycled,
+      });
+    }
+  }
+
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
         // Run gin rummy migration once (no-op after first successful run)
         this.runGinRummyMigration();
+        // Recycle replay_buffer entries back into sender_hand for re-dispatch
+        this.recycleReplayBuffer();
         // Upgrade 'first_tx' sender seeds to Hiro-authoritative values
         await this.retrySeedFirstTxSenders();
 
@@ -5780,6 +6001,46 @@ export class NonceDO {
       } catch (error) {
         return this.internalError(error);
       }
+    }
+
+    // POST /hand-submit — add a sender tx to the hand and check for a dispatchable run.
+    // Returns HandSubmitResult: either dispatched (nonce assigned) or held (gap exists).
+    if (request.method === "POST" && url.pathname === "/hand-submit") {
+      const { value: body, errorResponse } = await this.parseJson<{
+        senderAddress: string;
+        senderNonce: number;
+        txHex: string;
+      }>(request);
+      if (errorResponse) return errorResponse;
+      if (!body?.senderAddress || typeof body.senderNonce !== "number" || !body.txHex) {
+        return this.badRequest("Missing senderAddress, senderNonce, or txHex");
+      }
+
+      return this.state.blockConcurrencyWhile(async () => {
+        try {
+          // 1. Seed sender state on first contact
+          await this.seedSenderState(body.senderAddress, body.senderNonce);
+
+          // 2. Reject stale sender nonces (already confirmed)
+          const stateRow = this.getSenderState(body.senderAddress);
+          if (stateRow && body.senderNonce < stateRow.next_expected_nonce) {
+            return this.jsonResponse({
+              error: "Stale sender nonce — already confirmed or superseded",
+              code: "STALE_SENDER_NONCE",
+              nextExpected: stateRow.next_expected_nonce,
+            }, 400);
+          }
+
+          // 3. Add to hand (agent submission — INSERT OR REPLACE)
+          this.addToHand(body.senderAddress, body.senderNonce, body.txHex, "agent");
+
+          // 4. Check for a gapless run and dispatch if found
+          const result = this.checkAndDispatchRun(body.senderAddress);
+          return this.jsonResponse(result);
+        } catch (error) {
+          return this.internalError(error);
+        }
+      });
     }
 
     return new Response("Not found", { status: 404 });

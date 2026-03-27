@@ -292,12 +292,24 @@ export class Sponsor extends BaseEndpoint {
       }
 
       const sponsorResult = await sponsorService.sponsorTransaction(
-        validation.transaction
+        validation.transaction,
+        body.transaction  // pass original hex for hand-submit sender nonce tracking
       );
       if (sponsorResult.success === false) {
+        // Gin rummy: tx held in sender hand — nonce gap exists, agent must submit missing nonces
+        if ("held" in sponsorResult && sponsorResult.held) {
+          return c.json({
+            success: false,
+            held: true,
+            nextExpected: sponsorResult.nextExpected,
+            missingNonces: sponsorResult.missingNonces,
+            expiresAt: sponsorResult.expiresAt,
+            message: "Transaction held pending nonce gap fill. Submit the missing nonces to dispatch.",
+          }, 202);
+        }
         return this.sponsorFailureResponse(
           c,
-          sponsorResult,
+          sponsorResult as { error: string; details: string; code?: string; retryAfter?: number },
           statsService.recordError("sponsoring").catch(() => {})
         );
       }

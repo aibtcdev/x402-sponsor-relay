@@ -438,7 +438,22 @@ export class Settle extends BaseEndpoint {
         // Sponsor the transaction (reserves nonce from NonceDO, adds fee + sponsor sig)
         const sponsorResult = await sponsorService.sponsorTransaction(validateResult.transaction);
         if (!sponsorResult.success) {
-          logger.warn("Sponsoring failed", { error: sponsorResult.error, code: sponsorResult.code });
+          // Gin rummy: tx held — nonce gap exists; treat as transient failure
+          if ("held" in sponsorResult && sponsorResult.held) {
+            logger.warn("Sponsoring held — nonce gap in sender hand", {
+              nextExpected: sponsorResult.nextExpected,
+              missingNonces: sponsorResult.missingNonces,
+            });
+            c.executionCtx.waitUntil(
+              Promise.all([
+                statsService.recordError("sponsoring"),
+                statsService.logFailure("settle", false, failureCtx),
+              ]).catch(() => {})
+            );
+            return v2Error(X402_V2_ERROR_CODES.BROADCAST_FAILED, 200);
+          }
+          const failResult = sponsorResult as { error: string; code?: string };
+          logger.warn("Sponsoring failed", { error: failResult.error, code: failResult.code });
           c.executionCtx.waitUntil(
             Promise.all([
               statsService.recordError("sponsoring"),
@@ -448,9 +463,9 @@ export class Settle extends BaseEndpoint {
           // Transient sponsor failures — signal retryable via BROADCAST_FAILED
           // Note: SponsorService maps CHAINING_LIMIT_EXCEEDED → RATE_LIMIT_EXCEEDED
           const isTransient =
-            sponsorResult.code === "LOW_HEADROOM" ||
-            sponsorResult.code === "RATE_LIMIT_EXCEEDED" ||
-            sponsorResult.code === "SERVICE_DEGRADED";
+            failResult.code === "LOW_HEADROOM" ||
+            failResult.code === "RATE_LIMIT_EXCEEDED" ||
+            failResult.code === "SERVICE_DEGRADED";
           const errorReason = isTransient
             ? X402_V2_ERROR_CODES.BROADCAST_FAILED
             : X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE;
@@ -606,10 +621,11 @@ export class Settle extends BaseEndpoint {
                   logger.warn("Retry verify failed but sponsor nonce was null; skipping nonce release");
                 }
               }
-            } else {
+            } else if (!("held" in retrySponsorResult && retrySponsorResult.held)) {
+              const retryFail = retrySponsorResult as { error: string; code?: string };
               logger.warn("Retry sponsor failed after inline resync", {
-                error: retrySponsorResult.error,
-                code: retrySponsorResult.code,
+                error: retryFail.error,
+                code: retryFail.code,
               });
             }
           }
