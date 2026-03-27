@@ -1,12 +1,5 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { StxVerifyService } from "../services/stx-verify";
-import type { AppContext, Sip018Auth } from "../types";
-import { SIP018_DOMAIN } from "../types";
-import {
-  tupleCV,
-  stringAsciiCV,
-  uintCV,
-} from "@stacks/transactions";
+import type { AppContext } from "../types";
 import {
   Error401Response,
   Error500Response,
@@ -164,71 +157,9 @@ export class QueueRead extends BaseEndpoint {
       });
     }
 
-    // Parse auth from request body
-    let auth: Sip018Auth;
-    try {
-      const body = await c.req.json() as { auth?: Sip018Auth };
-      if (!body?.auth) {
-        return this.err(c, {
-          error: "Missing auth field — SIP-018 signature required",
-          code: "INVALID_AUTH_SIGNATURE",
-          status: 401,
-          retryable: false,
-        });
-      }
-      auth = body.auth;
-    } catch {
-      return this.err(c, {
-        error: "Invalid JSON body",
-        code: "INVALID_PAYLOAD",
-        status: 400,
-        retryable: false,
-      });
-    }
-
-    // Verify SIP-018 auth and recover signer address
-    const stxVerify = new StxVerifyService(logger, c.env.STACKS_NETWORK);
-    const authError = stxVerify.verifySip018Auth(auth, "queue-read");
-    if (authError) {
-      return this.err(c, {
-        error: authError.error,
-        code: authError.code,
-        status: 401,
-        retryable: false,
-      });
-    }
-
-    // Recover signer address and verify it matches the URL param
-    const nonce = parseInt(auth.message.nonce, 10);
-    const expiry = parseInt(auth.message.expiry, 10);
-    const domain = c.env.STACKS_NETWORK === "mainnet"
-      ? SIP018_DOMAIN.mainnet
-      : SIP018_DOMAIN.testnet;
-    const domainTuple = tupleCV({
-      name: stringAsciiCV(domain.name),
-      version: stringAsciiCV(domain.version),
-      "chain-id": uintCV(domain.chainId),
-    });
-    const messageTuple = tupleCV({
-      action: stringAsciiCV(auth.message.action),
-      nonce: uintCV(nonce),
-      expiry: uintCV(expiry),
-    });
-    const verifyResult = stxVerify.verifySip018({
-      signature: auth.signature,
-      domain: domainTuple,
-      message: messageTuple,
-      expectedAddress: senderAddress,
-    });
-
-    if (!verifyResult.valid) {
-      return this.err(c, {
-        error: "Signature does not match senderAddress — you may only read your own queue",
-        code: "QUEUE_ACCESS_DENIED",
-        status: 403,
-        retryable: false,
-      });
-    }
+    // Parse and verify SIP-018 auth with address ownership check
+    const authError = await this.parseAndVerifyQueueAuth(c, "queue-read", senderAddress);
+    if (authError) return authError;
 
     if (!c.env.NONCE_DO) {
       return this.err(c, {

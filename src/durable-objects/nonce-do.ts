@@ -4884,13 +4884,10 @@ export class NonceDO {
 
           // Verify address ownership
           if (row.sender_address !== senderAddress) {
-            return new Response(
-              JSON.stringify({
-                error: "Address mismatch: you do not own this queue entry",
-                code: "QUEUE_ACCESS_DENIED",
-              }),
-              { status: 403, headers: { "content-type": "application/json" } }
-            );
+            return this.jsonResponse({
+              error: "Address mismatch: you do not own this queue entry",
+              code: "QUEUE_ACCESS_DENIED",
+            }, 403);
           }
 
           const previousState = row.state;
@@ -4942,13 +4939,10 @@ export class NonceDO {
         if (replayRows.length > 0) {
           const replayRow = replayRows[0];
           if (replayRow.sender_address !== senderAddress) {
-            return new Response(
-              JSON.stringify({
-                error: "Address mismatch: you do not own this replay buffer entry",
-                code: "QUEUE_ACCESS_DENIED",
-              }),
-              { status: 403, headers: { "content-type": "application/json" } }
-            );
+            return this.jsonResponse({
+              error: "Address mismatch: you do not own this replay buffer entry",
+              code: "QUEUE_ACCESS_DENIED",
+            }, 403);
           }
           this.sql.exec("DELETE FROM replay_buffer WHERE id = ?", replayRow.id);
           return this.jsonResponse({
@@ -4959,13 +4953,10 @@ export class NonceDO {
           });
         }
 
-        return new Response(
-          JSON.stringify({
-            error: "Queue entry not found",
-            code: "QUEUE_NOT_FOUND",
-          }),
-          { status: 404, headers: { "content-type": "application/json" } }
-        );
+        return this.jsonResponse({
+          error: "Queue entry not found",
+          code: "QUEUE_NOT_FOUND",
+        }, 404);
       } catch (error) {
         return this.internalError(error);
       }

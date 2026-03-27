@@ -9,8 +9,10 @@ import type {
   RelayErrorResponse,
   RelaySuccessResponse,
   SettlementResult,
+  Sip018Auth,
 } from "../types";
 import { buildExplorerUrl } from "../utils";
+import { StxVerifyService } from "../services/stx-verify";
 
 /**
  * Base endpoint class with common helpers
@@ -274,5 +276,60 @@ export class BaseEndpoint extends OpenAPIRoute {
     } catch {
       return 30;
     }
+  }
+
+  /**
+   * Parse SIP-018 auth from request body and verify signature + address ownership.
+   * Shared by queue-read and queue-cancel endpoints.
+   *
+   * Returns an error Response if validation fails, or null if auth is valid.
+   * The `action` parameter scopes the signature to the specific endpoint.
+   */
+  protected async parseAndVerifyQueueAuth(
+    c: AppContext,
+    action: "queue-read" | "queue-cancel",
+    expectedAddress: string
+  ): Promise<Response | null> {
+    let auth: Sip018Auth;
+    try {
+      const body = await c.req.json() as { auth?: Sip018Auth };
+      if (!body?.auth) {
+        return this.err(c, {
+          error: "Missing auth field — SIP-018 signature required",
+          code: "INVALID_AUTH_SIGNATURE",
+          status: 401,
+          retryable: false,
+        });
+      }
+      auth = body.auth;
+    } catch {
+      return this.err(c, {
+        error: "Invalid JSON body",
+        code: "INVALID_PAYLOAD",
+        status: 400,
+        retryable: false,
+      });
+    }
+
+    const logger = this.getLogger(c);
+    const stxVerify = new StxVerifyService(logger, c.env.STACKS_NETWORK);
+    const authError = stxVerify.verifySip018Auth(auth, action, { expectedAddress });
+    if (authError) {
+      // Address mismatch from verifySip018 uses "address mismatch" in error text — map to 403
+      const isAddressMismatch = authError.error.includes("address mismatch");
+      const accessDescription = action === "queue-read"
+        ? "read your own queue"
+        : "cancel your own transactions";
+      return this.err(c, {
+        error: isAddressMismatch
+          ? `Signature does not match senderAddress — you may only ${accessDescription}`
+          : authError.error,
+        code: isAddressMismatch ? "QUEUE_ACCESS_DENIED" : authError.code,
+        status: isAddressMismatch ? 403 : 401,
+        retryable: false,
+      });
+    }
+
+    return null;
   }
 }
