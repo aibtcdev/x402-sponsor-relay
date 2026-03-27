@@ -5,7 +5,9 @@ import {
   tokenCard,
   healthCard,
   successRateCard,
-  clientErrorsCard,
+  statusBannerPlaceholder,
+  settlementTimeCard,
+  feesSpentCard,
 } from "../components/cards";
 import {
   formatTrend,
@@ -174,21 +176,26 @@ export function overviewPage(data: DashboardOverview, network?: string): string 
 ${header(network)}
 
 <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-8">
-  <!-- Stats Cards Row -->
-  <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-    ${statsCard("Transactions (24h)", data.transactions.total, {
-      trend: trend.html,
-      icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`,
-    })}
+  <!-- Zone A + Zone B: Status banner and metric cards (shared Alpine statusApp component) -->
+  <div x-data="statusApp()" x-init="init()">
+    <!-- Zone A: Full-width status banner -->
+    <div class="mb-4">
+      ${statusBannerPlaceholder()}
+    </div>
 
-    ${successRateCard(data.transactions.success, data.transactions.total, data.transactions.clientErrors)}
+    <!-- Zone B: Redesigned metric cards -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+      ${statsCard("Transactions (24h)", data.transactions.total, {
+        trend: trend.html,
+        icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`,
+      })}
 
-    ${clientErrorsCard(data.transactions.clientErrors ?? 0, data.transactions.total)}
+      ${successRateCard(data.transactions.success, data.transactions.total, data.transactions.clientErrors)}
 
-    ${statsCard("Hiro Latency", `${settlement.avgLatencyMs}ms`, {
-      colorClass: settlement.avgLatencyMs > 2000 ? "text-yellow-400" : "text-white",
-      icon: `<svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`,
-    })}
+      ${settlementTimeCard()}
+
+      ${feesSpentCard(data.fees.total, data.fees.average)}
+    </div>
   </div>
 
   <!-- Transaction Volume Chart (full-width, with 24h/7d toggle) -->
@@ -403,6 +410,60 @@ ${footer(utcTimestamp())}
       })
       .catch(function() {});
   }, 60000);
+
+  // Status banner Alpine.js component — fetches /nonce/state on init and every 10s
+  function statusApp() {
+    return {
+      statusColor: '#6B7280',
+      statusLabel: 'Loading...',
+      capacityPct: 0,
+      capacityColor: '#6B7280',
+      capacityLabel: '--/--',
+      settlementP50: '--',
+      showWarning: false,
+      p50Display: '--',
+      p95Display: '--',
+      _interval: null,
+
+      init: function() {
+        var self = this;
+        self.refresh();
+        self._interval = setInterval(function() { self.refresh(); }, 10000);
+      },
+
+      refresh: function() {
+        var self = this;
+        fetch('/nonce/state')
+          .then(function(r) { return r.ok ? r.json() : null; })
+          .then(function(data) {
+            if (!data || !data.state) return;
+            var state = data.state;
+            var healthy = state.healthy;
+            var hasRecommendation = state.recommendation === 'fallback_to_direct';
+            var totalReserved = state.totalReserved || 0;
+            var totalCapacity = state.totalCapacity || 1;
+            var pct = Math.round((totalReserved / totalCapacity) * 100);
+
+            if (healthy && !hasRecommendation) {
+              self.statusColor = '#10B981';
+              self.statusLabel = 'Healthy';
+            } else if (!healthy || hasRecommendation) {
+              self.statusColor = '#FBBF24';
+              self.statusLabel = hasRecommendation ? 'Degraded — fallback to direct' : 'Degraded';
+            } else {
+              self.statusColor = '#F87171';
+              self.statusLabel = 'Unhealthy';
+            }
+
+            self.capacityPct = Math.min(pct, 100);
+            self.capacityColor = pct < 70 ? '#10B981' : pct < 90 ? '#FBBF24' : '#F87171';
+            self.capacityLabel = totalReserved + '/' + totalCapacity;
+            self.showWarning = !healthy || hasRecommendation;
+          })
+          .catch(function() { /* silently ignore network errors */ });
+      }
+    };
+  }
 
   // Wallet status Alpine.js component — fetches /wallets on init
   function walletApp() {

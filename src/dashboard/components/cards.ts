@@ -261,7 +261,7 @@ export function apiKeySummaryCards(stats: AggregateKeyStats): string {
  */
 export function statusBannerPlaceholder(): string {
   return `
-<div class="status-banner" x-data="statusApp()">
+<div class="status-banner">
   <div class="flex items-center gap-3">
     <span class="status-dot" :style="'background-color: ' + statusColor"></span>
     <span class="font-medium" :style="'color: ' + statusColor" x-text="statusLabel">Loading...</span>
@@ -278,7 +278,7 @@ export function statusBannerPlaceholder(): string {
     <span class="text-sm font-mono text-white" x-text="settlementP50">--</span>
   </div>
 </div>
-<template x-if="showWarning" x-data>
+<template x-if="showWarning">
   <div class="status-banner status-banner--warning mt-2">
     <span class="text-sm" style="color: ${colors.status.degraded}">Nonce pool unhealthy — agents should consider direct submission</span>
   </div>
