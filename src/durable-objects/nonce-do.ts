@@ -663,13 +663,14 @@ export class NonceDO {
       `INSERT OR REPLACE INTO dispatch_queue
          (wallet_index, position, sender_tx_hex, sender_address, sender_nonce,
           sponsor_nonce, state, queued_at, dispatched_at, confirmed_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, NULL, NULL)`,
+       VALUES (?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, NULL)`,
       walletIndex,
       position,
       senderTxHex,
       senderAddress,
       senderNonce,
       sponsorNonce,
+      now,
       now
     );
   }
@@ -3161,7 +3162,8 @@ export class NonceDO {
         .toArray();
 
       if (stuckEntries.length === 0) {
-        return { flushed: 0, replayBufferDepth: 0 };
+        const currentDepth = this.getReplayBufferDepth(walletIndex);
+        return { flushed: 0, replayBufferDepth: currentDepth };
       }
 
       // Batch flush detection: log a high-visibility event when many slots are stuck
@@ -3367,8 +3369,10 @@ export class NonceDO {
             continue;
           }
 
-          // Reserve the nonce in the ledger
+          // Reserve the nonce in the ledger and advance head to mirror normal assignment path
           this.ledgerAssign(targetWallet.walletIndex, freshNonce);
+          this.ledgerAdvanceWalletHead(targetWallet.walletIndex, freshNonce + 1);
+          this.updateAssignedStats(freshNonce);
 
           // Deserialize and re-sponsor the sender tx
           const cleanHex = entry.sender_tx_hex.replace(/^0x/i, "");

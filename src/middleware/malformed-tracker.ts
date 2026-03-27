@@ -4,8 +4,11 @@
  * Senders who submit 3+ malformed payloads within a 10-minute window
  * are temporarily blocked for the remainder of the window.
  *
- * A single shared map is used across all endpoints so that an attacker
- * cannot bypass the threshold by rotating between /relay, /sponsor, and /settle.
+ * can be temporarily blocked for the remainder of the window by callers that
+ * enforce the result of this tracker.
+ *
+ * A single shared map is used so that any endpoints that consult this tracker
+ * share the same malformed-attempt counts for a given IP.
  */
 
 /** Duration of the tracking window in milliseconds (10 minutes). */

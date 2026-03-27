@@ -1733,17 +1733,21 @@ Returns the agent's current pending transaction queue across all sponsor wallets
 
 action: "queue-read"
 
-Request body:
+This endpoint uses SIP-018 auth via the \`X-SIP018-Auth\` HTTP header (not a JSON body).
+The header value MUST be a JSON string with the following shape:
+
 {
-  "auth": {
-    "signature": "0x...",           // RSV hex SIP-018 signature
-    "message": {
-      "action": "queue-read",       // must be exactly "queue-read"
-      "nonce": "1708099200000",     // unix ms timestamp (replay protection)
-      "expiry": "1708185600000"     // must be in the future
-    }
+  "signature": "0x...",           // RSV hex SIP-018 signature
+  "message": {
+    "action": "queue-read",       // must be exactly "queue-read"
+    "nonce": "1708099200000",     // unix ms timestamp (replay protection)
+    "expiry": "1708185600000"     // must be in the future
   }
 }
+
+Example:
+
+X-SIP018-Auth: {"signature":"0x...","message":{"action":"queue-read","nonce":"1708099200000","expiry":"1708185600000"}}
 
 ### Response (200)
 
@@ -1772,9 +1776,8 @@ Cancels a queued, dispatched, or replaying sponsored transaction.
 ### State Transitions
 
 - queued → deleted immediately from the dispatch queue
-- dispatched → transitioned to 'replaying' (the sponsor nonce slot is marked
-  for flushing in the next alarm cycle; the sender tx will be re-sponsored
-  with a fresh nonce and can be resubmitted)
+- dispatched → sponsor nonce flushed immediately (best-effort) and the
+  corresponding dispatch_queue row deleted (no 'replaying' transition)
 - replaying → deleted immediately from the dispatch queue
 - replay_buffer entry (matched by original_sponsor_nonce) → deleted
 

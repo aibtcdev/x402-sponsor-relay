@@ -15,7 +15,7 @@ import {
  *
  * State transitions:
  *   queued → deleted immediately
- *   dispatched → set to 'replaying' (signals the alarm to flush the sponsor nonce slot)
+ *   dispatched → sponsor nonce flushed immediately (best-effort via RBF), then deleted
  *   replaying → deleted immediately
  *   replay_buffer → deleted (matched by original_sponsor_nonce)
  *
@@ -31,7 +31,7 @@ export class QueueCancel extends BaseEndpoint {
       "The recovered signer address must match the :senderAddress URL parameter.\n\n" +
       "State transitions:\n" +
       "- queued → deleted immediately\n" +
-      "- dispatched → transitioned to 'replaying' (sponsor nonce slot will be flushed in next alarm cycle)\n" +
+      "- dispatched → sponsor nonce flushed immediately (best-effort via RBF), then deleted\n" +
       "- replaying → deleted immediately\n" +
       "- replay_buffer entry (matched by original_sponsor_nonce) → deleted",
     request: {
@@ -101,8 +101,10 @@ export class QueueCancel extends BaseEndpoint {
               type: "object" as const,
               properties: {
                 success: { type: "boolean" as const, example: false },
+                requestId: { type: "string" as const, format: "uuid" },
                 error: { type: "string" as const },
                 code: { type: "string" as const, example: "QUEUE_ACCESS_DENIED" },
+                retryable: { type: "boolean" as const, example: false },
               },
             },
           },
