@@ -203,6 +203,10 @@ interface ObservableWalletState {
   reserved: number;
   circuitBreakerOpen: boolean;
   healthy: boolean;
+  /** Total non-confirmed dispatch_queue rows (queued + dispatched + replaying) */
+  queueDepth?: number;
+  /** Rows in replay_buffer for this wallet (waiting for re-sponsoring) */
+  replayBufferDepth?: number;
 }
 
 /**
@@ -258,6 +262,10 @@ interface NonceStatsResponse {
   walletUtilization: WalletUtilization[];
   /** Dynamic wallet count stored in ledger (null if no scale-up has occurred) */
   dynamicWalletCount: number | null;
+  /** Total non-confirmed dispatch_queue rows across all wallets */
+  totalQueueDepth: number;
+  /** Total replay_buffer rows across all wallets (waiting for re-sponsoring) */
+  totalReplayBufferDepth: number;
 }
 
 /**
@@ -563,6 +571,261 @@ export class NonceDO {
         resolved_at         TEXT
       );
     `);
+
+    // Dispatch queue: tracks (senderTx, sponsorNonce) pairs flowing through the relay.
+    // The relay owns the sponsor nonce sequence — this table is the authoritative record
+    // of what has been dispatched (broadcast) and what is waiting (queued).
+    // States: 'queued' → 'dispatched' → 'confirmed' | 'replaying'
+    // 'replaying' means the sponsor nonce slot was stuck and is being flushed; the sender tx
+    // will be moved to replay_buffer for re-sponsoring with a fresh nonce.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS dispatch_queue (
+        wallet_index    INTEGER NOT NULL,
+        position        INTEGER NOT NULL DEFAULT 0,
+        sender_tx_hex   TEXT    NOT NULL,
+        sender_address  TEXT    NOT NULL,
+        sender_nonce    INTEGER NOT NULL,
+        sponsor_nonce   INTEGER NOT NULL,
+        state           TEXT    NOT NULL DEFAULT 'queued',
+        queued_at       TEXT    NOT NULL,
+        dispatched_at   TEXT,
+        confirmed_at    TEXT,
+        PRIMARY KEY (wallet_index, sponsor_nonce)
+      );
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_dispatch_queue_state
+        ON dispatch_queue(wallet_index, state);
+    `);
+
+    // Replay buffer: sender txs waiting for a fresh sponsor nonce assignment.
+    // Populated when a dispatched slot is stuck and needs to be flushed.
+    // The relay will re-sponsor these txs with new nonces in the next alarm cycle.
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS replay_buffer (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        wallet_index          INTEGER NOT NULL,
+        sender_tx_hex         TEXT    NOT NULL,
+        sender_address        TEXT    NOT NULL,
+        sender_nonce          INTEGER NOT NULL,
+        original_sponsor_nonce INTEGER NOT NULL,
+        queued_at             TEXT    NOT NULL,
+        assigned_at           TEXT
+      );
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_replay_buffer_wallet
+        ON replay_buffer(wallet_index, queued_at ASC);
+    `);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dispatch queue helpers (proactive queue-based dispatch, phase 2)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Insert or replace a sender tx + sponsor nonce pair into the dispatch queue.
+   * Called when a sender tx is ready to be dispatched with a specific sponsor nonce.
+   * Uses INSERT OR REPLACE to handle re-queue on duplicate sponsor_nonce.
+   */
+  private queueDispatch(
+    walletIndex: number,
+    senderTxHex: string,
+    senderAddress: string,
+    senderNonce: number,
+    sponsorNonce: number
+  ): void {
+    const now = new Date().toISOString();
+    // Compute position as next slot (max position + 1) for ordering within the wallet queue
+    const posRows = this.sql
+      .exec<{ max_pos: number | null }>(
+        "SELECT MAX(position) as max_pos FROM dispatch_queue WHERE wallet_index = ?",
+        walletIndex
+      )
+      .toArray();
+    const position = (posRows[0]?.max_pos ?? -1) + 1;
+
+    this.sql.exec(
+      `INSERT OR REPLACE INTO dispatch_queue
+         (wallet_index, position, sender_tx_hex, sender_address, sender_nonce,
+          sponsor_nonce, state, queued_at, dispatched_at, confirmed_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, NULL, NULL)`,
+      walletIndex,
+      position,
+      senderTxHex,
+      senderAddress,
+      senderNonce,
+      sponsorNonce,
+      now
+    );
+  }
+
+  /**
+   * Return all non-confirmed dispatch_queue rows for a wallet, ordered by sponsor_nonce ASC.
+   */
+  private getQueuedForWallet(walletIndex: number): Array<{
+    sender_tx_hex: string;
+    sender_address: string;
+    sender_nonce: number;
+    sponsor_nonce: number;
+    state: string;
+    queued_at: string;
+    dispatched_at: string | null;
+  }> {
+    return this.sql
+      .exec<{
+        sender_tx_hex: string;
+        sender_address: string;
+        sender_nonce: number;
+        sponsor_nonce: number;
+        state: string;
+        queued_at: string;
+        dispatched_at: string | null;
+      }>(
+        `SELECT sender_tx_hex, sender_address, sender_nonce, sponsor_nonce,
+                state, queued_at, dispatched_at
+         FROM dispatch_queue
+         WHERE wallet_index = ? AND state != 'confirmed'
+         ORDER BY sponsor_nonce ASC`,
+        walletIndex
+      )
+      .toArray();
+  }
+
+  /**
+   * Fast O(1) count of non-confirmed dispatch_queue rows per state for a wallet.
+   */
+  private getDispatchQueueDepth(walletIndex: number): {
+    queued: number;
+    dispatched: number;
+    replaying: number;
+  } {
+    const rows = this.sql
+      .exec<{ state: string; cnt: number }>(
+        `SELECT state, COUNT(*) as cnt FROM dispatch_queue
+         WHERE wallet_index = ? AND state != 'confirmed'
+         GROUP BY state`,
+        walletIndex
+      )
+      .toArray();
+
+    const result = { queued: 0, dispatched: 0, replaying: 0 };
+    for (const row of rows) {
+      if (row.state === "queued") result.queued = row.cnt;
+      else if (row.state === "dispatched") result.dispatched = row.cnt;
+      else if (row.state === "replaying") result.replaying = row.cnt;
+    }
+    return result;
+  }
+
+  /** Mark a dispatch_queue entry as dispatched (broadcast succeeded). */
+  private markDispatchedInQueue(walletIndex: number, sponsorNonce: number): void {
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `UPDATE dispatch_queue SET state = 'dispatched', dispatched_at = ?
+       WHERE wallet_index = ? AND sponsor_nonce = ?`,
+      now,
+      walletIndex,
+      sponsorNonce
+    );
+  }
+
+  /** Mark a dispatch_queue entry as confirmed (nonce confirmed on-chain). */
+  private markQueueEntryConfirmed(walletIndex: number, sponsorNonce: number): void {
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `UPDATE dispatch_queue SET state = 'confirmed', confirmed_at = ?
+       WHERE wallet_index = ? AND sponsor_nonce = ?`,
+      now,
+      walletIndex,
+      sponsorNonce
+    );
+  }
+
+  /** Mark a dispatch_queue entry as replaying (slot stuck, being flushed). */
+  private markQueueEntryReplaying(walletIndex: number, sponsorNonce: number): void {
+    this.sql.exec(
+      `UPDATE dispatch_queue SET state = 'replaying'
+       WHERE wallet_index = ? AND sponsor_nonce = ?`,
+      walletIndex,
+      sponsorNonce
+    );
+  }
+
+  /**
+   * Move a sender tx into the replay buffer.
+   * Called when its sponsor nonce slot is being flushed with a self-transfer.
+   * The entry will be picked up by the next alarm cycle for re-sponsoring.
+   */
+  private addToReplayBuffer(
+    walletIndex: number,
+    senderTxHex: string,
+    senderAddress: string,
+    senderNonce: number,
+    originalSponsorNonce: number
+  ): void {
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `INSERT INTO replay_buffer
+         (wallet_index, sender_tx_hex, sender_address, sender_nonce,
+          original_sponsor_nonce, queued_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      walletIndex,
+      senderTxHex,
+      senderAddress,
+      senderNonce,
+      originalSponsorNonce,
+      now
+    );
+  }
+
+  /**
+   * Return all replay_buffer rows for a wallet ordered by queued_at ASC.
+   * These are sender txs awaiting re-sponsoring with fresh nonces.
+   */
+  private getReplayBuffer(walletIndex: number): Array<{
+    id: number;
+    sender_tx_hex: string;
+    sender_address: string;
+    sender_nonce: number;
+    original_sponsor_nonce: number;
+    queued_at: string;
+  }> {
+    return this.sql
+      .exec<{
+        id: number;
+        sender_tx_hex: string;
+        sender_address: string;
+        sender_nonce: number;
+        original_sponsor_nonce: number;
+        queued_at: string;
+      }>(
+        `SELECT id, sender_tx_hex, sender_address, sender_nonce,
+                original_sponsor_nonce, queued_at
+         FROM replay_buffer
+         WHERE wallet_index = ?
+         ORDER BY queued_at ASC`,
+        walletIndex
+      )
+      .toArray();
+  }
+
+  /** Remove a specific entry from the replay buffer (after it has been re-sponsored). */
+  private removeFromReplayBuffer(id: number): void {
+    this.sql.exec("DELETE FROM replay_buffer WHERE id = ?", id);
+  }
+
+  /** Count replay_buffer rows for a specific wallet. */
+  private getReplayBufferDepth(walletIndex: number): number {
+    const rows = this.sql
+      .exec<{ cnt: number }>(
+        "SELECT COUNT(*) as cnt FROM replay_buffer WHERE wallet_index = ?",
+        walletIndex
+      )
+      .toArray();
+    return rows[0]?.cnt ?? 0;
   }
 
   private jsonResponse(body: unknown, status = 200): Response {
@@ -2493,7 +2756,19 @@ export class NonceDO {
         const cbOpen = activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
         const reserved = this.ledgerReservedCount(walletIndex);
         const available = Math.max(0, CHAINING_LIMIT - reserved);
-        return { walletIndex, circuitBreakerOpen: cbOpen, reserved, available, quarantineCount: activeQuarantines.length };
+        // Queue state for observability (dispatch_queue + replay_buffer)
+        const queueState = this.getDispatchQueueDepth(walletIndex);
+        const replayDepth = this.getReplayBufferDepth(walletIndex);
+        return {
+          walletIndex,
+          circuitBreakerOpen: cbOpen,
+          reserved,
+          available,
+          quarantineCount: activeQuarantines.length,
+          queueDepth: queueState.queued + queueState.dispatched + queueState.replaying,
+          replayBufferDepth: replayDepth,
+          dispatchedCount: queueState.dispatched,
+        };
       })
     );
 
@@ -2591,6 +2866,15 @@ export class NonceDO {
 
     const dynamicWalletCount = this.getStateValue("dynamic_wallet_count");
 
+    // Queue state aggregated across all wallets
+    let totalQueueDepth = 0;
+    let totalReplayBufferDepth = 0;
+    for (const { walletIndex } of initializedWallets) {
+      const qd = this.getDispatchQueueDepth(walletIndex);
+      totalQueueDepth += qd.queued + qd.dispatched + qd.replaying;
+      totalReplayBufferDepth += this.getReplayBufferDepth(walletIndex);
+    }
+
     return {
       totalAssigned,
       conflictsDetected,
@@ -2612,6 +2896,8 @@ export class NonceDO {
       dynamicWalletCount: dynamicWalletCount !== null && dynamicWalletCount > 0
         ? dynamicWalletCount
         : null,
+      totalQueueDepth,
+      totalReplayBufferDepth,
     };
   }
 
@@ -2731,6 +3017,10 @@ export class NonceDO {
         const available = this.walletHeadroom(walletIndex);
         const reserved = CHAINING_LIMIT - available;
 
+        // Queue state for observability
+        const queueState = this.getDispatchQueueDepth(walletIndex);
+        const replayDepth = this.getReplayBufferDepth(walletIndex);
+
         return {
           walletIndex,
           sponsorAddress: address,
@@ -2742,6 +3032,8 @@ export class NonceDO {
           reserved,
           circuitBreakerOpen,
           healthy: gaps.length === 0 && !circuitBreakerOpen && available > 0,
+          queueDepth: queueState.queued + queueState.dispatched + queueState.replaying,
+          replayBufferDepth: replayDepth,
         };
       })
     );
@@ -2798,6 +3090,160 @@ export class NonceDO {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Proactive flush and replay cycle for a specific wallet.
+   *
+   * Detects dispatch_queue entries with state='dispatched' that have been pending
+   * longer than stuckAgeMs. For each stuck entry:
+   *   1. Mark the queue entry as 'replaying'
+   *   2. Broadcast a 1 uSTX self-transfer at the stuck sponsor nonce (flush the slot)
+   *   3. Move the original sender tx to the replay_buffer for re-sponsoring
+   *
+   * Sender txs in the replay_buffer are logged as 'replay_buffer_pending' so operators
+   * can observe their count. Actual re-sponsoring (calling SponsorService with a fresh
+   * nonce) is outside the DO's scope — a future enhancement will wire that path.
+   *
+   * Batch flush threshold: when >= 5 slots are stuck simultaneously, logs a
+   * 'wallet_flush_and_replay' event to signal that a batch recovery is occurring.
+   *
+   * Returns {flushed, replayed} counts for inclusion in reconciliation_summary.
+   * Never throws — all errors are logged and the cycle continues.
+   */
+  private async runFlushAndReplayCycle(
+    walletIndex: number,
+    stuckAgeMs: number
+  ): Promise<{ flushed: number; replayed: number }> {
+    let flushed = 0;
+    let replayed = 0;
+
+    try {
+      // Fetch all dispatched entries for this wallet
+      const dispatchedRows = this.sql
+        .exec<{
+          sender_tx_hex: string;
+          sender_address: string;
+          sender_nonce: number;
+          sponsor_nonce: number;
+          dispatched_at: string | null;
+          queued_at: string;
+        }>(
+          `SELECT sender_tx_hex, sender_address, sender_nonce, sponsor_nonce,
+                  dispatched_at, queued_at
+           FROM dispatch_queue
+           WHERE wallet_index = ? AND state = 'dispatched'
+           ORDER BY sponsor_nonce ASC`,
+          walletIndex
+        )
+        .toArray();
+
+      if (dispatchedRows.length === 0) {
+        return { flushed: 0, replayed: 0 };
+      }
+
+      // Filter to stuck entries (older than stuckAgeMs)
+      const now = Date.now();
+      const stuckEntries = dispatchedRows.filter((row) => {
+        const dispatchedMs = row.dispatched_at
+          ? new Date(row.dispatched_at).getTime()
+          : new Date(row.queued_at).getTime();
+        return now - dispatchedMs >= stuckAgeMs;
+      });
+
+      if (stuckEntries.length === 0) {
+        return { flushed: 0, replayed: 0 };
+      }
+
+      // Batch flush detection: log a high-visibility event when many slots are stuck
+      const BATCH_FLUSH_THRESHOLD = 5;
+      if (stuckEntries.length >= BATCH_FLUSH_THRESHOLD) {
+        this.log("warn", "wallet_flush_and_replay", {
+          walletIndex,
+          stuckCount: stuckEntries.length,
+          stuckNonces: stuckEntries.map((e) => e.sponsor_nonce),
+          stuckAgeMs,
+        });
+      }
+
+      // Derive private key for gap-fill broadcasts
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      if (!privateKey) {
+        this.log("warn", "dispatch_flush_no_key", {
+          walletIndex,
+          stuckCount: stuckEntries.length,
+          reason: "Cannot derive private key for wallet",
+        });
+        return { flushed: 0, replayed: 0 };
+      }
+
+      for (const entry of stuckEntries) {
+        try {
+          // Step 1: Mark the queue entry as 'replaying'
+          this.markQueueEntryReplaying(walletIndex, entry.sponsor_nonce);
+
+          // Step 2: Flush the stuck sponsor nonce slot with a self-transfer
+          // (reuses the existing fillGapNonce mechanism: 1 uSTX, 30k fee)
+          const flushTxid = await this.fillGapNonce(
+            walletIndex,
+            entry.sponsor_nonce,
+            privateKey
+          );
+
+          this.log("info", "dispatch_flush_start", {
+            walletIndex,
+            sponsorNonce: entry.sponsor_nonce,
+            senderAddress: entry.sender_address,
+            senderNonce: entry.sender_nonce,
+            flushTxid: flushTxid ?? null,
+            reason: "dispatched_entry_stuck",
+          });
+
+          // Step 3: Move the original sender tx to the replay buffer
+          this.addToReplayBuffer(
+            walletIndex,
+            entry.sender_tx_hex,
+            entry.sender_address,
+            entry.sender_nonce,
+            entry.sponsor_nonce
+          );
+
+          flushed++;
+        } catch (e) {
+          this.log("warn", "dispatch_flush_entry_error", {
+            walletIndex,
+            sponsorNonce: entry.sponsor_nonce,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+
+      // Log replay_buffer_pending for observability: operators can see how many
+      // sender txs are waiting for re-sponsoring with fresh nonces.
+      const bufferDepth = this.getReplayBufferDepth(walletIndex);
+      if (bufferDepth > 0) {
+        const bufferEntries = this.getReplayBuffer(walletIndex);
+        this.log("info", "replay_buffer_pending", {
+          walletIndex,
+          bufferDepth,
+          entries: bufferEntries.map((e) => ({
+            id: e.id,
+            senderAddress: e.sender_address,
+            senderNonce: e.sender_nonce,
+            originalSponsorNonce: e.original_sponsor_nonce,
+            queuedAt: e.queued_at,
+          })),
+        });
+        replayed = bufferDepth; // track buffer depth as "pending replay" count
+      }
+    } catch (e) {
+      this.log("warn", "flush_replay_cycle_error", {
+        walletIndex,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    return { flushed, replayed };
   }
 
   /**
@@ -3412,6 +3858,13 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
+    // Proactive flush and replay: detect stuck dispatched entries in the
+    // dispatch_queue, flush their sponsor nonce slots with self-transfers,
+    // and move sender txs to the replay buffer for re-sponsoring.
+    // -------------------------------------------------------------------------
+    const flushResult = await this.runFlushAndReplayCycle(walletIndex, effectiveStuckTxAge);
+
+    // -------------------------------------------------------------------------
     // Log reconciliation_summary for this wallet
     // -------------------------------------------------------------------------
     this.log("info", "reconciliation_summary", {
@@ -3432,6 +3885,8 @@ export class NonceDO {
       head_bump_nonce: headBumpNonce,
       possible_next_nonce,
       last_executed_tx_nonce,
+      flush_flushed: flushResult.flushed,
+      flush_replayed: flushResult.replayed,
     });
 
     // -------------------------------------------------------------------------
@@ -3765,6 +4220,21 @@ export class NonceDO {
         // Replacement notifications: scan replaced_tx:* KV entries and transition payment
         // records to "replaced" status so agents can detect via GET /payment/:id.
         await this.processReplacementNotifications();
+
+        // Queue observability: log an info event if any wallet has pending replay buffer
+        // entries, so operators can see that re-sponsoring work is queued up.
+        for (const { walletIndex } of initializedWallets) {
+          const replayDepth = this.getReplayBufferDepth(walletIndex);
+          if (replayDepth > 0) {
+            const queueDepth = this.getDispatchQueueDepth(walletIndex);
+            this.log("info", "replay_buffer_non_empty", {
+              walletIndex,
+              replayBufferDepth: replayDepth,
+              queueDepth: queueDepth.queued + queueDepth.dispatched + queueDepth.replaying,
+              dispatchedCount: queueDepth.dispatched,
+            });
+          }
+        }
 
         // Dynamic alarm interval: use cascade (20s) when cascade is active + in-flight nonces,
         // active (60s) when in-flight nonces present, idle (5min) when all wallets are drained.

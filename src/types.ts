@@ -619,6 +619,12 @@ export interface WalletHealthSnapshot {
   reserved: number;
   available: number;
   quarantineCount: number;
+  /** Total non-confirmed dispatch_queue rows for this wallet (queued + dispatched + replaying) */
+  queueDepth?: number;
+  /** Rows currently in the replay_buffer for this wallet (waiting for re-sponsoring) */
+  replayBufferDepth?: number;
+  /** Rows with state='dispatched' in dispatch_queue for this wallet */
+  dispatchedCount?: number;
 }
 
 /**
