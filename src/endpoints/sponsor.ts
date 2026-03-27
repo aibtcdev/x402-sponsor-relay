@@ -9,6 +9,7 @@ import {
   recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
+  queueDispatchDO,
 } from "../services";
 import {
   Error400Response,
@@ -415,6 +416,17 @@ export class Sponsor extends BaseEndpoint {
             txid, 200, undefined, undefined
           ).catch((e) => {
             logger.warn("Failed to record broadcast outcome", { error: String(e) });
+          })
+        );
+        // Record in dispatch queue for stuck-tx flush and replay tracking
+        c.executionCtx.waitUntil(
+          queueDispatchDO(
+            c.env, logger, sponsorWalletIndex,
+            body.transaction, validation.senderAddress,
+            Number(validation.transaction.auth.spendingCondition.nonce),
+            sponsorNonce
+          ).catch((e) => {
+            logger.warn("Failed to record queue dispatch", { error: String(e) });
           })
         );
       }

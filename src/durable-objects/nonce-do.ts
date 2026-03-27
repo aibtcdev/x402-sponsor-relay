@@ -629,7 +629,6 @@ export class NonceDO {
    * Insert or replace a sender tx + sponsor nonce pair into the dispatch queue.
    * Called when a sender tx is ready to be dispatched with a specific sponsor nonce.
    * Uses INSERT OR REPLACE to handle re-queue on duplicate sponsor_nonce.
-   * @internal Scaffolding for phase 2 — will be called when dispatch path is wired.
    */
   private queueDispatch(
     walletIndex: number,
@@ -665,7 +664,6 @@ export class NonceDO {
 
   /**
    * Return all non-confirmed dispatch_queue rows for a wallet, ordered by sponsor_nonce ASC.
-   * @internal Scaffolding for phase 2 — will be called when dispatch path is wired.
    */
   private getQueuedForWallet(walletIndex: number): Array<{
     sender_tx_hex: string;
@@ -818,9 +816,7 @@ export class NonceDO {
       .toArray();
   }
 
-  /** Remove a specific entry from the replay buffer (after it has been re-sponsored).
-   * @internal Scaffolding for phase 2 — will be called when re-sponsor path is wired.
-   */
+  /** Remove a specific entry from the replay buffer (after it has been re-sponsored). */
   private removeFromReplayBuffer(id: number): void {
     this.sql.exec("DELETE FROM replay_buffer WHERE id = ?", id);
   }
@@ -2064,6 +2060,8 @@ export class NonceDO {
           JSON.stringify({ txid, httpStatus: httpStatus ?? 200, nodeUrl: nodeUrl ?? null }),
           now
         );
+        // Advance matching dispatch queue entry from 'queued' to 'dispatched'
+        this.transitionQueueEntry(walletIndex, nonce, "dispatched");
       } else {
         // Determine if this is a nonce conflict (quarantine) or generic failure
         const isConflict =
@@ -2197,6 +2195,8 @@ export class NonceDO {
         JSON.stringify({ txid, reason: "chain_advanced_past_nonce" }),
         now
       );
+      // Also advance any matching dispatch queue entry to 'confirmed'
+      this.transitionQueueEntry(walletIndex, nonce, "confirmed");
     } catch (e) {
       this.log("debug", "ledger_reconcile_confirmed_error", {
         walletIndex,
@@ -4645,6 +4645,38 @@ export class NonceDO {
 
     if (request.method === "POST" && url.pathname === "/clear-conflicts") {
       return this.handleClearConflicts();
+    }
+
+    if (request.method === "POST" && url.pathname === "/queue-dispatch") {
+      const { value: body, errorResponse } =
+        await this.parseJson<{
+          walletIndex: number;
+          senderTxHex: string;
+          senderAddress: string;
+          senderNonce: number;
+          sponsorNonce: number;
+        }>(request);
+      if (errorResponse) return errorResponse;
+      if (
+        typeof body?.walletIndex !== "number" ||
+        typeof body?.sponsorNonce !== "number" ||
+        !body?.senderTxHex ||
+        !body?.senderAddress
+      ) {
+        return this.badRequest("Missing required fields");
+      }
+      try {
+        this.queueDispatch(
+          body.walletIndex,
+          body.senderTxHex,
+          body.senderAddress,
+          body.senderNonce ?? 0,
+          body.sponsorNonce
+        );
+        return this.jsonResponse({ success: true });
+      } catch (error) {
+        return this.internalError(error);
+      }
     }
 
     if (request.method === "POST" && url.pathname === "/broadcast-outcome") {

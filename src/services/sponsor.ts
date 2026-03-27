@@ -1370,3 +1370,53 @@ export async function releaseNonceDO(
     });
   }
 }
+
+/**
+ * Record a sender transaction in the NonceDO dispatch queue after successful broadcast.
+ * This allows the reconciliation loop to track, flush, and replay stuck transactions.
+ *
+ * Call via executionCtx.waitUntil() as fire-and-forget alongside recordBroadcastOutcomeDO().
+ * Never throws — all errors are logged as warnings.
+ */
+export async function queueDispatchDO(
+  env: Env,
+  logger: Logger,
+  walletIndex: number,
+  senderTxHex: string,
+  senderAddress: string,
+  senderNonce: number,
+  sponsorNonce: number
+): Promise<void> {
+  if (!env.NONCE_DO) {
+    return;
+  }
+  try {
+    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch("https://nonce-do/queue-dispatch", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        walletIndex,
+        senderTxHex,
+        senderAddress,
+        senderNonce,
+        sponsorNonce,
+      }),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      logger.warn("Nonce DO queue-dispatch failed", {
+        status: response.status,
+        body,
+        walletIndex,
+        sponsorNonce,
+      });
+    }
+  } catch (e) {
+    logger.warn("Failed to record queue dispatch in NonceDO", {
+      error: e instanceof Error ? e.message : String(e),
+      walletIndex,
+      sponsorNonce,
+    });
+  }
+}

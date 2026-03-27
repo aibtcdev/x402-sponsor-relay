@@ -17,6 +17,7 @@ import {
   releaseNonceDO,
   recordBroadcastOutcomeDO,
   recordNonceTxid,
+  queueDispatchDO,
 } from "../services";
 import { stripHexPrefix } from "../utils";
 import { checkAndRecordMalformed } from "../middleware";
@@ -153,6 +154,8 @@ export class Settle extends BaseEndpoint {
       paymentIdService, paymentIdentifier, paymentIdPayloadHash,
     } = params;
 
+    const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
+
     // Consume the sponsor nonce on broadcast success (fire-and-forget)
     if (sponsorNonce !== null) {
       c.executionCtx.waitUntil(
@@ -163,13 +166,17 @@ export class Settle extends BaseEndpoint {
             c.env, logger, sponsorNonce, sponsorWalletIndex,
             txid, 200, undefined, undefined
           ),
+          queueDispatchDO(
+            c.env, logger, sponsorWalletIndex,
+            txHex, payer,
+            Number(verifiedTx.auth.spendingCondition.nonce),
+            sponsorNonce
+          ),
         ]).catch((e) => {
           logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
         })
       );
     }
-
-    const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
 
     // Await dedup + tx status before returning — these must be visible to subsequent
     // requests for idempotency (dedup) and for the background poller (tx status).

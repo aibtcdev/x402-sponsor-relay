@@ -10,6 +10,7 @@ import {
   recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
+  queueDispatchDO,
 } from "../services";
 import { checkRateLimit, RATE_LIMIT, checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import { stripHexPrefix } from "../utils";
@@ -528,6 +529,16 @@ export class Relay extends BaseEndpoint {
                       logger.warn("Failed to record retry broadcast outcome", { error: String(e) });
                     })
                   );
+                  c.executionCtx.waitUntil(
+                    queueDispatchDO(
+                      c.env, logger, retryWalletIndex,
+                      body.transaction, validation.senderAddress,
+                      Number(validation.transaction.auth.spendingCondition.nonce),
+                      retryNonce
+                    ).catch((e) => {
+                      logger.warn("Failed to record retry queue dispatch", { error: String(e) });
+                    })
+                  );
                 }
 
                 const retryTokenType = body.settle.tokenType || "STX";
@@ -698,6 +709,17 @@ export class Relay extends BaseEndpoint {
             broadcastResult.txid, 200, undefined, undefined  // success path — no nodeUrl available from polling result
           ).catch((e) => {
             logger.warn("Failed to record broadcast outcome", { error: String(e) });
+          })
+        );
+        // Record in dispatch queue for stuck-tx flush and replay tracking
+        c.executionCtx.waitUntil(
+          queueDispatchDO(
+            c.env, logger, sponsorWalletIndex,
+            body.transaction, validation.senderAddress,
+            Number(validation.transaction.auth.spendingCondition.nonce),
+            sponsorNonce
+          ).catch((e) => {
+            logger.warn("Failed to record queue dispatch", { error: String(e) });
           })
         );
       }
