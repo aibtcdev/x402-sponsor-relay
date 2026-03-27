@@ -10,8 +10,9 @@ import {
   recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
+  queueDispatchDO,
 } from "../services";
-import { checkRateLimit, RATE_LIMIT } from "../middleware";
+import { checkRateLimit, RATE_LIMIT, checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import { stripHexPrefix } from "../utils";
 import type { AppContext, RelayRequest, SettlementResult, Logger } from "../types";
 import {
@@ -263,10 +264,32 @@ export class Relay extends BaseEndpoint {
         return this.handleSelfPay(c, body, sponsorService, settlementService, statsService, logger);
       }
 
+      const clientIp = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? null;
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("relay", true, { tokenType: body.settle.tokenType, amount: body.settle.minAmount }).catch(() => {}));
+        if (validation.error === "Malformed transaction payload") {
+          const blocked = clientIp ? checkAndRecordMalformed(clientIp) : false;
+          if (blocked) {
+            logger.warn("IP blocked for repeated malformed payloads", { ip: clientIp });
+            return this.err(c, {
+              error: "Too many malformed transaction payloads — try again later",
+              code: "RATE_LIMIT_EXCEEDED",
+              status: 429,
+              details: `Submitted ${MALFORMED_BLOCK_THRESHOLD}+ malformed payloads within 10 minutes`,
+              retryable: true,
+              retryAfter: 600,
+            });
+          }
+          return this.err(c, {
+            error: validation.error,
+            code: "MALFORMED_PAYLOAD",
+            status: 400,
+            details: validation.details,
+            retryable: false,
+          });
+        }
         const code = validation.error === "Transaction must be sponsored"
           ? "NOT_SPONSORED"
           : "INVALID_TRANSACTION";
@@ -506,6 +529,16 @@ export class Relay extends BaseEndpoint {
                       logger.warn("Failed to record retry broadcast outcome", { error: String(e) });
                     })
                   );
+                  c.executionCtx.waitUntil(
+                    queueDispatchDO(
+                      c.env, logger, retryWalletIndex,
+                      body.transaction, validation.senderAddress,
+                      Number(validation.transaction.auth.spendingCondition.nonce),
+                      retryNonce
+                    ).catch((e) => {
+                      logger.warn("Failed to record retry queue dispatch", { error: String(e) });
+                    })
+                  );
                 }
 
                 const retryTokenType = body.settle.tokenType || "STX";
@@ -676,6 +709,17 @@ export class Relay extends BaseEndpoint {
             broadcastResult.txid, 200, undefined, undefined  // success path — no nodeUrl available from polling result
           ).catch((e) => {
             logger.warn("Failed to record broadcast outcome", { error: String(e) });
+          })
+        );
+        // Record in dispatch queue for stuck-tx flush and replay tracking
+        c.executionCtx.waitUntil(
+          queueDispatchDO(
+            c.env, logger, sponsorWalletIndex,
+            body.transaction, validation.senderAddress,
+            Number(validation.transaction.auth.spendingCondition.nonce),
+            sponsorNonce
+          ).catch((e) => {
+            logger.warn("Failed to record queue dispatch", { error: String(e) });
           })
         );
       }

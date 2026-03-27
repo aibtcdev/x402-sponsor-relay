@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceState, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook } from "./endpoints";
+import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceState, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook, QueueRead, QueueCancel } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -111,6 +111,8 @@ openapi.get("/supported", Supported as unknown as typeof Supported);
 openapi.get("/wallets", Wallets as unknown as typeof Wallets);
 openapi.get("/payment/:id", PaymentStatus as unknown as typeof PaymentStatus);
 openapi.post("/webhook/chainhook", Chainhook as unknown as typeof Chainhook);
+openapi.get("/queue/:senderAddress", QueueRead as unknown as typeof QueueRead);
+openapi.delete("/queue/:senderAddress/:walletIndex/:sponsorNonce", QueueCancel as unknown as typeof QueueCancel);
 
 // Mount dashboard routes (HTML pages, not OpenAPI)
 app.route("/dashboard", dashboard);
@@ -151,6 +153,8 @@ app.get("/", (c) => {
       wallets: "GET /wallets - Sponsor wallet status (balance, fees, pool)",
       paymentStatus: "GET /payment/:id - Check queue-based payment status",
       chainhook: "POST /webhook/chainhook - Hiro chainhook transaction webhook",
+      queueRead: "GET /queue/:senderAddress - Agent queue state (SIP-018 auth required)",
+      queueCancel: "DELETE /queue/:senderAddress/:walletIndex/:sponsorNonce - Cancel queued tx (SIP-018 auth required)",
       settle: "POST /settle - x402 V2 facilitator settle",
       settleStatus: "GET /settle/status/:txid - Transaction settlement status",
       verifyV2: "POST /verify - x402 V2 facilitator verify",

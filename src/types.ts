@@ -599,7 +599,10 @@ export type RelayErrorCode =
   | "LOW_HEADROOM"
   | "SERVICE_DEGRADED"
   | "UNSUPPORTED_ADDRESS_TYPE"
-  | "INVALID_BTC_ADDRESS";
+  | "INVALID_BTC_ADDRESS"
+  | "MALFORMED_PAYLOAD"
+  | "QUEUE_NOT_FOUND"
+  | "QUEUE_ACCESS_DENIED";
 
 /**
  * Default retry-after for SERVICE_DEGRADED responses (seconds).
@@ -618,6 +621,12 @@ export interface WalletHealthSnapshot {
   reserved: number;
   available: number;
   quarantineCount: number;
+  /** Total non-confirmed dispatch_queue rows for this wallet (queued + dispatched + replaying) */
+  queueDepth?: number;
+  /** Rows currently in the replay_buffer for this wallet (waiting for re-sponsoring) */
+  replayBufferDepth?: number;
+  /** Rows with state='dispatched' in dispatch_queue for this wallet */
+  dispatchedCount?: number;
 }
 
 /**

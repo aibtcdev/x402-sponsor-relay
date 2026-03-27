@@ -58,6 +58,7 @@ Use this relay when your agent needs to:
 - Verify that a payment receipt is valid (GET /verify/:receiptId)
 - Access a receipt-gated resource (POST /access)
 - Provision a free-tier API key via Bitcoin or Stacks signature
+- Inspect or cancel your own pending queue entries (GET/DELETE /queue/:address)
 
 ## Supported Tokens
 
@@ -204,6 +205,7 @@ For focused deep-dives:
 - https://x402-relay.aibtc.com/topics/authentication
 - https://x402-relay.aibtc.com/topics/errors
 - https://x402-relay.aibtc.com/topics/x402-v2-facilitator
+- https://x402-relay.aibtc.com/topics/queue-management
 
 ---
 
@@ -868,6 +870,12 @@ discovery.get("/topics", (c) => {
         "x402 V2 spec compliance: relay as a facilitator. POST /settle (verify + broadcast), POST /verify (local validation), GET /supported (static config). CAIP-2 network identifiers, CAIP-19 asset format, V2 error codes, and usage examples.",
       url: `${baseUrl}/topics/x402-v2-facilitator`,
     },
+    {
+      topic: "queue-management",
+      description:
+        "Agent queue visibility and self-service cancellation. GET /queue/:senderAddress returns queued/dispatched/replaying tx state across all sponsor wallets. DELETE /queue/:senderAddress/:walletIndex/:sponsorNonce cancels a tx. Both require SIP-018 auth scoped to the sender address.",
+      url: `${baseUrl}/topics/queue-management`,
+    },
   ];
 
   return c.json({
@@ -1200,7 +1208,7 @@ Testnet (chainId = 2147483648):
 The message that gets signed is a Clarity tuple:
 
 {
-  action: (string-ascii 10),   ;; "relay" or "sponsor"
+  action: (string-ascii 12),   ;; "relay", "sponsor", "queue-read", or "queue-cancel"
   nonce: uint,                  ;; unix timestamp ms (replay protection)
   expiry: uint                  ;; expiry timestamp (unix ms), must be in future
 }
@@ -1702,6 +1710,134 @@ Skip it when:
   if you need the full relay flow (settle options, payment receipts, dedup).
 - See GET /fees for current fee estimates before building your transaction.
 `,
+    "queue-management": `# Queue Management — Agent Queue Visibility and Cancellation
+
+Service: https://x402-relay.aibtc.com
+Quick-start: https://x402-relay.aibtc.com/llms.txt
+
+## Overview
+
+Agents can inspect their own pending sponsored transactions and cancel them
+without operator intervention. Both endpoints require a SIP-018 structured
+data signature proving ownership of the sender Stacks address.
+
+Auth is scoped: the recovered signer address from the signature MUST match
+the :senderAddress URL parameter. A mismatched address returns 403 QUEUE_ACCESS_DENIED.
+You can only read or cancel your own queue entries.
+
+## GET /queue/:senderAddress — Read Queue State
+
+Returns the agent's current pending transaction queue across all sponsor wallets.
+
+### Auth
+
+action: "queue-read"
+
+This endpoint uses SIP-018 auth via the \`X-SIP018-Auth\` HTTP header (not a JSON body).
+The header value MUST be a JSON string with the following shape:
+
+{
+  "signature": "0x...",           // RSV hex SIP-018 signature
+  "message": {
+    "action": "queue-read",       // must be exactly "queue-read"
+    "nonce": "1708099200000",     // unix ms timestamp (replay protection)
+    "expiry": "1708185600000"     // must be in the future
+  }
+}
+
+Example:
+
+X-SIP018-Auth: {"signature":"0x...","message":{"action":"queue-read","nonce":"1708099200000","expiry":"1708185600000"}}
+
+### Response (200)
+
+{
+  "success": true,
+  "requestId": "uuid",
+  "queue": {
+    "queued": [
+      { "walletIndex": 0, "sponsorNonce": 42, "senderNonce": 5, "queuedAt": "2026-03-27T..." }
+    ],
+    "dispatched": [
+      { "walletIndex": 1, "sponsorNonce": 55, "senderNonce": 6, "queuedAt": "...", "dispatchedAt": "..." }
+    ],
+    "replaying": [],
+    "replayBuffer": [
+      { "id": 7, "walletIndex": 0, "originalSponsorNonce": 40, "senderNonce": 4, "queuedAt": "..." }
+    ],
+    "total": 3
+  }
+}
+
+## DELETE /queue/:senderAddress/:walletIndex/:sponsorNonce — Cancel a Transaction
+
+Cancels a queued, dispatched, or replaying sponsored transaction.
+
+### State Transitions
+
+- queued → deleted immediately from the dispatch queue
+- dispatched → sponsor nonce flushed immediately (best-effort) and the
+  corresponding dispatch_queue row deleted (no 'replaying' transition)
+- replaying → deleted immediately from the dispatch queue
+- replay_buffer entry (matched by original_sponsor_nonce) → deleted
+
+### Auth
+
+action: "queue-cancel"
+
+Request body:
+{
+  "auth": {
+    "signature": "0x...",
+    "message": {
+      "action": "queue-cancel",
+      "nonce": "1708099200000",
+      "expiry": "1708185600000"
+    }
+  }
+}
+
+### Response (200)
+
+{
+  "success": true,
+  "requestId": "uuid",
+  "cancelled": {
+    "cancelled": true,
+    "previousState": "queued",    // "queued" | "dispatched" | "replaying" | "replay_buffer"
+    "walletIndex": 0,
+    "sponsorNonce": 42
+  }
+}
+
+### Error Responses
+
+- 401 INVALID_AUTH_SIGNATURE — bad or expired SIP-018 signature
+- 403 QUEUE_ACCESS_DENIED — signature does not match :senderAddress
+- 404 QUEUE_NOT_FOUND — no matching queue entry found
+
+## SIP-018 Auth for Queue Endpoints
+
+Domain (testnet): { name: "x402-sponsor-relay", version: "1", chain-id: u2147483648 }
+Domain (mainnet): { name: "x402-sponsor-relay", version: "1", chain-id: u1 }
+
+Message tuple:
+{ action: (string-ascii 12), nonce: uint, expiry: uint }
+
+- action: "queue-read" or "queue-cancel" (cross-endpoint replay is prevented)
+- nonce: unix millisecond timestamp at time of signing
+- expiry: unix millisecond timestamp when the auth expires (must be in the future)
+
+See https://x402-relay.aibtc.com/topics/authentication for full SIP-018 details.
+
+## URL Parameters
+
+- :senderAddress — the agent's Stacks address (SP... or ST... for testnet)
+- :walletIndex — the sponsor wallet index (0-based integer)
+- :sponsorNonce — the sponsor nonce (integer from the queue state response)
+
+Use GET /queue/:senderAddress to discover valid walletIndex + sponsorNonce pairs.
+`,
   };
 
   const content = topicDocs[topic];
@@ -1711,7 +1847,7 @@ Skip it when:
       {
         error: "Topic not found",
         code: "NOT_FOUND",
-        details: `Unknown topic: ${topic}. Available topics: sponsored-transactions, api-keys, authentication, errors, x402-v2-facilitator`,
+        details: `Unknown topic: ${topic}. Available topics: sponsored-transactions, api-keys, authentication, errors, x402-v2-facilitator, queue-management`,
         retryable: false,
       },
       404
@@ -1757,6 +1893,7 @@ discovery.get("/.well-known/agent.json", (c) => {
         authentication: `${baseUrl}/topics/authentication`,
         errors: `${baseUrl}/topics/errors`,
         x402V2Facilitator: `${baseUrl}/topics/x402-v2-facilitator`,
+        queueManagement: `${baseUrl}/topics/queue-management`,
       },
       relatedPlatform: "https://aibtc.com/llms.txt",
     },
@@ -1767,13 +1904,16 @@ discovery.get("/.well-known/agent.json", (c) => {
       x402Facilitator: true,
       x402FacilitatorSpec: "x402-v2",
       x402FacilitatorSpecUrl: "https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md",
+      queueVisibility: true,
+      queueCancellation: true,
     },
     authentication: {
       schemes: ["bearer"],
       description:
         "Bearer token (API key) required for POST /sponsor. " +
         "Provision a free key via POST /keys/provision (BTC sig) or POST /keys/provision-stx (STX sig). " +
-        "Optional SIP-018 structured data auth available on POST /relay and POST /sponsor.",
+        "Optional SIP-018 structured data auth available on POST /relay and POST /sponsor. " +
+        "SIP-018 auth required for GET /queue/:senderAddress and DELETE /queue/:senderAddress/:walletIndex/:sponsorNonce.",
     },
     defaultInputModes: ["application/json"],
     defaultOutputModes: ["application/json"],
@@ -1910,6 +2050,25 @@ discovery.get("/.well-known/agent.json", (c) => {
         examples: [
           "Is the relay healthy?",
           "Check relay status before submitting a transaction",
+        ],
+        inputModes: ["application/json"],
+        outputModes: ["application/json"],
+      },
+      {
+        id: "queue-management",
+        name: "Agent Queue Visibility and Cancellation",
+        description:
+          "Inspect your own pending sponsored transaction queue and cancel entries without operator intervention. " +
+          "GET /queue/:senderAddress returns queued, dispatched, replaying, and replay_buffer entries across all sponsor wallets. " +
+          "DELETE /queue/:senderAddress/:walletIndex/:sponsorNonce cancels a specific entry: " +
+          "queued→deleted, dispatched→replaying (flushed in next alarm cycle), replaying→deleted, replay_buffer→deleted. " +
+          "Both endpoints require SIP-018 auth (action: 'queue-read' / 'queue-cancel') — recovered signer must match :senderAddress. " +
+          "See /topics/queue-management for details.",
+        tags: ["queue", "cancel", "nonce", "sip018", "auth"],
+        examples: [
+          "Show me my pending sponsored transactions",
+          "Cancel a stuck queued transaction",
+          "Check if my transaction is still in the relay queue",
         ],
         inputModes: ["application/json"],
         outputModes: ["application/json"],

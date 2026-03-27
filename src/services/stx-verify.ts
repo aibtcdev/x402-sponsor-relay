@@ -270,7 +270,11 @@ export class StxVerifyService {
    *
    * Returns null if auth is valid, or an error object if validation fails.
    */
-  verifySip018Auth(auth: Sip018Auth, expectedAction: "relay" | "sponsor"): Sip018AuthError | null {
+  verifySip018Auth(
+    auth: Sip018Auth,
+    expectedAction: "relay" | "sponsor" | "queue-read" | "queue-cancel",
+    opts?: { expectedAddress?: string }
+  ): Sip018AuthError | null {
     // Validate auth structure
     if (!auth.signature || !auth.message?.action || !auth.message?.nonce || !auth.message?.expiry) {
       return {
@@ -322,11 +326,12 @@ export class StxVerifyService {
       expiry: uintCV(expiry),
     });
 
-    // Verify SIP-018 signature
+    // Verify SIP-018 signature (with optional address matching)
     const verifyResult = this.verifySip018({
       signature: auth.signature,
       domain: domainTuple,
       message: messageTuple,
+      expectedAddress: opts?.expectedAddress,
     });
 
     if (!verifyResult.valid) {

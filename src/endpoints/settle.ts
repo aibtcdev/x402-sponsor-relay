@@ -17,8 +17,10 @@ import {
   releaseNonceDO,
   recordBroadcastOutcomeDO,
   recordNonceTxid,
+  queueDispatchDO,
 } from "../services";
 import { stripHexPrefix } from "../utils";
+import { checkAndRecordMalformed } from "../middleware";
 import type { AppContext, SettleOptions, X402SettlementResponseV2, X402SettleRequestV2, TxStatusRecord, Logger } from "../types";
 import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
@@ -152,6 +154,8 @@ export class Settle extends BaseEndpoint {
       paymentIdService, paymentIdentifier, paymentIdPayloadHash,
     } = params;
 
+    const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
+
     // Consume the sponsor nonce on broadcast success (fire-and-forget)
     if (sponsorNonce !== null) {
       c.executionCtx.waitUntil(
@@ -162,13 +166,17 @@ export class Settle extends BaseEndpoint {
             c.env, logger, sponsorNonce, sponsorWalletIndex,
             txid, 200, undefined, undefined
           ),
+          queueDispatchDO(
+            c.env, logger, sponsorWalletIndex,
+            txHex, payer,
+            Number(verifiedTx.auth.spendingCondition.nonce),
+            sponsorNonce
+          ),
         ]).catch((e) => {
           logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
         })
       );
     }
-
-    const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
 
     // Await dedup + tx status before returning — these must be visible to subsequent
     // requests for idempotency (dedup) and for the background poller (tx status).
@@ -343,16 +351,40 @@ export class Settle extends BaseEndpoint {
         return c.json(response, 200);
       }
 
+      const clientIp = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? null;
+
+      // Fast hex pre-validation before expensive deserialization (mirrors SponsorService.preValidateTxHex)
+      const cleanHexForCheck = stripHexPrefix(txHex);
+      if (
+        cleanHexForCheck.length < 4 ||
+        cleanHexForCheck.length % 2 !== 0 ||
+        !/^[0-9a-fA-F]+$/.test(cleanHexForCheck)
+      ) {
+        if (clientIp) checkAndRecordMalformed(clientIp);
+        logger.info("Malformed transaction hex rejected before deserialization", {
+          txHexLength: txHex.length,
+          reason: "invalid hex format",
+        });
+        c.executionCtx.waitUntil(
+          Promise.all([
+            statsService.recordError("validation"),
+            statsService.logFailure("settle", true),
+          ]).catch(() => {})
+        );
+        return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
+      }
+
       // Deserialize transaction to inspect sponsor slot
       let parsedTx: ReturnType<typeof deserializeTransaction>;
       try {
-        parsedTx = deserializeTransaction(stripHexPrefix(txHex));
+        parsedTx = deserializeTransaction(cleanHexForCheck);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        logger.warn("Failed to deserialize transaction for sponsor-slot inspection", {
+        if (clientIp) checkAndRecordMalformed(clientIp);
+        logger.info("Failed to deserialize transaction for sponsor-slot inspection", {
           error: errMsg,
           txHexLength: txHex.length,
-          txHexPrefix: stripHexPrefix(txHex).slice(0, 20),
+          txHexPrefix: cleanHexForCheck.slice(0, 20),
         });
         c.executionCtx.waitUntil(
           Promise.all([
@@ -387,7 +419,10 @@ export class Settle extends BaseEndpoint {
         // Validate the transaction is sponsorable
         const validateResult = sponsorService.validateTransaction(txHex);
         if (!validateResult.valid) {
-          logger.warn("Transaction failed sponsor validation", { error: validateResult.error });
+          if (validateResult.error === "Malformed transaction payload" && clientIp) {
+            checkAndRecordMalformed(clientIp);
+          }
+          logger.info("Transaction failed sponsor validation", { error: validateResult.error });
           c.executionCtx.waitUntil(
             Promise.all([
               statsService.recordError("validation"),

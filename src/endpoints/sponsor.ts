@@ -9,6 +9,7 @@ import {
   recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
+  queueDispatchDO,
 } from "../services";
 import {
   Error400Response,
@@ -19,6 +20,7 @@ import {
   Error502Response,
   Error503Response,
 } from "../schemas";
+import { checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import type { AppContext, Env, Logger, SponsorRequest } from "../types";
 import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
@@ -189,11 +191,33 @@ export class Sponsor extends BaseEndpoint {
       }
 
       const sponsorService = new SponsorService(c.env, logger);
+      const clientIp = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? null;
 
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        if (validation.error === "Malformed transaction payload") {
+          const blocked = clientIp ? checkAndRecordMalformed(clientIp) : false;
+          if (blocked) {
+            logger.warn("IP blocked for repeated malformed payloads", { ip: clientIp });
+            return this.err(c, {
+              error: "Too many malformed transaction payloads — try again later",
+              code: "RATE_LIMIT_EXCEEDED",
+              status: 429,
+              details: `Submitted ${MALFORMED_BLOCK_THRESHOLD}+ malformed payloads within 10 minutes`,
+              retryable: true,
+              retryAfter: 600,
+            });
+          }
+          return this.err(c, {
+            error: validation.error,
+            code: "MALFORMED_PAYLOAD",
+            status: 400,
+            details: validation.details,
+            retryable: false,
+          });
+        }
         const code =
           validation.error === "Transaction must be sponsored"
             ? "NOT_SPONSORED"
@@ -392,6 +416,17 @@ export class Sponsor extends BaseEndpoint {
             txid, 200, undefined, undefined
           ).catch((e) => {
             logger.warn("Failed to record broadcast outcome", { error: String(e) });
+          })
+        );
+        // Record in dispatch queue for stuck-tx flush and replay tracking
+        c.executionCtx.waitUntil(
+          queueDispatchDO(
+            c.env, logger, sponsorWalletIndex,
+            body.transaction, validation.senderAddress,
+            Number(validation.transaction.auth.spendingCondition.nonce),
+            sponsorNonce
+          ).catch((e) => {
+            logger.warn("Failed to record queue dispatch", { error: String(e) });
           })
         );
       }

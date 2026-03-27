@@ -532,17 +532,78 @@ export class SponsorService {
   }
 
   /**
+   * Fast O(1) pre-validation of transaction hex before expensive deserialization.
+   *
+   * Checks:
+   * 1. Valid hex string (even length, only 0-9a-fA-F chars)
+   * 2. Minimum length (at least 2 bytes = 4 hex chars)
+   * 3. Version byte (byte 0): 0x00 for mainnet, 0x80 for testnet
+   * 4. Auth type byte (byte 1): 0x04 (Standard) or 0x05 (Sponsored)
+   *
+   * Input must already have the 0x prefix stripped (use stripHexPrefix first).
+   */
+  private preValidateTxHex(cleanHex: string): { valid: true } | { valid: false; reason: string } {
+    // Must be a valid hex string (even length, only hex chars)
+    if (cleanHex.length === 0) {
+      return { valid: false, reason: "Transaction hex is empty" };
+    }
+    if (cleanHex.length % 2 !== 0) {
+      return { valid: false, reason: "Transaction hex has odd length — not valid hex" };
+    }
+    if (!/^[0-9a-fA-F]+$/.test(cleanHex)) {
+      return { valid: false, reason: "Transaction hex contains non-hex characters" };
+    }
+
+    // Must have at least 2 bytes (version + auth type)
+    if (cleanHex.length < 4) {
+      return { valid: false, reason: "Transaction hex too short — must be at least 2 bytes" };
+    }
+
+    // Check version byte (byte 0)
+    const versionByte = parseInt(cleanHex.slice(0, 2), 16);
+    const isMainnet = this.env.STACKS_NETWORK === "mainnet";
+    const expectedVersionByte = isMainnet ? 0x00 : 0x80;
+    if (versionByte !== expectedVersionByte) {
+      return {
+        valid: false,
+        reason: `Invalid transaction version byte 0x${versionByte.toString(16).padStart(2, "0")} for ${this.env.STACKS_NETWORK} — expected 0x${expectedVersionByte.toString(16).padStart(2, "0")}`,
+      };
+    }
+
+    // Check auth type byte (byte 1): 0x04 = Standard, 0x05 = Sponsored
+    const authTypeByte = parseInt(cleanHex.slice(2, 4), 16);
+    if (authTypeByte !== 0x04 && authTypeByte !== 0x05) {
+      return {
+        valid: false,
+        reason: `Invalid auth type byte 0x${authTypeByte.toString(16).padStart(2, "0")} — expected 0x04 (Standard) or 0x05 (Sponsored)`,
+      };
+    }
+
+    return { valid: true };
+  }
+
+  /**
    * Validate and deserialize a non-sponsored (standard auth) transaction for self-pay settlement.
    * Rejects sponsored transactions — callers that want to sponsor should use validateTransaction().
    */
   validateNonSponsoredTransaction(txHex: string): TransactionValidationResult {
     const cleanHex = stripHexPrefix(txHex);
 
+    // Fast pre-validation: check hex format and header bytes before expensive deserialization
+    const preCheck = this.preValidateTxHex(cleanHex);
+    if (!preCheck.valid) {
+      return {
+        valid: false,
+        error: "Malformed transaction payload",
+        details: preCheck.reason,
+      };
+    }
+
     let transaction: StacksTransactionWire;
     try {
       transaction = deserializeTransaction(cleanHex);
     } catch (e) {
-      this.logger.warn("Failed to deserialize transaction", {
+      this.logger.info("Failed to deserialize transaction", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       return {
@@ -554,7 +615,7 @@ export class SponsorService {
 
     // Reject sponsored transactions — self-pay requires standard auth
     if (transaction.auth.authType === AuthType.Sponsored) {
-      this.logger.warn("Self-pay transaction must not be sponsored");
+      this.logger.info("Self-pay transaction must not be sponsored");
       return {
         valid: false,
         error: "Transaction must not be sponsored for self-pay settlement",
@@ -583,12 +644,22 @@ export class SponsorService {
   validateTransaction(txHex: string): TransactionValidationResult {
     const cleanHex = stripHexPrefix(txHex);
 
+    // Fast pre-validation: check hex format and header bytes before expensive deserialization
+    const preCheck = this.preValidateTxHex(cleanHex);
+    if (!preCheck.valid) {
+      return {
+        valid: false,
+        error: "Malformed transaction payload",
+        details: preCheck.reason,
+      };
+    }
+
     // Deserialize the transaction
     let transaction: StacksTransactionWire;
     try {
       transaction = deserializeTransaction(cleanHex);
     } catch (e) {
-      this.logger.warn("Failed to deserialize transaction", {
+      this.logger.info("Failed to deserialize transaction", {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       return {
@@ -600,7 +671,7 @@ export class SponsorService {
 
     // Verify it's a sponsored transaction
     if (transaction.auth.authType !== AuthType.Sponsored) {
-      this.logger.warn("Transaction not sponsored", {
+      this.logger.info("Transaction not sponsored", {
         auth_type: transaction.auth.authType,
       });
       return {
@@ -1296,6 +1367,56 @@ export async function releaseNonceDO(
       walletIndex,
       ...(txid ? { txid } : {}),
       ...(fee ? { fee } : {}),
+    });
+  }
+}
+
+/**
+ * Record a sender transaction in the NonceDO dispatch queue after successful broadcast.
+ * This allows the reconciliation loop to track, flush, and replay stuck transactions.
+ *
+ * Call via executionCtx.waitUntil() as fire-and-forget alongside recordBroadcastOutcomeDO().
+ * Never throws — all errors are logged as warnings.
+ */
+export async function queueDispatchDO(
+  env: Env,
+  logger: Logger,
+  walletIndex: number,
+  senderTxHex: string,
+  senderAddress: string,
+  senderNonce: number,
+  sponsorNonce: number
+): Promise<void> {
+  if (!env.NONCE_DO) {
+    return;
+  }
+  try {
+    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch("https://nonce-do/queue-dispatch", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        walletIndex,
+        senderTxHex,
+        senderAddress,
+        senderNonce,
+        sponsorNonce,
+      }),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      logger.warn("Nonce DO queue-dispatch failed", {
+        status: response.status,
+        body,
+        walletIndex,
+        sponsorNonce,
+      });
+    }
+  } catch (e) {
+    logger.warn("Failed to record queue dispatch in NonceDO", {
+      error: e instanceof Error ? e.message : String(e),
+      walletIndex,
+      sponsorNonce,
     });
   }
 }
