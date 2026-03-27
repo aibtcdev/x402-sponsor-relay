@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.25.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.24.0...x402-sponsor-relay-v1.25.0) (2026-03-27)
+
+
+### Features
+
+* sequence-aware nonce dispatch (gin rummy model) ([#248](https://github.com/aibtcdev/x402-sponsor-relay/issues/248)) ([7eceab2](https://github.com/aibtcdev/x402-sponsor-relay/commit/7eceab27e94152e8464860c2f9990b8739fa8d82))
+
 ## [1.24.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.23.1...x402-sponsor-relay-v1.24.0) (2026-03-27)
 
 
