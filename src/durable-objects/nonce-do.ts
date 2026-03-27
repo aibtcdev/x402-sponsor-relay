@@ -323,6 +323,11 @@ const MAX_GAP_FILLS_PER_ALARM = 5;
 /** Maximum gap-fills per admin /fill-gaps call (prevents DO stall on degenerate ranges) */
 const MAX_ADMIN_GAP_FILLS = 50;
 /**
+ * How long a sender transaction stays in the hand queue before expiry.
+ * After this window, the entry is pruned and the sender must resubmit.
+ */
+const HAND_HOLD_TIMEOUT_MS = 5 * 60 * 1000;
+/**
  * Age threshold for considering a mempool transaction "stuck" (15 minutes).
  * Transactions that remain pending beyond this window have a very low confirmation
  * probability and are candidates for RBF replacement.
@@ -631,6 +636,54 @@ export class NonceDO {
       CREATE INDEX IF NOT EXISTS idx_replay_buffer_sender
         ON replay_buffer(sender_address);
     `);
+
+    // ---------------------------------------------------------------------------
+    // Gin rummy dispatch tables (Phase 1 — data model only)
+    // ---------------------------------------------------------------------------
+
+    // sender_state: per-sender nonce tracking, seeded from Hiro on first contact
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS sender_state (
+        sender_address       TEXT    PRIMARY KEY,
+        next_expected_nonce  INTEGER NOT NULL,
+        seeded_from          TEXT    NOT NULL,
+        seeded_at            TEXT    NOT NULL,
+        last_advanced_at     TEXT
+      );
+    `);
+
+    // sender_hand: per-sender queue of transactions waiting to form a gapless run
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS sender_hand (
+        sender_address  TEXT    NOT NULL,
+        sender_nonce    INTEGER NOT NULL,
+        tx_hex          TEXT    NOT NULL,
+        source          TEXT    NOT NULL DEFAULT 'agent',
+        received_at     TEXT    NOT NULL,
+        expires_at      TEXT    NOT NULL,
+        PRIMARY KEY (sender_address, sender_nonce)
+      );
+    `);
+
+    // wallet_hand: per-wallet sponsor nonce slot tracking (replaces dispatch_queue for decisions)
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS wallet_hand (
+        wallet_index    INTEGER NOT NULL,
+        sponsor_nonce   INTEGER NOT NULL,
+        state           TEXT    NOT NULL DEFAULT 'available',
+        sender_address  TEXT,
+        sender_nonce    INTEGER,
+        original_fee    TEXT,
+        dispatched_at   TEXT,
+        confirmed_at    TEXT,
+        PRIMARY KEY (wallet_index, sponsor_nonce)
+      );
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_wallet_hand_state
+        ON wallet_hand(wallet_index, state);
+    `);
   }
 
   // ---------------------------------------------------------------------------
@@ -843,6 +896,199 @@ export class NonceDO {
       )
       .toArray();
     return rows[0]?.cnt ?? 0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Gin rummy dispatch helpers (Phase 1 — data model)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Seed sender_state for a new address on first contact.
+   * Queries Hiro for possible_next_nonce; falls back to the observed tx nonce.
+   * Idempotent — returns immediately if the sender already has a state row.
+   */
+  private async seedSenderState(senderAddress: string, txNonce: number): Promise<void> {
+    const existing = this.sql
+      .exec<{ sender_address: string }>(
+        "SELECT sender_address FROM sender_state WHERE sender_address = ? LIMIT 1",
+        senderAddress
+      )
+      .toArray();
+    if (existing.length > 0) return;
+
+    const now = new Date().toISOString();
+    try {
+      const info = await this.fetchNonceInfo(senderAddress);
+      this.sql.exec(
+        `INSERT OR IGNORE INTO sender_state
+           (sender_address, next_expected_nonce, seeded_from, seeded_at)
+         VALUES (?, ?, 'hiro', ?)`,
+        senderAddress,
+        info.possible_next_nonce,
+        now
+      );
+    } catch {
+      // Hiro unreachable — seed from the observed tx nonce; re-seed path in alarm will upgrade
+      this.sql.exec(
+        `INSERT OR IGNORE INTO sender_state
+           (sender_address, next_expected_nonce, seeded_from, seeded_at)
+         VALUES (?, ?, 'first_tx', ?)`,
+        senderAddress,
+        txNonce,
+        now
+      );
+    }
+  }
+
+  /**
+   * Add a transaction to the sender's hand queue.
+   * - source='agent': INSERT OR REPLACE (agent can resubmit same nonce with updated tx)
+   * - source='replay': INSERT OR IGNORE (don't overwrite a fresher agent submission)
+   */
+  private addToHand(
+    senderAddress: string,
+    senderNonce: number,
+    txHex: string,
+    source: "agent" | "replay"
+  ): void {
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
+    if (source === "agent") {
+      this.sql.exec(
+        `INSERT OR REPLACE INTO sender_hand
+           (sender_address, sender_nonce, tx_hex, source, received_at, expires_at)
+         VALUES (?, ?, ?, 'agent', ?, ?)`,
+        senderAddress,
+        senderNonce,
+        txHex,
+        now,
+        expiresAt
+      );
+    } else {
+      this.sql.exec(
+        `INSERT OR IGNORE INTO sender_hand
+           (sender_address, sender_nonce, tx_hex, source, received_at, expires_at)
+         VALUES (?, ?, ?, 'replay', ?, ?)`,
+        senderAddress,
+        senderNonce,
+        txHex,
+        now,
+        expiresAt
+      );
+    }
+  }
+
+  /**
+   * Return all entries in a sender's hand, ordered by sender_nonce ASC.
+   */
+  private getHand(senderAddress: string): Array<{
+    sender_address: string;
+    sender_nonce: number;
+    tx_hex: string;
+    source: string;
+    received_at: string;
+    expires_at: string;
+  }> {
+    return this.sql
+      .exec<{
+        sender_address: string;
+        sender_nonce: number;
+        tx_hex: string;
+        source: string;
+        received_at: string;
+        expires_at: string;
+      }>(
+        `SELECT sender_address, sender_nonce, tx_hex, source, received_at, expires_at
+         FROM sender_hand
+         WHERE sender_address = ?
+         ORDER BY sender_nonce ASC`,
+        senderAddress
+      )
+      .toArray();
+  }
+
+  /**
+   * Count available headroom in a wallet's nonce hand.
+   * Returns the number of slots with state 'available' or 'confirmed'
+   * within the next CHAINING_LIMIT range from the current minimum sponsor nonce.
+   */
+  private getWalletHeadroom(walletIndex: number): number {
+    const rows = this.sql
+      .exec<{ cnt: number }>(
+        `SELECT COUNT(*) as cnt
+         FROM wallet_hand
+         WHERE wallet_index = ? AND state IN ('available', 'confirmed')`,
+        walletIndex
+      )
+      .toArray();
+    return rows[0]?.cnt ?? 0;
+  }
+
+  /**
+   * Allocate a sponsor nonce slot to a sender transaction.
+   * Sets state='allocated' with sender info and fee.
+   */
+  private allocateSlot(
+    walletIndex: number,
+    sponsorNonce: number,
+    senderAddress: string,
+    senderNonce: number,
+    fee: string
+  ): void {
+    this.sql.exec(
+      `INSERT OR REPLACE INTO wallet_hand
+         (wallet_index, sponsor_nonce, state, sender_address, sender_nonce, original_fee,
+          dispatched_at, confirmed_at)
+       VALUES (?, ?, 'allocated', ?, ?, ?, NULL, NULL)`,
+      walletIndex,
+      sponsorNonce,
+      senderAddress,
+      senderNonce,
+      fee
+    );
+  }
+
+  /**
+   * Mark a sponsor nonce slot as confirmed (transaction landed on-chain).
+   * Frees the slot for future headroom calculations.
+   */
+  private confirmSlot(walletIndex: number, sponsorNonce: number): void {
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `UPDATE wallet_hand
+       SET state = 'confirmed', confirmed_at = ?
+       WHERE wallet_index = ? AND sponsor_nonce = ?`,
+      now,
+      walletIndex,
+      sponsorNonce
+    );
+  }
+
+  /**
+   * Advance a sender's next_expected_nonce after on-chain confirmation.
+   * Also prunes stale hand entries below the new frontier.
+   *
+   * Called during reconciliation when a sender tx is confirmed on-chain.
+   */
+  private advanceSenderNonce(senderAddress: string, confirmedNonce: number): void {
+    const newFrontier = confirmedNonce + 1;
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `UPDATE sender_state
+       SET next_expected_nonce = MAX(next_expected_nonce, ?),
+           last_advanced_at = ?
+       WHERE sender_address = ?`,
+      newFrontier,
+      now,
+      senderAddress
+    );
+    // Prune hand entries that are now behind the frontier (already confirmed or stale)
+    this.sql.exec(
+      `DELETE FROM sender_hand
+       WHERE sender_address = ? AND sender_nonce < ?`,
+      senderAddress,
+      newFrontier
+    );
   }
 
   private jsonResponse(body: unknown, status = 200): Response {
@@ -4553,9 +4799,121 @@ export class NonceDO {
     }
   }
 
+  /**
+   * One-time migration: backfill wallet_hand and sender_state from existing tables.
+   *
+   * Detection: wallet_hand has zero rows AND dispatch_queue has non-confirmed rows.
+   * Runs at start of each alarm cycle; is a no-op after the first successful run.
+   */
+  private runGinRummyMigration(): void {
+    const walletHandCount = this.sql
+      .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM wallet_hand")
+      .toArray()[0]?.cnt ?? 0;
+
+    const dispatchQueueCount = this.sql
+      .exec<{ cnt: number }>(
+        "SELECT COUNT(*) as cnt FROM dispatch_queue WHERE state != 'confirmed'"
+      )
+      .toArray()[0]?.cnt ?? 0;
+
+    // Migration only needed when wallet_hand is empty and dispatch_queue has rows
+    if (walletHandCount > 0 || dispatchQueueCount === 0) return;
+
+    const now = new Date().toISOString();
+
+    // 1. Backfill wallet_hand from dispatch_queue — non-confirmed → 'dispatched', confirmed → 'confirmed'
+    this.sql.exec(
+      `INSERT OR IGNORE INTO wallet_hand
+         (wallet_index, sponsor_nonce, state, sender_address, sender_nonce,
+          original_fee, dispatched_at, confirmed_at)
+       SELECT
+         wallet_index,
+         sponsor_nonce,
+         CASE WHEN state = 'confirmed' THEN 'confirmed' ELSE 'dispatched' END,
+         sender_address,
+         sender_nonce,
+         NULL,
+         dispatched_at,
+         confirmed_at
+       FROM dispatch_queue`
+    );
+
+    const walletHandInserted = this.sql
+      .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM wallet_hand")
+      .toArray()[0]?.cnt ?? 0;
+
+    // 2. Seed sender_state from highest confirmed sender_nonce in dispatch_queue
+    this.sql.exec(
+      `INSERT OR IGNORE INTO sender_state
+         (sender_address, next_expected_nonce, seeded_from, seeded_at)
+       SELECT
+         sender_address,
+         MAX(sender_nonce) + 1,
+         'relay_cache',
+         ?
+       FROM dispatch_queue
+       WHERE state = 'confirmed'
+       GROUP BY sender_address`,
+      now
+    );
+
+    const senderStateInserted = this.sql
+      .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM sender_state")
+      .toArray()[0]?.cnt ?? 0;
+
+    this.log("info", "gin_rummy_migration_completed", {
+      wallet_hand_rows: walletHandInserted,
+      sender_state_rows: senderStateInserted,
+    });
+  }
+
+  /**
+   * Re-seed sender_state rows that were seeded from 'first_tx' (Hiro was unreachable at first contact).
+   * Runs in the alarm cycle; up to 5 re-seeds per cycle to avoid alarm timeout.
+   */
+  private async retrySeedFirstTxSenders(): Promise<void> {
+    const staleSenders = this.sql
+      .exec<{ sender_address: string; next_expected_nonce: number }>(
+        `SELECT sender_address, next_expected_nonce
+         FROM sender_state
+         WHERE seeded_from = 'first_tx'
+         LIMIT 5`
+      )
+      .toArray();
+
+    for (const row of staleSenders) {
+      try {
+        const info = await this.fetchNonceInfo(row.sender_address);
+        const now = new Date().toISOString();
+        this.sql.exec(
+          `UPDATE sender_state
+           SET next_expected_nonce = MAX(next_expected_nonce, ?),
+               seeded_from = 'hiro',
+               seeded_at = ?
+           WHERE sender_address = ?`,
+          info.possible_next_nonce,
+          now,
+          row.sender_address
+        );
+        this.log("debug", "gin_rummy_reseed_success", {
+          senderAddress: row.sender_address,
+          oldNonce: row.next_expected_nonce,
+          hiroNonce: info.possible_next_nonce,
+        });
+      } catch {
+        // Hiro still unreachable — will retry on next alarm cycle
+      }
+    }
+  }
+
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
+        // Run gin rummy migration once (no-op after first successful run)
+        this.runGinRummyMigration();
+        // Upgrade 'first_tx' sender seeds to Hiro-authoritative values
+        await this.retrySeedFirstTxSenders();
+
         const initializedWallets = await this.getInitializedWallets();
 
         // Read cascade state once per alarm cycle so we don't repeat the KV read
