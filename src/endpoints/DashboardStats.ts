@@ -238,45 +238,8 @@ export class DashboardStats extends BaseEndpoint {
 
       const dashboardData = buildDashboardData(overview, health, apiKeyStats);
 
-      // Fetch settlement time percentiles from NonceDO (fire-and-forget fallback to null)
-      let settlementTimes: { p50: number; p95: number; avg: number; count: number } | null = null;
-      if (c.env.NONCE_DO) {
-        try {
-          const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
-          const nonceStateResp = await stub.fetch("https://nonce-do/nonce-state");
-          if (nonceStateResp.ok) {
-            const nonceState = await nonceStateResp.json() as {
-              wallets?: Array<{ settlementTimes?: { p50: number; p95: number; avg: number; count: number } }>;
-            };
-            // Aggregate per-wallet settlement times into a global summary
-            const walletStats = (nonceState.wallets ?? [])
-              .map((w) => w.settlementTimes)
-              .filter((st): st is { p50: number; p95: number; avg: number; count: number } =>
-                st !== undefined && st.count > 0
-              );
-            if (walletStats.length > 0) {
-              const totalCount = walletStats.reduce((s, st) => s + st.count, 0);
-              const weightedAvg = Math.round(
-                walletStats.reduce((s, st) => s + st.avg * st.count, 0) / totalCount
-              );
-              // Use median of p50s and p95s across wallets as a simple global estimate
-              const sorted50 = walletStats.map((s) => s.p50).sort((a, b) => a - b);
-              const sorted95 = walletStats.map((s) => s.p95).sort((a, b) => a - b);
-              const mid = Math.floor(sorted50.length / 2);
-              settlementTimes = {
-                p50: sorted50[mid] ?? 0,
-                p95: sorted95[mid] ?? 0,
-                avg: weightedAvg,
-                count: totalCount,
-              };
-            } else {
-              settlementTimes = { p50: 0, p95: 0, avg: 0, count: 0 };
-            }
-          }
-        } catch {
-          // NonceDO unavailable — omit settlementTimes from response
-        }
-      }
+      // Fetch settlement time percentiles from NonceDO (fallback to null if unavailable)
+      const settlementTimes = await this.fetchSettlementTimes(c);
 
       return this.ok(c, {
         ...dashboardData,
@@ -296,6 +259,55 @@ export class DashboardStats extends BaseEndpoint {
         retryable: true,
         retryAfter: 5,
       });
+    }
+  }
+
+  /**
+   * Fetch settlement time percentiles from NonceDO and aggregate across wallets.
+   * Returns null when NonceDO is unavailable or has no data.
+   */
+  private async fetchSettlementTimes(
+    c: AppContext
+  ): Promise<{ p50: number; p95: number; avg: number; count: number } | null> {
+    if (!c.env.NONCE_DO) return null;
+
+    try {
+      const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
+      const resp = await stub.fetch("https://nonce-do/nonce-state");
+      if (!resp.ok) return null;
+
+      const nonceState = await resp.json() as {
+        wallets?: Array<{ settlementTimes?: { p50: number; p95: number; avg: number; count: number } }>;
+      };
+
+      const walletStats = (nonceState.wallets ?? [])
+        .map((w) => w.settlementTimes)
+        .filter((st): st is { p50: number; p95: number; avg: number; count: number } =>
+          st !== undefined && st.count > 0
+        );
+
+      if (walletStats.length === 0) {
+        return { p50: 0, p95: 0, avg: 0, count: 0 };
+      }
+
+      const totalCount = walletStats.reduce((s, st) => s + st.count, 0);
+      const weightedAvg = Math.round(
+        walletStats.reduce((s, st) => s + st.avg * st.count, 0) / totalCount
+      );
+      // Use median of per-wallet percentiles as a simple global estimate
+      const median = (values: number[]): number => {
+        const sorted = [...values].sort((a, b) => a - b);
+        return sorted[Math.floor(sorted.length / 2)] ?? 0;
+      };
+
+      return {
+        p50: median(walletStats.map((s) => s.p50)),
+        p95: median(walletStats.map((s) => s.p95)),
+        avg: weightedAvg,
+        count: totalCount,
+      };
+    } catch {
+      return null;
     }
   }
 }

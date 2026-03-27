@@ -251,6 +251,17 @@ export class SponsorService {
   }
 
   /**
+   * Derive a c32check-encoded Stacks address from a transaction's spending condition.
+   * Shared by validateTransaction() and validateNonSponsoredTransaction().
+   */
+  private deriveSenderAddress(transaction: StacksTransactionWire): string {
+    const network = this.getNetwork();
+    const { hashMode, signer } = transaction.auth.spendingCondition;
+    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
+    return addressToString(addressFromVersionHash(version, signer));
+  }
+
+  /**
    * Map PayloadType to FeeTransactionType for fee estimation
    */
   private payloadToFeeType(payloadType: PayloadType): FeeTransactionType {
@@ -560,10 +571,6 @@ export class SponsorService {
           status: response.status,
           body: text,
         });
-        // Propagate stale nonce as a hard failure (not a fallback case)
-        if (response.status === 400) {
-          return null; // caller should inspect the status code
-        }
         return null;
       }
 
@@ -668,18 +675,10 @@ export class SponsorService {
       };
     }
 
-    // Derive a proper c32check-encoded Stacks address from the signer hash160.
-    // Uses the same hashMode-aware derivation as SettlementService.senderToAddress()
-    // so the address format is consistent across sponsored and self-pay paths.
-    const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
-    const { hashMode, signer } = transaction.auth.spendingCondition;
-    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
-    const senderAddress = addressToString(addressFromVersionHash(version, signer));
-
     return {
       valid: true,
       transaction,
-      senderAddress,
+      senderAddress: this.deriveSenderAddress(transaction),
     };
   }
 
@@ -726,18 +725,10 @@ export class SponsorService {
       };
     }
 
-    // Derive a proper c32check-encoded Stacks address from the signer hash160.
-    // Uses the same hashMode-aware derivation as validateNonSponsoredTransaction()
-    // so the address format is consistent across sponsored and self-pay paths.
-    const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
-    const { hashMode, signer } = transaction.auth.spendingCondition;
-    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
-    const senderAddress = addressToString(addressFromVersionHash(version, signer));
-
     return {
       valid: true,
       transaction,
-      senderAddress,
+      senderAddress: this.deriveSenderAddress(transaction),
     };
   }
 
@@ -801,19 +792,16 @@ export class SponsorService {
             missingNonces: handResult.missingNonces,
             mode,
           });
-          const heldResult: SponsorHeld = {
+          return {
             success: false,
             held: true,
             nextExpected: handResult.nextExpected,
             missingNonces: handResult.missingNonces,
             expiresAt: handResult.expiresAt,
-          };
-          // Forward recently-expired nonce info so agents can understand why their
-          // previously-submitted nonces disappeared from the queue after the 5-min timeout.
-          if (handResult.recentlyExpired) {
-            heldResult.recentlyExpired = handResult.recentlyExpired;
-          }
-          return heldResult;
+            // Forward recently-expired nonce info so agents can understand why their
+            // previously-submitted nonces disappeared from the queue after the 5-min timeout.
+            ...(handResult.recentlyExpired && { recentlyExpired: handResult.recentlyExpired }),
+          } satisfies SponsorHeld;
         }
 
         // Dispatched — use the assigned nonce and wallet index from the DO
@@ -1484,6 +1472,43 @@ export async function releaseNonceDO(
  * Call via executionCtx.waitUntil() as fire-and-forget alongside recordBroadcastOutcomeDO().
  * Never throws — all errors are logged as warnings.
  */
+/**
+ * Fire-and-forget nonce lifecycle calls after a successful broadcast.
+ * Consolidates the four parallel DO calls (release, recordTxid, broadcastOutcome,
+ * queueDispatch) into a single waitUntil-friendly promise.
+ * Never throws — all errors are logged as warnings.
+ */
+export async function nonceLifecycleOnBroadcastSuccess(
+  env: Env,
+  logger: Logger,
+  opts: {
+    sponsorNonce: number;
+    walletIndex: number;
+    txid: string;
+    fee?: string;
+    senderTxHex: string;
+    senderAddress: string;
+    senderNonce: number;
+  }
+): Promise<void> {
+  await Promise.all([
+    releaseNonceDO(env, logger, opts.sponsorNonce, opts.txid, opts.walletIndex, opts.fee),
+    recordNonceTxid(env, logger, opts.txid, opts.sponsorNonce),
+    recordBroadcastOutcomeDO(
+      env, logger, opts.sponsorNonce, opts.walletIndex,
+      opts.txid, 200, undefined, undefined
+    ),
+    queueDispatchDO(
+      env, logger, opts.walletIndex,
+      opts.senderTxHex, opts.senderAddress,
+      opts.senderNonce, opts.sponsorNonce,
+      opts.fee ?? null
+    ),
+  ]).catch((e) => {
+    logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
+  });
+}
+
 export async function queueDispatchDO(
   env: Env,
   logger: Logger,

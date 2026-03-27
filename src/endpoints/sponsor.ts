@@ -6,10 +6,9 @@ import {
   AuthService,
   StxVerifyService,
   extractSponsorNonce,
-  recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
-  queueDispatchDO,
+  nonceLifecycleOnBroadcastSuccess,
 } from "../services";
 import {
   Error400Response,
@@ -425,38 +424,15 @@ export class Sponsor extends BaseEndpoint {
       const txid = broadcastResult.txid;
 
       if (sponsorNonce !== null) {
-        // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
-        // Also records the fee in NonceDO's cumulative per-wallet fee stats
         c.executionCtx.waitUntil(
-          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex, sponsorResult.fee).catch((e) => {
-            logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
-          })
-        );
-        // Also record nonce→txid mapping in NonceDO SQL table for gap detection
-        c.executionCtx.waitUntil(
-          recordNonceTxid(c.env, logger, txid, sponsorNonce).catch((e) => {
-            logger.warn("Failed to record nonce txid", { error: String(e) });
-          })
-        );
-        // Record broadcast outcome for ledger fidelity (state='broadcasted', txid, http_status=200)
-        c.executionCtx.waitUntil(
-          recordBroadcastOutcomeDO(
-            c.env, logger, sponsorNonce, sponsorWalletIndex,
-            txid, 200, undefined, undefined
-          ).catch((e) => {
-            logger.warn("Failed to record broadcast outcome", { error: String(e) });
-          })
-        );
-        // Record in dispatch queue for stuck-tx flush and replay tracking
-        c.executionCtx.waitUntil(
-          queueDispatchDO(
-            c.env, logger, sponsorWalletIndex,
-            body.transaction, validation.senderAddress,
-            Number(validation.transaction.auth.spendingCondition.nonce),
+          nonceLifecycleOnBroadcastSuccess(c.env, logger, {
             sponsorNonce,
-            sponsorResult.fee
-          ).catch((e) => {
-            logger.warn("Failed to record queue dispatch", { error: String(e) });
+            walletIndex: sponsorWalletIndex,
+            txid,
+            fee: sponsorResult.fee,
+            senderTxHex: body.transaction,
+            senderAddress: validation.senderAddress,
+            senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
           })
         );
       }

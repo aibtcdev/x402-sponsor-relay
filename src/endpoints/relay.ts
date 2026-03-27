@@ -7,10 +7,9 @@ import {
   ReceiptService,
   StxVerifyService,
   extractSponsorNonce,
-  recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
-  queueDispatchDO,
+  nonceLifecycleOnBroadcastSuccess,
 } from "../services";
 import { checkRateLimit, RATE_LIMIT, checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import { stripHexPrefix } from "../utils";
@@ -25,6 +24,23 @@ import {
   Error502Response,
   Error503Response,
 } from "../schemas";
+
+/**
+ * Reserve time (ms) for broadcast overhead, sponsoring, and response serialization.
+ * Subtracted from maxTimeoutSeconds to ensure the relay responds before the caller's timeout fires.
+ */
+const RELAY_OVERHEAD_MS = 5_000;
+
+/**
+ * Compute max poll time from caller-supplied maxTimeoutSeconds.
+ * Returns undefined (use default) when no timeout is specified.
+ */
+function computeMaxPollTimeMs(maxTimeoutSeconds?: number): number | undefined {
+  if (maxTimeoutSeconds != null && maxTimeoutSeconds > 0) {
+    return Math.max(maxTimeoutSeconds * 1000 - RELAY_OVERHEAD_MS, 1_000);
+  }
+  return undefined;
+}
 
 /**
  * Relay endpoint - sponsors and settles transactions
@@ -453,12 +469,7 @@ export class Relay extends BaseEndpoint {
       // Step D — Broadcast and poll for confirmation.
       // Cap poll time to caller's maxTimeoutSeconds so the relay responds
       // before the caller's own timeout fires (avoids 500 empty-body errors).
-      // Reserve 5s for broadcast overhead, sponsoring, and response serialization.
-      const RELAY_OVERHEAD_MS = 5_000;
-      const maxPollTimeMs =
-        body.settle.maxTimeoutSeconds != null && body.settle.maxTimeoutSeconds > 0
-          ? Math.max(body.settle.maxTimeoutSeconds * 1000 - RELAY_OVERHEAD_MS, 1_000)
-          : undefined;
+      const maxPollTimeMs = computeMaxPollTimeMs(body.settle.maxTimeoutSeconds);
       const broadcastResult = await settlementService.broadcastAndConfirm(
         verifyResult.data.transaction,
         maxPollTimeMs
@@ -544,32 +555,14 @@ export class Relay extends BaseEndpoint {
 
                 if (retryNonce !== null) {
                   c.executionCtx.waitUntil(
-                    releaseNonceDO(c.env, logger, retryNonce, retryBroadcastResult.txid, retryWalletIndex, retryFee).catch((e) => {
-                      logger.warn("Failed to consume retry nonce after broadcast success", { error: String(e) });
-                    })
-                  );
-                  c.executionCtx.waitUntil(
-                    recordNonceTxid(c.env, logger, retryBroadcastResult.txid, retryNonce).catch((e) => {
-                      logger.warn("Failed to record retry nonce txid", { error: String(e) });
-                    })
-                  );
-                  c.executionCtx.waitUntil(
-                    recordBroadcastOutcomeDO(
-                      c.env, logger, retryNonce, retryWalletIndex,
-                      retryBroadcastResult.txid, 200, undefined, undefined
-                    ).catch((e) => {
-                      logger.warn("Failed to record retry broadcast outcome", { error: String(e) });
-                    })
-                  );
-                  c.executionCtx.waitUntil(
-                    queueDispatchDO(
-                      c.env, logger, retryWalletIndex,
-                      body.transaction, validation.senderAddress,
-                      Number(validation.transaction.auth.spendingCondition.nonce),
-                      retryNonce,
-                      retryFee
-                    ).catch((e) => {
-                      logger.warn("Failed to record retry queue dispatch", { error: String(e) });
+                    nonceLifecycleOnBroadcastSuccess(c.env, logger, {
+                      sponsorNonce: retryNonce,
+                      walletIndex: retryWalletIndex,
+                      txid: retryBroadcastResult.txid,
+                      fee: retryFee,
+                      senderTxHex: body.transaction,
+                      senderAddress: validation.senderAddress,
+                      senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
                     })
                   );
                 }
@@ -722,38 +715,15 @@ export class Relay extends BaseEndpoint {
       }
 
       if (sponsorNonce !== null) {
-        // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
-        // Also records the fee in NonceDO's cumulative per-wallet fee stats
         c.executionCtx.waitUntil(
-          releaseNonceDO(c.env, logger, sponsorNonce, broadcastResult.txid, sponsorWalletIndex, sponsorResult.fee).catch((e) => {
-            logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
-          })
-        );
-        // Also record nonce→txid mapping in NonceDO SQL table for gap detection
-        c.executionCtx.waitUntil(
-          recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce).catch((e) => {
-            logger.warn("Failed to record nonce txid", { error: String(e) });
-          })
-        );
-        // Record broadcast outcome for ledger fidelity (state='broadcasted', http_status=200, txid)
-        c.executionCtx.waitUntil(
-          recordBroadcastOutcomeDO(
-            c.env, logger, sponsorNonce, sponsorWalletIndex,
-            broadcastResult.txid, 200, undefined, undefined  // success path — no nodeUrl available from polling result
-          ).catch((e) => {
-            logger.warn("Failed to record broadcast outcome", { error: String(e) });
-          })
-        );
-        // Record in dispatch queue for stuck-tx flush and replay tracking
-        c.executionCtx.waitUntil(
-          queueDispatchDO(
-            c.env, logger, sponsorWalletIndex,
-            body.transaction, validation.senderAddress,
-            Number(validation.transaction.auth.spendingCondition.nonce),
+          nonceLifecycleOnBroadcastSuccess(c.env, logger, {
             sponsorNonce,
-            sponsorResult.fee
-          ).catch((e) => {
-            logger.warn("Failed to record queue dispatch", { error: String(e) });
+            walletIndex: sponsorWalletIndex,
+            txid: broadcastResult.txid,
+            fee: sponsorResult.fee,
+            senderTxHex: body.transaction,
+            senderAddress: validation.senderAddress,
+            senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
           })
         );
       }
@@ -969,11 +939,7 @@ export class Relay extends BaseEndpoint {
     }
 
     // Step SP-E — Broadcast and poll for confirmation
-    const RELAY_OVERHEAD_MS = 5_000;
-    const maxPollTimeMs =
-      body.settle.maxTimeoutSeconds != null && body.settle.maxTimeoutSeconds > 0
-        ? Math.max(body.settle.maxTimeoutSeconds * 1000 - RELAY_OVERHEAD_MS, 1_000)
-        : undefined;
+    const maxPollTimeMs = computeMaxPollTimeMs(body.settle.maxTimeoutSeconds);
 
     const broadcastResult = await settlementService.broadcastAndConfirm(
       verifyResult.data.transaction,

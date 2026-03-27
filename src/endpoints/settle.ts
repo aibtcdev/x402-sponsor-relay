@@ -16,8 +16,7 @@ import {
   extractSponsorNonce,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
-  recordNonceTxid,
-  queueDispatchDO,
+  nonceLifecycleOnBroadcastSuccess,
 } from "../services";
 import { stripHexPrefix } from "../utils";
 import { checkAndRecordMalformed } from "../middleware";
@@ -159,22 +158,14 @@ export class Settle extends BaseEndpoint {
     // Consume the sponsor nonce on broadcast success (fire-and-forget)
     if (sponsorNonce !== null) {
       c.executionCtx.waitUntil(
-        Promise.all([
-          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex, sponsorFee),
-          recordNonceTxid(c.env, logger, txid, sponsorNonce),
-          recordBroadcastOutcomeDO(
-            c.env, logger, sponsorNonce, sponsorWalletIndex,
-            txid, 200, undefined, undefined
-          ),
-          queueDispatchDO(
-            c.env, logger, sponsorWalletIndex,
-            txHex, payer,
-            Number(verifiedTx.auth.spendingCondition.nonce),
-            sponsorNonce,
-            sponsorFee ?? null
-          ),
-        ]).catch((e) => {
-          logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
+        nonceLifecycleOnBroadcastSuccess(c.env, logger, {
+          sponsorNonce,
+          walletIndex: sponsorWalletIndex,
+          txid,
+          fee: sponsorFee,
+          senderTxHex: txHex,
+          senderAddress: payer,
+          senderNonce: Number(verifiedTx.auth.spendingCondition.nonce),
         })
       );
     }

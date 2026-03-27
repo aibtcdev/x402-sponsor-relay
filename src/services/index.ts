@@ -1,4 +1,4 @@
-export { SponsorService, hasSponsorSignature, extractSponsorNonce, recordNonceTxid, releaseNonceDO, recordBroadcastOutcomeDO, queueDispatchDO } from "./sponsor";
+export { SponsorService, hasSponsorSignature, extractSponsorNonce, recordNonceTxid, releaseNonceDO, recordBroadcastOutcomeDO, queueDispatchDO, nonceLifecycleOnBroadcastSuccess } from "./sponsor";
 export type {
   TransactionValidationResult,
   TransactionValidationSuccess,

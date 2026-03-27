@@ -1500,14 +1500,6 @@ export function buildQueueInfo(
   recentlyExpired?: RecentExpiryInfo
 ): QueueInfo {
   const hasGaps = held.missingNonces.length > 0;
-  const estimatedDispatchMs = hasGaps
-    ? null
-    : ALARM_CADENCE_ESTIMATE_MS;
-
-  const helpNonces = held.missingNonces;
-  const help = helpNonces.length > 0
-    ? `Submit transactions with nonces ${helpNonces.join(", ")} to unblock dispatch`
-    : "Waiting for dispatch — no gaps detected, tx will be processed on next alarm tick";
 
   const queueInfo: QueueInfo = {
     status: "held",
@@ -1515,9 +1507,11 @@ export function buildQueueInfo(
     nextExpectedNonce: held.nextExpected,
     missingNonces: held.missingNonces,
     handSize: held.missingNonces.length + 1, // gaps + the submitted tx
-    estimatedDispatchMs,
+    estimatedDispatchMs: hasGaps ? null : ALARM_CADENCE_ESTIMATE_MS,
     expiresAt: held.expiresAt,
-    help,
+    help: hasGaps
+      ? `Submit transactions with nonces ${held.missingNonces.join(", ")} to unblock dispatch`
+      : "Waiting for dispatch — no gaps detected, tx will be processed on next alarm tick",
   };
 
   // Prefer explicitly passed recentlyExpired; fall back to value on the held object itself
