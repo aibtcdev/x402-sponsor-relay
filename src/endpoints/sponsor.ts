@@ -436,7 +436,8 @@ export class Sponsor extends BaseEndpoint {
             c.env, logger, sponsorWalletIndex,
             body.transaction, validation.senderAddress,
             Number(validation.transaction.auth.spendingCondition.nonce),
-            sponsorNonce
+            sponsorNonce,
+            sponsorResult.fee
           ).catch((e) => {
             logger.warn("Failed to record queue dispatch", { error: String(e) });
           })

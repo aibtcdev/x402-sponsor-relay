@@ -238,7 +238,50 @@ export class DashboardStats extends BaseEndpoint {
 
       const dashboardData = buildDashboardData(overview, health, apiKeyStats);
 
-      return this.ok(c, dashboardData, {
+      // Fetch settlement time percentiles from NonceDO (fire-and-forget fallback to null)
+      let settlementTimes: { p50: number; p95: number; avg: number; count: number } | null = null;
+      if (c.env.NONCE_DO) {
+        try {
+          const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
+          const nonceStateResp = await stub.fetch("https://nonce-do/nonce-state");
+          if (nonceStateResp.ok) {
+            const nonceState = await nonceStateResp.json() as {
+              wallets?: Array<{ settlementTimes?: { p50: number; p95: number; avg: number; count: number } }>;
+            };
+            // Aggregate per-wallet settlement times into a global summary
+            const walletStats = (nonceState.wallets ?? [])
+              .map((w) => w.settlementTimes)
+              .filter((st): st is { p50: number; p95: number; avg: number; count: number } =>
+                st !== undefined && st.count > 0
+              );
+            if (walletStats.length > 0) {
+              const totalCount = walletStats.reduce((s, st) => s + st.count, 0);
+              const weightedAvg = Math.round(
+                walletStats.reduce((s, st) => s + st.avg * st.count, 0) / totalCount
+              );
+              // Use median of p50s and p95s across wallets as a simple global estimate
+              const sorted50 = walletStats.map((s) => s.p50).sort((a, b) => a - b);
+              const sorted95 = walletStats.map((s) => s.p95).sort((a, b) => a - b);
+              const mid = Math.floor(sorted50.length / 2);
+              settlementTimes = {
+                p50: sorted50[mid] ?? 0,
+                p95: sorted95[mid] ?? 0,
+                avg: weightedAvg,
+                count: totalCount,
+              };
+            } else {
+              settlementTimes = { p50: 0, p95: 0, avg: 0, count: 0 };
+            }
+          }
+        } catch {
+          // NonceDO unavailable — omit settlementTimes from response
+        }
+      }
+
+      return this.ok(c, {
+        ...dashboardData,
+        ...(settlementTimes !== null ? { settlementTimes } : {}),
+      }, {
         "Cache-Control": "public, max-age=15",
       });
     } catch (e) {

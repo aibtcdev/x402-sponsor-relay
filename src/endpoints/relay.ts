@@ -546,7 +546,8 @@ export class Relay extends BaseEndpoint {
                       c.env, logger, retryWalletIndex,
                       body.transaction, validation.senderAddress,
                       Number(validation.transaction.auth.spendingCondition.nonce),
-                      retryNonce
+                      retryNonce,
+                      retryFee
                     ).catch((e) => {
                       logger.warn("Failed to record retry queue dispatch", { error: String(e) });
                     })
@@ -729,7 +730,8 @@ export class Relay extends BaseEndpoint {
             c.env, logger, sponsorWalletIndex,
             body.transaction, validation.senderAddress,
             Number(validation.transaction.auth.spendingCondition.nonce),
-            sponsorNonce
+            sponsorNonce,
+            sponsorResult.fee
           ).catch((e) => {
             logger.warn("Failed to record queue dispatch", { error: String(e) });
           })

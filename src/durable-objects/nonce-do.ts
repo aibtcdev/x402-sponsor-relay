@@ -209,6 +209,8 @@ interface ObservableWalletState {
   queueDepth?: number;
   /** Rows in replay_buffer for this wallet (waiting for re-sponsoring) */
   replayBufferDepth?: number;
+  /** Settlement time percentiles for this wallet (last 24h, null if no data) */
+  settlementTimes?: SettlementTimeStats;
 }
 
 /**
@@ -231,6 +233,21 @@ interface ObservableNonceState {
   /** When non-null, clients should bypass sponsored submission */
   recommendation: "fallback_to_direct" | null;
   timestamp: string;
+}
+
+/**
+ * Settlement time percentiles computed from dispatch_queue entries with non-null settlement_ms.
+ * Used for broadcast-to-confirm latency tracking per wallet and globally.
+ */
+interface SettlementTimeStats {
+  /** Median settlement time in milliseconds (0 if no data) */
+  p50: number;
+  /** 95th percentile settlement time in milliseconds (0 if no data) */
+  p95: number;
+  /** Mean settlement time in milliseconds (0 if no data) */
+  avg: number;
+  /** Number of confirmed entries with settlement_ms recorded in the last 24 hours */
+  count: number;
 }
 
 interface NonceStatsResponse {
@@ -268,6 +285,10 @@ interface NonceStatsResponse {
   totalQueueDepth: number;
   /** Total replay_buffer rows across all wallets (waiting for re-sponsoring) */
   totalReplayBufferDepth: number;
+  /** Global settlement time percentiles from confirmed dispatch_queue entries (last 24h) */
+  settlementTimes: SettlementTimeStats;
+  /** Per-wallet settlement time percentiles (last 24h) */
+  walletSettlementTimes: Record<number, SettlementTimeStats>;
 }
 
 /**
@@ -652,6 +673,28 @@ export class NonceDO {
         ON dispatch_queue(sender_address, state);
     `);
 
+    // Migration: add original_fee column to dispatch_queue (nullable, text for bigint safety).
+    // The standard SQLite ADD COLUMN IF NOT EXISTS is not supported — use try/catch instead.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('dispatch_queue') WHERE name = 'original_fee'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE dispatch_queue ADD COLUMN original_fee TEXT");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // Migration: add settlement_ms column to dispatch_queue (null until confirmed).
+    // Computed as confirmed_at − dispatched_at in milliseconds.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('dispatch_queue') WHERE name = 'settlement_ms'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE dispatch_queue ADD COLUMN settlement_ms INTEGER");
+      }
+    } catch { /* already present or error — fail-open */ }
+
     // Replay buffer: sender txs waiting for a fresh sponsor nonce assignment.
     // Populated when a dispatched slot is stuck and needs to be flushed.
     // The relay will re-sponsor these txs with new nonces in the next alarm cycle.
@@ -741,7 +784,8 @@ export class NonceDO {
     senderTxHex: string,
     senderAddress: string,
     senderNonce: number,
-    sponsorNonce: number
+    sponsorNonce: number,
+    fee: string | null = null
   ): void {
     const now = new Date().toISOString();
     // Compute position as next slot (max position + 1) for ordering within the wallet queue
@@ -831,6 +875,51 @@ export class NonceDO {
   }
 
   /**
+   * Compute settlement time percentiles (p50, p95, avg, count) from confirmed dispatch_queue
+   * entries with non-null settlement_ms in the last 24 hours.
+   * Optionally scoped to a single wallet; omit walletIndex for global stats.
+   * Returns zeros when no data is available.
+   */
+  private computeSettlementPercentiles(walletIndex?: number): SettlementTimeStats {
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    let rows: Array<{ settlement_ms: number }>;
+    if (walletIndex !== undefined) {
+      rows = this.sql
+        .exec<{ settlement_ms: number }>(
+          `SELECT settlement_ms FROM dispatch_queue
+           WHERE state = 'confirmed' AND settlement_ms IS NOT NULL
+             AND wallet_index = ? AND confirmed_at >= ?
+           ORDER BY settlement_ms ASC`,
+          walletIndex,
+          cutoff
+        )
+        .toArray();
+    } else {
+      rows = this.sql
+        .exec<{ settlement_ms: number }>(
+          `SELECT settlement_ms FROM dispatch_queue
+           WHERE state = 'confirmed' AND settlement_ms IS NOT NULL
+             AND confirmed_at >= ?
+           ORDER BY settlement_ms ASC`,
+          cutoff
+        )
+        .toArray();
+    }
+
+    const count = rows.length;
+    if (count === 0) {
+      return { p50: 0, p95: 0, avg: 0, count: 0 };
+    }
+
+    const values = rows.map((r) => r.settlement_ms);
+    const p50 = values[Math.floor(count * 0.5)] ?? values[count - 1];
+    const p95 = values[Math.floor(count * 0.95)] ?? values[count - 1];
+    const avg = Math.round(values.reduce((s, v) => s + v, 0) / count);
+
+    return { p50, p95, avg, count };
+  }
+
+  /**
    * Transition a dispatch_queue entry to a new state.
    * For 'dispatched' and 'confirmed', also sets the corresponding timestamp column.
    */
@@ -839,22 +928,52 @@ export class NonceDO {
     sponsorNonce: number,
     newState: "dispatched" | "confirmed" | "replaying"
   ): void {
-    const timestampCol =
-      newState === "dispatched" ? "dispatched_at" :
-      newState === "confirmed" ? "confirmed_at" :
-      null;
+    const now = new Date().toISOString();
 
-    if (timestampCol) {
-      const now = new Date().toISOString();
+    if (newState === "confirmed") {
+      // On confirmation: set confirmed_at and compute settlement_ms from dispatched_at.
+      // Also read original_fee and sender_address for the settlement_confirmed log event.
+      const preRow = this.sql
+        .exec<{ dispatched_at: string | null; original_fee: string | null; sender_address: string | null }>(
+          "SELECT dispatched_at, original_fee, sender_address FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
+          walletIndex,
+          sponsorNonce
+        )
+        .toArray()[0];
+
+      let settlementMs: number | null = null;
+      if (preRow?.dispatched_at) {
+        settlementMs = Math.max(0, Date.now() - new Date(preRow.dispatched_at).getTime());
+      }
+
       this.sql.exec(
-        `UPDATE dispatch_queue SET state = ?, ${timestampCol} = ?
+        `UPDATE dispatch_queue
+         SET state = 'confirmed', confirmed_at = ?, settlement_ms = ?
          WHERE wallet_index = ? AND sponsor_nonce = ?`,
-        newState,
+        now,
+        settlementMs,
+        walletIndex,
+        sponsorNonce
+      );
+
+      // Emit structured log for settlement latency tracking
+      this.log("info", "settlement_confirmed", {
+        walletIndex,
+        sponsorNonce,
+        settlementMs,
+        originalFee: preRow?.original_fee ?? null,
+        senderAddress: preRow?.sender_address ?? null,
+      });
+    } else if (newState === "dispatched") {
+      this.sql.exec(
+        `UPDATE dispatch_queue SET state = 'dispatched', dispatched_at = ?
+         WHERE wallet_index = ? AND sponsor_nonce = ?`,
         now,
         walletIndex,
         sponsorNonce
       );
     } else {
+      // replaying — no timestamp column to set
       this.sql.exec(
         `UPDATE dispatch_queue SET state = ?
          WHERE wallet_index = ? AND sponsor_nonce = ?`,
@@ -1633,6 +1752,25 @@ export class NonceDO {
     const attemptNum = state.rbfAttempts + 1;
 
     try {
+      // Fetch original_fee from dispatch_queue for rbf_fee_used log
+      const dispatchRow = this.sql
+        .exec<{ original_fee: string | null }>(
+          "SELECT original_fee FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
+          walletIndex,
+          nonce
+        )
+        .toArray()[0];
+      const originalFeeForLog = dispatchRow?.original_fee ?? null;
+
+      this.log("info", "rbf_fee_used", {
+        walletIndex,
+        nonce,
+        rbfFee: RBF_FEE.toString(),
+        originalFee: originalFeeForLog,
+        hadOriginalFee: originalFeeForLog !== null,
+        attemptNum,
+      });
+
       const tx = await makeSTXTokenTransfer({
         recipient,
         amount: GAP_FILL_AMOUNT,
@@ -3503,6 +3641,13 @@ export class NonceDO {
       totalReplayBufferDepth += this.getReplayBufferDepth(walletIndex);
     }
 
+    // Settlement time percentiles from confirmed dispatch_queue entries (last 24h)
+    const settlementTimes = this.computeSettlementPercentiles();
+    const walletSettlementTimes: Record<number, SettlementTimeStats> = {};
+    for (const { walletIndex } of initializedWallets) {
+      walletSettlementTimes[walletIndex] = this.computeSettlementPercentiles(walletIndex);
+    }
+
     return {
       totalAssigned,
       conflictsDetected,
@@ -3526,6 +3671,8 @@ export class NonceDO {
         : null,
       totalQueueDepth,
       totalReplayBufferDepth,
+      settlementTimes,
+      walletSettlementTimes,
     };
   }
 
@@ -3649,6 +3796,9 @@ export class NonceDO {
         const queueState = this.getDispatchQueueDepth(walletIndex);
         const replayDepth = this.getReplayBufferDepth(walletIndex);
 
+        // Settlement time percentiles for this wallet (last 24h)
+        const settlementTimes = this.computeSettlementPercentiles(walletIndex);
+
         return {
           walletIndex,
           sponsorAddress: address,
@@ -3662,6 +3812,7 @@ export class NonceDO {
           healthy: gaps.length === 0 && !circuitBreakerOpen && available > 0,
           queueDepth: queueState.total,
           replayBufferDepth: replayDepth,
+          settlementTimes,
         };
       })
     );
@@ -4185,13 +4336,14 @@ export class NonceDO {
           // Broadcast the re-sponsored tx
           const result = await this.broadcastRawTx(reSponsoredTx, "replay_respon");
           if (result.ok) {
-            // Record in dispatch queue
+            // Record in dispatch queue (fee=GAP_FILL_FEE used for replayed txs)
             this.queueDispatch(
               targetWallet.walletIndex,
               entry.sender_tx_hex,
               entry.sender_address,
               entry.sender_nonce,
-              freshNonce
+              freshNonce,
+              GAP_FILL_FEE.toString()
             );
             // Transition to dispatched
             this.transitionQueueEntry(targetWallet.walletIndex, freshNonce, "dispatched");
@@ -5443,6 +5595,13 @@ export class NonceDO {
 
         const result = await this.broadcastRawTx(sponsoredTx, "bounded_broadcast");
         if (result.ok) {
+          // Update original_fee on the existing dispatch_queue row (inserted by checkAndDispatchRun with fee=NULL)
+          this.sql.exec(
+            `UPDATE dispatch_queue SET original_fee = ? WHERE wallet_index = ? AND sponsor_nonce = ? AND original_fee IS NULL`,
+            GAP_FILL_FEE.toString(),
+            entry.wallet_index,
+            entry.sponsor_nonce
+          );
           this.transitionQueueEntry(entry.wallet_index, entry.sponsor_nonce, "dispatched");
           this.ledgerBroadcastOutcome(
             entry.wallet_index, entry.sponsor_nonce, result.txid, 200, undefined, undefined
@@ -6178,6 +6337,7 @@ export class NonceDO {
           senderAddress: string;
           senderNonce: number;
           sponsorNonce: number;
+          fee?: string | null;
         }>(request);
       if (errorResponse) return errorResponse;
       if (
@@ -6194,7 +6354,8 @@ export class NonceDO {
           body.senderTxHex,
           body.senderAddress,
           body.senderNonce ?? 0,
-          body.sponsorNonce
+          body.sponsorNonce,
+          typeof body.fee === "string" ? body.fee : null
         );
         return this.jsonResponse({ success: true });
       } catch (error) {

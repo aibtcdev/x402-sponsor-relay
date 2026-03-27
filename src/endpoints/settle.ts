@@ -170,7 +170,8 @@ export class Settle extends BaseEndpoint {
             c.env, logger, sponsorWalletIndex,
             txHex, payer,
             Number(verifiedTx.auth.spendingCondition.nonce),
-            sponsorNonce
+            sponsorNonce,
+            sponsorFee ?? null
           ),
         ]).catch((e) => {
           logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });

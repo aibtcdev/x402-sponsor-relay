@@ -1477,7 +1477,8 @@ export async function queueDispatchDO(
   senderTxHex: string,
   senderAddress: string,
   senderNonce: number,
-  sponsorNonce: number
+  sponsorNonce: number,
+  fee?: string | null
 ): Promise<void> {
   if (!env.NONCE_DO) {
     return;
@@ -1493,6 +1494,7 @@ export async function queueDispatchDO(
         senderAddress,
         senderNonce,
         sponsorNonce,
+        fee: fee ?? null,
       }),
     });
     if (!response.ok) {
