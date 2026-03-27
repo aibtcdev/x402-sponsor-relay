@@ -171,8 +171,9 @@ export class QueueCancel extends BaseEndpoint {
       }
 
       if (response.status === 403) {
+        const doBody = await response.json().catch(() => null) as { error?: string } | null;
         return this.err(c, {
-          error: "Access denied to queue entry",
+          error: doBody?.error ?? "Access denied to queue entry",
           code: "QUEUE_ACCESS_DENIED",
           status: 403,
           retryable: false,

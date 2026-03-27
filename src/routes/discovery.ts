@@ -1208,7 +1208,7 @@ Testnet (chainId = 2147483648):
 The message that gets signed is a Clarity tuple:
 
 {
-  action: (string-ascii 10),   ;; "relay" or "sponsor"
+  action: (string-ascii 12),   ;; "relay", "sponsor", "queue-read", or "queue-cancel"
   nonce: uint,                  ;; unix timestamp ms (replay protection)
   expiry: uint                  ;; expiry timestamp (unix ms), must be in future
 }
@@ -1819,7 +1819,7 @@ Domain (testnet): { name: "x402-sponsor-relay", version: "1", chain-id: u2147483
 Domain (mainnet): { name: "x402-sponsor-relay", version: "1", chain-id: u1 }
 
 Message tuple:
-{ action: (string-ascii 10), nonce: uint, expiry: uint }
+{ action: (string-ascii 12), nonce: uint, expiry: uint }
 
 - action: "queue-read" or "queue-cancel" (cross-endpoint replay is prevented)
 - nonce: unix millisecond timestamp at time of signing

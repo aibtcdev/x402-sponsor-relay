@@ -3128,15 +3128,16 @@ export class NonceDO {
    * Batch flush threshold: when >= 5 slots are stuck simultaneously, logs a
    * 'wallet_flush_and_replay' event to signal that a batch recovery is occurring.
    *
-   * Returns {flushed, replayed} counts for inclusion in reconciliation_summary.
+   * Returns {flushed, replayBufferDepth} counts for inclusion in reconciliation_summary.
+   * `replayBufferDepth` is the total replay buffer depth after flushing (not entries added this cycle).
    * Never throws — all errors are logged and the cycle continues.
    */
   private async runFlushAndReplayCycle(
     walletIndex: number,
     stuckAgeMs: number
-  ): Promise<{ flushed: number; replayed: number }> {
+  ): Promise<{ flushed: number; replayBufferDepth: number }> {
     let flushed = 0;
-    let replayed = 0;
+    let replayBufferDepth = 0;
 
     try {
       // Fetch dispatched entries older than stuckAgeMs (candidates for flushing).
@@ -3160,7 +3161,7 @@ export class NonceDO {
         .toArray();
 
       if (stuckEntries.length === 0) {
-        return { flushed: 0, replayed: 0 };
+        return { flushed: 0, replayBufferDepth: 0 };
       }
 
       // Batch flush detection: log a high-visibility event when many slots are stuck
@@ -3182,7 +3183,7 @@ export class NonceDO {
           stuckCount: stuckEntries.length,
           reason: "Cannot derive private key for wallet",
         });
-        return { flushed: 0, replayed: 0 };
+        return { flushed: 0, replayBufferDepth: 0 };
       }
 
       for (const entry of stuckEntries) {
@@ -3239,9 +3240,9 @@ export class NonceDO {
       }
 
       // Track total replay buffer depth for the return value.
-      // Detailed per-entry logging is handled by the alarm handler's
-      // 'replay_buffer_non_empty' event, so we avoid a redundant full SELECT here.
-      replayed = this.getReplayBufferDepth(walletIndex);
+      // This is NOT the count of entries added this cycle (that equals `flushed`),
+      // but the total depth including entries from prior cycles.
+      replayBufferDepth = this.getReplayBufferDepth(walletIndex);
     } catch (e) {
       this.log("warn", "flush_replay_cycle_error", {
         walletIndex,
@@ -3249,7 +3250,7 @@ export class NonceDO {
       });
     }
 
-    return { flushed, replayed };
+    return { flushed, replayBufferDepth };
   }
 
   /**
@@ -4082,7 +4083,7 @@ export class NonceDO {
       possible_next_nonce,
       last_executed_tx_nonce,
       flush_flushed: flushResult.flushed,
-      flush_replayed: flushResult.replayed,
+      flush_replay_buffer_depth: flushResult.replayBufferDepth,
     });
 
     // -------------------------------------------------------------------------
@@ -5040,7 +5041,8 @@ export class NonceDO {
                     queued_at, dispatched_at
              FROM dispatch_queue
              WHERE sender_address = ? AND state != 'confirmed'
-             ORDER BY sponsor_nonce ASC`,
+             ORDER BY sponsor_nonce ASC
+             LIMIT 100`,
             senderAddress
           )
           .toArray();
@@ -5056,7 +5058,8 @@ export class NonceDO {
             `SELECT id, wallet_index, sender_nonce, original_sponsor_nonce, queued_at
              FROM replay_buffer
              WHERE sender_address = ?
-             ORDER BY queued_at ASC`,
+             ORDER BY queued_at ASC
+             LIMIT 100`,
             senderAddress
           )
           .toArray();
@@ -5168,10 +5171,15 @@ export class NonceDO {
               sponsorNonce
             );
           } else if (previousState === "replaying") {
-            // Already being flushed — just delete from queue (sender tx is already
-            // in replay_buffer if a flush succeeded, or will be cleaned up by alarm)
+            // Flush cycle already moved this to replay_buffer; remove from both
+            // tables to prevent re-sponsoring a cancelled tx
             this.sql.exec(
               "DELETE FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ?",
+              walletIndex,
+              sponsorNonce
+            );
+            this.sql.exec(
+              "DELETE FROM replay_buffer WHERE wallet_index = ? AND original_sponsor_nonce = ?",
               walletIndex,
               sponsorNonce
             );
