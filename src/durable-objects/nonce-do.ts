@@ -641,7 +641,6 @@ export class NonceDO {
    * Insert or replace a sender tx + sponsor nonce pair into the dispatch queue.
    * Called when a sender tx is ready to be dispatched with a specific sponsor nonce.
    * Uses INSERT OR REPLACE to handle re-queue on duplicate sponsor_nonce.
-   * @internal Scaffolding for phase 2 — will be called when dispatch path is wired.
    */
   private queueDispatch(
     walletIndex: number,
@@ -678,7 +677,6 @@ export class NonceDO {
 
   /**
    * Return all non-confirmed dispatch_queue rows for a wallet, ordered by sponsor_nonce ASC.
-   * @internal Scaffolding for phase 2 — will be called when dispatch path is wired.
    */
   private getQueuedForWallet(walletIndex: number): Array<{
     sender_tx_hex: string;
@@ -831,9 +829,7 @@ export class NonceDO {
       .toArray();
   }
 
-  /** Remove a specific entry from the replay buffer (after it has been re-sponsored).
-   * @internal Scaffolding for phase 2 — will be called when re-sponsor path is wired.
-   */
+  /** Remove a specific entry from the replay buffer (after it has been re-sponsored). */
   private removeFromReplayBuffer(id: number): void {
     this.sql.exec("DELETE FROM replay_buffer WHERE id = ?", id);
   }
