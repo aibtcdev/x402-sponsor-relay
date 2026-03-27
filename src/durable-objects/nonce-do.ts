@@ -687,6 +687,16 @@ export class NonceDO {
         ON dispatch_queue(sender_address, state);
     `);
 
+    // Index for computeSettlementPercentiles() ORDER BY settlement_ms queries
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_dq_settlement
+        ON dispatch_queue(state, confirmed_at);
+    `);
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_dq_wallet_settlement
+        ON dispatch_queue(wallet_index, state, confirmed_at);
+    `);
+
     // Migration: add original_fee column to dispatch_queue (nullable, text for bigint safety).
     // The standard SQLite ADD COLUMN IF NOT EXISTS is not supported — use try/catch instead.
     try {
@@ -825,14 +835,15 @@ export class NonceDO {
     this.sql.exec(
       `INSERT OR REPLACE INTO dispatch_queue
          (wallet_index, position, sender_tx_hex, sender_address, sender_nonce,
-          sponsor_nonce, state, queued_at, dispatched_at, confirmed_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, NULL)`,
+          sponsor_nonce, original_fee, state, queued_at, dispatched_at, confirmed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, NULL)`,
       walletIndex,
       position,
       senderTxHex,
       senderAddress,
       senderNonce,
       sponsorNonce,
+      fee,
       now,
       now
     );
@@ -1291,6 +1302,41 @@ export class NonceDO {
   }
 
   /**
+   * Gather the sender's active hand entries and detect gaps relative to next_expected_nonce.
+   * Shared by checkAndAssignRun() and checkWouldDispatch() to avoid duplicating gap detection logic.
+   */
+  private getHandGapInfo(senderAddress: string): {
+    hand: Array<{ sender_nonce: number; tx_hex: string; expires_at: string }>;
+    missingNonces: number[];
+    nextExpected: number;
+    handSize: number;
+  } {
+    const now = new Date().toISOString();
+
+    const stateRow = this.getSenderState(senderAddress);
+    const nextExpected = stateRow?.next_expected_nonce ?? 0;
+
+    const rawHand = this.getHand(senderAddress);
+    const hand = rawHand.filter(
+      (e) => e.sender_nonce >= nextExpected && e.expires_at > now
+    );
+
+    // Detect missing nonces between nextExpected and the first entry in the hand
+    const missingNonces: number[] = [];
+    const lowestInHand = hand.length > 0 ? hand[0].sender_nonce : null;
+    if (lowestInHand !== null && lowestInHand > nextExpected) {
+      for (let n = nextExpected; n < lowestInHand && missingNonces.length < 10; n++) {
+        missingNonces.push(n);
+      }
+    } else if (lowestInHand === null) {
+      // Hand is empty — report nextExpected as the single missing nonce
+      missingNonces.push(nextExpected);
+    }
+
+    return { hand, missingNonces, nextExpected, handSize: hand.length };
+  }
+
+  /**
    * Check the sender's hand for a gapless run starting at next_expected_nonce.
    * Delegates the actual dispatch to assignRunToWallet() for fairness-first selection.
    *
@@ -1298,18 +1344,8 @@ export class NonceDO {
    * - dispatched:true with sponsorNonce/walletIndex/sponsorAddress for the first tx
    * - dispatched:false with missingNonces when a gap exists
    */
-  private checkAndDispatchRun(senderAddress: string): HandSubmitResult {
-    const now = new Date().toISOString();
-
-    // Get next_expected_nonce for this sender
-    const stateRow = this.getSenderState(senderAddress);
-    const nextExpected = stateRow?.next_expected_nonce ?? 0;
-
-    // Fetch the hand, pruning expired and already-confirmed entries
-    const rawHand = this.getHand(senderAddress);
-    const hand = rawHand.filter(
-      (e) => e.sender_nonce >= nextExpected && e.expires_at > now
-    );
+  private checkAndAssignRun(senderAddress: string): HandSubmitResult {
+    const { hand, missingNonces, nextExpected, handSize } = this.getHandGapInfo(senderAddress);
 
     // Build the gapless run starting at nextExpected
     const run: Array<{ senderNonce: number; txHex: string }> = [];
@@ -1325,12 +1361,6 @@ export class NonceDO {
 
     if (run.length === 0) {
       // No run available — hand is empty or starts with a gap
-      const lowestInHand = hand.length > 0 ? hand[0].sender_nonce : null;
-      const gapEnd = lowestInHand !== null ? lowestInHand : nextExpected + 1;
-      const missingNonces: number[] = [];
-      for (let n = nextExpected; n < gapEnd && missingNonces.length < 10; n++) {
-        missingNonces.push(n);
-      }
       const oldestExpiry = hand.length > 0
         ? hand[0].expires_at
         : new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
@@ -1339,7 +1369,8 @@ export class NonceDO {
         held: true,
         nextExpected,
         missingNonces,
-        handSize: hand.length,
+        handSize,
+        holdReason: "gap" as const,
         expiresAt: oldestExpiry,
       };
     }
@@ -1355,14 +1386,15 @@ export class NonceDO {
         held: true,
         nextExpected,
         missingNonces: [],
-        handSize: hand.length,
+        handSize,
+        holdReason: "capacity" as const,
         expiresAt: oldestExpiry,
       };
     }
 
     const firstAssigned = dispatchResult.assigned[0];
 
-    this.log("info", "hand_run_dispatched", {
+    this.log("info", "hand_run_assigned", {
       senderAddress,
       runLength: dispatchResult.assigned.length,
       walletIndex: firstAssigned.walletIndex,
@@ -1396,15 +1428,14 @@ export class NonceDO {
   ):
     | { dispatches: true }
     | { dispatches: false; heldResult: Extract<import("../types").HandSubmitResult, { dispatched: false }> } {
-    const stateRow = this.getSenderState(senderAddress);
-    const nextExpected = stateRow?.next_expected_nonce ?? 0;
+    const { hand, missingNonces, nextExpected, handSize } = this.getHandGapInfo(senderAddress);
 
     // The submitted nonce must equal nextExpected to start a gapless run
     if (senderNonce !== nextExpected) {
       // Gap: nonces between nextExpected and senderNonce are missing
-      const missingNonces: number[] = [];
-      for (let n = nextExpected; n < senderNonce && missingNonces.length < 10; n++) {
-        missingNonces.push(n);
+      const gapNonces: number[] = [];
+      for (let n = nextExpected; n < senderNonce && gapNonces.length < 10; n++) {
+        gapNonces.push(n);
       }
       const expiresAt = new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
       return {
@@ -1413,22 +1444,32 @@ export class NonceDO {
           dispatched: false,
           held: true,
           nextExpected,
-          missingNonces,
+          missingNonces: gapNonces,
           handSize: 0, // tx was not inserted, so hand remains empty for this sender
+          holdReason: "gap" as const,
           expiresAt,
         },
       };
     }
 
-    // Also check existing hand entries — there must be no gap already in the hand
-    const now = new Date().toISOString();
-    const rawHand = this.getHand(senderAddress);
-    const hand = rawHand.filter(
-      (e) => e.sender_nonce >= nextExpected && e.expires_at > now
-    );
-
     // Check if the existing hand forms a contiguous prefix (no gap before senderNonce)
-    // The submitted tx is conceptually at senderNonce; we need nextExpected..senderNonce-1 to be in the hand
+    if (missingNonces.length > 0) {
+      const oldestExpiry = hand[0]?.expires_at ?? new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
+      return {
+        dispatches: false,
+        heldResult: {
+          dispatched: false,
+          held: true,
+          nextExpected,
+          missingNonces,
+          handSize, // existing hand size (not counting the uninserted tx)
+          holdReason: "gap" as const,
+          expiresAt: oldestExpiry,
+        },
+      };
+    }
+
+    // Also verify the hand forms a contiguous prefix up to senderNonce
     let expectedCursor = nextExpected;
     for (const entry of hand) {
       if (entry.sender_nonce === expectedCursor) {
@@ -1440,9 +1481,9 @@ export class NonceDO {
 
     if (expectedCursor < senderNonce) {
       // Gap exists in the hand before the submitted nonce
-      const missingNonces: number[] = [];
-      for (let n = expectedCursor; n < senderNonce && missingNonces.length < 10; n++) {
-        missingNonces.push(n);
+      const gapNonces: number[] = [];
+      for (let n = expectedCursor; n < senderNonce && gapNonces.length < 10; n++) {
+        gapNonces.push(n);
       }
       const oldestExpiry = hand[0]?.expires_at ?? new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
       return {
@@ -1451,8 +1492,9 @@ export class NonceDO {
           dispatched: false,
           held: true,
           nextExpected,
-          missingNonces,
-          handSize: hand.length, // existing hand size (not counting the uninserted tx)
+          missingNonces: gapNonces,
+          handSize,
+          holdReason: "gap" as const,
           expiresAt: oldestExpiry,
         },
       };
@@ -1606,27 +1648,8 @@ export class NonceDO {
       return { network, recipient: this.env.FLUSH_RECIPIENT };
     }
 
-    // Rotation fallback: use the next wallet address in the round-robin sequence
-    if (walletIndex !== undefined) {
-      const walletCountRaw = this.env.SPONSOR_WALLET_COUNT ?? "1";
-      const walletCount = Math.max(1, parseInt(walletCountRaw, 10) || 1);
-      const nextWalletIndex = (walletIndex + 1) % walletCount;
-      // Try to derive the rotation address synchronously from the ledger
-      // We can't make this async here; use the chain frontier key pattern to store address
-      // The rotation address is stored in DO KV as sponsor_address:{walletIndex}
-      // Since this is synchronous, we attempt a best-effort lookup from SQLite
-      const rotationRows = this.sql
-        .exec<{ value: number }>(
-          "SELECT value FROM nonce_state WHERE key = ? LIMIT 1",
-          `wallet_rotation_addr:${nextWalletIndex}`
-        )
-        .toArray();
-      // If we have a cached rotation address stored as a nonce_state integer key,
-      // we can't store strings there. Instead, fall back to the default constant
-      // but log the intent. Full rotation requires an async derive which isn't
-      // feasible in a synchronous method. Operators should set FLUSH_RECIPIENT.
-      void rotationRows; // suppress unused warning
-    }
+    // Rotation fallback is handled by getFlushRecipientAsync() in async contexts.
+    // This sync version cannot derive wallet addresses, so it falls through to the default.
 
     // Default constant fallback (original behavior)
     const defaultRecipient = network === "mainnet"
@@ -3953,14 +3976,15 @@ export class NonceDO {
         count: number;
         oldest_received_at: string;
       }>(
-        `SELECT sender_address,
-                MIN(sender_nonce) AS next_expected_nonce,
+        `SELECT sh.sender_address,
+                MIN(COALESCE(ss.next_expected_nonce, sh.sender_nonce)) AS next_expected_nonce,
                 COUNT(*) AS count,
-                MIN(received_at) AS oldest_received_at
-         FROM sender_hand
-         WHERE expires_at > ?
-         GROUP BY sender_address
-         ORDER BY sender_address ASC
+                MIN(sh.received_at) AS oldest_received_at
+         FROM sender_hand sh
+         LEFT JOIN sender_state ss ON ss.sender_address = sh.sender_address
+         WHERE sh.expires_at > ?
+         GROUP BY sh.sender_address
+         ORDER BY sh.sender_address ASC
          LIMIT 50`,
         nowIso
       )
@@ -5422,7 +5446,7 @@ export class NonceDO {
   /**
    * Sweep up to MAX_SWEEP_SENDERS sender hands per alarm tick.
    * Uses a round-robin cursor (alarm_sender_cursor) so no single sender is always skipped.
-   * For each sender with a non-empty hand, calls checkAndDispatchRun() to try to dispatch.
+   * For each sender with a non-empty hand, calls checkAndAssignRun() to try to assign runs.
    */
   private sweepHeldHands(): void {
     const now = new Date().toISOString();
@@ -5458,7 +5482,7 @@ export class NonceDO {
     let swept = 0;
     for (const { sender_address } of senders) {
       try {
-        this.checkAndDispatchRun(sender_address);
+        this.checkAndAssignRun(sender_address);
         swept++;
       } catch (e) {
         this.log("warn", "sweep_hand_error", {
@@ -5640,7 +5664,7 @@ export class NonceDO {
 
         const result = await this.broadcastRawTx(sponsoredTx, "bounded_broadcast");
         if (result.ok) {
-          // Update original_fee on the existing dispatch_queue row (inserted by checkAndDispatchRun with fee=NULL)
+          // Update original_fee on the existing dispatch_queue row (inserted by checkAndAssignRun with fee=NULL)
           this.sql.exec(
             `UPDATE dispatch_queue SET original_fee = ? WHERE wallet_index = ? AND sponsor_nonce = ? AND original_fee IS NULL`,
             GAP_FILL_FEE.toString(),
@@ -6793,7 +6817,7 @@ export class NonceDO {
           this.addToHand(body.senderAddress, body.senderNonce, body.txHex, "agent");
 
           // 5. Check for a gapless run and dispatch if found
-          const result = this.checkAndDispatchRun(body.senderAddress);
+          const result = this.checkAndAssignRun(body.senderAddress);
 
           // 6. Attach recentlyExpired info when entries expired before this submission.
           //    Helps agents understand why previously-submitted nonces disappeared.

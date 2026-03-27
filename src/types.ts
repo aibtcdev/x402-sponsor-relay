@@ -1400,6 +1400,12 @@ export type HandSubmitResult =
       /** ISO timestamp when the oldest hand entry expires */
       expiresAt: string;
       /**
+       * Why the tx is held:
+       * - 'gap': missing sender nonces before this tx (missingNonces is non-empty)
+       * - 'capacity': no wallet headroom to dispatch (missingNonces is empty)
+       */
+      holdReason?: "gap" | "capacity";
+      /**
        * Info about recently expired hand entries, if any expired before this submission.
        * Helps agents understand why previously-submitted nonces are missing from the queue.
        */
@@ -1442,6 +1448,12 @@ export interface SponsorHeld {
   handSize: number;
   /** ISO timestamp when the held tx expires from the hand */
   expiresAt: string;
+  /**
+   * Why the tx is held:
+   * - 'gap': missing sender nonces before this tx (missingNonces is non-empty)
+   * - 'capacity': no wallet headroom to dispatch (missingNonces is empty)
+   */
+  holdReason?: "gap" | "capacity";
   /**
    * Info about recently expired hand entries, if any expired before this submission.
    * Helps agents understand why previously-submitted nonces are missing from the queue.
@@ -1501,7 +1513,7 @@ export function buildQueueInfo(
   senderNonce: number,
   recentlyExpired?: RecentExpiryInfo
 ): QueueInfo {
-  const hasGaps = held.missingNonces.length > 0;
+  const reason = held.holdReason ?? (held.missingNonces.length > 0 ? "gap" : "capacity");
 
   const queueInfo: QueueInfo = {
     status: "held",
@@ -1509,11 +1521,11 @@ export function buildQueueInfo(
     nextExpectedNonce: held.nextExpected,
     missingNonces: held.missingNonces,
     handSize: held.handSize,
-    estimatedDispatchMs: hasGaps ? null : ALARM_CADENCE_ESTIMATE_MS,
+    estimatedDispatchMs: reason === "gap" ? null : ALARM_CADENCE_ESTIMATE_MS,
     expiresAt: held.expiresAt,
-    help: hasGaps
+    help: reason === "gap"
       ? `Submit transactions with nonces ${held.missingNonces.join(", ")} to unblock dispatch`
-      : "Waiting for dispatch — no gaps detected, tx will be processed on next alarm tick",
+      : "All wallet slots are at capacity — tx will be dispatched when headroom opens",
   };
 
   // Prefer explicitly passed recentlyExpired; fall back to value on the held object itself

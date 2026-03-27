@@ -783,13 +783,18 @@ export class SponsorService {
       if (handResult !== null) {
         if (!handResult.dispatched) {
           // Tx is held — gap exists in the sender's nonce sequence
-          this.logger.info("Transaction held in sender hand — nonce gap", {
-            senderAddress,
-            senderNonce,
-            nextExpected: handResult.nextExpected,
-            missingNonces: handResult.missingNonces,
-            mode,
-          });
+          this.logger.info(
+            mode === "immediate"
+              ? "Nonce gap — rejected (immediate mode, not enqueued)"
+              : "Transaction held in sender hand — nonce gap",
+            {
+              senderAddress,
+              senderNonce,
+              nextExpected: handResult.nextExpected,
+              missingNonces: handResult.missingNonces,
+              mode,
+            }
+          );
           return {
             success: false,
             held: true,
@@ -797,6 +802,7 @@ export class SponsorService {
             missingNonces: handResult.missingNonces,
             handSize: handResult.handSize,
             expiresAt: handResult.expiresAt,
+            holdReason: handResult.missingNonces.length > 0 ? "gap" : "capacity",
             // Forward recently-expired nonce info so agents can understand why their
             // previously-submitted nonces disappeared from the queue after the 5-min timeout.
             ...(handResult.recentlyExpired && { recentlyExpired: handResult.recentlyExpired }),
