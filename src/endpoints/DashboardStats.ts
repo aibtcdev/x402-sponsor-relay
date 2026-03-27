@@ -287,7 +287,7 @@ export class DashboardStats extends BaseEndpoint {
         );
 
       if (walletStats.length === 0) {
-        return { p50: 0, p95: 0, avg: 0, count: 0 };
+        return null;
       }
 
       const totalCount = walletStats.reduce((s, st) => s + st.count, 0);

@@ -776,9 +776,7 @@ export class SponsorService {
       const txHexForHand = originalTxHex ?? transaction.serialize();
 
       // Derive senderAddress from the transaction's spending condition hash
-      const { hashMode, signer } = transaction.auth.spendingCondition;
-      const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
-      const senderAddress = addressToString(addressFromVersionHash(version, signer));
+      const senderAddress = this.deriveSenderAddress(transaction);
 
       const handResult = await this.submitToHand(senderAddress, senderNonce, txHexForHand, mode);
 
@@ -797,6 +795,7 @@ export class SponsorService {
             held: true,
             nextExpected: handResult.nextExpected,
             missingNonces: handResult.missingNonces,
+            handSize: handResult.handSize,
             expiresAt: handResult.expiresAt,
             // Forward recently-expired nonce info so agents can understand why their
             // previously-submitted nonces disappeared from the queue after the 5-min timeout.
@@ -1491,13 +1490,22 @@ export async function nonceLifecycleOnBroadcastSuccess(
     senderNonce: number;
   }
 ): Promise<void> {
+  // Record broadcast outcome FIRST so ledgerBroadcastOutcome() runs while state is
+  // still non-terminal. If releaseNonceDO() ran first the nonce would already be
+  // terminal and the outcome write would be skipped.
+  try {
+    await recordBroadcastOutcomeDO(
+      env, logger, opts.sponsorNonce, opts.walletIndex,
+      opts.txid, 200, undefined, undefined
+    );
+  } catch (e) {
+    logger.warn("Failed to record broadcast outcome", { error: String(e) });
+  }
+
+  // Now release nonce and queue dispatch in parallel (order-independent)
   await Promise.all([
     releaseNonceDO(env, logger, opts.sponsorNonce, opts.txid, opts.walletIndex, opts.fee),
     recordNonceTxid(env, logger, opts.txid, opts.sponsorNonce),
-    recordBroadcastOutcomeDO(
-      env, logger, opts.sponsorNonce, opts.walletIndex,
-      opts.txid, 200, undefined, undefined
-    ),
     queueDispatchDO(
       env, logger, opts.walletIndex,
       opts.senderTxHex, opts.senderAddress,

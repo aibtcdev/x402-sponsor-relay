@@ -1438,6 +1438,8 @@ export interface SponsorHeld {
   nextExpected: number;
   /** Missing nonces that must be submitted to unblock dispatch */
   missingNonces: number[];
+  /** Total entries currently in the sender's hand */
+  handSize: number;
   /** ISO timestamp when the held tx expires from the hand */
   expiresAt: string;
   /**
@@ -1506,7 +1508,7 @@ export function buildQueueInfo(
     senderNonce,
     nextExpectedNonce: held.nextExpected,
     missingNonces: held.missingNonces,
-    handSize: held.missingNonces.length + 1, // gaps + the submitted tx
+    handSize: held.handSize,
     estimatedDispatchMs: hasGaps ? null : ALARM_CADENCE_ESTIMATE_MS,
     expiresAt: held.expiresAt,
     help: hasGaps
