@@ -3174,6 +3174,9 @@ export class NonceDO {
       // Record the assignment in the nonce_intents ledger (authoritative nonce state)
       this.ledgerAssign(walletIndex, sponsorNonce);
 
+      // Update assignment counters so /nonce/stats and dashboards stay accurate
+      this.updateAssignedStats(sponsorNonce);
+
       // Record in wallet_hand (allocated state)
       this.sql.exec(
         `INSERT OR REPLACE INTO wallet_hand

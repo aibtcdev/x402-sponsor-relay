@@ -668,7 +668,35 @@ export class Relay extends BaseEndpoint {
                 );
               }
             }
-          } else if (!("held" in retrySponsorResult && retrySponsorResult.held)) {
+          } else if ("held" in retrySponsorResult && retrySponsorResult.held) {
+            // Retry resulted in a held tx (gap or capacity) — return 202 with QueueInfo
+            // instead of a misleading 409/429 conflict error.
+            const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
+            const queue = buildQueueInfo(retrySponsorResult, senderNonce);
+            const retryAfterSeconds = queue.estimatedDispatchMs
+              ? Math.ceil(queue.estimatedDispatchMs / 1000)
+              : 30;
+            logger.info("Retry after resync held in sender hand — returning 202", {
+              senderNonce,
+              missingNonces: retrySponsorResult.missingNonces,
+              retryAfterSeconds,
+            });
+            return new Response(
+              JSON.stringify({
+                success: true,
+                status: "held",
+                requestId: crypto.randomUUID(),
+                queue,
+              }),
+              {
+                status: 202,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Retry-After": String(retryAfterSeconds),
+                },
+              }
+            );
+          } else {
             logger.warn("Retry sponsor failed after inline resync", {
               error: (retrySponsorResult as { error: string }).error,
               code: (retrySponsorResult as { code?: string }).code,

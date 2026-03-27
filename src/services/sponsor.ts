@@ -21,6 +21,20 @@ import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix } from "../utils";
 import { FeeService } from "./fee";
 
 /**
+ * Typed error thrown by submitToHand() when the DO returns a 4xx validation
+ * rejection (e.g., STALE_SENDER_NONCE). Callers catch this to fail fast
+ * with an accurate error code instead of falling through to the legacy path.
+ */
+interface HandSubmitValidationError extends Error {
+  code: string;
+  isHandSubmitValidation: true;
+}
+
+function isHandSubmitValidationError(e: unknown): e is HandSubmitValidationError {
+  return e instanceof Error && (e as HandSubmitValidationError).isHandSubmitValidation === true;
+}
+
+/**
  * Successful transaction validation result
  */
 export interface TransactionValidationSuccess {
@@ -571,6 +585,17 @@ export class SponsorService {
           status: response.status,
           body: text,
         });
+        // Propagate 4xx validation errors (e.g., STALE_SENDER_NONCE) so callers
+        // can fail fast with an accurate code. Only return null for 5xx/timeouts
+        // (unavailable) to fall through to the legacy path.
+        if (response.status >= 400 && response.status < 500) {
+          let parsed: { error?: string; code?: string } = {};
+          try { parsed = JSON.parse(text); } catch { /* use defaults */ }
+          const err = new Error(parsed.error ?? `NonceDO rejected with ${response.status}`);
+          (err as HandSubmitValidationError).code = parsed.code ?? "DO_VALIDATION_ERROR";
+          (err as HandSubmitValidationError).isHandSubmitValidation = true;
+          throw err;
+        }
         return null;
       }
 
@@ -778,7 +803,23 @@ export class SponsorService {
       // Derive senderAddress from the transaction's spending condition hash
       const senderAddress = this.deriveSenderAddress(transaction);
 
-      const handResult = await this.submitToHand(senderAddress, senderNonce, txHexForHand, mode);
+      let handResult: HandSubmitResult | null;
+      try {
+        handResult = await this.submitToHand(senderAddress, senderNonce, txHexForHand, mode);
+      } catch (e) {
+        if (isHandSubmitValidationError(e)) {
+          // DO returned a 4xx validation rejection (e.g., STALE_SENDER_NONCE).
+          // Fail fast with an accurate code instead of falling to legacy path.
+          this.logger.warn("NonceDO validation rejection", { code: e.code, error: e.message });
+          return {
+            success: false,
+            error: e.message,
+            details: `NonceDO rejected: ${e.code}`,
+            code: e.code,
+          };
+        }
+        throw e;
+      }
 
       if (handResult !== null) {
         if (!handResult.dispatched) {
