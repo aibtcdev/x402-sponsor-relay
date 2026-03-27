@@ -1386,6 +1386,27 @@ export type HandSubmitResult =
     };
 
 /**
+ * Result of assignRunToWallet(): describes which txs were dispatched vs held.
+ * All assigned txs land on the SAME walletIndex (one run → one wallet invariant).
+ */
+export interface RunDispatchResult {
+  /** Txs that were assigned sponsor nonces and inserted into dispatch_queue */
+  assigned: Array<{
+    /** Sender account nonce */
+    senderNonce: number;
+    /** Wallet index that owns this sponsor nonce slot */
+    walletIndex: number;
+    /** Sponsor nonce assigned to this tx */
+    sponsorNonce: number;
+  }>;
+  /** Txs that remain in sender_hand for the next dispatch cycle */
+  held: Array<{
+    /** Sender account nonce still in the hand */
+    senderNonce: number;
+  }>;
+}
+
+/**
  * Held sponsoring result — tx accepted but deferred until nonce gap is filled.
  * The caller should return HTTP 202 and instruct the agent to submit the missing nonces.
  */
