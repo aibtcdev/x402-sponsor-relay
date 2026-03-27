@@ -15,6 +15,7 @@ import {
 import { checkRateLimit, RATE_LIMIT, checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import { stripHexPrefix } from "../utils";
 import type { AppContext, RelayRequest, SettlementResult, Logger } from "../types";
+import { buildQueueInfo } from "../types";
 import {
   Error400Response,
   Error401Response,
@@ -379,16 +380,35 @@ export class Relay extends BaseEndpoint {
         body.transaction  // pass original hex for hand-submit sender nonce tracking
       );
       if (sponsorResult.success === false) {
-        // Gin rummy: tx held in sender hand — nonce gap exists, agent must submit missing nonces
+        // Gin rummy: tx held in sender hand — nonce gap exists.
+        // POST /relay is async-ok: return 202 Accepted with QueueInfo so the agent
+        // knows what nonces to submit to unblock dispatch.
         if ("held" in sponsorResult && sponsorResult.held) {
-          return c.json({
-            success: false,
-            held: true,
-            nextExpected: sponsorResult.nextExpected,
+          const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
+          const queue = buildQueueInfo(sponsorResult, senderNonce);
+          const retryAfterSeconds = queue.estimatedDispatchMs
+            ? Math.ceil(queue.estimatedDispatchMs / 1000)
+            : 30;
+          logger.info("Transaction held in sender hand — returning 202", {
+            senderNonce,
             missingNonces: sponsorResult.missingNonces,
-            expiresAt: sponsorResult.expiresAt,
-            message: "Transaction held pending nonce gap fill. Submit the missing nonces to dispatch.",
-          }, 202);
+            retryAfterSeconds,
+          });
+          return new Response(
+            JSON.stringify({
+              success: true,
+              status: "held",
+              requestId: crypto.randomUUID(),
+              queue,
+            }),
+            {
+              status: 202,
+              headers: {
+                "Content-Type": "application/json",
+                "Retry-After": String(retryAfterSeconds),
+              },
+            }
+          );
         }
         return this.sponsorFailureResponse(
           c,

@@ -221,8 +221,22 @@ interface ObservableWalletState {
  * `recommendation` is derived here (single source of truth) so that
  * endpoints don't duplicate the fallback decision logic.
  */
+/** Summary of a sender's hand queue — senders with held transactions pending gap fill. */
+interface SenderHandSummary {
+  /** Sender Stacks address */
+  address: string;
+  /** Lowest sender nonce in the hand (next needed to form a gapless run) */
+  nextExpected: number;
+  /** Number of transactions held in the sender's hand */
+  handSize: number;
+  /** Milliseconds since the oldest entry was received */
+  oldestEntryAge: number;
+}
+
 interface ObservableNonceState {
   wallets: ObservableWalletState[];
+  /** Active sender hands — senders with held transactions waiting for gap fill (capped at 50) */
+  senderHands: SenderHandSummary[];
   healthy: boolean;
   healInProgress: boolean;
   gapsFilled: number;
@@ -1354,6 +1368,87 @@ export class NonceDO {
       walletIndex: firstAssigned.walletIndex,
       sponsorAddress: "",
     };
+  }
+
+  /**
+   * Check whether a new tx with the given senderNonce would be dispatched immediately
+   * (i.e., it fills a gapless run from nextExpected) WITHOUT inserting it into sender_hand.
+   * Used by the mode:"immediate" path in /hand-submit so /sponsor can reject gap submissions
+   * without polluting the hand queue with transactions that will never be dispatched.
+   *
+   * Returns { dispatches: true } when the tx would be assigned immediately,
+   * or { dispatches: false, heldResult: HandSubmitResult } with the held reason.
+   */
+  private checkWouldDispatch(
+    senderAddress: string,
+    senderNonce: number
+  ):
+    | { dispatches: true }
+    | { dispatches: false; heldResult: Extract<import("../types").HandSubmitResult, { dispatched: false }> } {
+    const stateRow = this.getSenderState(senderAddress);
+    const nextExpected = stateRow?.next_expected_nonce ?? 0;
+
+    // The submitted nonce must equal nextExpected to start a gapless run
+    if (senderNonce !== nextExpected) {
+      // Gap: nonces between nextExpected and senderNonce are missing
+      const missingNonces: number[] = [];
+      for (let n = nextExpected; n < senderNonce && missingNonces.length < 10; n++) {
+        missingNonces.push(n);
+      }
+      const expiresAt = new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
+      return {
+        dispatches: false,
+        heldResult: {
+          dispatched: false,
+          held: true,
+          nextExpected,
+          missingNonces,
+          handSize: 0, // tx was not inserted, so hand remains empty for this sender
+          expiresAt,
+        },
+      };
+    }
+
+    // Also check existing hand entries — there must be no gap already in the hand
+    const now = new Date().toISOString();
+    const rawHand = this.getHand(senderAddress);
+    const hand = rawHand.filter(
+      (e) => e.sender_nonce >= nextExpected && e.expires_at > now
+    );
+
+    // Check if the existing hand forms a contiguous prefix (no gap before senderNonce)
+    // The submitted tx is conceptually at senderNonce; we need nextExpected..senderNonce-1 to be in the hand
+    let expectedCursor = nextExpected;
+    for (const entry of hand) {
+      if (entry.sender_nonce === expectedCursor) {
+        expectedCursor++;
+      } else {
+        break;
+      }
+    }
+
+    if (expectedCursor < senderNonce) {
+      // Gap exists in the hand before the submitted nonce
+      const missingNonces: number[] = [];
+      for (let n = expectedCursor; n < senderNonce && missingNonces.length < 10; n++) {
+        missingNonces.push(n);
+      }
+      const oldestExpiry = hand[0]?.expires_at ?? new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
+      return {
+        dispatches: false,
+        heldResult: {
+          dispatched: false,
+          held: true,
+          nextExpected,
+          missingNonces,
+          handSize: hand.length, // existing hand size (not counting the uninserted tx)
+          expiresAt: oldestExpiry,
+        },
+      };
+    }
+
+    // No gap — this tx would be dispatched immediately
+    return { dispatches: true };
   }
 
   private jsonResponse(body: unknown, status = 200): Response {
@@ -3833,8 +3928,40 @@ export class NonceDO {
     const recommendation: "fallback_to_direct" | null =
       !healthy && (anyGaps || allDegraded) ? "fallback_to_direct" : null;
 
+    // Sender hands: active senders with held transactions waiting for nonce gap fill.
+    // Capped at 50 senders to bound the response size.
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const handRows = this.sql
+      .exec<{
+        sender_address: string;
+        next_expected_nonce: number;
+        count: number;
+        oldest_received_at: string;
+      }>(
+        `SELECT sender_address,
+                MIN(sender_nonce) AS next_expected_nonce,
+                COUNT(*) AS count,
+                MIN(received_at) AS oldest_received_at
+         FROM sender_hand
+         WHERE expires_at > ?
+         GROUP BY sender_address
+         ORDER BY sender_address ASC
+         LIMIT 50`,
+        nowIso
+      )
+      .toArray();
+
+    const senderHands: SenderHandSummary[] = handRows.map((row) => ({
+      address: row.sender_address,
+      nextExpected: row.next_expected_nonce,
+      handSize: row.count,
+      oldestEntryAge: nowMs - new Date(row.oldest_received_at).getTime(),
+    }));
+
     return {
       wallets,
+      senderHands,
       healthy,
       healInProgress,
       gapsFilled,
@@ -6692,16 +6819,24 @@ export class NonceDO {
 
     // POST /hand-submit — add a sender tx to the hand and check for a dispatchable run.
     // Returns HandSubmitResult: either dispatched (nonce assigned) or held (gap exists).
+    //
+    // Optional mode field:
+    //   "hold" (default) — insert into hand even if held; agent can submit gaps later
+    //   "immediate" — reject (return held) without inserting if a gap exists; used by /sponsor
+    //     so that synchronous callers (MCP server, skills) get a 400 instead of a 202.
     if (request.method === "POST" && url.pathname === "/hand-submit") {
       const { value: body, errorResponse } = await this.parseJson<{
         senderAddress: string;
         senderNonce: number;
         txHex: string;
+        mode?: "hold" | "immediate";
       }>(request);
       if (errorResponse) return errorResponse;
       if (!body?.senderAddress || typeof body.senderNonce !== "number" || !body.txHex) {
         return this.badRequest("Missing senderAddress, senderNonce, or txHex");
       }
+
+      const mode = body.mode ?? "hold";
 
       return this.state.blockConcurrencyWhile(async () => {
         try {
@@ -6718,10 +6853,20 @@ export class NonceDO {
             }, 400);
           }
 
-          // 3. Add to hand (agent submission — INSERT OR REPLACE)
+          // 3. For immediate mode, check if the tx would be held BEFORE inserting.
+          //    If it would be held, return the held result without touching sender_hand.
+          //    This prevents rejected /sponsor txs from lingering in the hand queue.
+          if (mode === "immediate") {
+            const wouldDispatch = this.checkWouldDispatch(body.senderAddress, body.senderNonce);
+            if (!wouldDispatch.dispatches) {
+              return this.jsonResponse(wouldDispatch.heldResult);
+            }
+          }
+
+          // 4. Add to hand (agent submission — INSERT OR REPLACE)
           this.addToHand(body.senderAddress, body.senderNonce, body.txHex, "agent");
 
-          // 4. Check for a gapless run and dispatch if found
+          // 5. Check for a gapless run and dispatch if found
           const result = this.checkAndDispatchRun(body.senderAddress);
           return this.jsonResponse(result);
         } catch (error) {

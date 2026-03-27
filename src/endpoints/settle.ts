@@ -22,7 +22,7 @@ import {
 import { stripHexPrefix } from "../utils";
 import { checkAndRecordMalformed } from "../middleware";
 import type { AppContext, SettleOptions, X402SettlementResponseV2, X402SettleRequestV2, TxStatusRecord, Logger } from "../types";
-import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
+import { CAIP2_NETWORKS, X402_V2_ERROR_CODES, buildQueueInfo } from "../types";
 
 /** Parameters for the shared post-broadcast success handler */
 interface BroadcastSuccessParams {
@@ -439,9 +439,14 @@ export class Settle extends BaseEndpoint {
         // Sponsor the transaction (reserves nonce from NonceDO, adds fee + sponsor sig)
         const sponsorResult = await sponsorService.sponsorTransaction(validateResult.transaction);
         if (!sponsorResult.success) {
-          // Gin rummy: tx held — nonce gap exists; treat as transient failure
+          // Gin rummy: tx held — nonce gap exists.
+          // POST /settle must return HTTP 200 per V2 spec; signal held via errorReason.
+          // Include QueueInfo in the response extension so V2 clients can surface the gap info.
           if ("held" in sponsorResult && sponsorResult.held) {
+            const senderNonce = Number(parsedTx.auth.spendingCondition.nonce);
+            const queue = buildQueueInfo(sponsorResult, senderNonce);
             logger.warn("Sponsoring held — nonce gap in sender hand", {
+              senderNonce,
               nextExpected: sponsorResult.nextExpected,
               missingNonces: sponsorResult.missingNonces,
             });
@@ -451,7 +456,13 @@ export class Settle extends BaseEndpoint {
                 statsService.logFailure("settle", false, failureCtx),
               ]).catch(() => {})
             );
-            return v2Error(X402_V2_ERROR_CODES.BROADCAST_FAILED, 200);
+            return c.json({
+              success: false,
+              errorReason: X402_V2_ERROR_CODES.TRANSACTION_HELD,
+              transaction: "",
+              network,
+              queue,
+            }, 200);
           }
           const failResult = sponsorResult as { error: string; code?: string };
           logger.warn("Sponsoring failed", { error: failResult.error, code: failResult.code });

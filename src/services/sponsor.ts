@@ -535,11 +535,15 @@ export class SponsorService {
    * Submit a transaction to the NonceDO hand-submit endpoint.
    * The DO adds it to the sender's hand and checks for a gapless run.
    * Returns the HandSubmitResult, or null if the DO is unavailable (fall back to legacy path).
+   *
+   * @param mode - "hold" (default): insert into hand even if held (async callers like /relay).
+   *               "immediate": reject without inserting if a gap exists (sync callers like /sponsor).
    */
   private async submitToHand(
     senderAddress: string,
     senderNonce: number,
-    txHex: string
+    txHex: string,
+    mode: "hold" | "immediate" = "hold"
   ): Promise<HandSubmitResult | null> {
     if (!this.env.NONCE_DO) return null;
     try {
@@ -547,7 +551,7 @@ export class SponsorService {
       const response = await stub.fetch("https://nonce-do/hand-submit", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ senderAddress, senderNonce, txHex }),
+        body: JSON.stringify({ senderAddress, senderNonce, txHex, mode }),
       });
 
       if (!response.ok) {
@@ -743,16 +747,19 @@ export class SponsorService {
    * When NONCE_DO is configured, routes through the gin rummy hand-submit path:
    * the tx is added to the sender's hand and checked for a gapless run. If a run
    * exists, the nonce is assigned and sponsoring proceeds. If the tx fills a gap,
-   * it is held and SponsorHeld is returned (HTTP 202 semantics for the caller).
+   * it is held and SponsorHeld is returned.
    *
    * Falls back to the legacy fetchNonceFromDO path when hand-submit is unavailable.
    *
    * @param transaction - The deserialized sponsored transaction to sign
    * @param originalTxHex - Original hex for hand-submit (defaults to re-serialized)
+   * @param mode - "hold" (default): queue tx even if held (for /relay and /settle async paths).
+   *               "immediate": reject without queuing if a gap exists (for /sponsor sync path).
    */
   async sponsorTransaction(
     transaction: StacksTransactionWire,
-    originalTxHex?: string
+    originalTxHex?: string,
+    mode: "hold" | "immediate" = "hold"
   ): Promise<SponsorResult> {
     const network = this.getNetwork();
 
@@ -782,7 +789,7 @@ export class SponsorService {
       const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
       const senderAddress = addressToString(addressFromVersionHash(version, signer));
 
-      const handResult = await this.submitToHand(senderAddress, senderNonce, txHexForHand);
+      const handResult = await this.submitToHand(senderAddress, senderNonce, txHexForHand, mode);
 
       if (handResult !== null) {
         if (!handResult.dispatched) {
@@ -792,6 +799,7 @@ export class SponsorService {
             senderNonce,
             nextExpected: handResult.nextExpected,
             missingNonces: handResult.missingNonces,
+            mode,
           });
           return {
             success: false,

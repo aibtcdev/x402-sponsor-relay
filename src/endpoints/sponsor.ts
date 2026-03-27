@@ -22,6 +22,7 @@ import {
 } from "../schemas";
 import { checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import type { AppContext, Env, Logger, SponsorRequest } from "../types";
+import { buildQueueInfo } from "../types";
 import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
 
@@ -291,21 +292,37 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
+      // mode:"immediate" — reject without queuing if a gap exists.
+      // POST /sponsor must remain synchronous (200 with txid or error, NEVER 202).
+      // MCP server and skills expect either txid or a 4xx error; they cannot handle 202.
       const sponsorResult = await sponsorService.sponsorTransaction(
         validation.transaction,
-        body.transaction  // pass original hex for hand-submit sender nonce tracking
+        body.transaction, // pass original hex for hand-submit sender nonce tracking
+        "immediate"
       );
       if (sponsorResult.success === false) {
-        // Gin rummy: tx held in sender hand — nonce gap exists, agent must submit missing nonces
+        // Gin rummy: nonce gap detected — reject immediately with actionable error.
+        // The tx was NOT added to sender_hand (mode:"immediate" prevents insertion on gap).
         if ("held" in sponsorResult && sponsorResult.held) {
+          c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+          const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
+          const queue = buildQueueInfo(sponsorResult, senderNonce);
+          logger.warn("Sender nonce gap — rejecting /sponsor request", {
+            senderNonce,
+            missingNonces: sponsorResult.missingNonces,
+            nextExpected: sponsorResult.nextExpected,
+          });
           return c.json({
             success: false,
-            held: true,
-            nextExpected: sponsorResult.nextExpected,
+            requestId: crypto.randomUUID(),
+            code: "SENDER_NONCE_GAP",
+            error: `Sender nonce ${senderNonce} cannot be sponsored — nonces ${sponsorResult.missingNonces.join(", ")} must be submitted first`,
             missingNonces: sponsorResult.missingNonces,
-            expiresAt: sponsorResult.expiresAt,
-            message: "Transaction held pending nonce gap fill. Submit the missing nonces to dispatch.",
-          }, 202);
+            nextExpectedNonce: sponsorResult.nextExpected,
+            retryable: false,
+            queue,
+          }, 400);
         }
         return this.sponsorFailureResponse(
           c,

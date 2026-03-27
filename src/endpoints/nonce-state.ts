@@ -79,6 +79,19 @@ export class NonceState extends BaseEndpoint {
                     totalReserved: { type: "number" as const },
                     totalCapacity: { type: "number" as const },
                     lastGapDetected: { type: "string" as const, nullable: true },
+                    senderHands: {
+                      type: "array" as const,
+                      description: "Active sender hands — senders with held transactions waiting for nonce gap fill (capped at 50)",
+                      items: {
+                        type: "object" as const,
+                        properties: {
+                          address: { type: "string" as const, description: "Sender Stacks address" },
+                          nextExpected: { type: "number" as const, description: "Next sender nonce needed to unblock dispatch" },
+                          handSize: { type: "number" as const, description: "Number of transactions held in the sender's hand" },
+                          oldestEntryAge: { type: "number" as const, description: "Milliseconds since oldest entry was received" },
+                        },
+                      },
+                    },
                     recommendation: {
                       type: "string" as const,
                       nullable: true,

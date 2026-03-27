@@ -410,6 +410,8 @@ export const X402_V2_ERROR_CODES = {
   CLIENT_BAD_NONCE: "client_bad_nonce",
   /** Transaction signature is invalid — wrong network, mismatched key, or corrupted bytes */
   SIGNATURE_VALIDATION_FAILED: "signature_validation_failed",
+  /** Transaction is held pending a sender nonce gap fill — agent must submit missing nonces */
+  TRANSACTION_HELD: "transaction_held",
 } as const;
 
 /**
@@ -602,7 +604,8 @@ export type RelayErrorCode =
   | "INVALID_BTC_ADDRESS"
   | "MALFORMED_PAYLOAD"
   | "QUEUE_NOT_FOUND"
-  | "QUEUE_ACCESS_DENIED";
+  | "QUEUE_ACCESS_DENIED"
+  | "SENDER_NONCE_GAP";
 
 /**
  * Default retry-after for SERVICE_DEGRADED responses (seconds).
@@ -1419,4 +1422,64 @@ export interface SponsorHeld {
   missingNonces: number[];
   /** ISO timestamp when the held tx expires from the hand */
   expiresAt: string;
+}
+
+/**
+ * Queue position info returned to agents when a transaction is held pending a nonce gap fill.
+ * Included in 202 responses from POST /relay and in POST /settle held responses.
+ */
+export interface QueueInfo {
+  /** Always "held" — indicates the tx is waiting in the sender's hand */
+  status: "held";
+  /** The nonce of the submitted transaction */
+  senderNonce: number;
+  /** The next sequential nonce the relay needs before it can dispatch */
+  nextExpectedNonce: number;
+  /** The specific nonces that must be submitted to fill the gap */
+  missingNonces: number[];
+  /** Total number of transactions in the sender's hand (including this one) */
+  handSize: number;
+  /**
+   * Estimated milliseconds until dispatch after gaps are filled.
+   * null when missingNonces.length > 0 — the agent controls dispatch timing
+   * by submitting the missing nonces.
+   */
+  estimatedDispatchMs: number | null;
+  /** ISO timestamp when the held tx expires from the hand */
+  expiresAt: string;
+  /** Actionable instruction for the agent */
+  help: string;
+}
+
+/**
+ * Alarm cadence estimate used for estimatedDispatchMs when there are no gaps.
+ * 10s is a conservative lower bound on the DO alarm tick interval.
+ */
+const ALARM_CADENCE_ESTIMATE_MS = 10_000;
+
+/**
+ * Build a QueueInfo object from a SponsorHeld result and the submitted sender nonce.
+ * Suitable for inclusion in 202 responses (POST /relay) and V2 held responses (POST /settle).
+ */
+export function buildQueueInfo(held: SponsorHeld, senderNonce: number): QueueInfo {
+  const hasGaps = held.missingNonces.length > 0;
+  const estimatedDispatchMs = hasGaps
+    ? null
+    : ALARM_CADENCE_ESTIMATE_MS;
+
+  const helpNonces = held.missingNonces;
+  const help = helpNonces.length > 0
+    ? `Submit transactions with nonces ${helpNonces.join(", ")} to unblock dispatch`
+    : "Waiting for dispatch — no gaps detected, tx will be processed on next alarm tick";
+
+  return {
+    status: "held",
+    senderNonce,
+    nextExpectedNonce: held.nextExpected,
+    missingNonces: held.missingNonces,
+    handSize: held.missingNonces.length + 1, // gaps + the submitted tx
+    estimatedDispatchMs,
+    expiresAt: held.expiresAt,
+    help,
+  };
 }
