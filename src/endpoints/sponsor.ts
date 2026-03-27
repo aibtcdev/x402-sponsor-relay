@@ -191,14 +191,14 @@ export class Sponsor extends BaseEndpoint {
       }
 
       const sponsorService = new SponsorService(c.env, logger);
-      const clientIp = c.req.header("cf-connecting-ip") ?? "unknown";
+      const clientIp = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? null;
 
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
         if (validation.error === "Malformed transaction payload") {
-          const blocked = checkAndRecordMalformed(clientIp);
+          const blocked = clientIp ? checkAndRecordMalformed(clientIp) : false;
           if (blocked) {
             logger.warn("IP blocked for repeated malformed payloads", { ip: clientIp });
             return this.err(c, {

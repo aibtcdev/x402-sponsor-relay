@@ -136,8 +136,10 @@ async function main() {
     const auth = createQueueAuth("queue-read", privateKey);
     const response = await fetch(`${relayUrl}/queue/${senderAddress}`, {
       method: "GET",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ auth }),
+      headers: {
+        "Content-Type": "application/json",
+        "X-SIP018-Auth": JSON.stringify(auth),
+      },
     });
 
     const result = (await response.json()) as Record<string, unknown>;
@@ -184,8 +186,10 @@ async function main() {
     const auth = createQueueAuth("queue-cancel", privateKey); // wrong action for GET
     const response = await fetch(`${relayUrl}/queue/${senderAddress}`, {
       method: "GET",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ auth }),
+      headers: {
+        "Content-Type": "application/json",
+        "X-SIP018-Auth": JSON.stringify(auth),
+      },
     });
 
     const result = (await response.json()) as Record<string, unknown>;

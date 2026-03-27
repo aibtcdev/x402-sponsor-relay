@@ -351,19 +351,40 @@ export class Settle extends BaseEndpoint {
         return c.json(response, 200);
       }
 
-      const clientIp = c.req.header("cf-connecting-ip") ?? "unknown";
+      const clientIp = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? null;
+
+      // Fast hex pre-validation before expensive deserialization (mirrors SponsorService.preValidateTxHex)
+      const cleanHexForCheck = stripHexPrefix(txHex);
+      if (
+        cleanHexForCheck.length < 4 ||
+        cleanHexForCheck.length % 2 !== 0 ||
+        !/^[0-9a-fA-F]+$/.test(cleanHexForCheck)
+      ) {
+        if (clientIp) checkAndRecordMalformed(clientIp);
+        logger.info("Malformed transaction hex rejected before deserialization", {
+          txHexLength: txHex.length,
+          reason: "invalid hex format",
+        });
+        c.executionCtx.waitUntil(
+          Promise.all([
+            statsService.recordError("validation"),
+            statsService.logFailure("settle", true),
+          ]).catch(() => {})
+        );
+        return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
+      }
 
       // Deserialize transaction to inspect sponsor slot
       let parsedTx: ReturnType<typeof deserializeTransaction>;
       try {
-        parsedTx = deserializeTransaction(stripHexPrefix(txHex));
+        parsedTx = deserializeTransaction(cleanHexForCheck);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        checkAndRecordMalformed(clientIp);
+        if (clientIp) checkAndRecordMalformed(clientIp);
         logger.info("Failed to deserialize transaction for sponsor-slot inspection", {
           error: errMsg,
           txHexLength: txHex.length,
-          txHexPrefix: stripHexPrefix(txHex).slice(0, 20),
+          txHexPrefix: cleanHexForCheck.slice(0, 20),
         });
         c.executionCtx.waitUntil(
           Promise.all([
@@ -398,7 +419,7 @@ export class Settle extends BaseEndpoint {
         // Validate the transaction is sponsorable
         const validateResult = sponsorService.validateTransaction(txHex);
         if (!validateResult.valid) {
-          if (validateResult.error === "Malformed transaction payload") {
+          if (validateResult.error === "Malformed transaction payload" && clientIp) {
             checkAndRecordMalformed(clientIp);
           }
           logger.info("Transaction failed sponsor validation", { error: validateResult.error });

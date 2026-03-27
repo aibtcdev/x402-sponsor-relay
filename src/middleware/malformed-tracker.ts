@@ -14,15 +14,26 @@ export const MALFORMED_BLOCK_WINDOW_MS = 10 * 60 * 1000;
 /** Number of malformed attempts before the IP is blocked. */
 export const MALFORMED_BLOCK_THRESHOLD = 3;
 
+/** Maximum number of tracked IPs to prevent unbounded growth under high-cardinality traffic. */
+const MAX_TRACKED_IPS = 10_000;
+
 const trackerMap = new Map<string, { count: number; firstSeen: number }>();
 
 /**
  * Remove entries whose window has expired so the map does not grow unbounded.
+ * Also enforces a hard cap: if the map exceeds MAX_TRACKED_IPS after pruning,
+ * evict the oldest entries until it fits.
  */
 function pruneExpired(): void {
   const cutoff = Date.now() - MALFORMED_BLOCK_WINDOW_MS;
   for (const [ip, entry] of trackerMap) {
     if (entry.firstSeen < cutoff) trackerMap.delete(ip);
+  }
+  // Hard cap: evict oldest entries if map is still too large
+  if (trackerMap.size > MAX_TRACKED_IPS) {
+    const sorted = [...trackerMap.entries()].sort((a, b) => a[1].firstSeen - b[1].firstSeen);
+    const toEvict = sorted.slice(0, trackerMap.size - MAX_TRACKED_IPS);
+    for (const [ip] of toEvict) trackerMap.delete(ip);
   }
 }
 

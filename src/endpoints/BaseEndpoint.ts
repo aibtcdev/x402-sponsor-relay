@@ -279,8 +279,12 @@ export class BaseEndpoint extends OpenAPIRoute {
   }
 
   /**
-   * Parse SIP-018 auth from request body and verify signature + address ownership.
+   * Parse SIP-018 auth and verify signature + address ownership.
    * Shared by queue-read and queue-cancel endpoints.
+   *
+   * Auth is accepted from (in priority order):
+   * 1. X-SIP018-Auth header (JSON-encoded) — works with GET and all HTTP methods
+   * 2. JSON request body `{ auth: { ... } }` — only for non-GET methods
    *
    * Returns an error Response if validation fails, or null if auth is valid.
    * The `action` parameter scopes the signature to the specific endpoint.
@@ -290,25 +294,52 @@ export class BaseEndpoint extends OpenAPIRoute {
     action: "queue-read" | "queue-cancel",
     expectedAddress: string
   ): Promise<Response | null> {
-    let auth: Sip018Auth;
-    try {
-      const body = await c.req.json() as { auth?: Sip018Auth };
-      if (!body?.auth) {
+    let auth: Sip018Auth | undefined;
+
+    // Try X-SIP018-Auth header first (works for all methods including GET)
+    const headerValue = c.req.header("x-sip018-auth");
+    if (headerValue) {
+      try {
+        auth = JSON.parse(headerValue) as Sip018Auth;
+      } catch {
         return this.err(c, {
-          error: "Missing auth field — SIP-018 signature required",
+          error: "Invalid JSON in X-SIP018-Auth header",
+          code: "INVALID_PAYLOAD",
+          status: 400,
+          retryable: false,
+        });
+      }
+    }
+
+    // Fall back to JSON body for non-GET methods
+    if (!auth) {
+      if (c.req.method.toUpperCase() === "GET") {
+        return this.err(c, {
+          error: "Missing auth — provide SIP-018 signature via X-SIP018-Auth header",
           code: "INVALID_AUTH_SIGNATURE",
           status: 401,
           retryable: false,
         });
       }
-      auth = body.auth;
-    } catch {
-      return this.err(c, {
-        error: "Invalid JSON body",
-        code: "INVALID_PAYLOAD",
-        status: 400,
-        retryable: false,
-      });
+      try {
+        const body = await c.req.json() as { auth?: Sip018Auth };
+        if (!body?.auth) {
+          return this.err(c, {
+            error: "Missing auth field — SIP-018 signature required (body or X-SIP018-Auth header)",
+            code: "INVALID_AUTH_SIGNATURE",
+            status: 401,
+            retryable: false,
+          });
+        }
+        auth = body.auth;
+      } catch {
+        return this.err(c, {
+          error: "Invalid JSON body",
+          code: "INVALID_PAYLOAD",
+          status: 400,
+          retryable: false,
+        });
+      }
     }
 
     const logger = this.getLogger(c);

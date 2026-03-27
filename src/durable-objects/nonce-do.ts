@@ -601,6 +601,11 @@ export class NonceDO {
         ON dispatch_queue(wallet_index, state);
     `);
 
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_dispatch_queue_sender
+        ON dispatch_queue(sender_address, state);
+    `);
+
     // Replay buffer: sender txs waiting for a fresh sponsor nonce assignment.
     // Populated when a dispatched slot is stuck and needs to be flushed.
     // The relay will re-sponsor these txs with new nonces in the next alarm cycle.
@@ -620,6 +625,11 @@ export class NonceDO {
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_replay_buffer_wallet
         ON replay_buffer(wallet_index, queued_at ASC);
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_replay_buffer_sender
+        ON replay_buffer(sender_address);
     `);
   }
 
@@ -3177,15 +3187,13 @@ export class NonceDO {
 
       for (const entry of stuckEntries) {
         try {
-          // Step 1: Mark the queue entry as 'replaying'
-          this.transitionQueueEntry(walletIndex, entry.sponsor_nonce, "replaying");
-
-          // Step 2: Flush the stuck sponsor nonce slot with a self-transfer
-          // (reuses the existing fillGapNonce mechanism: 1 uSTX, 30k fee)
-          const flushTxid = await this.fillGapNonce(
+          // Step 1: Flush the stuck sponsor nonce slot with a self-transfer.
+          // Uses RBF_FEE to guarantee eviction of the stuck tx from the mempool.
+          const flushTxid = await this.broadcastRbfForNonce(
             walletIndex,
             entry.sponsor_nonce,
-            privateKey
+            privateKey,
+            null  // no original txid available from dispatch queue
           );
 
           this.log("info", "dispatch_flush_start", {
@@ -3196,6 +3204,20 @@ export class NonceDO {
             flushTxid: flushTxid ?? null,
             reason: "dispatched_entry_stuck",
           });
+
+          if (!flushTxid) {
+            // Flush broadcast failed (e.g., ConflictingNonceInMempool or network error).
+            // Keep the entry in 'dispatched' state — will be retried next alarm cycle.
+            this.log("info", "dispatch_flush_skipped", {
+              walletIndex,
+              sponsorNonce: entry.sponsor_nonce,
+              reason: "flush broadcast did not return txid",
+            });
+            continue;
+          }
+
+          // Step 2: Mark the queue entry as 'replaying' (only after successful flush)
+          this.transitionQueueEntry(walletIndex, entry.sponsor_nonce, "replaying");
 
           // Step 3: Move the original sender tx to the replay buffer
           this.addToReplayBuffer(
@@ -5133,16 +5155,21 @@ export class NonceDO {
               sponsorNonce
             );
           } else if (previousState === "dispatched") {
-            // Transition to replaying — signals the alarm to flush this slot
+            // Dispatched tx is in the mempool — flush the sponsor nonce slot with a
+            // self-transfer so the slot clears, then delete the queue entry.
+            // The flush cycle handles actual re-broadcasting; we just mark for cleanup.
+            const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+            if (privateKey) {
+              await this.broadcastRbfForNonce(walletIndex, sponsorNonce, privateKey, null);
+            }
             this.sql.exec(
-              `UPDATE dispatch_queue SET state = 'replaying'
-               WHERE wallet_index = ? AND sponsor_nonce = ?`,
+              "DELETE FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ?",
               walletIndex,
               sponsorNonce
             );
           } else if (previousState === "replaying") {
-            // Already in replaying state; move to replay_buffer and delete from queue
-            // so the sender tx will be re-sponsored with a fresh nonce
+            // Already being flushed — just delete from queue (sender tx is already
+            // in replay_buffer if a flush succeeded, or will be cleaned up by alarm)
             this.sql.exec(
               "DELETE FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ?",
               walletIndex,

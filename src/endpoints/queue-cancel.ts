@@ -130,9 +130,9 @@ export class QueueCancel extends BaseEndpoint {
 
     const walletIndex = parseInt(walletIndexStr, 10);
     const sponsorNonce = parseInt(sponsorNonceStr, 10);
-    if (!Number.isInteger(walletIndex) || !Number.isInteger(sponsorNonce)) {
+    if (!Number.isInteger(walletIndex) || !Number.isInteger(sponsorNonce) || walletIndex < 0 || sponsorNonce < 0) {
       return this.err(c, {
-        error: "walletIndex and sponsorNonce must be integers",
+        error: "walletIndex and sponsorNonce must be non-negative integers",
         code: "INVALID_PAYLOAD",
         status: 400,
         retryable: false,

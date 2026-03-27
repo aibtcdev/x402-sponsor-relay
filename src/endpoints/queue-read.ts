@@ -21,38 +21,9 @@ export class QueueRead extends BaseEndpoint {
     description:
       "Returns the agent's pending transaction queue state across all sponsor wallets. " +
       "Requires a SIP-018 signature with action \"queue-read\" from the sender's Stacks key. " +
+      "Auth is passed via X-SIP018-Auth header (JSON-encoded {signature, message}). " +
       "Returns queued, dispatched, replaying, and replay_buffer entries.",
-    request: {
-      body: {
-        content: {
-          "application/json": {
-            schema: {
-              type: "object" as const,
-              required: ["auth"],
-              properties: {
-                auth: {
-                  type: "object" as const,
-                  required: ["signature", "message"],
-                  description: "SIP-018 structured data signature proving ownership of senderAddress",
-                  properties: {
-                    signature: { type: "string" as const, description: "RSV hex signature" },
-                    message: {
-                      type: "object" as const,
-                      required: ["action", "nonce", "expiry"],
-                      properties: {
-                        action: { type: "string" as const, enum: ["queue-read"] },
-                        nonce: { type: "string" as const, description: "Unix timestamp ms" },
-                        expiry: { type: "string" as const, description: "Expiry unix timestamp ms" },
-                      },
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
+    request: {},
     responses: {
       "200": {
         description: "Queue state retrieved successfully",
@@ -133,8 +104,10 @@ export class QueueRead extends BaseEndpoint {
               type: "object" as const,
               properties: {
                 success: { type: "boolean" as const, example: false },
+                requestId: { type: "string" as const, format: "uuid" },
                 error: { type: "string" as const },
                 code: { type: "string" as const, example: "QUEUE_ACCESS_DENIED" },
+                retryable: { type: "boolean" as const, example: false },
               },
             },
           },
