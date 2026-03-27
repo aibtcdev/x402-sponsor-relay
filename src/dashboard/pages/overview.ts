@@ -47,7 +47,7 @@ function hasTransactionChartData(
  */
 function chartEmptyState(message: string): string {
   return `
-<div class="h-96 flex items-center justify-center">
+<div class="h-64 flex items-center justify-center">
   <div class="text-center">
     ${barChartSvg("w-10 h-10")}
     <p class="text-gray-400 mt-2">${escapeHtml(message)}</p>
@@ -87,6 +87,55 @@ function apiKeysSection(apiKeys: AggregateKeyStats): string {
       </div>
     </div>
   </div>`;
+}
+
+/**
+ * Render just the grid of endpoint cards (no outer wrapper).
+ * Used by the collapsible accordion section.
+ */
+function endpointBreakdownCards(breakdown: EndpointBreakdown): string {
+  function endpointCard(
+    name: string,
+    total: number,
+    success?: number,
+    failed?: number,
+    clientErrors?: number
+  ): string {
+    const hasDetail = success !== undefined && failed !== undefined;
+    const successColor = colors.status.healthy;
+    const failColor = colors.status.down;
+    const clientColor = colors.status.degraded;
+
+    return `
+<div class="brand-card p-4">
+  <p class="text-sm text-gray-400 font-medium">${escapeHtml(name)}</p>
+  <p class="text-2xl font-bold text-white mt-2">${formatNumber(total)}</p>
+  ${hasDetail ? `
+  <div class="mt-2">
+    <div class="flex items-center justify-between text-xs">
+      <span style="color: ${successColor}">Success</span>
+      <span style="color: ${successColor}">${formatNumber(success!)}</span>
+    </div>
+    <div class="flex items-center justify-between text-xs mt-1">
+      <span style="color: ${failColor}">Failed</span>
+      <span style="color: ${failColor}">${formatNumber(failed!)}</span>
+    </div>
+    ${clientErrors !== undefined && clientErrors > 0 ? `
+    <div class="flex items-center justify-between text-xs mt-1">
+      <span style="color: ${clientColor}">Client Err</span>
+      <span style="color: ${clientColor}">${formatNumber(clientErrors)}</span>
+    </div>` : ""}
+  </div>` : `<p class="text-xs text-gray-500 mt-2">verify-only (no settlement)</p>`}
+</div>`;
+  }
+
+  return `
+<div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+  ${endpointCard("/relay", breakdown.relay.total, breakdown.relay.success, breakdown.relay.failed)}
+  ${endpointCard("/sponsor", breakdown.sponsor.total, breakdown.sponsor.success, breakdown.sponsor.failed)}
+  ${endpointCard("/settle", breakdown.settle.total, breakdown.settle.success, breakdown.settle.failed, breakdown.settle.clientErrors)}
+  ${endpointCard("/verify", breakdown.verify.total)}
+</div>`;
 }
 
 /**
@@ -297,7 +346,7 @@ ${header(network)}
         </div>
       </div>
       ${showTxChart
-        ? `<div class="h-96 relative">
+        ? `<div class="h-64 relative">
         <div x-show="loading" class="absolute inset-0 flex items-center justify-center bg-gray-900 bg-opacity-50 rounded z-10">
           <span class="text-gray-400 text-sm">Loading...</span>
         </div>
@@ -307,98 +356,165 @@ ${header(network)}
     </div>
   </div>
 
-  <!-- Token Breakdown Cards -->
+  <!-- Zone E: Detail Sections (collapsible accordion) -->
   <div class="mb-6">
-    <h3 class="text-lg font-semibold text-white mb-4">Token Breakdown</h3>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-      ${tokenCard("STX", data.tokens.STX.count, data.tokens.STX.percentage, data.tokens.STX.volume)}
-      ${tokenCard("sBTC", data.tokens.sBTC.count, data.tokens.sBTC.percentage, data.tokens.sBTC.volume)}
-      ${tokenCard("USDCx", data.tokens.USDCx.count, data.tokens.USDCx.percentage, data.tokens.USDCx.volume)}
-    </div>
-  </div>
 
-  <!-- Endpoint Breakdown Section -->
-  ${data.endpointBreakdown ? endpointBreakdownSection(data.endpointBreakdown) : ""}
-
-  <!-- Stacks API Section -->
-  <div class="mb-6">
-    ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
-  </div>
-
-  ${data.apiKeys ? apiKeysSection(data.apiKeys) : ""}
-
-  <!-- Sponsor Wallets Section (client-side fetch from /wallets) -->
-  <div class="mb-6" x-data="walletApp()" x-init="init()">
-    <div class="brand-section p-6">
-      <h3 class="text-lg font-semibold text-white mb-4">Sponsor Wallets</h3>
-      <div x-show="loading" class="text-gray-400 text-sm py-4">Loading wallet status...</div>
-      <div x-show="!loading && error" class="text-gray-500 text-sm py-4" x-text="error"></div>
-      <div x-show="!loading && !error && totals">
-        <!-- Summary row -->
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-          <div class="brand-card p-4">
-            <p class="text-sm text-gray-400">Total Balance</p>
-            <p class="text-xl font-bold text-white mt-2" x-text="formatSTX(totals && totals.totalBalance)"></p>
-          </div>
-          <div class="brand-card p-4">
-            <p class="text-sm text-gray-400">Total Fees Spent</p>
-            <p class="text-xl font-bold text-white mt-2" x-text="formatSTX(totals && totals.totalFeesSpent)"></p>
-          </div>
-          <div class="brand-card p-4">
-            <p class="text-sm text-gray-400">Total Tx Count</p>
-            <p class="text-xl font-bold text-white mt-2" x-text="totals && totals.totalTxCount"></p>
-          </div>
-          <div class="brand-card p-4">
-            <p class="text-sm text-gray-400">Wallet Count</p>
-            <p class="text-xl font-bold text-white mt-2" x-text="totals && totals.walletCount"></p>
-          </div>
-        </div>
-        <!-- Per-wallet table -->
-        <div class="overflow-x-auto">
-          <table class="w-full">
-            <thead>
-              <tr class="text-left text-gray-400 text-sm">
-                <th class="py-2 px-4 font-medium">#</th>
-                <th class="py-2 px-4 font-medium">Address</th>
-                <th class="py-2 px-4 font-medium text-right">Balance</th>
-                <th class="py-2 px-4 font-medium text-right">Fees Spent</th>
-                <th class="py-2 px-4 font-medium text-right">Txs Today</th>
-                <th class="py-2 px-4 font-medium text-right">Pool</th>
-                <th class="py-2 px-4 font-medium text-right">Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              <template x-for="wallet in wallets" :key="wallet.index">
-                <tr class="border-t" style="border-color: #1a1a1a">
-                  <td class="py-3 px-4 text-gray-400 text-sm" x-text="wallet.index"></td>
-                  <td class="py-3 px-4">
-                    <code class="text-sm font-mono text-purple-400" x-text="truncateAddr(wallet.address)"></code>
-                  </td>
-                  <td class="py-3 px-4 text-right">
-                    <span class="text-white font-medium" x-text="formatSTX(wallet.balance)"></span>
-                  </td>
-                  <td class="py-3 px-4 text-right">
-                    <span class="text-gray-400 text-sm" x-text="formatSTX(wallet.totalFeesSpent)"></span>
-                  </td>
-                  <td class="py-3 px-4 text-right">
-                    <span class="text-white" x-text="wallet.txCountToday"></span>
-                    <span class="text-gray-500 text-xs ml-1" x-text="'(' + wallet.txCount + ' total)'"></span>
-                  </td>
-                  <td class="py-3 px-4 text-right text-sm text-gray-400">
-                    <span x-text="wallet.pool.available + ' avail / ' + wallet.pool.reserved + ' rsv'"></span>
-                  </td>
-                  <td class="py-3 px-4 text-right">
-                    <span class="px-2 py-0.5 text-xs rounded-full font-medium"
-                          :style="'background-color: ' + statusColor(wallet.status) + '20; color: ' + statusColor(wallet.status) + '; border: 1px solid ' + statusColor(wallet.status) + '40'"
-                          x-text="statusLabel(wallet.status)"></span>
-                  </td>
-                </tr>
-              </template>
-            </tbody>
-          </table>
+    <!-- Token Breakdown -->
+    <div class="detail-section" x-data="{ open: false }">
+      <button class="detail-section__header" @click="open = !open" type="button">
+        <span class="text-sm font-semibold text-white">Token Breakdown</span>
+        <svg class="detail-section__chevron" :class="{ 'detail-section__chevron--open': open }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div class="detail-section__body" x-show="open" x-cloak>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          ${tokenCard("STX", data.tokens.STX.count, data.tokens.STX.percentage, data.tokens.STX.volume)}
+          ${tokenCard("sBTC", data.tokens.sBTC.count, data.tokens.sBTC.percentage, data.tokens.sBTC.volume)}
+          ${tokenCard("USDCx", data.tokens.USDCx.count, data.tokens.USDCx.percentage, data.tokens.USDCx.volume)}
         </div>
       </div>
     </div>
+
+    ${data.endpointBreakdown && (data.endpointBreakdown.relay.total + data.endpointBreakdown.sponsor.total + data.endpointBreakdown.settle.total + data.endpointBreakdown.verify.total) > 0 ? `
+    <!-- Endpoint Breakdown -->
+    <div class="detail-section" x-data="{ open: false }">
+      <button class="detail-section__header" @click="open = !open" type="button">
+        <span class="text-sm font-semibold text-white">Endpoint Breakdown (Today)</span>
+        <svg class="detail-section__chevron" :class="{ 'detail-section__chevron--open': open }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div class="detail-section__body" x-show="open" x-cloak>
+        ${data.endpointBreakdown ? endpointBreakdownCards(data.endpointBreakdown) : ""}
+      </div>
+    </div>
+    ` : ""}
+
+    <!-- Health / Stacks API -->
+    <div class="detail-section" x-data="{ open: false }">
+      <button class="detail-section__header" @click="open = !open" type="button">
+        <span class="text-sm font-semibold text-white">Stacks API Health</span>
+        <svg class="detail-section__chevron" :class="{ 'detail-section__chevron--open': open }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div class="detail-section__body" x-show="open" x-cloak>
+        ${healthCard(settlement.status, settlement.avgLatencyMs, settlement.uptime24h, settlement.lastCheck)}
+      </div>
+    </div>
+
+    <!-- Sponsor Wallets -->
+    <div class="detail-section" x-data="Object.assign({ open: false }, walletApp())" x-init="init()">
+      <button class="detail-section__header" @click="open = !open" type="button">
+        <span class="text-sm font-semibold text-white">Sponsor Wallets</span>
+        <svg class="detail-section__chevron" :class="{ 'detail-section__chevron--open': open }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div class="detail-section__body" x-show="open" x-cloak>
+        <div x-show="loading" class="text-gray-400 text-sm py-4">Loading wallet status...</div>
+        <div x-show="!loading && error" class="text-gray-500 text-sm py-4" x-text="error"></div>
+        <div x-show="!loading && !error && totals">
+          <!-- Summary row -->
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+            <div class="brand-card p-4">
+              <p class="text-sm text-gray-400">Total Balance</p>
+              <p class="text-xl font-bold text-white mt-2" x-text="formatSTX(totals && totals.totalBalance)"></p>
+            </div>
+            <div class="brand-card p-4">
+              <p class="text-sm text-gray-400">Total Fees Spent</p>
+              <p class="text-xl font-bold text-white mt-2" x-text="formatSTX(totals && totals.totalFeesSpent)"></p>
+            </div>
+            <div class="brand-card p-4">
+              <p class="text-sm text-gray-400">Total Tx Count</p>
+              <p class="text-xl font-bold text-white mt-2" x-text="totals && totals.totalTxCount"></p>
+            </div>
+            <div class="brand-card p-4">
+              <p class="text-sm text-gray-400">Wallet Count</p>
+              <p class="text-xl font-bold text-white mt-2" x-text="totals && totals.walletCount"></p>
+            </div>
+          </div>
+          <!-- Per-wallet table -->
+          <div class="overflow-x-auto">
+            <table class="w-full">
+              <thead>
+                <tr class="text-left text-gray-400 text-sm">
+                  <th class="py-2 px-4 font-medium">#</th>
+                  <th class="py-2 px-4 font-medium">Address</th>
+                  <th class="py-2 px-4 font-medium text-right">Balance</th>
+                  <th class="py-2 px-4 font-medium text-right">Fees Spent</th>
+                  <th class="py-2 px-4 font-medium text-right">Txs Today</th>
+                  <th class="py-2 px-4 font-medium text-right">Pool</th>
+                  <th class="py-2 px-4 font-medium text-right">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="wallet in wallets" :key="wallet.index">
+                  <tr class="border-t" style="border-color: #1a1a1a">
+                    <td class="py-3 px-4 text-gray-400 text-sm" x-text="wallet.index"></td>
+                    <td class="py-3 px-4">
+                      <code class="text-sm font-mono text-purple-400" x-text="truncateAddr(wallet.address)"></code>
+                    </td>
+                    <td class="py-3 px-4 text-right">
+                      <span class="text-white font-medium" x-text="formatSTX(wallet.balance)"></span>
+                    </td>
+                    <td class="py-3 px-4 text-right">
+                      <span class="text-gray-400 text-sm" x-text="formatSTX(wallet.totalFeesSpent)"></span>
+                    </td>
+                    <td class="py-3 px-4 text-right">
+                      <span class="text-white" x-text="wallet.txCountToday"></span>
+                      <span class="text-gray-500 text-xs ml-1" x-text="'(' + wallet.txCount + ' total)'"></span>
+                    </td>
+                    <td class="py-3 px-4 text-right text-sm text-gray-400">
+                      <span x-text="wallet.pool.available + ' avail / ' + wallet.pool.reserved + ' rsv'"></span>
+                    </td>
+                    <td class="py-3 px-4 text-right">
+                      <span class="px-2 py-0.5 text-xs rounded-full font-medium"
+                            :style="'background-color: ' + statusColor(wallet.status) + '20; color: ' + statusColor(wallet.status) + '; border: 1px solid ' + statusColor(wallet.status) + '40'"
+                            x-text="statusLabel(wallet.status)"></span>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    ${data.apiKeys ? `
+    <!-- API Keys -->
+    <div class="detail-section" x-data="{ open: false }">
+      <button class="detail-section__header" @click="open = !open" type="button">
+        <span class="text-sm font-semibold text-white">API Keys</span>
+        <svg class="detail-section__chevron" :class="{ 'detail-section__chevron--open': open }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div class="detail-section__body" x-show="open" x-cloak>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400">Total Active</p>
+            <p class="text-2xl font-bold text-white mt-2">${escapeHtml(String(data.apiKeys.totalActiveKeys))}</p>
+          </div>
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400">Registered (7d)</p>
+            <p class="text-2xl font-bold text-green-400 mt-2">${escapeHtml(String(data.apiKeys.newKeysLast7Days))}</p>
+          </div>
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400">Expired</p>
+            <p class="text-2xl font-bold text-yellow-400 mt-2">${escapeHtml(String(data.apiKeys.expiredKeys))}</p>
+          </div>
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400">Revoked</p>
+            <p class="text-2xl font-bold text-red-400 mt-2">${escapeHtml(String(data.apiKeys.revokedKeys))}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+    ` : ""}
+
   </div>
 </main>
 
