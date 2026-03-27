@@ -5209,18 +5209,41 @@ export class NonceDO {
       .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM wallet_hand")
       .toArray()[0]?.cnt ?? 0;
 
-    const dispatchQueueCount = this.sql
+    const totalDqCount = this.sql
+      .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM dispatch_queue")
+      .toArray()[0]?.cnt ?? 0;
+
+    const activeDqCount = this.sql
       .exec<{ cnt: number }>(
         "SELECT COUNT(*) as cnt FROM dispatch_queue WHERE state != 'confirmed'"
       )
       .toArray()[0]?.cnt ?? 0;
 
-    // Migration only needed when wallet_hand is empty and dispatch_queue has rows
-    if (walletHandCount > 0 || dispatchQueueCount === 0) return;
+    // Migration only needed when wallet_hand is empty and dispatch_queue has active rows
+    if (walletHandCount > 0 || activeDqCount === 0) {
+      // Log skip reason on first few alarms for observability
+      if (walletHandCount === 0 && totalDqCount > 0) {
+        this.log("info", "gin_rummy_migration_skipped", {
+          reason: "dispatch_queue has only confirmed rows — no active work to migrate",
+          walletHandCount,
+          totalDqCount,
+          activeDqCount,
+        });
+      }
+      return;
+    }
+
+    this.log("info", "gin_rummy_migration_starting", {
+      walletHandCount,
+      totalDqCount,
+      activeDqCount,
+    });
 
     const now = new Date().toISOString();
 
-    // 1. Backfill wallet_hand from dispatch_queue — non-confirmed → 'dispatched', confirmed → 'confirmed'
+    // 1. Backfill wallet_hand from ALL dispatch_queue rows
+    //    Non-confirmed → 'dispatched', confirmed → 'confirmed'
+    //    INSERT OR IGNORE: safe to re-run if interrupted
     this.sql.exec(
       `INSERT OR IGNORE INTO wallet_hand
          (wallet_index, sponsor_nonce, state, sender_address, sender_nonce,
@@ -5231,7 +5254,7 @@ export class NonceDO {
          CASE WHEN state = 'confirmed' THEN 'confirmed' ELSE 'dispatched' END,
          sender_address,
          sender_nonce,
-         NULL,
+         original_fee,
          dispatched_at,
          confirmed_at
        FROM dispatch_queue`
@@ -5241,7 +5264,20 @@ export class NonceDO {
       .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM wallet_hand")
       .toArray()[0]?.cnt ?? 0;
 
+    // Per-state breakdown for diagnostics
+    const walletHandStates = this.sql
+      .exec<{ state: string; cnt: number }>(
+        "SELECT state, COUNT(*) as cnt FROM wallet_hand GROUP BY state"
+      )
+      .toArray();
+
+    this.log("info", "gin_rummy_migration_wallet_hand_done", {
+      totalInserted: walletHandInserted,
+      byState: Object.fromEntries(walletHandStates.map((r) => [r.state, r.cnt])),
+    });
+
     // 2. Seed sender_state from highest confirmed sender_nonce in dispatch_queue
+    //    INSERT OR IGNORE: won't overwrite if already seeded from Hiro
     this.sql.exec(
       `INSERT OR IGNORE INTO sender_state
          (sender_address, next_expected_nonce, seeded_from, seeded_at)
@@ -5260,9 +5296,21 @@ export class NonceDO {
       .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM sender_state")
       .toArray()[0]?.cnt ?? 0;
 
+    // List seeded senders for verification
+    const seededSenders = this.sql
+      .exec<{ sender_address: string; next_expected_nonce: number }>(
+        "SELECT sender_address, next_expected_nonce FROM sender_state ORDER BY sender_address"
+      )
+      .toArray();
+
     this.log("info", "gin_rummy_migration_completed", {
       wallet_hand_rows: walletHandInserted,
+      wallet_hand_states: Object.fromEntries(walletHandStates.map((r) => [r.state, r.cnt])),
       sender_state_rows: senderStateInserted,
+      seeded_senders: seededSenders.map((s) => ({
+        address: s.sender_address,
+        nextNonce: s.next_expected_nonce,
+      })),
     });
   }
 
@@ -5763,12 +5811,30 @@ export class NonceDO {
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
-        // Run gin rummy migration once (no-op after first successful run)
+        // --- Gin rummy preamble: migration, replay recycling, seed upgrades ---
         this.runGinRummyMigration();
-        // Recycle up to 5 replay_buffer entries back into sender_hand for re-dispatch
         this.recycleReplayBuffer();
-        // Upgrade 'first_tx' sender seeds to Hiro-authoritative values
         await this.retrySeedFirstTxSenders();
+
+        // Snapshot gin rummy state for alarm diagnostics
+        const senderHandTotal = this.sql
+          .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM sender_hand")
+          .toArray()[0]?.cnt ?? 0;
+        const senderStateTotal = this.sql
+          .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM sender_state")
+          .toArray()[0]?.cnt ?? 0;
+        const walletHandActive = this.sql
+          .exec<{ cnt: number }>(
+            "SELECT COUNT(*) as cnt FROM wallet_hand WHERE state IN ('allocated','dispatched','stuck')"
+          )
+          .toArray()[0]?.cnt ?? 0;
+        if (senderHandTotal > 0 || walletHandActive > 0) {
+          this.log("info", "gin_rummy_alarm_state", {
+            senderHandEntries: senderHandTotal,
+            senderStateTracked: senderStateTotal,
+            walletHandActive,
+          });
+        }
 
         const initializedWallets = await this.getInitializedWallets();
 
