@@ -1428,62 +1428,31 @@ export class NonceDO {
   ):
     | { dispatches: true }
     | { dispatches: false; heldResult: Extract<import("../types").HandSubmitResult, { dispatched: false }> } {
-    const { hand, missingNonces, nextExpected, handSize } = this.getHandGapInfo(senderAddress);
+    const { hand, nextExpected, handSize } = this.getHandGapInfo(senderAddress);
 
-    // The submitted nonce must equal nextExpected to start a gapless run
-    if (senderNonce !== nextExpected) {
-      // Gap: nonces between nextExpected and senderNonce are missing
+    // Simulate adding the submitted nonce to the existing hand and check whether
+    // the combined set forms a gapless run starting at nextExpected.
+    // This correctly handles:
+    //   - Empty hand + senderNonce === nextExpected (first tx for a sender)
+    //   - Hand has [5,6,7] + senderNonce=8 when nextExpected=5
+    //   - Internal gaps in the hand
+    const handNonceSet = new Set(hand.map((e) => e.sender_nonce));
+    handNonceSet.add(senderNonce);
+
+    // Walk from nextExpected — every nonce must be present in hand or submitted tx
+    let cursor = nextExpected;
+    while (handNonceSet.has(cursor)) {
+      cursor++;
+    }
+
+    if (cursor <= senderNonce) {
+      // Gap exists: cursor stopped before reaching senderNonce.
+      // Compute the specific missing nonces for the error response.
       const gapNonces: number[] = [];
-      for (let n = nextExpected; n < senderNonce && gapNonces.length < 10; n++) {
-        gapNonces.push(n);
-      }
-      const expiresAt = new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
-      return {
-        dispatches: false,
-        heldResult: {
-          dispatched: false,
-          held: true,
-          nextExpected,
-          missingNonces: gapNonces,
-          handSize: 0, // tx was not inserted, so hand remains empty for this sender
-          holdReason: "gap" as const,
-          expiresAt,
-        },
-      };
-    }
-
-    // Check if the existing hand forms a contiguous prefix (no gap before senderNonce)
-    if (missingNonces.length > 0) {
-      const oldestExpiry = hand[0]?.expires_at ?? new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
-      return {
-        dispatches: false,
-        heldResult: {
-          dispatched: false,
-          held: true,
-          nextExpected,
-          missingNonces,
-          handSize, // existing hand size (not counting the uninserted tx)
-          holdReason: "gap" as const,
-          expiresAt: oldestExpiry,
-        },
-      };
-    }
-
-    // Also verify the hand forms a contiguous prefix up to senderNonce
-    let expectedCursor = nextExpected;
-    for (const entry of hand) {
-      if (entry.sender_nonce === expectedCursor) {
-        expectedCursor++;
-      } else {
-        break;
-      }
-    }
-
-    if (expectedCursor < senderNonce) {
-      // Gap exists in the hand before the submitted nonce
-      const gapNonces: number[] = [];
-      for (let n = expectedCursor; n < senderNonce && gapNonces.length < 10; n++) {
-        gapNonces.push(n);
+      for (let n = nextExpected; n <= senderNonce && gapNonces.length < 10; n++) {
+        if (!handNonceSet.has(n)) {
+          gapNonces.push(n);
+        }
       }
       const oldestExpiry = hand[0]?.expires_at ?? new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
       return {
