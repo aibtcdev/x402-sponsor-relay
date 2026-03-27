@@ -16,9 +16,23 @@ import {
   generateWallet,
 } from "@stacks/wallet-sdk";
 import { SERVICE_DEGRADED_RETRY_AFTER_S } from "../types";
-import type { Env, Logger, FeeTransactionType, FeePriority, WalletStatus, WalletsResponse } from "../types";
+import type { Env, Logger, FeeTransactionType, FeePriority, WalletStatus, WalletsResponse, HandSubmitResult, SponsorHeld } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix } from "../utils";
 import { FeeService } from "./fee";
+
+/**
+ * Typed error thrown by submitToHand() when the DO returns a 4xx validation
+ * rejection (e.g., STALE_SENDER_NONCE). Callers catch this to fail fast
+ * with an accurate error code instead of falling through to the legacy path.
+ */
+interface HandSubmitValidationError extends Error {
+  code: string;
+  isHandSubmitValidation: true;
+}
+
+function isHandSubmitValidationError(e: unknown): e is HandSubmitValidationError {
+  return e instanceof Error && (e as HandSubmitValidationError).isHandSubmitValidation === true;
+}
 
 /**
  * Successful transaction validation result
@@ -73,7 +87,7 @@ export interface SponsorFailure {
 /**
  * Result of transaction sponsoring (discriminated union)
  */
-export type SponsorResult = SponsorSuccess | SponsorFailure;
+export type SponsorResult = SponsorSuccess | SponsorFailure | SponsorHeld;
 
 // Module-level cache for derived sponsor keys (accountIndex → privateKey).
 // Env vars cannot change during a worker instance's lifetime — when secrets are
@@ -248,6 +262,17 @@ export class SponsorService {
     return this.env.STACKS_NETWORK === "mainnet"
       ? STACKS_MAINNET
       : STACKS_TESTNET;
+  }
+
+  /**
+   * Derive a c32check-encoded Stacks address from a transaction's spending condition.
+   * Shared by validateTransaction() and validateNonSponsoredTransaction().
+   */
+  private deriveSenderAddress(transaction: StacksTransactionWire): string {
+    const network = this.getNetwork();
+    const { hashMode, signer } = transaction.auth.spendingCondition;
+    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
+    return addressToString(addressFromVersionHash(version, signer));
   }
 
   /**
@@ -532,6 +557,58 @@ export class SponsorService {
   }
 
   /**
+   * Submit a transaction to the NonceDO hand-submit endpoint.
+   * The DO adds it to the sender's hand and checks for a gapless run.
+   * Returns the HandSubmitResult, or null if the DO is unavailable (fall back to legacy path).
+   *
+   * @param mode - "hold" (default): insert into hand even if held (async callers like /relay).
+   *               "immediate": reject without inserting if a gap exists (sync callers like /sponsor).
+   */
+  private async submitToHand(
+    senderAddress: string,
+    senderNonce: number,
+    txHex: string,
+    mode: "hold" | "immediate" = "hold"
+  ): Promise<HandSubmitResult | null> {
+    if (!this.env.NONCE_DO) return null;
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch("https://nonce-do/hand-submit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ senderAddress, senderNonce, txHex, mode }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        this.logger.warn("NonceDO /hand-submit error", {
+          status: response.status,
+          body: text,
+        });
+        // Propagate 4xx validation errors (e.g., STALE_SENDER_NONCE) so callers
+        // can fail fast with an accurate code. Only return null for 5xx/timeouts
+        // (unavailable) to fall through to the legacy path.
+        if (response.status >= 400 && response.status < 500) {
+          let parsed: { error?: string; code?: string } = {};
+          try { parsed = JSON.parse(text); } catch { /* use defaults */ }
+          const err = new Error(parsed.error ?? `NonceDO rejected with ${response.status}`);
+          (err as HandSubmitValidationError).code = parsed.code ?? "DO_VALIDATION_ERROR";
+          (err as HandSubmitValidationError).isHandSubmitValidation = true;
+          throw err;
+        }
+        return null;
+      }
+
+      return (await response.json()) as HandSubmitResult;
+    } catch (e) {
+      this.logger.warn("Failed to call NonceDO /hand-submit", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
+  }
+
+  /**
    * Fast O(1) pre-validation of transaction hex before expensive deserialization.
    *
    * Checks:
@@ -623,18 +700,10 @@ export class SponsorService {
       };
     }
 
-    // Derive a proper c32check-encoded Stacks address from the signer hash160.
-    // Uses the same hashMode-aware derivation as SettlementService.senderToAddress()
-    // so the address format is consistent across sponsored and self-pay paths.
-    const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
-    const { hashMode, signer } = transaction.auth.spendingCondition;
-    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
-    const senderAddress = addressToString(addressFromVersionHash(version, signer));
-
     return {
       valid: true,
       transaction,
-      senderAddress,
+      senderAddress: this.deriveSenderAddress(transaction),
     };
   }
 
@@ -681,30 +750,32 @@ export class SponsorService {
       };
     }
 
-    // Derive a proper c32check-encoded Stacks address from the signer hash160.
-    // Uses the same hashMode-aware derivation as validateNonSponsoredTransaction()
-    // so the address format is consistent across sponsored and self-pay paths.
-    const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
-    const { hashMode, signer } = transaction.auth.spendingCondition;
-    const version = addressHashModeToVersion(hashMode as AddressHashMode, network);
-    const senderAddress = addressToString(addressFromVersionHash(version, signer));
-
     return {
       valid: true,
       transaction,
-      senderAddress,
+      senderAddress: this.deriveSenderAddress(transaction),
     };
   }
 
   /**
    * Sponsor a validated transaction using round-robin wallet selection.
    *
-   * When NONCE_DO is configured, fetchNonceFromDO returns both nonce and walletIndex.
-   * The walletIndex determines which BIP-44 account key is used for signing.
-   * The walletIndex is included in SponsorSuccess so callers can route release calls.
+   * When NONCE_DO is configured, routes through the gin rummy hand-submit path:
+   * the tx is added to the sender's hand and checked for a gapless run. If a run
+   * exists, the nonce is assigned and sponsoring proceeds. If the tx fills a gap,
+   * it is held and SponsorHeld is returned.
+   *
+   * Falls back to the legacy fetchNonceFromDO path when hand-submit is unavailable.
+   *
+   * @param transaction - The deserialized sponsored transaction to sign
+   * @param originalTxHex - Original hex for hand-submit (defaults to re-serialized)
+   * @param mode - "hold" (default): queue tx even if held (for /relay and /settle async paths).
+   *               "immediate": reject without queuing if a gap exists (for /sponsor sync path).
    */
   async sponsorTransaction(
-    transaction: StacksTransactionWire
+    transaction: StacksTransactionWire,
+    originalTxHex?: string,
+    mode: "hold" | "immediate" = "hold"
   ): Promise<SponsorResult> {
     const network = this.getNetwork();
 
@@ -723,86 +794,155 @@ export class SponsorService {
     let totalReserved = 0;
 
     if (this.env.NONCE_DO) {
-      // Derive wallet 0 address for the NonceDO request.
-      // The DO will do round-robin internally and return the actual walletIndex used.
-      const wallet0Key = await this.getSponsorKeyForWallet(0);
-      if (!wallet0Key) {
-        this.logger.error("Sponsor key not configured");
-        return {
-          success: false,
-          error: "Service not configured",
-          details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
-        };
-      }
-      const wallet0Address = getAddressFromPrivateKey(wallet0Key, network);
+      // --- Gin rummy dispatch path ---
+      // Extract sender identity from the deserialized transaction
+      const senderNonce = Number(transaction.auth.spendingCondition.nonce);
+      // Use the provided originalTxHex, or re-serialize the transaction as fallback
+      const txHexForHand = originalTxHex ?? transaction.serialize();
 
-      // NONCE_DO is configured — it is the authoritative source; fail fast if unavailable
-      const doResult = await this.fetchNonceFromDO(wallet0Address);
-      if (doResult.ok) {
-        sponsorNonce = doResult.nonce;
-        walletIndex = doResult.walletIndex;
-        totalReserved = doResult.totalReserved;
+      // Derive senderAddress from the transaction's spending condition hash
+      const senderAddress = this.deriveSenderAddress(transaction);
+
+      let handResult: HandSubmitResult | null;
+      try {
+        handResult = await this.submitToHand(senderAddress, senderNonce, txHexForHand, mode);
+      } catch (e) {
+        if (isHandSubmitValidationError(e)) {
+          // DO returned a 4xx validation rejection (e.g., STALE_SENDER_NONCE).
+          // Fail fast with an accurate code instead of falling to legacy path.
+          this.logger.warn("NonceDO validation rejection", { code: e.code, error: e.message });
+          return {
+            success: false,
+            error: e.message,
+            details: `NonceDO rejected: ${e.code}`,
+            code: e.code,
+          };
+        }
+        throw e;
+      }
+
+      if (handResult !== null) {
+        if (!handResult.dispatched) {
+          // Tx is held — gap exists in the sender's nonce sequence
+          this.logger.info(
+            mode === "immediate"
+              ? "Nonce gap — rejected (immediate mode, not enqueued)"
+              : "Transaction held in sender hand — nonce gap",
+            {
+              senderAddress,
+              senderNonce,
+              nextExpected: handResult.nextExpected,
+              missingNonces: handResult.missingNonces,
+              mode,
+            }
+          );
+          return {
+            success: false,
+            held: true,
+            nextExpected: handResult.nextExpected,
+            missingNonces: handResult.missingNonces,
+            handSize: handResult.handSize,
+            expiresAt: handResult.expiresAt,
+            holdReason: handResult.missingNonces.length > 0 ? "gap" : "capacity",
+            // Forward recently-expired nonce info so agents can understand why their
+            // previously-submitted nonces disappeared from the queue after the 5-min timeout.
+            ...(handResult.recentlyExpired && { recentlyExpired: handResult.recentlyExpired }),
+          } satisfies SponsorHeld;
+        }
+
+        // Dispatched — use the assigned nonce and wallet index from the DO
+        sponsorNonce = BigInt(handResult.sponsorNonce);
+        walletIndex = handResult.walletIndex;
         nonceFromDO = true;
-        assignedNonceValue = Number(doResult.nonce);
-        this.logger.debug("Using NonceDO sponsor nonce", {
-          sponsorNonce: sponsorNonce.toString(),
+        assignedNonceValue = handResult.sponsorNonce;
+        this.logger.debug("Transaction dispatched via hand-submit", {
+          senderAddress,
+          senderNonce,
+          sponsorNonce: handResult.sponsorNonce,
           walletIndex,
-          totalReserved,
         });
       } else {
-        // Propagate specific error codes from NonceDO
-        const isChainingLimit = doResult.code === "CHAINING_LIMIT_EXCEEDED";
-        const isLowHeadroom = doResult.code === "LOW_HEADROOM";
-        const isAllDegraded = doResult.code === "ALL_WALLETS_DEGRADED";
-        let code: string;
-        if (isAllDegraded) {
-          code = "SERVICE_DEGRADED";
-        } else if (isChainingLimit) {
-          code = "RATE_LIMIT_EXCEEDED";
-        } else if (isLowHeadroom) {
-          code = "LOW_HEADROOM";
-        } else {
-          code = "NONCE_DO_UNAVAILABLE";
-        }
-        this.logger.error("NonceDO nonce assignment failed", {
-          code: doResult.code,
-          error: doResult.error,
-          status: doResult.status,
-          mempoolDepth: doResult.mempoolDepth,
-          estimatedDrainSeconds: doResult.estimatedDrainSeconds,
-          retryAfterSeconds: doResult.retryAfterSeconds,
-        });
+        // hand-submit failed (DO unavailable or error) — fall back to legacy assign path
+        this.logger.warn("hand-submit unavailable; falling back to legacy assign path");
 
-        let details: string;
-        let retryAfter: number | undefined;
-        if (isAllDegraded) {
-          const totalReserved = doResult.totalReserved ?? 0;
-          const totalCapacity = doResult.totalCapacity ?? 0;
-          details =
-            `All sponsor wallets are circuit-broken due to nonce contention. ` +
-            `${totalReserved} nonces in-flight out of ${totalCapacity} capacity. ` +
-            `Retry in ${SERVICE_DEGRADED_RETRY_AFTER_S}s after the pool recovers.`;
-          retryAfter = SERVICE_DEGRADED_RETRY_AFTER_S;
-        } else if (isChainingLimit && doResult.mempoolDepth !== undefined && doResult.estimatedDrainSeconds !== undefined) {
-          details = `All sponsor wallets at chaining limit (mempool depth: ${doResult.mempoolDepth}); retry in ~${doResult.estimatedDrainSeconds}s`;
-        } else if (isChainingLimit) {
-          details = "All sponsor wallets at chaining limit; retry in a few seconds";
-        } else if (isLowHeadroom && doResult.retryAfterSeconds !== undefined) {
-          details = `Nonce pool headroom is low; retry in ~${doResult.retryAfterSeconds}s`;
-          retryAfter = doResult.retryAfterSeconds;
-        } else if (isLowHeadroom) {
-          details = "Nonce pool headroom is low; retry in a few seconds";
-        } else {
-          details = "NonceDO did not return a nonce; retry in a few seconds";
+        const wallet0Key = await this.getSponsorKeyForWallet(0);
+        if (!wallet0Key) {
+          this.logger.error("Sponsor key not configured");
+          return {
+            success: false,
+            error: "Service not configured",
+            details: "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY",
+          };
         }
+        const wallet0Address = getAddressFromPrivateKey(wallet0Key, network);
 
-        return {
-          success: false,
-          error: doResult.error,
-          details,
-          code,
-          retryAfter,
-        };
+        const doResult = await this.fetchNonceFromDO(wallet0Address);
+        if (doResult.ok) {
+          sponsorNonce = doResult.nonce;
+          walletIndex = doResult.walletIndex;
+          totalReserved = doResult.totalReserved;
+          nonceFromDO = true;
+          assignedNonceValue = Number(doResult.nonce);
+          this.logger.debug("Using legacy NonceDO sponsor nonce (hand-submit fallback)", {
+            sponsorNonce: sponsorNonce.toString(),
+            walletIndex,
+            totalReserved,
+          });
+        } else {
+          // Propagate specific error codes from NonceDO
+          const isChainingLimit = doResult.code === "CHAINING_LIMIT_EXCEEDED";
+          const isLowHeadroom = doResult.code === "LOW_HEADROOM";
+          const isAllDegraded = doResult.code === "ALL_WALLETS_DEGRADED";
+          let code: string;
+          if (isAllDegraded) {
+            code = "SERVICE_DEGRADED";
+          } else if (isChainingLimit) {
+            code = "RATE_LIMIT_EXCEEDED";
+          } else if (isLowHeadroom) {
+            code = "LOW_HEADROOM";
+          } else {
+            code = "NONCE_DO_UNAVAILABLE";
+          }
+          this.logger.error("NonceDO nonce assignment failed", {
+            code: doResult.code,
+            error: doResult.error,
+            status: doResult.status,
+            mempoolDepth: doResult.mempoolDepth,
+            estimatedDrainSeconds: doResult.estimatedDrainSeconds,
+            retryAfterSeconds: doResult.retryAfterSeconds,
+          });
+
+          let details: string;
+          let retryAfter: number | undefined;
+          if (isAllDegraded) {
+            const totalReserved = doResult.totalReserved ?? 0;
+            const totalCapacity = doResult.totalCapacity ?? 0;
+            details =
+              `All sponsor wallets are circuit-broken due to nonce contention. ` +
+              `${totalReserved} nonces in-flight out of ${totalCapacity} capacity. ` +
+              `Retry in ${SERVICE_DEGRADED_RETRY_AFTER_S}s after the pool recovers.`;
+            retryAfter = SERVICE_DEGRADED_RETRY_AFTER_S;
+          } else if (isChainingLimit && doResult.mempoolDepth !== undefined && doResult.estimatedDrainSeconds !== undefined) {
+            details = `All sponsor wallets at chaining limit (mempool depth: ${doResult.mempoolDepth}); retry in ~${doResult.estimatedDrainSeconds}s`;
+          } else if (isChainingLimit) {
+            details = "All sponsor wallets at chaining limit; retry in a few seconds";
+          } else if (isLowHeadroom && doResult.retryAfterSeconds !== undefined) {
+            details = `Nonce pool headroom is low; retry in ~${doResult.retryAfterSeconds}s`;
+            retryAfter = doResult.retryAfterSeconds;
+          } else if (isLowHeadroom) {
+            details = "Nonce pool headroom is low; retry in a few seconds";
+          } else {
+            details = "NonceDO did not return a nonce; retry in a few seconds";
+          }
+
+          return {
+            success: false,
+            error: doResult.error,
+            details,
+            code,
+            retryAfter,
+          };
+        }
       }
     } else {
       // NONCE_DO not configured — fall back to Hiro with a warning (local dev / unconfigured)
@@ -1378,6 +1518,52 @@ export async function releaseNonceDO(
  * Call via executionCtx.waitUntil() as fire-and-forget alongside recordBroadcastOutcomeDO().
  * Never throws — all errors are logged as warnings.
  */
+/**
+ * Fire-and-forget nonce lifecycle calls after a successful broadcast.
+ * Consolidates the four parallel DO calls (release, recordTxid, broadcastOutcome,
+ * queueDispatch) into a single waitUntil-friendly promise.
+ * Never throws — all errors are logged as warnings.
+ */
+export async function nonceLifecycleOnBroadcastSuccess(
+  env: Env,
+  logger: Logger,
+  opts: {
+    sponsorNonce: number;
+    walletIndex: number;
+    txid: string;
+    fee?: string;
+    senderTxHex: string;
+    senderAddress: string;
+    senderNonce: number;
+  }
+): Promise<void> {
+  // Record broadcast outcome FIRST so ledgerBroadcastOutcome() runs while state is
+  // still non-terminal. If releaseNonceDO() ran first the nonce would already be
+  // terminal and the outcome write would be skipped.
+  try {
+    await recordBroadcastOutcomeDO(
+      env, logger, opts.sponsorNonce, opts.walletIndex,
+      opts.txid, 200, undefined, undefined
+    );
+  } catch (e) {
+    logger.warn("Failed to record broadcast outcome", { error: String(e) });
+  }
+
+  // Now release nonce and queue dispatch in parallel (order-independent)
+  await Promise.all([
+    releaseNonceDO(env, logger, opts.sponsorNonce, opts.txid, opts.walletIndex, opts.fee),
+    recordNonceTxid(env, logger, opts.txid, opts.sponsorNonce),
+    queueDispatchDO(
+      env, logger, opts.walletIndex,
+      opts.senderTxHex, opts.senderAddress,
+      opts.senderNonce, opts.sponsorNonce,
+      opts.fee ?? null
+    ),
+  ]).catch((e) => {
+    logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
+  });
+}
+
 export async function queueDispatchDO(
   env: Env,
   logger: Logger,
@@ -1385,7 +1571,8 @@ export async function queueDispatchDO(
   senderTxHex: string,
   senderAddress: string,
   senderNonce: number,
-  sponsorNonce: number
+  sponsorNonce: number,
+  fee?: string | null
 ): Promise<void> {
   if (!env.NONCE_DO) {
     return;
@@ -1401,6 +1588,7 @@ export async function queueDispatchDO(
         senderAddress,
         senderNonce,
         sponsorNonce,
+        fee: fee ?? null,
       }),
     });
     if (!response.ok) {

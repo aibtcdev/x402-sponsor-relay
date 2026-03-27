@@ -410,6 +410,8 @@ export const X402_V2_ERROR_CODES = {
   CLIENT_BAD_NONCE: "client_bad_nonce",
   /** Transaction signature is invalid — wrong network, mismatched key, or corrupted bytes */
   SIGNATURE_VALIDATION_FAILED: "signature_validation_failed",
+  /** Transaction is held pending a sender nonce gap fill — agent must submit missing nonces */
+  TRANSACTION_HELD: "transaction_held",
 } as const;
 
 /**
@@ -602,7 +604,8 @@ export type RelayErrorCode =
   | "INVALID_BTC_ADDRESS"
   | "MALFORMED_PAYLOAD"
   | "QUEUE_NOT_FOUND"
-  | "QUEUE_ACCESS_DENIED";
+  | "QUEUE_ACCESS_DENIED"
+  | "SENDER_NONCE_GAP";
 
 /**
  * Default retry-after for SERVICE_DEGRADED responses (seconds).
@@ -1254,4 +1257,263 @@ export interface TxStatusRecord {
   blockHeight?: number;
   /** Error reason (if failed) */
   errorReason?: string;
+}
+
+// =============================================================================
+// Gin Rummy Dispatch Types (Phase 1 — data model)
+// =============================================================================
+
+/**
+ * Info about recently expired hand entries for a sender.
+ * Included in HandSubmitResult (held branch) and QueueInfo to help agents
+ * understand why previously-submitted nonces disappeared from the queue
+ * after the 5-minute hold timeout expired.
+ */
+export interface RecentExpiryInfo {
+  /** Sender nonces that expired from the hand */
+  nonces: number[];
+  /** ISO timestamp when the expiry was recorded */
+  expiredAt: string;
+}
+
+/**
+ * A single entry in a sender's hand queue (sender_hand table row).
+ * Each entry represents an agent-submitted or replay transaction waiting
+ * to be dispatched.
+ */
+export interface SenderHandEntry {
+  /** Sender's Stacks address */
+  sender_address: string;
+  /** Sender's account nonce for this transaction */
+  sender_nonce: number;
+  /** Hex-encoded signed sponsored transaction (sponsor slot may be empty) */
+  tx_hex: string;
+  /** Origin of this entry: 'agent' = direct submission, 'replay' = re-queued after stuck slot */
+  source: "agent" | "replay";
+  /** ISO timestamp when the entry was received */
+  received_at: string;
+  /** ISO timestamp when the entry expires (received_at + HAND_HOLD_TIMEOUT_MS) */
+  expires_at: string;
+}
+
+/**
+ * Per-sender nonce tracking state (sender_state table row).
+ * Tracks the next expected nonce for each sender that has submitted transactions.
+ */
+export interface SenderState {
+  /** Sender's Stacks address */
+  sender_address: string;
+  /** The next nonce we expect this sender to use (gapless run start) */
+  next_expected_nonce: number;
+  /**
+   * Source of the initial seed:
+   * - 'hiro': seeded from Hiro possible_next_nonce (authoritative)
+   * - 'relay_cache': seeded from highest confirmed nonce in dispatch history
+   * - 'first_tx': seeded from the first observed tx nonce (Hiro was unreachable)
+   */
+  seeded_from: "hiro" | "relay_cache" | "first_tx";
+  /** ISO timestamp when the seed was first recorded */
+  seeded_at: string;
+  /** ISO timestamp of last advanceSenderNonce() call (null if never advanced) */
+  last_advanced_at: string | null;
+}
+
+/**
+ * A single slot in a sponsor wallet's nonce hand (wallet_hand table row).
+ * Tracks the lifecycle of each sponsor nonce slot from available to confirmed.
+ *
+ * State machine:
+ *   available → allocated → dispatched → confirmed
+ *                                     → stuck
+ *                                     → flushed
+ */
+export interface WalletSlot {
+  /** Sponsor wallet index (0-based) */
+  wallet_index: number;
+  /** Sponsor nonce for this slot */
+  sponsor_nonce: number;
+  /**
+   * Current slot state:
+   * - 'available': slot is free for allocation
+   * - 'allocated': slot reserved for a sender tx, not yet broadcast
+   * - 'dispatched': transaction broadcast to the network, awaiting confirmation
+   * - 'confirmed': transaction confirmed on-chain, slot is reusable
+   * - 'stuck': broadcast tx has not confirmed beyond stuck threshold
+   * - 'flushed': slot was gap-filled with a self-transfer (slot recycled)
+   */
+  state: "available" | "allocated" | "dispatched" | "confirmed" | "stuck" | "flushed";
+  /** Sender's Stacks address (null for available/flushed slots) */
+  sender_address: string | null;
+  /** Sender's account nonce (null for available/flushed slots) */
+  sender_nonce: number | null;
+  /** Sponsor fee paid for this slot in microSTX (null until dispatched) */
+  original_fee: string | null;
+  /** ISO timestamp when the transaction was dispatched (null until dispatched) */
+  dispatched_at: string | null;
+  /** ISO timestamp when the slot was confirmed (null until confirmed) */
+  confirmed_at: string | null;
+}
+
+/**
+ * Discriminated union returned by NonceDO POST /hand-submit.
+ * dispatched=true: a gapless run was found and txs are queued for broadcast.
+ * dispatched=false: the tx was held because a nonce gap exists.
+ */
+export type HandSubmitResult =
+  | {
+      dispatched: true;
+      /** Sponsor nonce assigned to the first tx in the dispatched run */
+      sponsorNonce: number;
+      /** Wallet index that owns this nonce slot */
+      walletIndex: number;
+      /** Sponsor wallet Stacks address */
+      sponsorAddress: string;
+    }
+  | {
+      dispatched: false;
+      held: true;
+      /** The next sender nonce we need before any dispatch can happen */
+      nextExpected: number;
+      /** Nonces that are missing to form a gapless run (gap between nextExpected and hand) */
+      missingNonces: number[];
+      /** Total entries currently in the sender's hand */
+      handSize: number;
+      /** ISO timestamp when the oldest hand entry expires */
+      expiresAt: string;
+      /**
+       * Why the tx is held:
+       * - 'gap': missing sender nonces before this tx (missingNonces is non-empty)
+       * - 'capacity': no wallet headroom to dispatch (missingNonces is empty)
+       */
+      holdReason?: "gap" | "capacity";
+      /**
+       * Info about recently expired hand entries, if any expired before this submission.
+       * Helps agents understand why previously-submitted nonces are missing from the queue.
+       */
+      recentlyExpired?: RecentExpiryInfo;
+    };
+
+/**
+ * Result of assignRunToWallet(): describes which txs were dispatched vs held.
+ * All assigned txs land on the SAME walletIndex (one run → one wallet invariant).
+ */
+export interface RunDispatchResult {
+  /** Txs that were assigned sponsor nonces and inserted into dispatch_queue */
+  assigned: Array<{
+    /** Sender account nonce */
+    senderNonce: number;
+    /** Wallet index that owns this sponsor nonce slot */
+    walletIndex: number;
+    /** Sponsor nonce assigned to this tx */
+    sponsorNonce: number;
+  }>;
+  /** Txs that remain in sender_hand for the next dispatch cycle */
+  held: Array<{
+    /** Sender account nonce still in the hand */
+    senderNonce: number;
+  }>;
+}
+
+/**
+ * Held sponsoring result — tx accepted but deferred until nonce gap is filled.
+ * The caller should return HTTP 202 and instruct the agent to submit the missing nonces.
+ */
+export interface SponsorHeld {
+  success: false;
+  held: true;
+  /** The next sender nonce we need before dispatch */
+  nextExpected: number;
+  /** Missing nonces that must be submitted to unblock dispatch */
+  missingNonces: number[];
+  /** Total entries currently in the sender's hand */
+  handSize: number;
+  /** ISO timestamp when the held tx expires from the hand */
+  expiresAt: string;
+  /**
+   * Why the tx is held:
+   * - 'gap': missing sender nonces before this tx (missingNonces is non-empty)
+   * - 'capacity': no wallet headroom to dispatch (missingNonces is empty)
+   */
+  holdReason?: "gap" | "capacity";
+  /**
+   * Info about recently expired hand entries, if any expired before this submission.
+   * Helps agents understand why previously-submitted nonces are missing from the queue.
+   */
+  recentlyExpired?: RecentExpiryInfo;
+}
+
+/**
+ * Queue position info returned to agents when a transaction is held pending a nonce gap fill.
+ * Included in 202 responses from POST /relay and in POST /settle held responses.
+ */
+export interface QueueInfo {
+  /** Always "held" — indicates the tx is waiting in the sender's hand */
+  status: "held";
+  /** The nonce of the submitted transaction */
+  senderNonce: number;
+  /** The next sequential nonce the relay needs before it can dispatch */
+  nextExpectedNonce: number;
+  /** The specific nonces that must be submitted to fill the gap */
+  missingNonces: number[];
+  /** Total number of transactions in the sender's hand (including this one) */
+  handSize: number;
+  /**
+   * Estimated milliseconds until dispatch after gaps are filled.
+   * null when missingNonces.length > 0 — the agent controls dispatch timing
+   * by submitting the missing nonces.
+   */
+  estimatedDispatchMs: number | null;
+  /** ISO timestamp when the held tx expires from the hand */
+  expiresAt: string;
+  /** Actionable instruction for the agent */
+  help: string;
+  /**
+   * Recently expired nonces for this sender, if any expired before this submission.
+   * Helps agents understand why previously-submitted nonces are missing from the queue.
+   * Format: "Your nonces N, M expired after 5 minutes waiting for the gap to be filled."
+   */
+  recentlyExpired?: RecentExpiryInfo;
+}
+
+/**
+ * Alarm cadence estimate used for estimatedDispatchMs when there are no gaps.
+ * 10s is a conservative lower bound on the DO alarm tick interval.
+ */
+const ALARM_CADENCE_ESTIMATE_MS = 10_000;
+
+/**
+ * Build a QueueInfo object from a SponsorHeld result and the submitted sender nonce.
+ * Suitable for inclusion in 202 responses (POST /relay) and V2 held responses (POST /settle).
+ *
+ * @param held - The SponsorHeld result from the sponsoring service
+ * @param senderNonce - The nonce of the submitted transaction
+ * @param recentlyExpired - Optional expiry info to surface to the agent
+ */
+export function buildQueueInfo(
+  held: SponsorHeld,
+  senderNonce: number,
+  recentlyExpired?: RecentExpiryInfo
+): QueueInfo {
+  const reason = held.holdReason ?? (held.missingNonces.length > 0 ? "gap" : "capacity");
+
+  const queueInfo: QueueInfo = {
+    status: "held",
+    senderNonce,
+    nextExpectedNonce: held.nextExpected,
+    missingNonces: held.missingNonces,
+    handSize: held.handSize,
+    estimatedDispatchMs: reason === "gap" ? null : ALARM_CADENCE_ESTIMATE_MS,
+    expiresAt: held.expiresAt,
+    help: reason === "gap"
+      ? `Verify your account nonce at /fees or via the Stacks API, then submit transactions with nonces ${held.missingNonces.join(", ")} to unblock dispatch`
+      : "All wallet slots are at capacity — tx will be dispatched when headroom opens",
+  };
+
+  // Prefer explicitly passed recentlyExpired; fall back to value on the held object itself
+  const expiry = recentlyExpired ?? held.recentlyExpired;
+  if (expiry) {
+    queueInfo.recentlyExpired = expiry;
+  }
+
+  return queueInfo;
 }

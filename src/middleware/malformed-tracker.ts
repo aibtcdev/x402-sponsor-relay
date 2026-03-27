@@ -2,13 +2,12 @@
  * IP-based tracking for repeated malformed transaction payloads.
  *
  * Senders who submit 3+ malformed payloads within a 10-minute window
- * are temporarily blocked for the remainder of the window.
- *
- * can be temporarily blocked for the remainder of the window by callers that
- * enforce the result of this tracker.
+ * can be temporarily blocked for the remainder of the window by callers
+ * that enforce the result of this tracker.
  *
  * A single shared map is used so that any endpoints that consult this tracker
- * share the same malformed-attempt counts for a given IP.
+ * share the same malformed-attempt counts for a given IP, so an attacker
+ * cannot bypass the threshold by rotating between those endpoints that enforce it.
  */
 
 /** Duration of the tracking window in milliseconds (10 minutes). */

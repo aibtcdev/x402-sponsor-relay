@@ -16,13 +16,12 @@ import {
   extractSponsorNonce,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
-  recordNonceTxid,
-  queueDispatchDO,
+  nonceLifecycleOnBroadcastSuccess,
 } from "../services";
 import { stripHexPrefix } from "../utils";
 import { checkAndRecordMalformed } from "../middleware";
 import type { AppContext, SettleOptions, X402SettlementResponseV2, X402SettleRequestV2, TxStatusRecord, Logger } from "../types";
-import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
+import { CAIP2_NETWORKS, X402_V2_ERROR_CODES, buildQueueInfo } from "../types";
 
 /** Parameters for the shared post-broadcast success handler */
 interface BroadcastSuccessParams {
@@ -159,21 +158,14 @@ export class Settle extends BaseEndpoint {
     // Consume the sponsor nonce on broadcast success (fire-and-forget)
     if (sponsorNonce !== null) {
       c.executionCtx.waitUntil(
-        Promise.all([
-          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex, sponsorFee),
-          recordNonceTxid(c.env, logger, txid, sponsorNonce),
-          recordBroadcastOutcomeDO(
-            c.env, logger, sponsorNonce, sponsorWalletIndex,
-            txid, 200, undefined, undefined
-          ),
-          queueDispatchDO(
-            c.env, logger, sponsorWalletIndex,
-            txHex, payer,
-            Number(verifiedTx.auth.spendingCondition.nonce),
-            sponsorNonce
-          ),
-        ]).catch((e) => {
-          logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
+        nonceLifecycleOnBroadcastSuccess(c.env, logger, {
+          sponsorNonce,
+          walletIndex: sponsorWalletIndex,
+          txid,
+          fee: sponsorFee,
+          senderTxHex: txHex,
+          senderAddress: payer,
+          senderNonce: Number(verifiedTx.auth.spendingCondition.nonce),
         })
       );
     }
@@ -438,7 +430,33 @@ export class Settle extends BaseEndpoint {
         // Sponsor the transaction (reserves nonce from NonceDO, adds fee + sponsor sig)
         const sponsorResult = await sponsorService.sponsorTransaction(validateResult.transaction);
         if (!sponsorResult.success) {
-          logger.warn("Sponsoring failed", { error: sponsorResult.error, code: sponsorResult.code });
+          // Gin rummy: tx held — nonce gap exists.
+          // POST /settle must return HTTP 200 per V2 spec; signal held via errorReason.
+          // Include QueueInfo in the response extension so V2 clients can surface the gap info.
+          if ("held" in sponsorResult && sponsorResult.held) {
+            const senderNonce = Number(parsedTx.auth.spendingCondition.nonce);
+            const queue = buildQueueInfo(sponsorResult, senderNonce);
+            logger.warn("Sponsoring held — nonce gap in sender hand", {
+              senderNonce,
+              nextExpected: sponsorResult.nextExpected,
+              missingNonces: sponsorResult.missingNonces,
+            });
+            c.executionCtx.waitUntil(
+              Promise.all([
+                statsService.recordError("sponsoring"),
+                statsService.logFailure("settle", false, failureCtx),
+              ]).catch(() => {})
+            );
+            return c.json({
+              success: false,
+              errorReason: X402_V2_ERROR_CODES.TRANSACTION_HELD,
+              transaction: "",
+              network,
+              queue,
+            }, 200);
+          }
+          const failResult = sponsorResult as { error: string; code?: string };
+          logger.warn("Sponsoring failed", { error: failResult.error, code: failResult.code });
           c.executionCtx.waitUntil(
             Promise.all([
               statsService.recordError("sponsoring"),
@@ -448,9 +466,9 @@ export class Settle extends BaseEndpoint {
           // Transient sponsor failures — signal retryable via BROADCAST_FAILED
           // Note: SponsorService maps CHAINING_LIMIT_EXCEEDED → RATE_LIMIT_EXCEEDED
           const isTransient =
-            sponsorResult.code === "LOW_HEADROOM" ||
-            sponsorResult.code === "RATE_LIMIT_EXCEEDED" ||
-            sponsorResult.code === "SERVICE_DEGRADED";
+            failResult.code === "LOW_HEADROOM" ||
+            failResult.code === "RATE_LIMIT_EXCEEDED" ||
+            failResult.code === "SERVICE_DEGRADED";
           const errorReason = isTransient
             ? X402_V2_ERROR_CODES.BROADCAST_FAILED
             : X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE;
@@ -606,10 +624,11 @@ export class Settle extends BaseEndpoint {
                   logger.warn("Retry verify failed but sponsor nonce was null; skipping nonce release");
                 }
               }
-            } else {
+            } else if (!("held" in retrySponsorResult && retrySponsorResult.held)) {
+              const retryFail = retrySponsorResult as { error: string; code?: string };
               logger.warn("Retry sponsor failed after inline resync", {
-                error: retrySponsorResult.error,
-                code: retrySponsorResult.code,
+                error: retryFail.error,
+                code: retryFail.code,
               });
             }
           }

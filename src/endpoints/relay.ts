@@ -7,14 +7,14 @@ import {
   ReceiptService,
   StxVerifyService,
   extractSponsorNonce,
-  recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
-  queueDispatchDO,
+  nonceLifecycleOnBroadcastSuccess,
 } from "../services";
 import { checkRateLimit, RATE_LIMIT, checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import { stripHexPrefix } from "../utils";
 import type { AppContext, RelayRequest, SettlementResult, Logger } from "../types";
+import { buildQueueInfo } from "../types";
 import {
   Error400Response,
   Error401Response,
@@ -24,6 +24,23 @@ import {
   Error502Response,
   Error503Response,
 } from "../schemas";
+
+/**
+ * Reserve time (ms) for broadcast overhead, sponsoring, and response serialization.
+ * Subtracted from maxTimeoutSeconds to ensure the relay responds before the caller's timeout fires.
+ */
+const RELAY_OVERHEAD_MS = 5_000;
+
+/**
+ * Compute max poll time from caller-supplied maxTimeoutSeconds.
+ * Returns undefined (use default) when no timeout is specified.
+ */
+function computeMaxPollTimeMs(maxTimeoutSeconds?: number): number | undefined {
+  if (maxTimeoutSeconds != null && maxTimeoutSeconds > 0) {
+    return Math.max(maxTimeoutSeconds * 1000 - RELAY_OVERHEAD_MS, 1_000);
+  }
+  return undefined;
+}
 
 /**
  * Relay endpoint - sponsors and settles transactions
@@ -373,14 +390,45 @@ export class Relay extends BaseEndpoint {
         }
       }
 
-      // Step B — Sponsor the transaction
+      // Step B — Sponsor the transaction (routes through gin rummy hand-submit when NONCE_DO configured)
       const sponsorResult = await sponsorService.sponsorTransaction(
-        validation.transaction
+        validation.transaction,
+        body.transaction  // pass original hex for hand-submit sender nonce tracking
       );
       if (sponsorResult.success === false) {
+        // Gin rummy: tx held in sender hand — nonce gap exists.
+        // POST /relay is async-ok: return 202 Accepted with QueueInfo so the agent
+        // knows what nonces to submit to unblock dispatch.
+        if ("held" in sponsorResult && sponsorResult.held) {
+          const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
+          const queue = buildQueueInfo(sponsorResult, senderNonce);
+          const retryAfterSeconds = queue.estimatedDispatchMs
+            ? Math.ceil(queue.estimatedDispatchMs / 1000)
+            : 30;
+          logger.info("Transaction held in sender hand — returning 202", {
+            senderNonce,
+            missingNonces: sponsorResult.missingNonces,
+            retryAfterSeconds,
+          });
+          return new Response(
+            JSON.stringify({
+              success: true,
+              status: "held",
+              requestId: crypto.randomUUID(),
+              queue,
+            }),
+            {
+              status: 202,
+              headers: {
+                "Content-Type": "application/json",
+                "Retry-After": String(retryAfterSeconds),
+              },
+            }
+          );
+        }
         return this.sponsorFailureResponse(
           c,
-          sponsorResult,
+          sponsorResult as { error: string; details: string; code?: string; retryAfter?: number },
           statsService.recordError("sponsoring").catch(() => {})
         );
       }
@@ -421,12 +469,7 @@ export class Relay extends BaseEndpoint {
       // Step D — Broadcast and poll for confirmation.
       // Cap poll time to caller's maxTimeoutSeconds so the relay responds
       // before the caller's own timeout fires (avoids 500 empty-body errors).
-      // Reserve 5s for broadcast overhead, sponsoring, and response serialization.
-      const RELAY_OVERHEAD_MS = 5_000;
-      const maxPollTimeMs =
-        body.settle.maxTimeoutSeconds != null && body.settle.maxTimeoutSeconds > 0
-          ? Math.max(body.settle.maxTimeoutSeconds * 1000 - RELAY_OVERHEAD_MS, 1_000)
-          : undefined;
+      const maxPollTimeMs = computeMaxPollTimeMs(body.settle.maxTimeoutSeconds);
       const broadcastResult = await settlementService.broadcastAndConfirm(
         verifyResult.data.transaction,
         maxPollTimeMs
@@ -512,31 +555,14 @@ export class Relay extends BaseEndpoint {
 
                 if (retryNonce !== null) {
                   c.executionCtx.waitUntil(
-                    releaseNonceDO(c.env, logger, retryNonce, retryBroadcastResult.txid, retryWalletIndex, retryFee).catch((e) => {
-                      logger.warn("Failed to consume retry nonce after broadcast success", { error: String(e) });
-                    })
-                  );
-                  c.executionCtx.waitUntil(
-                    recordNonceTxid(c.env, logger, retryBroadcastResult.txid, retryNonce).catch((e) => {
-                      logger.warn("Failed to record retry nonce txid", { error: String(e) });
-                    })
-                  );
-                  c.executionCtx.waitUntil(
-                    recordBroadcastOutcomeDO(
-                      c.env, logger, retryNonce, retryWalletIndex,
-                      retryBroadcastResult.txid, 200, undefined, undefined
-                    ).catch((e) => {
-                      logger.warn("Failed to record retry broadcast outcome", { error: String(e) });
-                    })
-                  );
-                  c.executionCtx.waitUntil(
-                    queueDispatchDO(
-                      c.env, logger, retryWalletIndex,
-                      body.transaction, validation.senderAddress,
-                      Number(validation.transaction.auth.spendingCondition.nonce),
-                      retryNonce
-                    ).catch((e) => {
-                      logger.warn("Failed to record retry queue dispatch", { error: String(e) });
+                    nonceLifecycleOnBroadcastSuccess(c.env, logger, {
+                      sponsorNonce: retryNonce,
+                      walletIndex: retryWalletIndex,
+                      txid: retryBroadcastResult.txid,
+                      fee: retryFee,
+                      senderTxHex: body.transaction,
+                      senderAddress: validation.senderAddress,
+                      senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
                     })
                   );
                 }
@@ -642,10 +668,38 @@ export class Relay extends BaseEndpoint {
                 );
               }
             }
+          } else if ("held" in retrySponsorResult && retrySponsorResult.held) {
+            // Retry resulted in a held tx (gap or capacity) — return 202 with QueueInfo
+            // instead of a misleading 409/429 conflict error.
+            const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
+            const queue = buildQueueInfo(retrySponsorResult, senderNonce);
+            const retryAfterSeconds = queue.estimatedDispatchMs
+              ? Math.ceil(queue.estimatedDispatchMs / 1000)
+              : 30;
+            logger.info("Retry after resync held in sender hand — returning 202", {
+              senderNonce,
+              missingNonces: retrySponsorResult.missingNonces,
+              retryAfterSeconds,
+            });
+            return new Response(
+              JSON.stringify({
+                success: true,
+                status: "held",
+                requestId: crypto.randomUUID(),
+                queue,
+              }),
+              {
+                status: 202,
+                headers: {
+                  "Content-Type": "application/json",
+                  "Retry-After": String(retryAfterSeconds),
+                },
+              }
+            );
           } else {
             logger.warn("Retry sponsor failed after inline resync", {
-              error: retrySponsorResult.error,
-              code: retrySponsorResult.code,
+              error: (retrySponsorResult as { error: string }).error,
+              code: (retrySponsorResult as { code?: string }).code,
             });
           }
 
@@ -689,37 +743,15 @@ export class Relay extends BaseEndpoint {
       }
 
       if (sponsorNonce !== null) {
-        // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
-        // Also records the fee in NonceDO's cumulative per-wallet fee stats
         c.executionCtx.waitUntil(
-          releaseNonceDO(c.env, logger, sponsorNonce, broadcastResult.txid, sponsorWalletIndex, sponsorResult.fee).catch((e) => {
-            logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
-          })
-        );
-        // Also record nonce→txid mapping in NonceDO SQL table for gap detection
-        c.executionCtx.waitUntil(
-          recordNonceTxid(c.env, logger, broadcastResult.txid, sponsorNonce).catch((e) => {
-            logger.warn("Failed to record nonce txid", { error: String(e) });
-          })
-        );
-        // Record broadcast outcome for ledger fidelity (state='broadcasted', http_status=200, txid)
-        c.executionCtx.waitUntil(
-          recordBroadcastOutcomeDO(
-            c.env, logger, sponsorNonce, sponsorWalletIndex,
-            broadcastResult.txid, 200, undefined, undefined  // success path — no nodeUrl available from polling result
-          ).catch((e) => {
-            logger.warn("Failed to record broadcast outcome", { error: String(e) });
-          })
-        );
-        // Record in dispatch queue for stuck-tx flush and replay tracking
-        c.executionCtx.waitUntil(
-          queueDispatchDO(
-            c.env, logger, sponsorWalletIndex,
-            body.transaction, validation.senderAddress,
-            Number(validation.transaction.auth.spendingCondition.nonce),
-            sponsorNonce
-          ).catch((e) => {
-            logger.warn("Failed to record queue dispatch", { error: String(e) });
+          nonceLifecycleOnBroadcastSuccess(c.env, logger, {
+            sponsorNonce,
+            walletIndex: sponsorWalletIndex,
+            txid: broadcastResult.txid,
+            fee: sponsorResult.fee,
+            senderTxHex: body.transaction,
+            senderAddress: validation.senderAddress,
+            senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
           })
         );
       }
@@ -935,11 +967,7 @@ export class Relay extends BaseEndpoint {
     }
 
     // Step SP-E — Broadcast and poll for confirmation
-    const RELAY_OVERHEAD_MS = 5_000;
-    const maxPollTimeMs =
-      body.settle.maxTimeoutSeconds != null && body.settle.maxTimeoutSeconds > 0
-        ? Math.max(body.settle.maxTimeoutSeconds * 1000 - RELAY_OVERHEAD_MS, 1_000)
-        : undefined;
+    const maxPollTimeMs = computeMaxPollTimeMs(body.settle.maxTimeoutSeconds);
 
     const broadcastResult = await settlementService.broadcastAndConfirm(
       verifyResult.data.transaction,

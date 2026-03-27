@@ -238,7 +238,13 @@ export class DashboardStats extends BaseEndpoint {
 
       const dashboardData = buildDashboardData(overview, health, apiKeyStats);
 
-      return this.ok(c, dashboardData, {
+      // Fetch settlement time percentiles from NonceDO (fallback to null if unavailable)
+      const settlementTimes = await this.fetchSettlementTimes(c);
+
+      return this.ok(c, {
+        ...dashboardData,
+        ...(settlementTimes !== null ? { settlementTimes } : {}),
+      }, {
         "Cache-Control": "public, max-age=15",
       });
     } catch (e) {
@@ -253,6 +259,55 @@ export class DashboardStats extends BaseEndpoint {
         retryable: true,
         retryAfter: 5,
       });
+    }
+  }
+
+  /**
+   * Fetch settlement time percentiles from NonceDO and aggregate across wallets.
+   * Returns null when NonceDO is unavailable or has no data.
+   */
+  private async fetchSettlementTimes(
+    c: AppContext
+  ): Promise<{ p50: number; p95: number; avg: number; count: number } | null> {
+    if (!c.env.NONCE_DO) return null;
+
+    try {
+      const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
+      const resp = await stub.fetch("https://nonce-do/nonce-state");
+      if (!resp.ok) return null;
+
+      const nonceState = await resp.json() as {
+        wallets?: Array<{ settlementTimes?: { p50: number; p95: number; avg: number; count: number } }>;
+      };
+
+      const walletStats = (nonceState.wallets ?? [])
+        .map((w) => w.settlementTimes)
+        .filter((st): st is { p50: number; p95: number; avg: number; count: number } =>
+          st !== undefined && st.count > 0
+        );
+
+      if (walletStats.length === 0) {
+        return null;
+      }
+
+      const totalCount = walletStats.reduce((s, st) => s + st.count, 0);
+      const weightedAvg = Math.round(
+        walletStats.reduce((s, st) => s + st.avg * st.count, 0) / totalCount
+      );
+      // Use median of per-wallet percentiles as a simple global estimate
+      const median = (values: number[]): number => {
+        const sorted = [...values].sort((a, b) => a - b);
+        return sorted[Math.floor(sorted.length / 2)] ?? 0;
+      };
+
+      return {
+        p50: median(walletStats.map((s) => s.p50)),
+        p95: median(walletStats.map((s) => s.p95)),
+        avg: weightedAvg,
+        count: totalCount,
+      };
+    } catch {
+      return null;
     }
   }
 }

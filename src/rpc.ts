@@ -245,7 +245,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
       warning = {
         code: "SENDER_NONCE_GAP",
-        detail: `Your account has a nonce gap. You sent nonce ${nonceCheck.provided} but nonce ${nonceCheck.expected} hasn't been seen yet. Your payment will sit in the mempool until the gap is filled or expires (~42 hours).`,
+        detail: `Your account has a nonce gap. You sent nonce ${nonceCheck.provided} but nonce ${nonceCheck.expected} hasn't been seen yet. Verify your account nonce via the Stacks API and submit the missing nonce to unblock dispatch.`,
         senderNonce: {
           provided: nonceCheck.provided,
           expected: nonceCheck.expected,

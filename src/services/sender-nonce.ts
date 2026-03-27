@@ -199,7 +199,7 @@ export async function checkSenderNonce(
       lastConfirmed: cache.lastConfirmed,
       currentNonce: cache.lastConfirmed + 1,
       help,
-      action: `Re-sign your transaction with nonce ${cache.lastConfirmed + 1} and resubmit.`,
+      action: `Verify your account nonce via the Stacks API, re-sign with nonce ${cache.lastConfirmed + 1}, and resubmit.`,
     };
   }
 
@@ -222,7 +222,7 @@ export async function checkSenderNonce(
       lastConfirmed: cache.lastConfirmed,
       currentNonce: expected,
       help,
-      action: `Nonce ${providedNonce} is already in-flight. Re-sign with nonce ${expected} and resubmit.`,
+      action: `Nonce ${providedNonce} is already in-flight. Verify your account nonce via the Stacks API, re-sign with nonce ${expected}, and resubmit.`,
     };
   }
 
@@ -234,7 +234,7 @@ export async function checkSenderNonce(
       expected,
       lastSeen: cache.lastSeen,
       help,
-      action: `Submit a transaction with nonce ${expected} to unblock, or wait for mempool expiry (~42 hours).`,
+      action: `Verify your account nonce via the Stacks API, then submit a transaction with nonce ${expected} to unblock dispatch.`,
     };
   }
 

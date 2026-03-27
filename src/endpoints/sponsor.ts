@@ -6,10 +6,9 @@ import {
   AuthService,
   StxVerifyService,
   extractSponsorNonce,
-  recordNonceTxid,
   releaseNonceDO,
   recordBroadcastOutcomeDO,
-  queueDispatchDO,
+  nonceLifecycleOnBroadcastSuccess,
 } from "../services";
 import {
   Error400Response,
@@ -22,6 +21,7 @@ import {
 } from "../schemas";
 import { checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import type { AppContext, Env, Logger, SponsorRequest } from "../types";
+import { buildQueueInfo } from "../types";
 import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
 
@@ -291,13 +291,41 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
+      // mode:"immediate" — reject without queuing if a gap exists.
+      // POST /sponsor must remain synchronous (200 with txid or error, NEVER 202).
+      // MCP server and skills expect either txid or a 4xx error; they cannot handle 202.
       const sponsorResult = await sponsorService.sponsorTransaction(
-        validation.transaction
+        validation.transaction,
+        body.transaction, // pass original hex for hand-submit sender nonce tracking
+        "immediate"
       );
       if (sponsorResult.success === false) {
+        // Gin rummy: nonce gap detected — reject immediately with actionable error.
+        // The tx was NOT added to sender_hand (mode:"immediate" prevents insertion on gap).
+        if ("held" in sponsorResult && sponsorResult.held) {
+          c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+          const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
+          const queue = buildQueueInfo(sponsorResult, senderNonce);
+          logger.warn("Sender nonce gap — rejecting /sponsor request", {
+            senderNonce,
+            missingNonces: sponsorResult.missingNonces,
+            nextExpected: sponsorResult.nextExpected,
+          });
+          return c.json({
+            success: false,
+            requestId: crypto.randomUUID(),
+            code: "SENDER_NONCE_GAP",
+            error: `Sender nonce ${senderNonce} cannot be sponsored — verify your account nonce via the Stacks API, then submit nonces ${sponsorResult.missingNonces.join(", ")} to unblock dispatch`,
+            missingNonces: sponsorResult.missingNonces,
+            nextExpectedNonce: sponsorResult.nextExpected,
+            retryable: false,
+            queue,
+          }, 400);
+        }
         return this.sponsorFailureResponse(
           c,
-          sponsorResult,
+          sponsorResult as { error: string; details: string; code?: string; retryAfter?: number },
           statsService.recordError("sponsoring").catch(() => {})
         );
       }
@@ -396,37 +424,15 @@ export class Sponsor extends BaseEndpoint {
       const txid = broadcastResult.txid;
 
       if (sponsorNonce !== null) {
-        // Consume the nonce (broadcast succeeded) — removes from reserved, not returned to available
-        // Also records the fee in NonceDO's cumulative per-wallet fee stats
         c.executionCtx.waitUntil(
-          releaseNonceDO(c.env, logger, sponsorNonce, txid, sponsorWalletIndex, sponsorResult.fee).catch((e) => {
-            logger.warn("Failed to consume nonce after broadcast success", { error: String(e) });
-          })
-        );
-        // Also record nonce→txid mapping in NonceDO SQL table for gap detection
-        c.executionCtx.waitUntil(
-          recordNonceTxid(c.env, logger, txid, sponsorNonce).catch((e) => {
-            logger.warn("Failed to record nonce txid", { error: String(e) });
-          })
-        );
-        // Record broadcast outcome for ledger fidelity (state='broadcasted', txid, http_status=200)
-        c.executionCtx.waitUntil(
-          recordBroadcastOutcomeDO(
-            c.env, logger, sponsorNonce, sponsorWalletIndex,
-            txid, 200, undefined, undefined
-          ).catch((e) => {
-            logger.warn("Failed to record broadcast outcome", { error: String(e) });
-          })
-        );
-        // Record in dispatch queue for stuck-tx flush and replay tracking
-        c.executionCtx.waitUntil(
-          queueDispatchDO(
-            c.env, logger, sponsorWalletIndex,
-            body.transaction, validation.senderAddress,
-            Number(validation.transaction.auth.spendingCondition.nonce),
-            sponsorNonce
-          ).catch((e) => {
-            logger.warn("Failed to record queue dispatch", { error: String(e) });
+          nonceLifecycleOnBroadcastSuccess(c.env, logger, {
+            sponsorNonce,
+            walletIndex: sponsorWalletIndex,
+            txid,
+            fee: sponsorResult.fee,
+            senderTxHex: body.transaction,
+            senderAddress: validation.senderAddress,
+            senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
           })
         );
       }
