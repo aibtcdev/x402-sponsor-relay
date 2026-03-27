@@ -4,11 +4,7 @@ import { VERSION } from "../../version";
 /**
  * Generate full HTML document wrapper
  */
-export function htmlDocument(content: string, title: string, options?: { includeChartJs?: boolean }): string {
-  const chartJsTag = options?.includeChartJs
-    ? `\n  <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" integrity="sha384-vsrfeLOOY6KuIYKDlmVH5UiBmgIdB1oEf7p01YgWHuqmOHfZr374+odEv96n9tNC" crossorigin="anonymous"></script>`
-    : "";
-
+export function htmlDocument(content: string, title: string): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17,7 +13,7 @@ export function htmlDocument(content: string, title: string, options?: { include
   <title>${escapeHtml(title)}</title>
   <link rel="icon" type="image/png" sizes="32x32" href="https://aibtc.com/favicon-32x32.png">
   <link rel="preconnect" href="https://aibtc.com" crossorigin>
-  ${chartJsTag}<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
   <style>
     ${dashboardCss}
     [x-cloak] { display: none !important; }

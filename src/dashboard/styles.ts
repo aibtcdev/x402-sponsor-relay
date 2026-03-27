@@ -99,18 +99,24 @@ export const dashboardCss = `
   .overflow-hidden { overflow: hidden; }
   .overflow-x-auto { overflow-x: auto; }
   .items-center { align-items: center; }
+  .items-end { align-items: flex-end; }
   .justify-between { justify-content: space-between; }
   .justify-center { justify-content: center; }
   .flex-shrink-0 { flex-shrink: 0; }
   .flex-wrap { flex-wrap: wrap; }
+  .flex-col { flex-direction: column; }
+  .flex-1 { flex: 1; }
 
   /* Grid columns */
   .grid-cols-1 { grid-template-columns: repeat(1, minmax(0, 1fr)); }
   .grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .grid-cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .grid-cols-10 { grid-template-columns: repeat(10, minmax(0, 1fr)); }
 
   /* ── Spacing ───────────────────────────────────────────────── */
   .gap-1 { gap: 0.25rem; }
+  .gap-2 { gap: 0.5rem; }
   .gap-3 { gap: 0.75rem; }
   .gap-4 { gap: 1rem; }
   .gap-y-2 { row-gap: 0.5rem; }
@@ -119,8 +125,10 @@ export const dashboardCss = `
   .space-x-4 > :not(:first-child) { margin-left: 1rem; }
   .p-1 { padding: 0.25rem; }
   .p-2 { padding: 0.5rem; }
+  .p-3 { padding: 0.75rem; }
   .p-4 { padding: 1rem; }
   .p-6 { padding: 1.5rem; }
+  .p-8 { padding: 2rem; }
   .p-12 { padding: 3rem; }
   .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
   .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; }
@@ -131,7 +139,9 @@ export const dashboardCss = `
   .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
   .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
   .py-4 { padding-top: 1rem; padding-bottom: 1rem; }
+  .py-6 { padding-top: 1.5rem; padding-bottom: 1.5rem; }
   .py-8 { padding-top: 2rem; padding-bottom: 2rem; }
+  .py-10 { padding-top: 2.5rem; padding-bottom: 2.5rem; }
   .pt-2 { padding-top: 0.5rem; }
   .mt-0\\.5 { margin-top: 0.125rem; }
   .mt-1 { margin-top: 0.25rem; }
@@ -139,6 +149,7 @@ export const dashboardCss = `
   .mt-3 { margin-top: 0.75rem; }
   .mt-4 { margin-top: 1rem; }
   .mt-6 { margin-top: 1.5rem; }
+  .mb-1 { margin-bottom: 0.25rem; }
   .mb-2 { margin-bottom: 0.5rem; }
   .mb-3 { margin-bottom: 0.75rem; }
   .mb-4 { margin-bottom: 1rem; }
@@ -146,19 +157,24 @@ export const dashboardCss = `
   .mb-8 { margin-bottom: 2rem; }
   .ml-1 { margin-left: 0.25rem; }
   .ml-2 { margin-left: 0.5rem; }
+  .ml-3 { margin-left: 0.75rem; }
   .mr-1 { margin-right: 0.25rem; }
   .mx-auto { margin-left: auto; margin-right: auto; }
 
   /* ── Sizing ────────────────────────────────────────────────── */
+  .w-1 { width: 0.25rem; }
+  .w-2 { width: 0.5rem; }
   .w-3 { width: 0.75rem; }
   .w-4 { width: 1rem; }
   .w-5 { width: 1.25rem; }
   .w-6 { width: 1.5rem; }
+  .w-8 { width: 2rem; }
   .w-10 { width: 2.5rem; }
   .w-11 { width: 2.75rem; }
   .w-12 { width: 3rem; }
   .w-16 { width: 4rem; }
   .w-full { width: 100%; }
+  .h-1 { height: 0.25rem; }
   .h-2 { height: 0.5rem; }
   .h-3 { height: 0.75rem; }
   .h-4 { height: 1rem; }
@@ -166,7 +182,10 @@ export const dashboardCss = `
   .h-6 { height: 1.5rem; }
   .h-8 { height: 2rem; }
   .h-10 { height: 2.5rem; }
+  .h-12 { height: 3rem; }
   .h-16 { height: 4rem; }
+  .h-20 { height: 5rem; }
+  .h-24 { height: 6rem; }
   .h-96 { height: 24rem; }
   .h-full { height: 100%; }
   .min-h-screen { min-height: 100vh; }
@@ -181,6 +200,10 @@ export const dashboardCss = `
   .text-lg { font-size: 1.125rem; line-height: 1.75rem; }
   .text-xl { font-size: 1.25rem; line-height: 1.75rem; }
   .text-2xl { font-size: 1.5rem; line-height: 2rem; }
+  .text-3xl { font-size: 1.875rem; line-height: 2.25rem; }
+  .text-4xl { font-size: 2.25rem; line-height: 2.5rem; }
+  .text-5xl { font-size: 3rem; line-height: 1; }
+  .text-6xl { font-size: 3.75rem; line-height: 1; }
   .font-medium { font-weight: 500; }
   .font-semibold { font-weight: 600; }
   .font-bold { font-weight: 700; }
@@ -188,6 +211,11 @@ export const dashboardCss = `
   .text-center { text-align: center; }
   .text-left { text-align: left; }
   .text-right { text-align: right; }
+  .uppercase { text-transform: uppercase; }
+  .tracking-wider { letter-spacing: 0.05em; }
+  .leading-none { line-height: 1; }
+  .select-none { user-select: none; }
+  .cursor-pointer { cursor: pointer; }
 
   /* ── Colors ────────────────────────────────────────────────── */
   .text-white { color: #ffffff; }
@@ -202,6 +230,7 @@ export const dashboardCss = `
   .text-yellow-400 { color: #facc15; }
   .bg-white { background-color: #ffffff; }
   .bg-gray-600 { background-color: #4b5563; }
+  .bg-gray-700 { background-color: #374151; }
   .bg-gray-800 { background-color: #1f2937; }
   .bg-gray-900 { background-color: #111827; }
   .bg-gray-900.bg-opacity-50 { background-color: rgba(17, 24, 39, 0.5); }
@@ -218,6 +247,7 @@ export const dashboardCss = `
   .rounded { border-radius: 0.25rem; }
   .rounded-sm { border-radius: 0.125rem; }
   .rounded-lg { border-radius: 0.5rem; }
+  .rounded-xl { border-radius: 0.75rem; }
   .rounded-full { border-radius: 9999px; }
 
   /* ── Opacity ───────────────────────────────────────────────── */
@@ -242,6 +272,10 @@ export const dashboardCss = `
   @media (min-width: 768px) {
     .md\\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .md\\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .md\\:grid-cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    .md\\:grid-cols-10 { grid-template-columns: repeat(10, minmax(0, 1fr)); }
+    .md\\:text-5xl { font-size: 3rem; line-height: 1; }
+    .md\\:text-6xl { font-size: 3.75rem; line-height: 1; }
   }
   @media (min-width: 1024px) {
     .lg\\:px-8 { padding-left: 2rem; padding-right: 2rem; }
@@ -302,6 +336,87 @@ export const dashboardCss = `
     background-color: ${colors.bg.card};
     border: 1px solid ${colors.bg.border};
     border-radius: 0.5rem;
+  }
+
+  /* ── Status Hero ───────────────────────────────────────────── */
+  .status-indicator {
+    width: 1rem;
+    height: 1rem;
+    border-radius: 9999px;
+    display: inline-block;
+    box-shadow: 0 0 12px currentColor;
+    animation: pulse-glow 2s ease-in-out infinite;
+  }
+  @keyframes pulse-glow {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.6; }
+  }
+
+  /* ── CSS Sparkline ─────────────────────────────────────────── */
+  .sparkline-container {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 48px;
+    padding: 4px 0;
+  }
+  .sparkline-bar {
+    flex: 1;
+    min-height: 3px;
+    border-radius: 2px 2px 0 0;
+    background-color: ${colors.brand.orange};
+    opacity: 0.85;
+    transition: opacity 0.15s;
+  }
+  .sparkline-bar:hover { opacity: 1; }
+
+  /* ── Nonce Pool Grid ───────────────────────────────────────── */
+  .wallet-cell {
+    border-radius: 0.5rem;
+    padding: 0.75rem 0.5rem;
+    text-align: center;
+    border: 1px solid transparent;
+    transition: transform 0.15s ease, border-color 0.15s ease;
+    min-height: 80px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+  }
+  .wallet-cell:hover {
+    transform: scale(1.04);
+  }
+  .wallet-cell-healthy {
+    background-color: rgba(16, 185, 129, 0.12);
+    border-color: rgba(16, 185, 129, 0.25);
+  }
+  .wallet-cell-degraded {
+    background-color: rgba(251, 191, 36, 0.12);
+    border-color: rgba(251, 191, 36, 0.25);
+  }
+  .wallet-cell-down {
+    background-color: rgba(248, 113, 113, 0.12);
+    border-color: rgba(248, 113, 113, 0.25);
+  }
+  .wallet-cell-unknown {
+    background-color: rgba(107, 114, 128, 0.08);
+    border-color: rgba(107, 114, 128, 0.15);
+  }
+
+  /* ── Capacity bar ──────────────────────────────────────────── */
+  .capacity-bar {
+    width: 100%;
+    height: 6px;
+    background-color: ${colors.bg.border};
+    border-radius: 9999px;
+    overflow: hidden;
+  }
+  .capacity-fill {
+    height: 100%;
+    background-color: ${colors.brand.orange};
+    border-radius: 9999px;
+    transition: width 0.4s ease;
   }
 
 `;

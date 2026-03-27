@@ -2,6 +2,62 @@ import { colors, formatNumber, formatTokenAmount, escapeHtml } from "../styles";
 import type { AggregateKeyStats, ApiKeyStatus } from "../../types";
 
 /**
+ * Status Hero card — giant operational status indicator.
+ * Shows HEALTHY / DEGRADED / CRITICAL with a pulsing dot, network badge, and version.
+ */
+export function statusHeroCard(
+  status: "healthy" | "degraded" | "down" | "unknown",
+  network: string | undefined,
+  version: string,
+  uptime24h: number
+): string {
+  const statusConfig = {
+    healthy: {
+      label: "HEALTHY",
+      color: colors.status.healthy,
+      subtext: "All systems operational",
+    },
+    degraded: {
+      label: "DEGRADED",
+      color: colors.status.degraded,
+      subtext: "Some systems may be impacted",
+    },
+    down: {
+      label: "CRITICAL",
+      color: colors.status.down,
+      subtext: "Service disruption detected",
+    },
+    unknown: {
+      label: "UNKNOWN",
+      color: colors.status.unknown,
+      subtext: "Status check pending",
+    },
+  };
+
+  const cfg = statusConfig[status];
+
+  const networkBadge = network
+    ? `<span class="px-3 py-1 rounded-full text-xs font-medium uppercase tracking-wider" style="background-color:${network === "mainnet" ? "rgba(16,185,129,0.15)" : "rgba(251,191,36,0.15)"}; color:${network === "mainnet" ? colors.status.healthy : colors.status.degraded}; border:1px solid ${network === "mainnet" ? "rgba(16,185,129,0.3)" : "rgba(251,191,36,0.3)"}">${escapeHtml(network)}</span>`
+    : "";
+
+  const versionBadge = `<span class="px-3 py-1 rounded-full text-xs font-medium" style="background-color:rgba(255,79,3,0.12); color:${colors.brand.orange}; border:1px solid rgba(255,79,3,0.25)">v${escapeHtml(version)}</span>`;
+
+  return `
+<div class="brand-section p-8 mb-6 text-center">
+  <div class="flex items-center justify-center gap-3 mb-6">
+    ${networkBadge}
+    ${versionBadge}
+  </div>
+  <div class="flex items-center justify-center gap-4 mb-3">
+    <span class="status-indicator" style="width:1.25rem;height:1.25rem;background-color:${cfg.color};color:${cfg.color};box-shadow:0 0 16px ${cfg.color}"></span>
+    <span class="text-4xl font-bold leading-none" style="color:${cfg.color}">${cfg.label}</span>
+  </div>
+  <p class="text-gray-400 mb-4">${escapeHtml(cfg.subtext)}</p>
+  <p class="text-sm text-gray-500">Hiro API uptime (24h): <span class="font-medium" style="color:${uptime24h >= 95 ? colors.status.healthy : uptime24h >= 80 ? colors.status.degraded : colors.status.down}">${uptime24h}%</span></p>
+</div>`;
+}
+
+/**
  * Stats card component
  */
 export function statsCard(

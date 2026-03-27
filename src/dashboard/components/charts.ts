@@ -46,59 +46,35 @@ export function formatTrend(
 }
 
 /**
- * Generate Chart.js config for transaction line chart
+ * Generate a CSS-only sparkline bar chart from hourly transaction data.
+ * Returns an HTML string with flexbox bars, height proportional to max value.
+ * No canvas, no Chart.js — pure CSS.
  */
-export function transactionChartConfig(
+export function cssSparkline(
   hourlyData: Array<{ hour: string; transactions: number; success: number }>
 ): string {
-  const labels = hourlyData.map((d) => d.hour);
-  const transactions = hourlyData.map((d) => d.transactions);
-  const success = hourlyData.map((d) => d.success);
+  if (!hourlyData || hourlyData.length === 0) {
+    return `<div class="sparkline-container" style="align-items:center;justify-content:center;">
+      <span class="text-gray-600 text-xs">No activity data</span>
+    </div>`;
+  }
 
-  return JSON.stringify({
-    type: "line",
-    data: {
-      labels,
-      datasets: [
-        {
-          label: "Total",
-          data: transactions,
-          borderColor: colors.brand.orange,
-          backgroundColor: `${colors.brand.orange}20`,
-          fill: true,
-          tension: 0.3,
-        },
-        {
-          label: "Success",
-          data: success,
-          borderColor: colors.status.healthy,
-          backgroundColor: `${colors.status.healthy}20`,
-          fill: true,
-          tension: 0.3,
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: {
-          position: "top",
-          labels: { color: "#9CA3AF" },
-        },
-      },
-      scales: {
-        x: {
-          grid: { color: "#374151" },
-          ticks: { color: "#9CA3AF" },
-        },
-        y: {
-          grid: { color: "#374151" },
-          ticks: { color: "#9CA3AF" },
-          beginAtZero: true,
-        },
-      },
-    },
-  });
+  const maxVal = Math.max(...hourlyData.map((d) => d.transactions), 1);
+
+  const bars = hourlyData
+    .map((d) => {
+      const heightPct = Math.max(
+        (d.transactions / maxVal) * 100,
+        d.transactions > 0 ? 6 : 2
+      );
+      const color =
+        d.transactions === 0
+          ? colors.bg.border
+          : colors.brand.orange;
+      const label = `${d.hour}: ${d.transactions} tx (${d.success} ok)`;
+      return `<div class="sparkline-bar" title="${label}" style="height:${heightPct}%;background-color:${color};${d.transactions === 0 ? "opacity:0.3;" : ""}"></div>`;
+    })
+    .join("");
+
+  return `<div class="sparkline-container">${bars}</div>`;
 }
-
