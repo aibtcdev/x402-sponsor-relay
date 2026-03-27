@@ -196,6 +196,84 @@ ${header(network)}
 
       ${feesSpentCard(data.fees.total, data.fees.average)}
     </div>
+
+    <!-- Zone C: Nonce Pool Visualization -->
+    <div class="mb-6" x-show="wallets.length > 0">
+      <div class="brand-section p-4">
+        <!-- Zone C header: title, toggle, capacity label -->
+        <div class="flex items-center justify-between mb-3" style="cursor: pointer" @click="poolOpen = !poolOpen">
+          <div class="flex items-center gap-3">
+            <h3 class="text-lg font-semibold text-white">Nonce Pool</h3>
+            <span class="text-sm text-gray-400" x-text="wallets.length + ' wallets · ' + capacityLabel + ' slots'"></span>
+          </div>
+          <svg class="w-5 h-5 text-gray-400" :style="poolOpen ? 'transform: rotate(180deg)' : ''" style="transition: transform 0.2s ease" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+          </svg>
+        </div>
+
+        <!-- Legend row -->
+        <div x-show="poolOpen" class="flex flex-wrap gap-3 mb-4" style="font-size: 0.75rem; color: #9ca3af">
+          <span class="flex items-center gap-1">
+            <span class="nonce-tile nonce-tile--available" style="display: inline-block"></span> available
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="nonce-tile nonce-tile--assigned" style="display: inline-block"></span> assigned
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="nonce-tile nonce-tile--broadcasted" style="display: inline-block"></span> broadcasted
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="nonce-tile nonce-tile--replaced" style="display: inline-block"></span> replaced
+          </span>
+          <span class="flex items-center gap-1">
+            <span class="nonce-tile nonce-tile--gap" style="display: inline-block"></span> gap
+          </span>
+        </div>
+
+        <!-- Wallet lanes -->
+        <div x-show="poolOpen">
+          <template x-for="wallet in wallets" :key="wallet.index">
+            <div class="nonce-lane" :class="{ 'nonce-lane--cb': wallet.circuitBreaker }">
+              <!-- Wallet index badge -->
+              <span class="text-xs font-mono text-gray-500" style="min-width: 1.5rem; text-align: right" x-text="'#' + wallet.index"></span>
+              <!-- Truncated address -->
+              <span class="text-xs font-mono text-purple-400" style="min-width: 8rem" x-text="truncateAddr(wallet.address)"></span>
+              <!-- Circuit breaker badge -->
+              <template x-if="wallet.circuitBreaker">
+                <span class="text-xs rounded circuit-breaker-active" style="padding: 0.125rem 0.375rem; background-color: #F8717120; color: #F87171; border: 1px solid #F8717140; font-size: 0.65rem; white-space: nowrap">CB</span>
+              </template>
+              <!-- Nonce tile grid (20 tiles per wallet) -->
+              <div class="flex flex-wrap gap-1" style="flex: 1">
+                <template x-for="slot in wallet.slots" :key="slot.offset">
+                  <div
+                    :class="tileClass(slot.state)"
+                    :title="'nonce ' + slot.nonce + (slot.txid ? ' · ' + slot.txid.slice(0, 10) + '...' : '') + (slot.sender ? ' · ' + truncateAddr(slot.sender) : '')"
+                    style="cursor: default">
+                  </div>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Sender hands (conditional: only shown when any slot has a sender) -->
+        <template x-if="poolOpen && wallets.some(function(w) { return walletSenders(w).length > 0; })">
+          <div style="margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #1a1a1a">
+            <p class="text-xs text-gray-500 mb-2">Active senders</p>
+            <div class="flex flex-wrap gap-2">
+              <template x-for="wallet in wallets" :key="'s' + wallet.index">
+                <template x-for="sender in walletSenders(wallet)" :key="sender">
+                  <span class="text-xs font-mono px-2 py-0.5 rounded" style="background-color: #0634D020; color: #a78bfa; border: 1px solid #0634D040">
+                    <span x-text="truncateAddr(sender)"></span>
+                    <span class="text-gray-600" x-text="' · w' + wallet.index"></span>
+                  </span>
+                </template>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
   </div>
 
   <!-- Transaction Volume Chart (full-width, with 24h/7d toggle) -->
@@ -411,7 +489,8 @@ ${footer(utcTimestamp())}
       .catch(function() {});
   }, 60000);
 
-  // Status banner Alpine.js component — fetches /nonce/state on init and every 10s
+  // Status banner Alpine.js component — fetches /nonce/state on init and every 10s.
+  // Also stores wallet data for Zone C nonce pool visualization (shared fetch).
   function statusApp() {
     return {
       statusColor: '#6B7280',
@@ -423,6 +502,8 @@ ${footer(utcTimestamp())}
       showWarning: false,
       p50Display: '--',
       p95Display: '--',
+      wallets: [],
+      poolOpen: true,
       _interval: null,
 
       init: function() {
@@ -459,8 +540,37 @@ ${footer(utcTimestamp())}
             self.capacityColor = pct < 70 ? '#10B981' : pct < 90 ? '#FBBF24' : '#F87171';
             self.capacityLabel = totalReserved + '/' + totalCapacity;
             self.showWarning = !healthy || hasRecommendation;
+
+            // Store wallet data for Zone C nonce pool visualization
+            self.wallets = (data && data.wallets) || [];
           })
           .catch(function() { /* silently ignore network errors */ });
+      },
+
+      // Truncate a Stacks address for display (first 6 + last 4 chars)
+      truncateAddr: function(addr) {
+        if (!addr || addr.length < 12) return addr || '';
+        return addr.slice(0, 6) + '...' + addr.slice(-4);
+      },
+
+      // Map a nonce slot state to its CSS tile class
+      tileClass: function(state) {
+        var valid = ['available', 'assigned', 'broadcasted', 'replaced', 'gap'];
+        return 'nonce-tile nonce-tile--' + (valid.indexOf(state) >= 0 ? state : 'available');
+      },
+
+      // Get unique senders from a wallet's slots
+      walletSenders: function(wallet) {
+        var senders = [];
+        var seen = {};
+        for (var i = 0; i < wallet.slots.length; i++) {
+          var slot = wallet.slots[i];
+          if (slot.sender && !seen[slot.sender]) {
+            seen[slot.sender] = true;
+            senders.push(slot.sender);
+          }
+        }
+        return senders;
       }
     };
   }
