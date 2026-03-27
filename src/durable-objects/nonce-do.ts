@@ -348,8 +348,15 @@ const MAX_WALLET_COUNT = 10;
 const VALID_MNEMONIC_LENGTHS = [12, 24];
 /** Gap-fill transfer: 1 uSTX (minimal amount to fill a nonce gap) */
 const GAP_FILL_AMOUNT = 1n;
-/** Gap-fill fee: 30,000 uSTX (high enough for RBF priority) */
-const GAP_FILL_FEE = 30_000n;
+/**
+ * Minimum fee floor for gap-fill and RBF self-transfers.
+ * Used when no original_fee is recorded (legacy entries) or for fresh gap-fills
+ * where no prior tx exists. The Stacks mempool clears fast when nonce sequences
+ * are correct, so a low fee is sufficient.
+ */
+const MIN_FLUSH_FEE = 30_000n;
+/** Gap-fill fee: alias for MIN_FLUSH_FEE (backward compat with log references) */
+const GAP_FILL_FEE = MIN_FLUSH_FEE;
 /** Default recipient for gap-fill self-transfers, per network */
 const DEFAULT_FLUSH_RECIPIENT_MAINNET = "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC";
 const DEFAULT_FLUSH_RECIPIENT_TESTNET = "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB";
@@ -373,25 +380,40 @@ const STUCK_TX_AGE_CASCADE_MS = 5 * 60 * 1000;
 /** Most aggressive stuck-tx age when a wallet's circuit breaker is open (3 min) */
 const STUCK_TX_AGE_CIRCUIT_OPEN_MS = 3 * 60 * 1000;
 /**
- * Fee for RBF replacement self-transfers (3× GAP_FILL_FEE).
- * Must exceed the original stuck tx fee to guarantee replacement acceptance
- * by the Stacks node's mempool eviction policy.
+ * Compute the RBF fee for replacing a stuck tx.
+ * Stacks only requires original_fee + 1 uSTX to replace. When original_fee is known
+ * (tracked in dispatch_queue/wallet_hand since Phase 4), use it directly.
+ * Falls back to MIN_FLUSH_FEE when no original fee is recorded (legacy entries).
+ *
+ * Ghost mempool entries clear slowly on their own but are instantly replaced by
+ * broadcasting a valid tx (even 1 uSTX self-transfer) at original_fee + 1.
+ * This is cheaper than the old fixed 90k uSTX and equally effective.
  */
-const RBF_FEE = GAP_FILL_FEE * 3n;
+function computeRbfFee(originalFee: string | null | undefined): bigint {
+  if (originalFee) {
+    try {
+      return BigInt(originalFee) + 1n;
+    } catch {
+      // Malformed fee string — fall back to floor
+    }
+  }
+  return MIN_FLUSH_FEE;
+}
+/** Legacy constant kept for backward compat with existing log queries */
+const RBF_FEE = MIN_FLUSH_FEE * 3n;
 /** Maximum RBF broadcast attempts per nonce to prevent runaway fee escalation */
 const MAX_RBF_ATTEMPTS = 3;
 /**
- * Fee for head-bump RBF after gap-fill (2× GAP_FILL_FEE).
+ * Fee for head-bump RBF after gap-fill: original_fee + 1 when known, else MIN_FLUSH_FEE.
  * Applied to the first real pending tx after gap-fills to signal miners to
- * re-evaluate the pending nonce sequence. Lower than RBF_FEE because the
- * original tx may still have a valid fee — we just need priority.
+ * re-evaluate the pending nonce sequence.
  *
  * NOTE: Head-bump replaces a real agent-sponsored tx with a self-transfer.
  * Agents are notified via replaced_tx KV → GET /payment/:id (status: "replaced",
  * resubmittable: true). Time-sensitive contract calls may fail if the
  * replacement + resubmission window exceeds the call's deadline.
  */
-const HEAD_BUMP_FEE = GAP_FILL_FEE * 2n;
+const HEAD_BUMP_FEE = MIN_FLUSH_FEE * 2n;
 /**
  * Per-wallet circuit breaker: if a wallet accumulates this many quarantines
  * within CIRCUIT_BREAKER_WINDOW_MS, it is skipped during nonce assignment
@@ -1687,8 +1709,10 @@ export class NonceDO {
   private async fillGapNonce(
     walletIndex: number,
     gapNonce: number,
-    privateKey: string
+    privateKey: string,
+    feeOverride?: bigint
   ): Promise<string | null> {
+    const fee = feeOverride ?? GAP_FILL_FEE;
     const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
     try {
       const tx = await makeSTXTokenTransfer({
@@ -1697,7 +1721,7 @@ export class NonceDO {
         senderKey: privateKey,
         network,
         nonce: BigInt(gapNonce),
-        fee: GAP_FILL_FEE,
+        fee,
         memo: `gap-fill-${gapNonce}`,
       });
       const result = await this.broadcastRawTx(tx, "gap_fill");
@@ -1793,7 +1817,7 @@ export class NonceDO {
     const attemptNum = state.rbfAttempts + 1;
 
     try {
-      // Fetch original_fee from dispatch_queue for rbf_fee_used log
+      // Fetch original_fee from dispatch_queue to compute minimal RBF fee
       const dispatchRow = this.sql
         .exec<{ original_fee: string | null }>(
           "SELECT original_fee FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
@@ -1801,14 +1825,15 @@ export class NonceDO {
           nonce
         )
         .toArray()[0];
-      const originalFeeForLog = dispatchRow?.original_fee ?? null;
+      const originalFeeStr = dispatchRow?.original_fee ?? null;
+      const rbfFee = computeRbfFee(originalFeeStr);
 
       this.log("info", "rbf_fee_used", {
         walletIndex,
         nonce,
-        rbfFee: RBF_FEE.toString(),
-        originalFee: originalFeeForLog,
-        hadOriginalFee: originalFeeForLog !== null,
+        rbfFee: rbfFee.toString(),
+        originalFee: originalFeeStr,
+        hadOriginalFee: originalFeeStr !== null,
         attemptNum,
       });
 
@@ -1818,7 +1843,7 @@ export class NonceDO {
         senderKey: privateKey,
         network,
         nonce: BigInt(nonce),
-        fee: RBF_FEE,
+        fee: rbfFee,
         memo: `rbf-${nonce}-attempt-${attemptNum}`,
       });
       const result = await this.broadcastRawTx(tx, "rbf");
@@ -1849,7 +1874,8 @@ export class NonceDO {
           walletIndex,
           nonce,
           txid: result.txid,
-          fee: RBF_FEE.toString(),
+          fee: rbfFee.toString(),
+          originalFee: originalFeeStr,
           attemptNum,
           originalTxid: state.originalTxid,
         });
@@ -4845,6 +4871,15 @@ export class NonceDO {
         const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
         if (privateKey) {
           const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
+          // Use original_fee + 1 when known, otherwise MIN_FLUSH_FEE
+          const bumpDispatchRow = this.sql
+            .exec<{ original_fee: string | null }>(
+              "SELECT original_fee FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
+              walletIndex,
+              bumpCandidate.nonce
+            )
+            .toArray()[0];
+          const bumpFee = computeRbfFee(bumpDispatchRow?.original_fee ?? null);
           try {
             const tx = await makeSTXTokenTransfer({
               recipient,
@@ -4852,7 +4887,7 @@ export class NonceDO {
               senderKey: privateKey,
               network,
               nonce: BigInt(bumpCandidate.nonce),
-              fee: HEAD_BUMP_FEE,
+              fee: bumpFee,
               memo: `head-bump-${bumpCandidate.nonce}`,
             });
             const result = await this.broadcastRawTx(tx, "head_bump");
@@ -5618,7 +5653,7 @@ export class NonceDO {
           transaction: senderTx,
           sponsorPrivateKey: privateKey,
           network,
-          fee: GAP_FILL_FEE, // Conservative fee; Phase 4 will tune this
+          fee: GAP_FILL_FEE, // Conservative low fee — mempool clears fast with correct nonce sequences
           sponsorNonce: BigInt(entry.sponsor_nonce),
         });
 
@@ -5691,8 +5726,9 @@ export class NonceDO {
         sender_address: string;
         sender_nonce: number;
         sender_tx_hex: string;
+        original_fee: string | null;
       }>(
-        `SELECT sender_address, sender_nonce, sender_tx_hex
+        `SELECT sender_address, sender_nonce, sender_tx_hex, original_fee
          FROM dispatch_queue
          WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1`,
         walletIndex,
@@ -5722,9 +5758,11 @@ export class NonceDO {
       );
 
       // 2. Gap-fill the dead sponsor nonce so the wallet nonce sequence stays gapless
+      //    Use original_fee + 1 to replace any ghost mempool entry cheaply
+      const flushFee = computeRbfFee(failedEntry.original_fee);
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
       if (privateKey) {
-        await this.fillGapNonce(walletIndex, failedSponsorNonce, privateKey);
+        await this.fillGapNonce(walletIndex, failedSponsorNonce, privateKey, flushFee);
       }
 
       // 3. Advance sender_state past the failed sender nonce (it was confirmed elsewhere)
@@ -5738,6 +5776,8 @@ export class NonceDO {
         failureType,
         slotsFlushed: 1,
         txsReturnedToHand: 0,
+        flushFee: flushFee.toString(),
+        originalFee: failedEntry.original_fee,
       });
     } else {
       // Case C: sender_abort — the tx aborted on-chain. The sender nonce was NOT confirmed.
@@ -5748,8 +5788,9 @@ export class NonceDO {
           sponsor_nonce: number;
           sender_nonce: number;
           sender_tx_hex: string;
+          original_fee: string | null;
         }>(
-          `SELECT sponsor_nonce, sender_nonce, sender_tx_hex
+          `SELECT sponsor_nonce, sender_nonce, sender_tx_hex, original_fee
            FROM dispatch_queue
            WHERE wallet_index = ? AND sender_address = ? AND sponsor_nonce >= ?
            ORDER BY sponsor_nonce ASC`,
@@ -5774,9 +5815,10 @@ export class NonceDO {
         );
         slotsFlushed++;
 
-        // Gap-fill the sponsor nonce slot
+        // Gap-fill the sponsor nonce slot using original_fee + 1 to replace any ghost mempool entry
+        const slotFlushFee = computeRbfFee(higher.original_fee);
         if (privateKey) {
-          await this.fillGapNonce(walletIndex, higher.sponsor_nonce, privateKey);
+          await this.fillGapNonce(walletIndex, higher.sponsor_nonce, privateKey, slotFlushFee);
         }
 
         // For higher sender nonces (not the failed one): return to sender_hand for resubmit
