@@ -1355,25 +1355,6 @@ export interface WalletSlot {
 }
 
 /**
- * Result of checking a sender's hand for a valid gapless nonce run.
- * Used by the dispatch engine (Phase 2) to decide whether to dispatch.
- */
-export interface RunCheckResult {
-  /** Sender's Stacks address */
-  senderAddress: string;
-  /** Whether the hand contains a valid run starting at next_expected_nonce */
-  hasRun: boolean;
-  /** The nonce at which the run starts (null if no run) */
-  runStart: number | null;
-  /** Length of the gapless run (0 if no run) */
-  runLength: number;
-  /** First missing nonce in the sequence (null if run is complete) */
-  missingAt: number | null;
-  /** Total number of entries in the sender's hand */
-  handSize: number;
-}
-
-/**
  * Discriminated union returned by NonceDO POST /hand-submit.
  * dispatched=true: a gapless run was found and txs are queued for broadcast.
  * dispatched=false: the tx was held because a nonce gap exists.

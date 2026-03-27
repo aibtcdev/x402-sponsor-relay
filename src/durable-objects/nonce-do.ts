@@ -1204,63 +1204,6 @@ export class NonceDO {
   }
 
   /**
-   * Count available headroom in a wallet's nonce hand.
-   * Returns the number of slots with state 'available' or 'confirmed'
-   * within the next CHAINING_LIMIT range from the current minimum sponsor nonce.
-   */
-  private getWalletHeadroom(walletIndex: number): number {
-    const rows = this.sql
-      .exec<{ cnt: number }>(
-        `SELECT COUNT(*) as cnt
-         FROM wallet_hand
-         WHERE wallet_index = ? AND state IN ('available', 'confirmed')`,
-        walletIndex
-      )
-      .toArray();
-    return rows[0]?.cnt ?? 0;
-  }
-
-  /**
-   * Allocate a sponsor nonce slot to a sender transaction.
-   * Sets state='allocated' with sender info and fee.
-   */
-  private allocateSlot(
-    walletIndex: number,
-    sponsorNonce: number,
-    senderAddress: string,
-    senderNonce: number,
-    fee: string
-  ): void {
-    this.sql.exec(
-      `INSERT OR REPLACE INTO wallet_hand
-         (wallet_index, sponsor_nonce, state, sender_address, sender_nonce, original_fee,
-          dispatched_at, confirmed_at)
-       VALUES (?, ?, 'allocated', ?, ?, ?, NULL, NULL)`,
-      walletIndex,
-      sponsorNonce,
-      senderAddress,
-      senderNonce,
-      fee
-    );
-  }
-
-  /**
-   * Mark a sponsor nonce slot as confirmed (transaction landed on-chain).
-   * Frees the slot for future headroom calculations.
-   */
-  private confirmSlot(walletIndex: number, sponsorNonce: number): void {
-    const now = new Date().toISOString();
-    this.sql.exec(
-      `UPDATE wallet_hand
-       SET state = 'confirmed', confirmed_at = ?
-       WHERE wallet_index = ? AND sponsor_nonce = ?`,
-      now,
-      walletIndex,
-      sponsorNonce
-    );
-  }
-
-  /**
    * Advance a sender's next_expected_nonce after on-chain confirmation.
    * Also prunes stale hand entries below the new frontier.
    *
@@ -5363,7 +5306,7 @@ export class NonceDO {
   }
 
   /**
-   * Recycle up to 20 replay_buffer entries back into sender_hand for re-dispatch.
+   * Recycle up to 5 replay_buffer entries back into sender_hand for re-dispatch.
    * Uses INSERT OR IGNORE so a fresher agent resubmission for the same sender nonce
    * takes precedence — the replay version is silently dropped but still consumed.
    * Runs once per alarm cycle, after gin rummy migration and before wallet reconciliation.
@@ -5745,7 +5688,7 @@ export class NonceDO {
         failedSenderNonce,
         senderAddress: sender_address,
         failureType,
-        slotsFlused: 1,
+        slotsFlushed: 1,
         txsReturnedToHand: 0,
       });
     } else {
@@ -5770,7 +5713,7 @@ export class NonceDO {
 
       const expiresAt = new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
-      let slotsFlused = 0;
+      let slotsFlushed = 0;
       let txsReturnedToHand = 0;
 
       for (const higher of higherEntries) {
@@ -5781,7 +5724,7 @@ export class NonceDO {
           walletIndex,
           higher.sponsor_nonce
         );
-        slotsFlused++;
+        slotsFlushed++;
 
         // Gap-fill the sponsor nonce slot
         if (privateKey) {
@@ -5811,7 +5754,7 @@ export class NonceDO {
         failedSenderNonce,
         senderAddress: sender_address,
         failureType,
-        slotsFlused,
+        slotsFlushed,
         txsReturnedToHand,
       });
     }
