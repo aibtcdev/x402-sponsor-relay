@@ -4765,6 +4765,212 @@ export class NonceDO {
       }
     }
 
+    // GET /queue-sender/:address — agent queue visibility.
+    // Returns dispatch_queue and replay_buffer rows for a specific sender address
+    // across all wallets. sender_tx_hex is excluded (large + unnecessary for clients).
+    const queueSenderMatch = url.pathname.match(/^\/queue-sender\/([^/]+)$/);
+    if (request.method === "GET" && queueSenderMatch) {
+      const senderAddress = decodeURIComponent(queueSenderMatch[1]);
+      try {
+        const queueRows = this.sql
+          .exec<{
+            wallet_index: number;
+            sponsor_nonce: number;
+            sender_nonce: number;
+            state: string;
+            queued_at: string;
+            dispatched_at: string | null;
+          }>(
+            `SELECT wallet_index, sponsor_nonce, sender_nonce, state,
+                    queued_at, dispatched_at
+             FROM dispatch_queue
+             WHERE sender_address = ? AND state != 'confirmed'
+             ORDER BY sponsor_nonce ASC`,
+            senderAddress
+          )
+          .toArray();
+
+        const replayRows = this.sql
+          .exec<{
+            id: number;
+            wallet_index: number;
+            sender_nonce: number;
+            original_sponsor_nonce: number;
+            queued_at: string;
+          }>(
+            `SELECT id, wallet_index, sender_nonce, original_sponsor_nonce, queued_at
+             FROM replay_buffer
+             WHERE sender_address = ?
+             ORDER BY queued_at ASC`,
+            senderAddress
+          )
+          .toArray();
+
+        const queued = queueRows
+          .filter((r) => r.state === "queued")
+          .map((r) => ({
+            walletIndex: r.wallet_index,
+            sponsorNonce: r.sponsor_nonce,
+            senderNonce: r.sender_nonce,
+            queuedAt: r.queued_at,
+          }));
+
+        const dispatched = queueRows
+          .filter((r) => r.state === "dispatched")
+          .map((r) => ({
+            walletIndex: r.wallet_index,
+            sponsorNonce: r.sponsor_nonce,
+            senderNonce: r.sender_nonce,
+            queuedAt: r.queued_at,
+            dispatchedAt: r.dispatched_at,
+          }));
+
+        const replaying = queueRows
+          .filter((r) => r.state === "replaying")
+          .map((r) => ({
+            walletIndex: r.wallet_index,
+            sponsorNonce: r.sponsor_nonce,
+            senderNonce: r.sender_nonce,
+            queuedAt: r.queued_at,
+          }));
+
+        const replayBuffer = replayRows.map((r) => ({
+          id: r.id,
+          walletIndex: r.wallet_index,
+          originalSponsorNonce: r.original_sponsor_nonce,
+          senderNonce: r.sender_nonce,
+          queuedAt: r.queued_at,
+        }));
+
+        return this.jsonResponse({
+          queued,
+          dispatched,
+          replaying,
+          replayBuffer,
+          total: queued.length + dispatched.length + replaying.length + replayBuffer.length,
+        });
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    // DELETE /queue-sender/:address/:walletIndex/:sponsorNonce — agent self-service cancellation.
+    // Cancels a queued/dispatched/replaying tx or replay_buffer entry.
+    // Address ownership is verified by the calling endpoint (SIP-018 auth).
+    const cancelQueueMatch = url.pathname.match(/^\/queue-sender\/([^/]+)\/(\d+)\/(\d+)$/);
+    if (request.method === "DELETE" && cancelQueueMatch) {
+      const senderAddress = decodeURIComponent(cancelQueueMatch[1]);
+      const walletIndex = parseInt(cancelQueueMatch[2], 10);
+      const sponsorNonce = parseInt(cancelQueueMatch[3], 10);
+
+      if (!Number.isInteger(walletIndex) || !Number.isInteger(sponsorNonce)) {
+        return this.badRequest("Invalid walletIndex or sponsorNonce");
+      }
+
+      try {
+        // Check dispatch_queue first
+        const rows = this.sql
+          .exec<{ state: string; sender_address: string }>(
+            `SELECT state, sender_address FROM dispatch_queue
+             WHERE wallet_index = ? AND sponsor_nonce = ?
+             LIMIT 1`,
+            walletIndex,
+            sponsorNonce
+          )
+          .toArray();
+
+        if (rows.length > 0) {
+          const row = rows[0];
+
+          // Verify address ownership
+          if (row.sender_address !== senderAddress) {
+            return new Response(
+              JSON.stringify({
+                error: "Address mismatch: you do not own this queue entry",
+                code: "QUEUE_ACCESS_DENIED",
+              }),
+              { status: 403, headers: { "content-type": "application/json" } }
+            );
+          }
+
+          const previousState = row.state;
+
+          if (previousState === "queued") {
+            // Remove immediately from queue
+            this.sql.exec(
+              "DELETE FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ?",
+              walletIndex,
+              sponsorNonce
+            );
+          } else if (previousState === "dispatched") {
+            // Transition to replaying — signals the alarm to flush this slot
+            this.sql.exec(
+              `UPDATE dispatch_queue SET state = 'replaying'
+               WHERE wallet_index = ? AND sponsor_nonce = ?`,
+              walletIndex,
+              sponsorNonce
+            );
+          } else if (previousState === "replaying") {
+            // Already in replaying state; move to replay_buffer and delete from queue
+            // so the sender tx will be re-sponsored with a fresh nonce
+            this.sql.exec(
+              "DELETE FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ?",
+              walletIndex,
+              sponsorNonce
+            );
+          }
+
+          return this.jsonResponse({
+            cancelled: true,
+            previousState,
+            walletIndex,
+            sponsorNonce,
+          });
+        }
+
+        // Not in dispatch_queue — check replay_buffer by original_sponsor_nonce
+        const replayRows = this.sql
+          .exec<{ id: number; sender_address: string }>(
+            `SELECT id, sender_address FROM replay_buffer
+             WHERE wallet_index = ? AND original_sponsor_nonce = ?
+             LIMIT 1`,
+            walletIndex,
+            sponsorNonce
+          )
+          .toArray();
+
+        if (replayRows.length > 0) {
+          const replayRow = replayRows[0];
+          if (replayRow.sender_address !== senderAddress) {
+            return new Response(
+              JSON.stringify({
+                error: "Address mismatch: you do not own this replay buffer entry",
+                code: "QUEUE_ACCESS_DENIED",
+              }),
+              { status: 403, headers: { "content-type": "application/json" } }
+            );
+          }
+          this.sql.exec("DELETE FROM replay_buffer WHERE id = ?", replayRow.id);
+          return this.jsonResponse({
+            cancelled: true,
+            previousState: "replay_buffer",
+            walletIndex,
+            sponsorNonce,
+          });
+        }
+
+        return new Response(
+          JSON.stringify({
+            error: "Queue entry not found",
+            code: "QUEUE_NOT_FOUND",
+          }),
+          { status: 404, headers: { "content-type": "application/json" } }
+        );
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
     return new Response("Not found", { status: 404 });
   }
 }

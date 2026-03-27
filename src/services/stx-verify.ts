@@ -270,7 +270,7 @@ export class StxVerifyService {
    *
    * Returns null if auth is valid, or an error object if validation fails.
    */
-  verifySip018Auth(auth: Sip018Auth, expectedAction: "relay" | "sponsor"): Sip018AuthError | null {
+  verifySip018Auth(auth: Sip018Auth, expectedAction: "relay" | "sponsor" | "queue-read" | "queue-cancel"): Sip018AuthError | null {
     // Validate auth structure
     if (!auth.signature || !auth.message?.action || !auth.message?.nonce || !auth.message?.expiry) {
       return {

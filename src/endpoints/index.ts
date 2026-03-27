@@ -22,3 +22,5 @@ export { Supported } from "./supported";
 export { Wallets } from "./wallets";
 export { PaymentStatus } from "./payment-status";
 export { Chainhook } from "./chainhook";
+export { QueueRead } from "./queue-read";
+export { QueueCancel } from "./queue-cancel";

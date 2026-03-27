@@ -600,7 +600,9 @@ export type RelayErrorCode =
   | "SERVICE_DEGRADED"
   | "UNSUPPORTED_ADDRESS_TYPE"
   | "INVALID_BTC_ADDRESS"
-  | "MALFORMED_PAYLOAD";
+  | "MALFORMED_PAYLOAD"
+  | "QUEUE_NOT_FOUND"
+  | "QUEUE_ACCESS_DENIED";
 
 /**
  * Default retry-after for SERVICE_DEGRADED responses (seconds).
