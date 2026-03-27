@@ -169,7 +169,7 @@ function noncePoolSection(): string {
     <div class="flex items-center justify-between mb-4">
       <h3 class="text-lg font-semibold text-white">Nonce Pool</h3>
       <span x-show="!loading && !error" class="text-xs text-gray-500"
-            x-text="state && state.totalReserved + ' reserved / ' + state.totalCapacity + ' capacity'"></span>
+            x-text="state && state.usedCapacity + ' reserved / ' + state.totalCapacity + ' capacity'"></span>
     </div>
 
     <!-- Loading state -->
@@ -190,18 +190,18 @@ function noncePoolSection(): string {
 
       <!-- Wallet grid: 5 cols on md, 2 cols on small -->
       <div class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-4">
-        <template x-for="wallet in (state && state.wallets) || []" :key="wallet.walletIndex">
+        <template x-for="wallet in (state && state.wallets) || []" :key="wallet.index">
           <div class="wallet-cell"
                :class="walletCellClass(wallet)"
-               :title="'Wallet ' + wallet.walletIndex + ': ' + wallet.sponsorAddress">
-            <span class="text-xs text-gray-400 font-medium" x-text="'W' + wallet.walletIndex"></span>
+               :title="'Wallet ' + wallet.index">
+            <span class="text-xs text-gray-400 font-medium" x-text="'W' + wallet.index"></span>
             <span class="text-lg font-bold" :style="'color:' + walletColor(wallet)" x-text="wallet.reserved"></span>
             <span class="text-xs" :style="'color:' + walletColor(wallet) + '99'" x-text="wallet.available + ' free'"></span>
             <span x-show="wallet.gaps && wallet.gaps.length > 0"
                   class="text-xs font-medium"
                   style="color:#F87171"
                   x-text="wallet.gaps.length + ' gap' + (wallet.gaps.length > 1 ? 's' : '')"></span>
-            <span x-show="wallet.circuitBreakerOpen"
+            <span x-show="wallet.health === 'degraded'"
                   class="text-xs font-medium"
                   style="color:#FBBF24">CB open</span>
           </div>
@@ -212,14 +212,14 @@ function noncePoolSection(): string {
       <div>
         <div class="flex items-center justify-between text-xs text-gray-500 mb-1">
           <span>Pool utilization</span>
-          <span x-text="state ? Math.round((state.totalReserved / Math.max(state.totalCapacity, 1)) * 100) + '%' : '0%'"></span>
+          <span x-text="state ? Math.round((state.usedCapacity / Math.max(state.totalCapacity, 1)) * 100) + '%' : '0%'"></span>
         </div>
         <div class="capacity-bar">
           <div class="capacity-fill"
-               :style="'width:' + (state ? Math.round((state.totalReserved / Math.max(state.totalCapacity, 1)) * 100) : 0) + '%'"></div>
+               :style="'width:' + (state ? Math.round((state.usedCapacity / Math.max(state.totalCapacity, 1)) * 100) : 0) + '%'"></div>
         </div>
         <p class="text-xs text-gray-600 mt-2"
-           x-text="state ? state.totalAvailable + ' available · ' + (state.healInProgress ? 'Heal in progress' : 'Stable') : ''"></p>
+           x-text="state ? (state.totalCapacity - state.usedCapacity) + ' available · ' + (state.healInProgress ? 'Heal in progress' : 'Stable') : ''"></p>
       </div>
     </div>
   </div>
@@ -277,7 +277,7 @@ ${header(network)}
 ${footer(utcTimestamp())}
 
 <script>
-  // Alpine.js component for nonce pool — fetches /nonce/state on init
+  // Alpine.js component for nonce pool — fetches /dashboard/api/nonce on init
   function noncePoolApp() {
     return {
       loading: true,
@@ -286,15 +286,16 @@ ${footer(utcTimestamp())}
 
       init: function() {
         var self = this;
-        fetch('/nonce/state')
+        fetch('/dashboard/api/nonce')
           .then(function(r) {
             if (!r.ok) throw new Error('Nonce state unavailable (' + r.status + ')');
             return r.json();
           })
           .then(function(data) {
-            self.state = data && data.state ? data.state : null;
-            if (!self.state) {
-              self.error = 'Nonce state unavailable';
+            if (data && data.healthStatus === 'unavailable' && data.wallets.length === 0) {
+              self.error = 'Nonce pool unavailable';
+            } else {
+              self.state = data || null;
             }
           })
           .catch(function(e) {
@@ -306,14 +307,14 @@ ${footer(utcTimestamp())}
       },
 
       walletColor: function(wallet) {
-        if (!wallet.healthy || wallet.gaps && wallet.gaps.length > 0) return '#F87171';
-        if (wallet.circuitBreakerOpen) return '#FBBF24';
+        if (wallet.health === 'down') return '#F87171';
+        if (wallet.health === 'degraded') return '#FBBF24';
         return '#10B981';
       },
 
       walletCellClass: function(wallet) {
-        if (!wallet.healthy || wallet.gaps && wallet.gaps.length > 0) return 'wallet-cell-down';
-        if (wallet.circuitBreakerOpen) return 'wallet-cell-degraded';
+        if (wallet.health === 'down') return 'wallet-cell-down';
+        if (wallet.health === 'degraded') return 'wallet-cell-degraded';
         return 'wallet-cell-healthy';
       }
     };
