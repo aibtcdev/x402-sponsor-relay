@@ -6128,16 +6128,18 @@ export class NonceDO {
   }
 
   /**
-   * Clear all per-wallet state and stored addresses.
-   * Wallets will reinitialize from Hiro on the next /assign call.
-   * Also resets nonce heads and clears the nonce_intents ledger for each wallet.
+   * Clear per-wallet nonce state and re-derive sponsor addresses from mnemonic.
+   * Resets nonce heads, clears nonce_intents ledger, and resets round-robin index.
+   * Always re-derives and stores sponsor addresses — this both preserves them
+   * during normal clears and recovers from a previous bug that deleted them.
    */
   private async handleClearPools(): Promise<Response> {
     return this.state.blockConcurrencyWhile(async () => {
       const initializedWallets = await this.getInitializedWallets();
       for (const { walletIndex } of initializedWallets) {
-        // Clear sponsor address
-        await this.state.storage.delete(this.sponsorAddressKey(walletIndex));
+        // NOTE: sponsor address is intentionally preserved — it is wallet
+        // identity, not nonce state. Deleting it breaks all admin actions
+        // until a redeploy re-runs /assign.
         // Reset the ledger head for this wallet
         if (walletIndex === 0) {
           this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.current);
@@ -6152,10 +6154,25 @@ export class NonceDO {
       // Reset round-robin index
       await this.state.storage.put(NEXT_WALLET_INDEX_KEY, 0);
 
+      // Re-derive and store sponsor addresses from the mnemonic.
+      // This both preserves addresses after a normal clear AND recovers from
+      // a previous clear-pools that erroneously deleted them.
+      const walletCountRaw = this.env.SPONSOR_WALLET_COUNT ?? "1";
+      const walletCount = Math.max(1, parseInt(walletCountRaw, 10) || 1);
+      const stacksNetwork = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+      let rederived = 0;
+      for (let wi = 0; wi < walletCount; wi++) {
+        const pk = await this.derivePrivateKeyForWallet(wi);
+        if (!pk) break;
+        const addr = getAddressFromPrivateKey(pk, stacksNetwork);
+        await this.setStoredSponsorAddressForWallet(wi, addr);
+        rederived++;
+      }
+
       const cleared = initializedWallets.length;
       const reason = cleared > 0
-        ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}`
-        : "No wallets to clear";
+        ? `Cleared ${cleared} wallet${cleared === 1 ? "" : "s"}, re-derived ${rederived} address${rederived === 1 ? "" : "es"}`
+        : `No wallets to clear, re-derived ${rederived} address${rederived === 1 ? "" : "es"}`;
       const result = {
         success: true,
         action: "clear_pools",
