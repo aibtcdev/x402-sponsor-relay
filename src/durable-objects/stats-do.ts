@@ -621,8 +621,8 @@ export class StatsDO {
         total: acc.total + h.transactions,
         success: acc.success + h.success,
         clientErrors: acc.clientErrors + (h.clientErrors ?? 0),
-        fees: acc.fees + BigInt(h.fees ?? "0"),
-        feeCount: h.fees && h.fees !== "0" ? acc.feeCount + h.success : acc.feeCount,
+        fees: acc.fees + BigInt(h.fees || "0"),
+        feeCount: h.fees && h.fees !== "0" ? acc.feeCount + 1 : acc.feeCount,
       }),
       { total: 0, success: 0, clientErrors: 0, fees: 0n, feeCount: 0 }
     );

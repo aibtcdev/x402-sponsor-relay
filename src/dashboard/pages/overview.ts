@@ -635,7 +635,7 @@ ${footer(utcTimestamp())}
 
       // Format milliseconds as a human-readable latency string
       formatMs: function(ms) {
-        if (!ms || ms === 0) return '--';
+        if (!ms) return '--';
         return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
       }
     };

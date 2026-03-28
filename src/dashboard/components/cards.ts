@@ -186,7 +186,7 @@ export function successRateCard(success: number, total: number, clientErrors?: n
 
 /**
  * Status banner placeholder — server-rendered shell hydrated by Alpine.js statusApp().
- * Renders a full-width banner with health dot, capacity gauge, and static p50 placeholder.
+ * Renders a full-width banner with health dot and capacity gauge.
  * The Alpine.js component fetches /nonce/state on 10s intervals and fills in health/capacity values.
  */
 export function statusBannerPlaceholder(): string {

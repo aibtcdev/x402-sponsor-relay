@@ -70,6 +70,16 @@ export class NonceState extends BaseEndpoint {
                           reserved: { type: "number" as const, description: "In-flight nonces across all states (assigned + broadcasted + confirmed-pending)" },
                           circuitBreakerOpen: { type: "boolean" as const },
                           healthy: { type: "boolean" as const },
+                          settlementTimes: {
+                            type: "object" as const,
+                            description: "Per-wallet broadcast-to-confirmation latency percentiles (last 24h)",
+                            properties: {
+                              p50: { type: "number" as const, description: "Median settlement time in milliseconds" },
+                              p95: { type: "number" as const, description: "95th percentile settlement time in milliseconds" },
+                              avg: { type: "number" as const, description: "Average settlement time in milliseconds" },
+                              count: { type: "number" as const, description: "Number of confirmed transactions in the sample" },
+                            },
+                          },
                         },
                       },
                     },
@@ -98,6 +108,16 @@ export class NonceState extends BaseEndpoint {
                       nullable: true,
                       enum: ["fallback_to_direct"],
                       description: "When non-null, clients should bypass sponsored submission",
+                    },
+                    settlementTimes: {
+                      type: "object" as const,
+                      description: "Global broadcast-to-confirmation latency percentiles across all wallets (last 24h)",
+                      properties: {
+                        p50: { type: "number" as const, description: "Median settlement time in milliseconds" },
+                        p95: { type: "number" as const, description: "95th percentile settlement time in milliseconds" },
+                        avg: { type: "number" as const, description: "Average settlement time in milliseconds" },
+                        count: { type: "number" as const, description: "Number of confirmed transactions in the sample" },
+                      },
                     },
                     timestamp: { type: "string" as const },
                   },
