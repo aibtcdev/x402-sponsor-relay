@@ -212,6 +212,34 @@ export function statusBannerPlaceholder(): string {
 }
 
 /**
+ * Settlement time card — Alpine.js-hydrated card showing p50/p95/avg latency and sample count.
+ * Data is populated from the /nonce/state response via the statusApp() component.
+ * The card is hidden when no settlement data exists (count === 0).
+ */
+export function settlementTimeCard(): string {
+  return `
+<div class="brand-card p-4" x-show="settlementTimes && settlementTimes.count > 0" x-cloak>
+  <p class="text-sm text-gray-400">Settlement Time (24h)</p>
+  <p class="text-2xl font-bold text-white mt-2" x-text="formatMs(settlementTimes.p50)"></p>
+  <p class="text-xs text-gray-500 mt-1">p50 median</p>
+  <div class="grid grid-cols-3 gap-2 mt-3 pt-2" style="border-top: 1px solid #1a1a1a">
+    <div>
+      <p class="text-xs text-gray-500">p95</p>
+      <p class="text-sm font-medium text-white" x-text="formatMs(settlementTimes.p95)"></p>
+    </div>
+    <div>
+      <p class="text-xs text-gray-500">avg</p>
+      <p class="text-sm font-medium text-white" x-text="formatMs(settlementTimes.avg)"></p>
+    </div>
+    <div>
+      <p class="text-xs text-gray-500">txs</p>
+      <p class="text-sm font-medium text-white" x-text="settlementTimes.count"></p>
+    </div>
+  </div>
+</div>`;
+}
+
+/**
  * Fees spent card — server-rendered card showing total STX fees sponsored.
  *
  * @param totalFees - Total fees in microSTX as a string (e.g. "1234567890")
