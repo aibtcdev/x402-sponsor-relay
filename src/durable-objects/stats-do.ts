@@ -613,16 +613,29 @@ export class StatsDO {
 
     // Hourly data covers the rolling 24h window (crossing midnight).
     // Sum it to produce headline totals that match the hourly chart exactly.
+    // Also sum fees from hourly data so the fee total is accurate at UTC day boundaries
+    // (when daily_stats has reset but the rolling window still has fee data from yesterday).
     const hourlyData = this.readHourlyData();
     const rolling = hourlyData.reduce(
       (acc, h) => ({
         total: acc.total + h.transactions,
         success: acc.success + h.success,
         clientErrors: acc.clientErrors + (h.clientErrors ?? 0),
+        fees: acc.fees + BigInt(h.fees || "0"),
+        feeCount: h.fees && h.fees !== "0" ? acc.feeCount + 1 : acc.feeCount,
       }),
-      { total: 0, success: 0, clientErrors: 0 }
+      { total: 0, success: 0, clientErrors: 0, fees: 0n, feeCount: 0 }
     );
     const rollingFailed = rolling.total - rolling.success;
+
+    // Use the rolling hourly fee sum as the headline total when available.
+    // Fall back to today's calendar-day fee total for backward compatibility
+    // (e.g., when hourly data is absent on a fresh deployment).
+    const rollingFeeTotal = rolling.fees > 0n ? rolling.fees.toString() : currentFees.total;
+    const rollingFeeAvg =
+      rolling.feeCount > 0
+        ? (rolling.fees / BigInt(rolling.feeCount)).toString()
+        : avgFee;
 
     // Per-endpoint breakdown from today's daily_stats
     const endpointBreakdown = this.readEndpointBreakdown(current.date);
@@ -658,8 +671,8 @@ export class StatsDO {
         },
       },
       fees: {
-        total: currentFees.total,
-        average: avgFee,
+        total: rollingFeeTotal,
+        average: rollingFeeAvg,
         min: currentFees.min || "0",
         max: currentFees.max || "0",
         trend: feeTrend,

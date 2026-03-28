@@ -189,6 +189,8 @@ interface ObservablePendingTx {
   replacementTxid?: string;
   /** Contention reason string from error_reason column (e.g. "contention:dropped_replace_by_fee"). */
   replacedReason?: string;
+  /** Stacks address of the transaction sender (from dispatch_queue). */
+  senderAddress?: string;
 }
 
 /**
@@ -246,6 +248,8 @@ interface ObservableNonceState {
   lastGapDetected: string | null;
   /** When non-null, clients should bypass sponsored submission */
   recommendation: "fallback_to_direct" | null;
+  /** Global settlement time percentiles from dispatch_queue (last 24h confirmed txs) */
+  settlementTimes: SettlementTimeStats;
   timestamp: string;
 }
 
@@ -3761,7 +3765,8 @@ export class NonceDO {
 
     const wallets: ObservableWalletState[] = await Promise.all(
       initializedWallets.map(async ({ walletIndex, address }) => {
-        // Pending txs: assigned or broadcasted nonce_intents
+        // Pending txs: assigned or broadcasted nonce_intents, joined with dispatch_queue
+        // to surface sender_address (issue #251).
         const pendingRows = this.sql
           .exec<{
             nonce: number;
@@ -3769,11 +3774,15 @@ export class NonceDO {
             txid: string | null;
             assigned_at: string;
             broadcasted_at: string | null;
+            sender_address: string | null;
           }>(
-            `SELECT nonce, state, txid, assigned_at, broadcasted_at
-             FROM nonce_intents
-             WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted')
-             ORDER BY nonce ASC`,
+            `SELECT ni.nonce, ni.state, ni.txid, ni.assigned_at, ni.broadcasted_at,
+                    dq.sender_address
+             FROM nonce_intents ni
+             LEFT JOIN dispatch_queue dq
+               ON dq.wallet_index = ni.wallet_index AND dq.sponsor_nonce = ni.nonce
+             WHERE ni.wallet_index = ? AND ni.state IN ('assigned', 'broadcasted')
+             ORDER BY ni.nonce ASC`,
             walletIndex
           )
           .toArray();
@@ -3784,6 +3793,7 @@ export class NonceDO {
           txid: row.txid ?? undefined,
           assignedAt: row.assigned_at,
           broadcastedAt: row.broadcasted_at ?? undefined,
+          senderAddress: row.sender_address ?? undefined,
         }));
 
         // Replaced txs: failed intents where error_reason starts with 'contention:'
@@ -3938,6 +3948,9 @@ export class NonceDO {
       oldestEntryAge: nowMs - new Date(row.oldest_received_at).getTime(),
     }));
 
+    // Global settlement percentiles (last 24h confirmed txs across all wallets)
+    const settlementTimes = this.computeSettlementPercentiles();
+
     return {
       wallets,
       senderHands,
@@ -3951,6 +3964,7 @@ export class NonceDO {
         ? new Date(lastGapDetectedMs).toISOString()
         : null,
       recommendation,
+      settlementTimes,
       timestamp: new Date().toISOString(),
     };
   }

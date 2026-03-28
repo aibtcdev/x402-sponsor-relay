@@ -7,6 +7,7 @@ import {
   successRateCard,
   statusBannerPlaceholder,
   feesSpentCard,
+  settlementTimeCard,
 } from "../components/cards";
 import {
   formatTrend,
@@ -144,7 +145,7 @@ ${header(network)}
     </div>
 
     <!-- Zone B: Redesigned metric cards -->
-    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
       ${statsCard("Transactions (24h)", data.transactions.total, {
         trend: trend.html,
         icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`,
@@ -153,6 +154,8 @@ ${header(network)}
       ${successRateCard(data.transactions.success, data.transactions.total, data.transactions.clientErrors)}
 
       ${feesSpentCard(data.fees.total, data.fees.average)}
+
+      ${settlementTimeCard()}
     </div>
 
     <!-- Zone C: Nonce Pool Visualization -->
@@ -525,6 +528,7 @@ ${footer(utcTimestamp())}
       capacityLabel: '--/--',
       showWarning: false,
       wallets: [],
+      settlementTimes: null,
       poolOpen: true,
       _interval: null,
 
@@ -559,6 +563,10 @@ ${footer(utcTimestamp())}
             self.capacityColor = pct < 70 ? '#10B981' : pct < 90 ? '#FBBF24' : '#F87171';
             self.capacityLabel = totalReserved + '/' + totalCapacity;
             self.showWarning = !healthy || hasRecommendation;
+
+            // Store global settlement time percentiles for Zone B settlement card
+            self.settlementTimes = (state.settlementTimes && state.settlementTimes.count > 0)
+              ? state.settlementTimes : null;
 
             // Store wallet data for Zone C nonce pool visualization
             // Map /nonce/state response shape to view-model expected by the template
@@ -623,6 +631,12 @@ ${footer(utcTimestamp())}
           }
         }
         return senders;
+      },
+
+      // Format milliseconds as a human-readable latency string
+      formatMs: function(ms) {
+        if (!ms) return '--';
+        return ms >= 1000 ? (ms / 1000).toFixed(1) + 's' : ms + 'ms';
       }
     };
   }
