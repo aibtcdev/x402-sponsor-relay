@@ -153,7 +153,7 @@ export class NonceReset extends BaseEndpoint {
 
     // Parse action and optional walletIndex from body (action defaults to "resync")
     let action: NonceResetAction = "resync";
-    let walletIndex = 0;
+    let walletIndex: number | undefined;
     try {
       const body = await c.req.json() as Record<string, unknown>;
       if (body.action !== undefined) {
@@ -175,26 +175,24 @@ export class NonceReset extends BaseEndpoint {
       // Body is optional — empty body or missing Content-Type is fine, use defaults
     }
 
-    // flush-wallet requires a specific walletIndex to be targeted
-    if (action === "flush-wallet") {
-      if (walletIndex < 0 || !Number.isInteger(walletIndex)) {
-        return this.err(c, {
-          error: "Invalid walletIndex for flush-wallet",
-          code: "NONCE_RESET_FAILED",
-          status: 400,
-          details: "flush-wallet requires a non-negative integer walletIndex in the request body",
-          retryable: false,
-        });
-      }
+    // flush-wallet requires an explicit walletIndex — don't silently default to 0
+    if (action === "flush-wallet" && walletIndex === undefined) {
+      return this.err(c, {
+        error: "Missing walletIndex for flush-wallet",
+        code: "NONCE_RESET_FAILED",
+        status: 400,
+        details: "flush-wallet requires a non-negative integer walletIndex in the request body",
+        retryable: false,
+      });
     }
 
-    logger.info("Nonce recovery triggered", { action, keyId, ...(action === "flush-wallet" && { walletIndex }) });
+    logger.info("Nonce recovery triggered", { action, keyId, ...(walletIndex !== undefined && { walletIndex }) });
 
     try {
       const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
       // flush-wallet targets a specific wallet; all other actions use the action name as path
       const doUrl = action === "flush-wallet"
-        ? `https://nonce-do/flush-wallet/${walletIndex}`
+        ? `https://nonce-do/flush-wallet/${walletIndex!}`
         : `https://nonce-do/${action}`;
       const response = await stub.fetch(doUrl, { method: "POST" });
 
