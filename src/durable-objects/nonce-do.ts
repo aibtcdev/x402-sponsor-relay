@@ -6224,15 +6224,19 @@ export class NonceDO {
         }
       }
 
-      // Remove nonces that are already in the mempool (assigned/broadcasted/confirmed).
+      // Remove nonces that are already managed by our ledger (assigned/broadcasted/confirmed).
+      // Lower bound covers the full gap range added above (last_executed + 1 or 0)
+      // so corridor nonces with existing ledger entries are correctly excluded.
       // 'confirmed' = broadcast accepted, still pending on-chain — same as ledgerInFlightCount.
+      const inFlightLowerBound =
+        last_executed_tx_nonce !== null ? last_executed_tx_nonce + 1 : 0;
       const inFlightRows = this.sql
         .exec<{ nonce: number }>(
           `SELECT nonce FROM nonce_intents
            WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')
              AND nonce >= ?`,
           walletIndex,
-          possible_next_nonce
+          inFlightLowerBound
         )
         .toArray();
       for (const row of inFlightRows) {
