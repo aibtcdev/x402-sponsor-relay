@@ -30,8 +30,8 @@ export function htmlDocument(content: string, title: string, options?: { include
 }
 
 /**
- * Dashboard header component
- * @param network - Optional network indicator ("testnet" | "mainnet")
+ * Dashboard header component with logo, title, and navigation links.
+ * @param _network - Unused; retained for call-site compatibility.
  */
 export function header(_network?: string): string {
   return `

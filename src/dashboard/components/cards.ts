@@ -186,8 +186,8 @@ export function successRateCard(success: number, total: number, clientErrors?: n
 
 /**
  * Status banner placeholder — server-rendered shell hydrated by Alpine.js statusApp().
- * Renders a full-width banner with health dot, capacity gauge, and p50 settlement time.
- * The Alpine.js component fetches /nonce/state on 10s intervals and fills in the values.
+ * Renders a full-width banner with health dot, capacity gauge, and static p50 placeholder.
+ * The Alpine.js component fetches /nonce/state on 10s intervals and fills in health/capacity values.
  */
 export function statusBannerPlaceholder(): string {
   return `
@@ -205,7 +205,7 @@ export function statusBannerPlaceholder(): string {
   </div>
   <div class="flex items-center gap-3">
     <span class="text-sm text-gray-400">p50</span>
-    <span class="text-sm font-mono text-white" x-text="settlementP50">--</span>
+    <span class="text-sm font-mono text-white">N/A</span>
   </div>
 </div>
 <template x-if="showWarning">
@@ -217,8 +217,8 @@ export function statusBannerPlaceholder(): string {
 
 /**
  * Settlement time card — metric card showing median (p50) settlement time.
- * Takes no server-side parameters; Alpine.js fills the values via x-text bindings.
- * Intended to be placed inside an Alpine component that exposes p50Display and p95Display.
+ * Currently renders static "N/A" placeholders since settlement latency data
+ * is not yet available from the /nonce/state API.
  */
 export function settlementTimeCard(): string {
   return `
@@ -230,8 +230,8 @@ export function settlementTimeCard(): string {
         d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
     </svg>
   </div>
-  <p class="text-2xl font-bold text-white mt-2" x-text="p50Display">--</p>
-  <p class="text-xs text-gray-500 mt-1" x-text="'p95: ' + p95Display">p95: --</p>
+  <p class="text-2xl font-bold text-white mt-2">N/A</p>
+  <p class="text-xs text-gray-500 mt-1">p95: N/A</p>
 </div>`;
 }
 

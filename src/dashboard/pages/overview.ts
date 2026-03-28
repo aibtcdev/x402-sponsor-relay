@@ -526,10 +526,7 @@ ${footer(utcTimestamp())}
       capacityPct: 0,
       capacityColor: '#6B7280',
       capacityLabel: '--/--',
-      settlementP50: '--',
       showWarning: false,
-      p50Display: '--',
-      p95Display: '--',
       wallets: [],
       poolOpen: true,
       _interval: null,
@@ -567,7 +564,40 @@ ${footer(utcTimestamp())}
             self.showWarning = !healthy || hasRecommendation;
 
             // Store wallet data for Zone C nonce pool visualization
-            self.wallets = (data && data.wallets) || [];
+            // Map /nonce/state response shape to view-model expected by the template
+            var rawWallets = (state && state.wallets) || [];
+            var CHAINING_LIMIT = 20;
+            self.wallets = rawWallets.map(function(w) {
+              // Build 20-tile slots array from chainFrontier + pendingTxs + gaps
+              var frontier = w.chainFrontier || 0;
+              var gapSet = {};
+              (w.gaps || []).forEach(function(g) { gapSet[g] = true; });
+              // Index pending txs by nonce for quick lookup
+              var pendingByNonce = {};
+              (w.pendingTxs || []).forEach(function(tx) { pendingByNonce[tx.sponsorNonce] = tx; });
+              var slots = [];
+              for (var i = 0; i < CHAINING_LIMIT; i++) {
+                var nonce = frontier + i;
+                var pending = pendingByNonce[nonce];
+                var slotState = 'available';
+                var txid = '';
+                var sender = '';
+                if (gapSet[nonce]) {
+                  slotState = 'gap';
+                } else if (pending) {
+                  slotState = pending.state || 'assigned';
+                  txid = pending.txid || '';
+                  sender = pending.senderAddress || '';
+                }
+                slots.push({ offset: i, state: slotState, nonce: nonce, txid: txid, sender: sender });
+              }
+              return {
+                index: w.walletIndex,
+                address: w.sponsorAddress || '',
+                circuitBreaker: !!w.circuitBreakerOpen,
+                slots: slots
+              };
+            });
           })
           .catch(function() { /* silently ignore network errors */ });
       },

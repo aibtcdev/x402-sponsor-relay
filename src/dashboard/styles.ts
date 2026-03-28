@@ -332,9 +332,6 @@ export const dashboardCss = `
     box-shadow: -4px 0 12px ${colors.status.down}40;
     padding-left: 0.75rem;
   }
-  .nonce-lane--unhealthy {
-    opacity: 0.5;
-  }
   .nonce-tile {
     width: 24px;
     height: 24px;
@@ -483,6 +480,16 @@ export function formatNumber(n: number): string {
 }
 
 /**
+ * Decimal-place lookup for supported tokens (hoisted to module scope
+ * to avoid re-allocating the object on every call).
+ */
+const DECIMALS_BY_TOKEN: Record<string, number> = {
+  STX: 6,
+  sBTC: 8,
+  USDCx: 6,
+};
+
+/**
  * Format a token amount for display in human-readable units.
  *
  * Converts raw micro-unit integer strings to decimal notation:
@@ -493,11 +500,6 @@ export function formatNumber(n: number): string {
  * Uses BigInt arithmetic to avoid floating-point precision loss.
  */
 export function formatTokenAmount(amount: string, token: string): string {
-  const DECIMALS_BY_TOKEN: Record<string, number> = {
-    STX: 6,
-    sBTC: 8,
-    USDCx: 6,
-  };
   const decimals = DECIMALS_BY_TOKEN[token];
   if (decimals === undefined) return amount;
 
