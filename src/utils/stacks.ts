@@ -54,7 +54,8 @@ export function decodeClarityUint(hex: string): string {
     return hex;
   }
   try {
-    const cv = hexToCV(stripHexPrefix(hex));
+    // hexToCV (via deserializeCV) handles the 0x prefix internally
+    const cv = hexToCV(hex);
     const value = cvToValue(cv, true);
     // cvToValue returns bigint for uint/int types
     return String(value);
