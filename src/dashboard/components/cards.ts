@@ -1,5 +1,4 @@
 import { colors, formatNumber, formatTokenAmount, escapeHtml } from "../styles";
-import type { AggregateKeyStats, ApiKeyStatus } from "../../types";
 
 /**
  * Stats card component
@@ -163,7 +162,15 @@ export function successRateCard(success: number, total: number, clientErrors?: n
   const rawRate = total > 0 ? Math.round((success / total) * 100) : 0;
 
   const hasClientErrors = (clientErrors ?? 0) > 0;
-  const color = effectiveRate >= 95 ? colors.status.healthy : effectiveRate >= 80 ? colors.status.degraded : colors.status.down;
+
+  let color: string;
+  if (effectiveRate >= 95) {
+    color = colors.status.healthy;
+  } else if (effectiveRate >= 80) {
+    color = colors.status.degraded;
+  } else {
+    color = colors.status.down;
+  }
 
   return `
 <div class="brand-card p-4">
@@ -178,137 +185,52 @@ export function successRateCard(success: number, total: number, clientErrors?: n
 }
 
 /**
- * Client errors card — shows client-caused failures separately from relay errors.
- *
- * Client errors include bad params, nonce conflicts, rate limit exceeded,
- * and other failures where the relay behaved correctly but the client request
- * was invalid. Displaying these separately prevents them from distorting the
- * relay success rate metric.
+ * Status banner placeholder — server-rendered shell hydrated by Alpine.js statusApp().
+ * Renders a full-width banner with health dot, capacity gauge, and static p50 placeholder.
+ * The Alpine.js component fetches /nonce/state on 10s intervals and fills in health/capacity values.
  */
-export function clientErrorsCard(clientErrors: number, total: number): string {
-  const clientPct = total > 0 ? Math.round((clientErrors / total) * 100) : 0;
-  const color = clientErrors === 0 ? colors.status.healthy : colors.status.degraded;
+export function statusBannerPlaceholder(): string {
+  return `
+<div class="status-banner">
+  <div class="flex items-center gap-3">
+    <span class="status-dot" :style="'background-color: ' + statusColor"></span>
+    <span class="font-medium" :style="'color: ' + statusColor" x-text="statusLabel">Loading...</span>
+  </div>
+  <div class="flex items-center gap-3">
+    <span class="text-sm text-gray-400">Capacity</span>
+    <div class="capacity-gauge">
+      <div class="capacity-gauge__fill" :style="'width: ' + capacityPct + '%; background-color: ' + capacityColor"></div>
+    </div>
+    <span class="text-sm font-mono text-gray-400" x-text="capacityLabel">--/--</span>
+  </div>
+</div>
+<template x-if="showWarning">
+  <div class="status-banner status-banner--warning mt-2">
+    <span class="text-sm" style="color: ${colors.status.degraded}">Nonce pool unhealthy — agents should consider direct submission</span>
+  </div>
+</template>`;
+}
+
+/**
+ * Fees spent card — server-rendered card showing total STX fees sponsored.
+ *
+ * @param totalFees - Total fees in microSTX as a string (e.g. "1234567890")
+ * @param avgFee - Average fee per transaction in microSTX as a string (e.g. "12345")
+ */
+export function feesSpentCard(totalFees: string, avgFee: string): string {
+  const formattedTotal = formatTokenAmount(totalFees, "STX");
+  const avgFeeNum = parseInt(avgFee || "0", 10);
 
   return `
 <div class="brand-card p-4">
   <div class="flex items-center justify-between">
-    <p class="text-sm text-gray-400">Client Errors</p>
-    <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
-  </div>
-  <p class="text-2xl font-bold mt-2" style="color: ${color}">${formatNumber(clientErrors)}</p>
-  <p class="text-xs text-gray-500 mt-2">${clientPct}% of requests</p>
-  <p class="text-xs text-gray-600 mt-0.5">bad params, rate limits, nonce conflicts</p>
-</div>`;
-}
-
-// =============================================================================
-// API Key Stats Components
-// =============================================================================
-
-/**
- * Get status badge HTML for an API key status
- */
-function getStatusBadge(status: ApiKeyStatus): string {
-  const statusConfig = {
-    active: {
-      label: "Active",
-      color: colors.status.healthy,
-      bgColor: `${colors.status.healthy}20`,
-    },
-    rate_limited: {
-      label: "Rate Limited",
-      color: colors.status.degraded,
-      bgColor: `${colors.status.degraded}20`,
-    },
-    capped: {
-      label: "Cap Reached",
-      color: colors.status.down,
-      bgColor: `${colors.status.down}20`,
-    },
-  };
-
-  const config = statusConfig[status];
-
-  return `<span class="px-2 py-0.5 text-xs rounded-full" style="background-color: ${config.bgColor}; color: ${config.color}">${config.label}</span>`;
-}
-
-/**
- * API key summary cards (active keys count + fees today)
- */
-export function apiKeySummaryCards(stats: AggregateKeyStats): string {
-  const formattedFees = formatTokenAmount(stats.totalFeesToday, "STX");
-
-  return `
-<div class="grid grid-cols-2 gap-4">
-  ${statsCard("Active API Keys", stats.totalActiveKeys, {
-    icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>`,
-  })}
-
-  ${statsCard("Fees Sponsored Today", formattedFees, {
-    icon: `<svg class="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>`,
-  })}
-</div>`;
-}
-
-/**
- * Top API keys table showing usage breakdown
- */
-export function topKeysTable(stats: AggregateKeyStats): string {
-  if (stats.topKeys.length === 0) {
-    return `
-<div class="brand-section p-6">
-  <h3 class="text-lg font-semibold text-white mb-4">Top Keys by Usage (Today)</h3>
-  <div class="text-center py-8">
-    <svg class="w-12 h-12 text-gray-600 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/>
+    <p class="text-sm text-gray-400">Fees Sponsored</p>
+    <svg class="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+        d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
     </svg>
-    <p class="text-gray-400">No API key activity today</p>
-    <p class="text-sm text-gray-500 mt-1">Usage stats will appear here once API keys are used</p>
   </div>
-</div>`;
-  }
-
-  const rows = stats.topKeys
-    .map((key) => {
-      const formattedFees = formatTokenAmount(key.feesToday, "STX");
-
-      return `
-    <tr class="border-t" style="border-color: ${colors.bg.border}">
-      <td class="py-3 px-4">
-        <code class="text-sm font-mono text-purple-400">${escapeHtml(key.keyPrefix)}...</code>
-      </td>
-      <td class="py-3 px-4 text-right">
-        <span class="text-white font-medium">${formatNumber(key.requestsToday)}</span>
-        <span class="text-gray-500 text-sm ml-1">req</span>
-      </td>
-      <td class="py-3 px-4 text-right">
-        <span class="text-white font-medium">${formattedFees}</span>
-      </td>
-      <td class="py-3 px-4 text-right">
-        ${getStatusBadge(key.status)}
-      </td>
-    </tr>`;
-    })
-    .join("");
-
-  return `
-<div class="brand-section p-6">
-  <h3 class="text-lg font-semibold text-white mb-4">Top Keys by Usage (Today)</h3>
-  <div class="overflow-x-auto">
-    <table class="w-full">
-      <thead>
-        <tr class="text-left text-gray-400 text-sm">
-          <th class="py-2 px-4 font-medium">Key ID</th>
-          <th class="py-2 px-4 font-medium text-right">Requests</th>
-          <th class="py-2 px-4 font-medium text-right">Fees</th>
-          <th class="py-2 px-4 font-medium text-right">Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows}
-      </tbody>
-    </table>
-  </div>
+  <p class="text-2xl font-bold mt-2" style="color: ${colors.brand.orange}">${escapeHtml(formattedTotal)}</p>
+  <p class="text-xs text-gray-500 mt-1">avg: ${formatNumber(avgFeeNum)} uSTX / tx</p>
 </div>`;
 }
-

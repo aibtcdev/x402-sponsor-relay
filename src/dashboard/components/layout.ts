@@ -30,18 +30,10 @@ export function htmlDocument(content: string, title: string, options?: { include
 }
 
 /**
- * Dashboard header component
- * @param network - Optional network indicator ("testnet" | "mainnet")
+ * Dashboard header component with logo, title, and navigation links.
+ * @param _network - Unused; retained for call-site compatibility.
  */
-export function header(network?: string): string {
-  const networkBadge = network
-    ? `<span class="ml-2 px-2 py-0.5 text-xs font-medium rounded-full ${
-        network === "mainnet"
-          ? "bg-green-900 text-green-300 border border-green-700"
-          : "bg-yellow-900 text-yellow-300 border border-yellow-700"
-      }">${escapeHtml(network)}</span>`
-    : "";
-
+export function header(_network?: string): string {
   return `
 <header class="brand-bar border-b">
   <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
@@ -49,10 +41,7 @@ export function header(network?: string): string {
       <div class="flex-shrink-0 flex items-center space-x-3">
         <img src="https://aibtc.com/Primary_Logo/SVG/AIBTC_PrimaryLogo_KO.svg" alt="AIBTC" class="h-8" width="32" height="32">
         <div>
-          <div class="flex items-center">
-            <h1 class="text-xl font-bold text-white">x402 Sponsor Relay</h1>
-            ${networkBadge}
-          </div>
+          <h1 class="text-xl font-bold text-white">x402 Sponsor Relay</h1>
           <p class="text-sm text-gray-400">Dashboard</p>
         </div>
       </div>
@@ -95,18 +84,6 @@ export function footer(lastUpdated: string): string {
           if (el) el.textContent = tz;
         })();
       </script>
-      <div x-data="{ autoRefresh: localStorage.getItem('dashboardAutoRefresh') !== 'false' }" class="flex items-center space-x-2">
-        <span>Auto-refresh:</span>
-        <button
-          @click="autoRefresh = !autoRefresh; localStorage.setItem('dashboardAutoRefresh', autoRefresh.toString()); if(autoRefresh) location.reload()"
-          :class="autoRefresh ? 'bg-green-600' : 'bg-gray-600'"
-          class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors min-w-[44px] min-h-[44px]">
-          <span
-            :class="autoRefresh ? 'translate-x-6' : 'translate-x-1'"
-            class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform">
-          </span>
-        </button>
-      </div>
     </div>
   </div>
 </footer>`;

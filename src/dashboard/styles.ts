@@ -17,6 +17,15 @@ export const colors = {
     purple: "#A855F7",
   },
 
+  // Nonce tile state colors
+  nonce: {
+    available: "#1a1a1a",
+    assigned: "#FF4F03", // brand orange
+    broadcasted: "#0634D0", // brand blue
+    replaced: "#A855F7", // brand purple
+    gap: "#F87171", // red
+  },
+
   // Status colors
   status: {
     healthy: "#10B981", // Green
@@ -167,7 +176,6 @@ export const dashboardCss = `
   .h-8 { height: 2rem; }
   .h-10 { height: 2.5rem; }
   .h-16 { height: 4rem; }
-  .h-96 { height: 24rem; }
   .h-full { height: 100%; }
   .min-h-screen { min-height: 100vh; }
   .min-h-\\[32px\\] { min-height: 32px; }
@@ -232,6 +240,9 @@ export const dashboardCss = `
 
   /* ── Interactive ───────────────────────────────────────────── */
   .hover\\:text-white:hover { color: #ffffff; }
+  .hover\\:text-gray-300:hover { color: #d1d5db; }
+  .cursor-pointer { cursor: pointer; }
+  .select-none { user-select: none; }
 
   /* ── Responsive ────────────────────────────────────────────── */
   @media (min-width: 640px) {
@@ -304,6 +315,145 @@ export const dashboardCss = `
     border-radius: 0.5rem;
   }
 
+  /* ── Utility additions for redesign ───────────────────────── */
+  .h-64 { height: 16rem; }
+  .gap-2 { gap: 0.5rem; }
+  .text-green-400 { color: #4ade80; }
+  .text-red-400 { color: #f87171; }
+  .flex-1 { flex: 1; }
+  .max-w-\\[200px\\] { max-width: 200px; }
+
+  /* ── Nonce tile classes ────────────────────────────────────── */
+  .nonce-lane {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0;
+  }
+  .nonce-lane--cb {
+    border-left: 3px solid ${colors.status.down};
+    box-shadow: -4px 0 12px ${colors.status.down}40;
+    padding-left: 0.75rem;
+  }
+  .nonce-tile {
+    width: 24px;
+    height: 24px;
+    border-radius: 2px;
+    transition: background-color 0.3s ease;
+    flex-shrink: 0;
+  }
+  .nonce-tile--available {
+    background-color: transparent;
+    border: 1px solid ${colors.bg.border};
+  }
+  .nonce-tile--assigned {
+    background-color: ${colors.nonce.assigned};
+  }
+  .nonce-tile--broadcasted {
+    background-color: ${colors.nonce.broadcasted};
+  }
+  .nonce-tile--replaced {
+    background-color: ${colors.nonce.replaced};
+  }
+  .nonce-tile--gap {
+    background-color: ${colors.nonce.gap};
+    animation: gapPulse 1.5s ease-in-out infinite;
+  }
+
+  @keyframes gapPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  /* Circuit breaker glow animation */
+  @keyframes circuitGlow {
+    0%, 100% { box-shadow: 0 0 4px ${colors.status.down}40; }
+    50% { box-shadow: 0 0 16px ${colors.status.down}80; }
+  }
+  .circuit-breaker-active {
+    animation: circuitGlow 2s ease-in-out infinite;
+    border-color: ${colors.status.down} !important;
+  }
+
+  /* ── Status banner classes ─────────────────────────────────── */
+  .status-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1.5rem;
+    border-radius: 0.5rem;
+    border: 1px solid ${colors.bg.border};
+    background-color: ${colors.bg.card};
+    flex-wrap: wrap;
+    gap: 1rem;
+  }
+  .status-banner--warning {
+    border-color: ${colors.status.degraded}40;
+    background-color: ${colors.status.degraded}08;
+  }
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* ── Capacity gauge classes ────────────────────────────────── */
+  .capacity-gauge {
+    height: 8px;
+    border-radius: 4px;
+    background-color: ${colors.bg.border};
+    overflow: hidden;
+    flex: 1;
+    max-width: 200px;
+    min-width: 80px;
+  }
+  .capacity-gauge__fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.5s ease;
+  }
+
+  /* ── Collapsible section classes ───────────────────────────── */
+  .detail-section {
+    border: 1px solid ${colors.bg.border};
+    border-radius: 0.5rem;
+    overflow: hidden;
+    margin-bottom: 0.75rem;
+  }
+  .detail-section__header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1rem 1.5rem;
+    cursor: pointer;
+    background-color: ${colors.bg.card};
+    transition: background-color 0.2s ease;
+    width: 100%;
+    text-align: left;
+    border: none;
+    color: inherit;
+    font-family: inherit;
+    font-size: inherit;
+  }
+  .detail-section__header:hover {
+    background-color: ${colors.bg.border};
+  }
+  .detail-section__chevron {
+    width: 20px;
+    height: 20px;
+    transition: transform 0.2s ease;
+    color: ${colors.text.secondary};
+    flex-shrink: 0;
+  }
+  .detail-section__chevron--open {
+    transform: rotate(180deg);
+  }
+  .detail-section__body {
+    padding: 1rem 1.5rem;
+    border-top: 1px solid ${colors.bg.border};
+  }
+
 `;
 
 /**
@@ -333,6 +483,16 @@ export function formatNumber(n: number): string {
 }
 
 /**
+ * Decimal-place lookup for supported tokens (hoisted to module scope
+ * to avoid re-allocating the object on every call).
+ */
+const DECIMALS_BY_TOKEN: Record<string, number> = {
+  STX: 6,
+  sBTC: 8,
+  USDCx: 6,
+};
+
+/**
  * Format a token amount for display in human-readable units.
  *
  * Converts raw micro-unit integer strings to decimal notation:
@@ -343,21 +503,8 @@ export function formatNumber(n: number): string {
  * Uses BigInt arithmetic to avoid floating-point precision loss.
  */
 export function formatTokenAmount(amount: string, token: string): string {
-  // Determine divisor and decimal places per token
-  let decimals: number;
-  switch (token) {
-    case "STX":
-      decimals = 6;
-      break;
-    case "sBTC":
-      decimals = 8;
-      break;
-    case "USDCx":
-      decimals = 6;
-      break;
-    default:
-      return amount;
-  }
+  const decimals = DECIMALS_BY_TOKEN[token];
+  if (decimals === undefined) return amount;
 
   const divisor = BigInt(10) ** BigInt(decimals);
   const value = BigInt(amount || "0");
