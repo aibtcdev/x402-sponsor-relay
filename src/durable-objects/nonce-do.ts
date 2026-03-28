@@ -4673,6 +4673,33 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
+    // Pre-mempool corridor: scan [last_executed_tx_nonce+1 .. possible_next_nonce)
+    // for nonces that Hiro never reports as "missing" because no mempool tx sits
+    // above them to create a detectable gap — the "first blocker" blind spot.
+    // -------------------------------------------------------------------------
+    if (last_executed_tx_nonce !== null && possible_next_nonce > last_executed_tx_nonce + 1) {
+      const corridorStart = last_executed_tx_nonce + 1;
+      const gapFillNonceSet = new Set(gapFillNonces);
+      let corridorDetected = 0;
+      for (let n = corridorStart; n < possible_next_nonce; n++) {
+        if (broadcastedByNonce.has(n) || assignedByNonce.has(n) || gapFillNonceSet.has(n)) continue;
+        gapFillNonces.push(n);
+        gapFillNonceSet.add(n);
+        corridorDetected++;
+      }
+      if (corridorDetected > 0) {
+        this.log("info", "corridor_gap_detected", {
+          walletIndex,
+          corridorStart,
+          corridorEnd: possible_next_nonce - 1,
+          detected: corridorDetected,
+          last_executed_tx_nonce,
+          possible_next_nonce,
+        });
+      }
+    }
+
+    // -------------------------------------------------------------------------
     // Execute RBF for candidates (both ledger age AND Hiro absence must agree)
     // -------------------------------------------------------------------------
     const rbfAttempted: number[] = [];
@@ -6163,13 +6190,22 @@ export class NonceDO {
         return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
       }
 
-      const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+      const { possible_next_nonce, detected_missing_nonces, last_executed_tx_nonce } = nonceInfo;
       this.advanceChainFrontier(walletIndex, possible_next_nonce);
       const head = this.ledgerGetWalletHead(walletIndex);
 
       // Compute gaps: Hiro-reported missing nonces + any range between
       // last_executed and head that Hiro doesn't see (ledger-only gaps)
       const gapSet = new Set(detected_missing_nonces);
+
+      // Pre-mempool corridor: [last_executed_tx_nonce+1 .. possible_next_nonce)
+      // Hiro never reports these as "missing" because no mempool tx sits above them
+      // to create a detectable gap — the "first blocker" blind spot.
+      if (last_executed_tx_nonce !== null) {
+        for (let n = last_executed_tx_nonce + 1; n < possible_next_nonce; n++) {
+          gapSet.add(n);
+        }
+      }
 
       // Also check contiguous range from possible_next_nonce to head for
       // nonces not in the mempool (Hiro won't report these as "missing"
