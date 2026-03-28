@@ -6,7 +6,6 @@ import {
   healthCard,
   successRateCard,
   statusBannerPlaceholder,
-  settlementTimeCard,
   feesSpentCard,
 } from "../components/cards";
 import {
@@ -145,15 +144,13 @@ ${header(network)}
     </div>
 
     <!-- Zone B: Redesigned metric cards -->
-    <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
       ${statsCard("Transactions (24h)", data.transactions.total, {
         trend: trend.html,
         icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`,
       })}
 
       ${successRateCard(data.transactions.success, data.transactions.total, data.transactions.clientErrors)}
-
-      ${settlementTimeCard()}
 
       ${feesSpentCard(data.fees.total, data.fees.average)}
     </div>

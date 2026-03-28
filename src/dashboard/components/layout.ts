@@ -84,18 +84,6 @@ export function footer(lastUpdated: string): string {
           if (el) el.textContent = tz;
         })();
       </script>
-      <div x-data="{ autoRefresh: localStorage.getItem('dashboardAutoRefresh') !== 'false' }" class="flex items-center space-x-2">
-        <span>Auto-refresh:</span>
-        <button
-          @click="autoRefresh = !autoRefresh; localStorage.setItem('dashboardAutoRefresh', autoRefresh.toString()); if(autoRefresh) location.reload()"
-          :class="autoRefresh ? 'bg-green-600' : 'bg-gray-600'"
-          class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors min-w-[44px] min-h-[44px]">
-          <span
-            :class="autoRefresh ? 'translate-x-6' : 'translate-x-1'"
-            class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform">
-          </span>
-        </button>
-      </div>
     </div>
   </div>
 </footer>`;

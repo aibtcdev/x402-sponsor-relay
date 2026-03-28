@@ -203,36 +203,12 @@ export function statusBannerPlaceholder(): string {
     </div>
     <span class="text-sm font-mono text-gray-400" x-text="capacityLabel">--/--</span>
   </div>
-  <div class="flex items-center gap-3">
-    <span class="text-sm text-gray-400">p50</span>
-    <span class="text-sm font-mono text-white">N/A</span>
-  </div>
 </div>
 <template x-if="showWarning">
   <div class="status-banner status-banner--warning mt-2">
     <span class="text-sm" style="color: ${colors.status.degraded}">Nonce pool unhealthy — agents should consider direct submission</span>
   </div>
 </template>`;
-}
-
-/**
- * Settlement time card — metric card showing median (p50) settlement time.
- * Currently renders static "N/A" placeholders since settlement latency data
- * is not yet available from the /nonce/state API.
- */
-export function settlementTimeCard(): string {
-  return `
-<div class="brand-card p-4">
-  <div class="flex items-center justify-between">
-    <p class="text-sm text-gray-400">Settlement Time</p>
-    <svg class="w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-        d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
-    </svg>
-  </div>
-  <p class="text-2xl font-bold text-white mt-2">N/A</p>
-  <p class="text-xs text-gray-500 mt-1">p95: N/A</p>
-</div>`;
 }
 
 /**
