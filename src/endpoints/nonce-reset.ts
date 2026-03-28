@@ -168,8 +168,18 @@ export class NonceReset extends BaseEndpoint {
         }
         action = body.action as NonceResetAction;
       }
-      if (typeof body.walletIndex === "number" && Number.isInteger(body.walletIndex) && body.walletIndex >= 0) {
-        walletIndex = body.walletIndex;
+      if (body.walletIndex !== undefined) {
+        if (typeof body.walletIndex === "number" && Number.isInteger(body.walletIndex) && body.walletIndex >= 0) {
+          walletIndex = body.walletIndex;
+        } else {
+          return this.err(c, {
+            error: "Invalid walletIndex",
+            code: "NONCE_RESET_FAILED",
+            status: 400,
+            details: `walletIndex must be a non-negative integer; got '${body.walletIndex}'`,
+            retryable: false,
+          });
+        }
       }
     } catch (_e) {
       // Body is optional — empty body or missing Content-Type is fine, use defaults
@@ -215,12 +225,14 @@ export class NonceReset extends BaseEndpoint {
           status: response.status,
           body,
         });
+        // Preserve 4xx from DO (operator input errors) — only map 5xx as internal error
+        const isClientError = response.status >= 400 && response.status < 500;
         return this.err(c, {
-          error: "Nonce recovery failed",
+          error: isClientError ? body || "Bad request" : "Nonce recovery failed",
           code: "NONCE_RESET_FAILED",
-          status: 500,
+          status: isClientError ? response.status : 500,
           details: body || `Nonce DO responded with status ${response.status}`,
-          retryable: true,
+          retryable: !isClientError,
         });
       }
 
