@@ -4673,6 +4673,37 @@ export class NonceDO {
     }
 
     // -------------------------------------------------------------------------
+    // Pre-mempool corridor: scan [last_executed_tx_nonce+1 .. possible_next_nonce)
+    // for nonces that Hiro never reports as "missing" because no mempool tx sits
+    // above them to create a detectable gap — the "first blocker" blind spot.
+    // -------------------------------------------------------------------------
+    if (last_executed_tx_nonce !== null && possible_next_nonce > last_executed_tx_nonce + 1) {
+      const corridorStart = last_executed_tx_nonce + 1;
+      // Clamp corridor scan to CHAINING_LIMIT nonces — if the range is huge
+      // (e.g., a very high-nonce mempool tx), the downstream gap-fill cap will
+      // truncate anyway, and this avoids O(N) iteration blocking the DO.
+      const corridorEnd = Math.min(possible_next_nonce, corridorStart + CHAINING_LIMIT);
+      const gapFillNonceSet = new Set(gapFillNonces);
+      let corridorDetected = 0;
+      for (let n = corridorStart; n < corridorEnd; n++) {
+        if (broadcastedByNonce.has(n) || assignedByNonce.has(n) || gapFillNonceSet.has(n)) continue;
+        gapFillNonces.push(n);
+        gapFillNonceSet.add(n);
+        corridorDetected++;
+      }
+      if (corridorDetected > 0) {
+        this.log("info", "corridor_gap_detected", {
+          walletIndex,
+          corridorStart,
+          corridorEnd: possible_next_nonce - 1,
+          detected: corridorDetected,
+          last_executed_tx_nonce,
+          possible_next_nonce,
+        });
+      }
+    }
+
+    // -------------------------------------------------------------------------
     // Execute RBF for candidates (both ledger age AND Hiro absence must agree)
     // -------------------------------------------------------------------------
     const rbfAttempted: number[] = [];
@@ -6163,13 +6194,26 @@ export class NonceDO {
         return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
       }
 
-      const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+      const { possible_next_nonce, detected_missing_nonces, last_executed_tx_nonce } = nonceInfo;
       this.advanceChainFrontier(walletIndex, possible_next_nonce);
       const head = this.ledgerGetWalletHead(walletIndex);
 
       // Compute gaps: Hiro-reported missing nonces + any range between
       // last_executed and head that Hiro doesn't see (ledger-only gaps)
       const gapSet = new Set(detected_missing_nonces);
+
+      // Pre-mempool corridor: [last_executed_tx_nonce+1 .. possible_next_nonce)
+      // Hiro never reports these as "missing" because no mempool tx sits above them
+      // to create a detectable gap — the "first blocker" blind spot.
+      if (last_executed_tx_nonce !== null) {
+        const corridorEnd = Math.min(
+          possible_next_nonce,
+          last_executed_tx_nonce + 1 + MAX_ADMIN_GAP_FILLS
+        );
+        for (let n = last_executed_tx_nonce + 1; n < corridorEnd; n++) {
+          gapSet.add(n);
+        }
+      }
 
       // Also check contiguous range from possible_next_nonce to head for
       // nonces not in the mempool (Hiro won't report these as "missing"
@@ -6180,15 +6224,19 @@ export class NonceDO {
         }
       }
 
-      // Remove nonces that are already in the mempool (assigned/broadcasted/confirmed).
+      // Remove nonces that are already managed by our ledger (assigned/broadcasted/confirmed).
+      // Lower bound covers the full gap range added above (last_executed + 1 or 0)
+      // so corridor nonces with existing ledger entries are correctly excluded.
       // 'confirmed' = broadcast accepted, still pending on-chain — same as ledgerInFlightCount.
+      const inFlightLowerBound =
+        last_executed_tx_nonce !== null ? last_executed_tx_nonce + 1 : 0;
       const inFlightRows = this.sql
         .exec<{ nonce: number }>(
           `SELECT nonce FROM nonce_intents
            WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')
              AND nonce >= ?`,
           walletIndex,
-          possible_next_nonce
+          inFlightLowerBound
         )
         .toArray();
       for (const row of inFlightRows) {
@@ -6250,6 +6298,212 @@ export class NonceDO {
         filled,
         failed,
         ...(truncated && { truncated: true, totalGaps: allGaps.length }),
+      });
+    } catch (error) {
+      return this.internalError(error);
+    }
+  }
+
+  /**
+   * Admin: full wallet flush — retract all active dispatch_queue entries to replay_buffer,
+   * replace every nonce in [last_executed+1 .. max(possible_next, head)] with a self-transfer,
+   * and reset the wallet head. Use when surgical gap-filling fails (18+ scattered gaps /
+   * TooMuchChaining prevents individual gap-fills from landing).
+   *
+   * Safety cap: MAX_ADMIN_GAP_FILLS (50) nonces per flush to prevent unbounded iteration.
+   * Nonces are processed ascending (lowest first) so the chain starts confirming immediately.
+   */
+  private async handleFlushWallet(walletIndex: number): Promise<Response> {
+    try {
+      const address = await this.getStoredSponsorAddressForWallet(walletIndex);
+      if (!address) {
+        return this.badRequest(`Wallet ${walletIndex} not initialized`);
+      }
+
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      if (!privateKey) {
+        return this.badRequest(`Cannot derive key for wallet ${walletIndex}`);
+      }
+
+      // Fetch current chain state from Hiro
+      let nonceInfo: HiroNonceInfo;
+      try {
+        nonceInfo = await this.fetchNonceInfo(address);
+      } catch (_e) {
+        return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
+      }
+
+      const { possible_next_nonce, last_executed_tx_nonce } = nonceInfo;
+      this.advanceChainFrontier(walletIndex, possible_next_nonce);
+      const head = this.ledgerGetWalletHead(walletIndex);
+
+      // Determine flush range: [flushStart .. flushEnd)
+      // flushStart = last_executed_tx_nonce + 1 (safe floor confirmed on-chain)
+      // flushEnd   = max(possible_next_nonce, head) so we cover all in-flight nonces
+      const flushStart = last_executed_tx_nonce !== null
+        ? last_executed_tx_nonce + 1
+        : possible_next_nonce;
+      const rawFlushEnd = Math.max(
+        possible_next_nonce,
+        head ?? possible_next_nonce
+      );
+      // Clamp to safety cap — process lowest nonces first so chain starts confirming
+      const flushEnd = Math.min(rawFlushEnd, flushStart + MAX_ADMIN_GAP_FILLS);
+
+      this.log("info", "flush_wallet_start", {
+        walletIndex,
+        address,
+        flushStart,
+        flushEnd,
+        possibleNextNonce: possible_next_nonce,
+        lastExecutedTxNonce: last_executed_tx_nonce,
+        head,
+        capped: rawFlushEnd > flushStart + MAX_ADMIN_GAP_FILLS,
+      });
+
+      // -------------------------------------------------------------------------
+      // Step 1: Index active dispatch_queue entries by sponsor nonce.
+      // We defer retraction to replay_buffer until after each nonce is
+      // successfully flushed — avoids re-sponsoring while old slot is occupied.
+      // -------------------------------------------------------------------------
+      const activeEntries = this.sql
+        .exec<{
+          sender_tx_hex: string;
+          sender_address: string;
+          sender_nonce: number;
+          sponsor_nonce: number;
+        }>(
+          `SELECT sender_tx_hex, sender_address, sender_nonce, sponsor_nonce
+           FROM dispatch_queue
+           WHERE wallet_index = ? AND state IN ('queued', 'dispatched')
+           ORDER BY sponsor_nonce ASC`,
+          walletIndex
+        )
+        .toArray();
+
+      // Map sponsor_nonce → entry for per-nonce retraction after successful flush
+      const activeByNonce = new Map(activeEntries.map((e) => [e.sponsor_nonce, e]));
+
+      // -------------------------------------------------------------------------
+      // Step 2: Fill every nonce in [flushStart .. flushEnd) with a self-transfer.
+      // For nonces occupied by real sponsored txs, use broadcastRbfForNonce to evict.
+      // For gaps or gap-fill slots, use fillGapNonce with MIN_FLUSH_FEE.
+      // On successful flush of a sponsored nonce, retract to replay_buffer.
+      // -------------------------------------------------------------------------
+      const filled: Array<{ nonce: number; txid: string; method: "rbf" | "gap_fill" }> = [];
+      const failedNonces: Array<{ nonce: number; reason: string }> = [];
+      let retracted = 0;
+
+      // Build set of nonces that hold real sponsored txs (non-gap-fill dispatch_queue entries)
+      const sponsoredNonceSet = new Set(
+        this.sql
+          .exec<{ sponsor_nonce: number }>(
+            `SELECT sponsor_nonce FROM dispatch_queue WHERE wallet_index = ? AND state NOT IN ('confirmed')`,
+            walletIndex
+          )
+          .toArray()
+          .map((r) => r.sponsor_nonce)
+      );
+
+      for (let nonce = flushStart; nonce < flushEnd; nonce++) {
+        try {
+          if (sponsoredNonceSet.has(nonce)) {
+            // Nonce held by a real sponsored tx — prefer RBF, fall back to gap-fill
+            let txid = await this.broadcastRbfForNonce(walletIndex, nonce, privateKey, null);
+            if (txid) {
+              filled.push({ nonce, txid, method: "rbf" });
+            } else {
+              // RBF failed (max attempts or network error) — fall back to gap-fill
+              const gapTxid = await this.fillGapNonce(walletIndex, nonce, privateKey, MIN_FLUSH_FEE);
+              if (gapTxid) {
+                txid = gapTxid;
+                this.ledgerInsertGapFill(walletIndex, nonce, gapTxid);
+                this.incrementCounter(STATE_KEYS.gapsFilled);
+                await this.recordGapFillFee(walletIndex, MIN_FLUSH_FEE.toString());
+                filled.push({ nonce, txid: gapTxid, method: "gap_fill" });
+              } else {
+                failedNonces.push({ nonce, reason: "rbf and gap-fill both failed or already occupied" });
+              }
+            }
+            // Only retract to replay_buffer after successful flush for this nonce
+            if (txid) {
+              const entry = activeByNonce.get(nonce);
+              if (entry) {
+                try {
+                  this.transitionQueueEntry(walletIndex, nonce, "replaying");
+                  this.addToReplayBuffer(
+                    walletIndex,
+                    entry.sender_tx_hex,
+                    entry.sender_address,
+                    entry.sender_nonce,
+                    entry.sponsor_nonce
+                  );
+                  retracted++;
+                } catch (e) {
+                  this.log("warn", "flush_wallet_retract_error", {
+                    walletIndex,
+                    sponsorNonce: nonce,
+                    error: e instanceof Error ? e.message : String(e),
+                  });
+                }
+              }
+            }
+          } else {
+            // Gap or unknown slot — use gap-fill self-transfer
+            const txid = await this.fillGapNonce(walletIndex, nonce, privateKey, MIN_FLUSH_FEE);
+            if (txid) {
+              this.ledgerInsertGapFill(walletIndex, nonce, txid);
+              this.incrementCounter(STATE_KEYS.gapsFilled);
+              await this.recordGapFillFee(walletIndex, MIN_FLUSH_FEE.toString());
+              filled.push({ nonce, txid, method: "gap_fill" });
+            } else {
+              // ConflictingNonceInMempool means already occupied — not a hard failure
+              failedNonces.push({ nonce, reason: "broadcast rejected or already occupied" });
+            }
+          }
+        } catch (e) {
+          this.log("warn", "flush_wallet_fill_error", {
+            walletIndex,
+            nonce,
+            error: e instanceof Error ? e.message : String(e),
+          });
+          failedNonces.push({ nonce, reason: e instanceof Error ? e.message : String(e) });
+        }
+      }
+
+      // -------------------------------------------------------------------------
+      // Step 3: Advance wallet head to flushEnd so /assign starts past the
+      // flushed range. Setting it to flushStart would cause immediate conflicts
+      // with the self-transfers we just broadcast.
+      // -------------------------------------------------------------------------
+      this.ledgerAdvanceWalletHead(walletIndex, flushEnd);
+      const replayBufferDepth = this.getReplayBufferDepth(walletIndex);
+
+      this.log("info", "flush_wallet_complete", {
+        walletIndex,
+        flushStart,
+        flushEnd,
+        retracted,
+        filledCount: filled.length,
+        failedCount: failedNonces.length,
+        newHead: flushEnd,
+        replayBufferDepth,
+      });
+
+      return this.jsonResponse({
+        success: true,
+        walletIndex,
+        address,
+        flushRange: { start: flushStart, end: flushEnd },
+        retracted,
+        filled,
+        failed: failedNonces,
+        newHead: flushEnd,
+        replayBufferDepth,
+        ...(rawFlushEnd > flushStart + MAX_ADMIN_GAP_FILLS && {
+          capped: true,
+          totalNonceRange: rawFlushEnd - flushStart,
+        }),
       });
     } catch (error) {
       return this.internalError(error);
@@ -6506,6 +6760,18 @@ export class NonceDO {
     if (request.method === "POST" && fillGapsMatch) {
       const walletIdx = parseInt(fillGapsMatch[1], 10);
       return this.state.blockConcurrencyWhile(() => this.handleFillGaps(walletIdx));
+    }
+
+    // POST /flush-wallet/:walletIndex — admin: full wallet flush when surgical gap-filling fails.
+    // Retracts all active dispatch_queue entries to replay_buffer, fills the entire nonce range
+    // with self-transfers, and resets the wallet head to last_executed+1.
+    const flushWalletMatch = url.pathname.match(/^\/flush-wallet\/(\d+)$/);
+    if (request.method === "POST" && flushWalletMatch) {
+      const walletIdx = parseInt(flushWalletMatch[1], 10);
+      if (!Number.isInteger(walletIdx) || walletIdx < 0 || walletIdx >= ABSOLUTE_MAX_WALLET_COUNT) {
+        return this.badRequest("Invalid wallet index");
+      }
+      return this.state.blockConcurrencyWhile(() => this.handleFlushWallet(walletIdx));
     }
 
     // GET /history/:wallet/:nonce — diagnostic endpoint for full nonce event trail.
