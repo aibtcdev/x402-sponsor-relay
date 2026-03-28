@@ -6128,16 +6128,20 @@ export class NonceDO {
   }
 
   /**
-   * Clear all per-wallet state and stored addresses.
-   * Wallets will reinitialize from Hiro on the next /assign call.
-   * Also resets nonce heads and clears the nonce_intents ledger for each wallet.
+   * Clear per-wallet nonce state while preserving sponsor addresses.
+   * Sponsor addresses are wallet identity (derived from mnemonic) and must
+   * survive pool clears — without them, resync/reset/flush-wallet all fail
+   * with "No sponsor address stored; call /assign first" and the only
+   * recovery path is a full redeploy.
+   * Resets nonce heads and clears the nonce_intents ledger for each wallet.
    */
   private async handleClearPools(): Promise<Response> {
     return this.state.blockConcurrencyWhile(async () => {
       const initializedWallets = await this.getInitializedWallets();
       for (const { walletIndex } of initializedWallets) {
-        // Clear sponsor address
-        await this.state.storage.delete(this.sponsorAddressKey(walletIndex));
+        // NOTE: sponsor address is intentionally preserved — it is wallet
+        // identity, not nonce state. Deleting it breaks all admin actions
+        // until a redeploy re-runs /assign.
         // Reset the ledger head for this wallet
         if (walletIndex === 0) {
           this.sql.exec("DELETE FROM nonce_state WHERE key = ?", STATE_KEYS.current);
