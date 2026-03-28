@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.26.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.25.0...x402-sponsor-relay-v1.26.0) (2026-03-28)
+
+
+### Features
+
+* **dashboard:** 6-zone redesign with nonce pool visualization ([#250](https://github.com/aibtcdev/x402-sponsor-relay/issues/250)) ([e16fb7b](https://github.com/aibtcdev/x402-sponsor-relay/commit/e16fb7b17655f27084fdb63e250b62077f7c06ed))
+
 ## [1.25.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.24.0...x402-sponsor-relay-v1.25.0) (2026-03-27)
 
 
