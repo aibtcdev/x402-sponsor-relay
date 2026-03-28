@@ -162,7 +162,15 @@ export function successRateCard(success: number, total: number, clientErrors?: n
   const rawRate = total > 0 ? Math.round((success / total) * 100) : 0;
 
   const hasClientErrors = (clientErrors ?? 0) > 0;
-  const color = effectiveRate >= 95 ? colors.status.healthy : effectiveRate >= 80 ? colors.status.degraded : colors.status.down;
+
+  let color: string;
+  if (effectiveRate >= 95) {
+    color = colors.status.healthy;
+  } else if (effectiveRate >= 80) {
+    color = colors.status.degraded;
+  } else {
+    color = colors.status.down;
+  }
 
   return `
 <div class="brand-card p-4">
@@ -250,5 +258,3 @@ export function feesSpentCard(totalFees: string, avgFee: string): string {
   <p class="text-xs text-gray-500 mt-1">avg: ${formatNumber(avgFeeNum)} uSTX / tx</p>
 </div>`;
 }
-
-

@@ -56,8 +56,6 @@ function chartEmptyState(message: string): string {
 </div>`;
 }
 
-
-
 /**
  * Render just the grid of endpoint cards (no outer wrapper).
  * Used by the collapsible accordion section.
@@ -107,6 +105,13 @@ function endpointBreakdownCards(breakdown: EndpointBreakdown): string {
 </div>`;
 }
 
+/**
+ * Check whether the endpoint breakdown section has any data to display
+ */
+function hasEndpointData(breakdown: EndpointBreakdown | undefined): breakdown is EndpointBreakdown {
+  if (!breakdown) return false;
+  return (breakdown.relay.total + breakdown.sponsor.total + breakdown.settle.total + breakdown.verify.total) > 0;
+}
 
 /**
  * Generate the main dashboard overview page
@@ -283,7 +288,7 @@ ${header(network)}
       </div>
     </div>
 
-    ${data.endpointBreakdown && (data.endpointBreakdown.relay.total + data.endpointBreakdown.sponsor.total + data.endpointBreakdown.settle.total + data.endpointBreakdown.verify.total) > 0 ? `
+    ${hasEndpointData(data.endpointBreakdown) ? `
     <!-- Endpoint Breakdown -->
     <div class="detail-section" x-data="{ open: false }">
       <button class="detail-section__header" @click="open = !open" type="button">
@@ -293,7 +298,7 @@ ${header(network)}
         </svg>
       </button>
       <div class="detail-section__body" x-show="open" x-cloak>
-        ${data.endpointBreakdown ? endpointBreakdownCards(data.endpointBreakdown) : ""}
+        ${endpointBreakdownCards(data.endpointBreakdown)}
       </div>
     </div>
     ` : ""}
@@ -551,12 +556,9 @@ ${footer(utcTimestamp())}
             if (healthy && !hasRecommendation) {
               self.statusColor = '#10B981';
               self.statusLabel = 'Healthy';
-            } else if (!healthy || hasRecommendation) {
+            } else {
               self.statusColor = '#FBBF24';
               self.statusLabel = hasRecommendation ? 'Degraded — fallback to direct' : 'Degraded';
-            } else {
-              self.statusColor = '#F87171';
-              self.statusLabel = 'Unhealthy';
             }
 
             self.capacityPct = Math.min(pct, 100);

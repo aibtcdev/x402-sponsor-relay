@@ -493,21 +493,13 @@ export function formatNumber(n: number): string {
  * Uses BigInt arithmetic to avoid floating-point precision loss.
  */
 export function formatTokenAmount(amount: string, token: string): string {
-  // Determine divisor and decimal places per token
-  let decimals: number;
-  switch (token) {
-    case "STX":
-      decimals = 6;
-      break;
-    case "sBTC":
-      decimals = 8;
-      break;
-    case "USDCx":
-      decimals = 6;
-      break;
-    default:
-      return amount;
-  }
+  const DECIMALS_BY_TOKEN: Record<string, number> = {
+    STX: 6,
+    sBTC: 8,
+    USDCx: 6,
+  };
+  const decimals = DECIMALS_BY_TOKEN[token];
+  if (decimals === undefined) return amount;
 
   const divisor = BigInt(10) ** BigInt(decimals);
   const value = BigInt(amount || "0");
