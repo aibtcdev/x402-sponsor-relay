@@ -17,7 +17,7 @@ import {
 } from "@stacks/wallet-sdk";
 import { SERVICE_DEGRADED_RETRY_AFTER_S } from "../types";
 import type { Env, Logger, FeeTransactionType, FeePriority, WalletStatus, WalletsResponse, HandSubmitResult, SponsorHeld } from "../types";
-import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix } from "../utils";
+import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix, decodeClarityUint } from "../utils";
 import { FeeService } from "./fee";
 
 /**
@@ -1120,7 +1120,10 @@ export class SponsorService {
         return "0";
       }
       const data = (await response.json()) as { balance?: string };
-      const balance = typeof data?.balance === "string" ? data.balance : "0";
+      const rawBalance = typeof data?.balance === "string" ? data.balance : "0";
+      // Hiro /v2/accounts returns balance as Clarity-encoded hex (e.g. "0x000...1451535f").
+      // Decode to decimal microSTX string for display.
+      const balance = decodeClarityUint(rawBalance);
 
       // Cache the result for 60 seconds
       if (this.env.RELAY_KV) {
