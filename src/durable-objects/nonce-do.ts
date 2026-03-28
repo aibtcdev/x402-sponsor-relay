@@ -74,6 +74,8 @@ interface ReleaseNonceRequest {
   walletIndex?: number;
   /** Fee paid for this transaction in microSTX (optional, used for cumulative tracking) */
   fee?: string;
+  /** Error reason for quarantine (e.g. "TooMuchChaining", "nonce_conflict") */
+  errorReason?: string;
 }
 
 interface BroadcastOutcomeRequest {
@@ -3462,7 +3464,7 @@ export class NonceDO {
    * walletIndex   → which wallet the nonce belongs to (default: 0)
    * fee           → when provided with txid (broadcast succeeded), recorded in cumulative wallet stats
    */
-  async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0, fee?: string): Promise<void> {
+  async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0, fee?: string, errorReason?: string): Promise<void> {
     return this.state.blockConcurrencyWhile(async () => {
       // Verify this nonce is actually in 'assigned' state in the ledger
       const intentRows = this.sql
@@ -3483,30 +3485,42 @@ export class NonceDO {
       let failureQuarantined = false;
 
       if (!txid) {
-        // No txid provided: check if a txid was previously recorded in nonce_txids.
-        // If so, the nonce was broadcast at some point — quarantine as failure.
-        const txidRows = this.sql
-          .exec<{ count: number }>(
-            "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
-            nonce
-          )
-          .toArray();
-        const hasPriorTxid = (txidRows[0]?.count ?? 0) > 0;
-
-        if (hasPriorTxid) {
-          // Nonce was broadcast at some point — quarantine permanently
+        // Caller-supplied error reason (e.g. TooMuchChaining, nonce_conflict from queue-consumer)
+        // takes priority — quarantine immediately so the circuit breaker fires.
+        if (errorReason) {
           failureQuarantined = true;
           this.log("warn", "nonce_quarantined", {
             walletIndex,
             nonce,
-            reason: "txid_recorded_on_failed_release",
+            reason: errorReason,
           });
-          this.ledgerRelease(walletIndex, nonce, undefined, "txid_recorded_on_failed_release");
+          this.ledgerRelease(walletIndex, nonce, undefined, errorReason);
         } else {
-          // Truly unused nonce (never broadcast) — mark expired
-          // The ledger head already advanced past this nonce on assignment,
-          // so this creates a gap that reconciliation will fill if needed.
-          this.ledgerRelease(walletIndex, nonce, undefined);
+          // No explicit error reason: check if a txid was previously recorded in nonce_txids.
+          // If so, the nonce was broadcast at some point — quarantine as failure.
+          const txidRows = this.sql
+            .exec<{ count: number }>(
+              "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
+              nonce
+            )
+            .toArray();
+          const hasPriorTxid = (txidRows[0]?.count ?? 0) > 0;
+
+          if (hasPriorTxid) {
+            // Nonce was broadcast at some point — quarantine permanently
+            failureQuarantined = true;
+            this.log("warn", "nonce_quarantined", {
+              walletIndex,
+              nonce,
+              reason: "txid_recorded_on_failed_release",
+            });
+            this.ledgerRelease(walletIndex, nonce, undefined, "txid_recorded_on_failed_release");
+          } else {
+            // Truly unused nonce (never broadcast) — mark expired
+            // The ledger head already advanced past this nonce on assignment,
+            // so this creates a gap that reconciliation will fill if needed.
+            this.ledgerRelease(walletIndex, nonce, undefined);
+          }
         }
       } else {
         // txid provided: nonce was broadcast successfully — consumed
@@ -6313,7 +6327,7 @@ export class NonceDO {
    * Safety cap: MAX_ADMIN_GAP_FILLS (50) nonces per flush to prevent unbounded iteration.
    * Nonces are processed ascending (lowest first) so the chain starts confirming immediately.
    */
-  private async handleFlushWallet(walletIndex: number): Promise<Response> {
+  private async handleFlushWallet(walletIndex: number, probeDepth?: number): Promise<Response> {
     try {
       const address = await this.getStoredSponsorAddressForWallet(walletIndex);
       if (!address) {
@@ -6358,8 +6372,79 @@ export class NonceDO {
         possibleNextNonce: possible_next_nonce,
         lastExecutedTxNonce: last_executed_tx_nonce,
         head,
+        probeDepth: probeDepth ?? null,
         capped: rawFlushEnd > flushStart + MAX_ADMIN_GAP_FILLS,
       });
+
+      // -------------------------------------------------------------------------
+      // Backward probe: when the forward range is empty (wallet looks clean per Hiro)
+      // but the Stacks node may have ghost mempool entries at confirmed nonces.
+      // Broadcast self-transfers at nonces below last_executed to evict ghosts.
+      // - Truly confirmed nonces → node returns ConflictingNonceInMempool (harmless, no cost)
+      // - Ghost entries → self-transfer replaces them, clearing the node's mempool
+      // -------------------------------------------------------------------------
+      if (flushStart >= flushEnd && probeDepth && probeDepth > 0 && last_executed_tx_nonce !== null) {
+        const probeStart = Math.max(0, last_executed_tx_nonce - probeDepth + 1);
+        const probeEnd = last_executed_tx_nonce + 1; // exclusive — probe up to and including last_executed
+
+        this.log("info", "flush_wallet_backward_probe_start", {
+          walletIndex,
+          address,
+          probeStart,
+          probeEnd,
+          probeDepth,
+          lastExecutedTxNonce: last_executed_tx_nonce,
+        });
+
+        const probed: Array<{ nonce: number; result: "replaced" | "already_confirmed" | "error" }> = [];
+        let replaced = 0;
+
+        for (let nonce = probeStart; nonce < probeEnd; nonce++) {
+          try {
+            const txid = await this.fillGapNonce(walletIndex, nonce, privateKey, MIN_FLUSH_FEE);
+            if (txid) {
+              // Ghost entry was replaced — this nonce had a phantom mempool entry
+              probed.push({ nonce, result: "replaced" });
+              replaced++;
+            } else {
+              // fillGapNonce returns null on ConflictingNonceInMempool or other rejection.
+              // At a confirmed nonce this means the slot is properly occupied — no ghost.
+              probed.push({ nonce, result: "already_confirmed" });
+            }
+          } catch (e) {
+            probed.push({ nonce, result: "error" });
+            this.log("debug", "flush_wallet_probe_nonce_error", {
+              walletIndex,
+              nonce,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+
+        this.log("info", "flush_wallet_backward_probe_complete", {
+          walletIndex,
+          probeStart,
+          probeEnd,
+          totalProbed: probed.length,
+          replaced,
+        });
+
+        return this.jsonResponse({
+          success: true,
+          walletIndex,
+          address,
+          mode: "backward_probe",
+          probeRange: { start: probeStart, end: probeEnd },
+          probed,
+          replaced,
+          forwardRangeEmpty: true,
+          chainState: {
+            lastExecutedTxNonce: last_executed_tx_nonce,
+            possibleNextNonce: possible_next_nonce,
+            head,
+          },
+        });
+      }
 
       // -------------------------------------------------------------------------
       // Step 1: Index active dispatch_queue entries by sponsor nonce.
@@ -6602,8 +6687,12 @@ export class NonceDO {
       // fee is optional; only recorded when present and txid is also present
       const fee = typeof body.fee === "string" && body.fee.length > 0 ? body.fee : undefined;
 
+      const errorReason = typeof body.errorReason === "string" && body.errorReason.length > 0
+        ? body.errorReason
+        : undefined;
+
       try {
-        await this.releaseNonce(body.nonce, body.txid, walletIndex, fee);
+        await this.releaseNonce(body.nonce, body.txid, walletIndex, fee, errorReason);
         return this.jsonResponse({ success: true });
       } catch (error) {
         return this.internalError(error);
@@ -6771,7 +6860,9 @@ export class NonceDO {
       if (!Number.isInteger(walletIdx) || walletIdx < 0 || walletIdx >= ABSOLUTE_MAX_WALLET_COUNT) {
         return this.badRequest("Invalid wallet index");
       }
-      return this.state.blockConcurrencyWhile(() => this.handleFlushWallet(walletIdx));
+      const probeDepthParam = url.searchParams.get("probeDepth");
+      const probeDepth = probeDepthParam ? parseInt(probeDepthParam, 10) : undefined;
+      return this.state.blockConcurrencyWhile(() => this.handleFlushWallet(walletIdx, probeDepth));
     }
 
     // GET /history/:wallet/:nonce — diagnostic endpoint for full nonce event trail.

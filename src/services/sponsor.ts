@@ -1473,7 +1473,8 @@ export async function releaseNonceDO(
   nonce: number,
   txid?: string,
   walletIndex: number = 0,
-  fee?: string
+  fee?: string,
+  errorReason?: string
 ): Promise<void> {
   if (!env.NONCE_DO) {
     return;
@@ -1489,6 +1490,7 @@ export async function releaseNonceDO(
         walletIndex,
         ...(txid ? { txid } : {}),
         ...(fee ? { fee } : {}),
+        ...(errorReason ? { errorReason } : {}),
       }),
     });
 
@@ -1501,6 +1503,7 @@ export async function releaseNonceDO(
         walletIndex,
         ...(txid ? { txid } : {}),
         ...(fee ? { fee } : {}),
+        ...(errorReason ? { errorReason } : {}),
       });
     }
   } catch (e) {
@@ -1510,6 +1513,7 @@ export async function releaseNonceDO(
       walletIndex,
       ...(txid ? { txid } : {}),
       ...(fee ? { fee } : {}),
+      ...(errorReason ? { errorReason } : {}),
     });
   }
 }
