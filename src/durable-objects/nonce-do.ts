@@ -6149,32 +6149,46 @@ export class NonceDO {
         return this.jsonResponse({ error: "Hiro API unavailable" }, 503);
       }
 
-      const { possible_next_nonce, detected_missing_nonces } = nonceInfo;
+      const { possible_next_nonce, detected_missing_nonces, last_executed_tx_nonce } = nonceInfo;
       this.advanceChainFrontier(walletIndex, possible_next_nonce);
       const head = this.ledgerGetWalletHead(walletIndex);
 
-      // Compute gaps: Hiro-reported missing nonces + any range between
-      // last_executed and head that Hiro doesn't see (ledger-only gaps)
+      // Compute gaps: three sources
       const gapSet = new Set(detected_missing_nonces);
 
-      // Also check contiguous range from possible_next_nonce to head for
-      // nonces not in the mempool (Hiro won't report these as "missing"
-      // if it doesn't know about them)
+      // Source 2: the range between last_executed_tx_nonce and the first mempool tx.
+      // Hiro's detected_missing_nonces only reports gaps *between* mempool txs — it
+      // does not include the gap between last_executed and the first mempool nonce.
+      // This is the most critical range: a missing nonce here blocks the entire chain.
+      // Nonces already occupied in the mempool will fail with ConflictingNonceInMempool
+      // (handled as a no-op in fillGapNonce), so over-including is safe.
+      if (last_executed_tx_nonce !== null) {
+        for (let n = last_executed_tx_nonce + 1; n < possible_next_nonce; n++) {
+          gapSet.add(n);
+        }
+      }
+
+      // Source 3: contiguous range from possible_next_nonce to head for nonces not
+      // yet in the mempool (Hiro won't report these as "missing" if it doesn't know
+      // about them — ledger-only gaps above the chain frontier)
       if (head !== null && head > possible_next_nonce) {
         for (let n = possible_next_nonce; n < head; n++) {
           gapSet.add(n);
         }
       }
 
-      // Remove nonces that are already in the mempool (assigned/broadcasted/confirmed).
+      // Remove nonces that are already managed by our ledger (assigned/broadcasted/confirmed).
+      // Lower bound covers the full gap range added above (last_executed + 1 or 0).
       // 'confirmed' = broadcast accepted, still pending on-chain — same as ledgerInFlightCount.
+      const inFlightLowerBound =
+        last_executed_tx_nonce !== null ? last_executed_tx_nonce + 1 : 0;
       const inFlightRows = this.sql
         .exec<{ nonce: number }>(
           `SELECT nonce FROM nonce_intents
            WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')
              AND nonce >= ?`,
           walletIndex,
-          possible_next_nonce
+          inFlightLowerBound
         )
         .toArray();
       for (const row of inFlightRows) {
