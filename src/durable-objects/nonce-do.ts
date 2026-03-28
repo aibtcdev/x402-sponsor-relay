@@ -248,6 +248,8 @@ interface ObservableNonceState {
   lastGapDetected: string | null;
   /** When non-null, clients should bypass sponsored submission */
   recommendation: "fallback_to_direct" | null;
+  /** Global settlement time percentiles from dispatch_queue (last 24h confirmed txs) */
+  settlementTimes: SettlementTimeStats;
   timestamp: string;
 }
 
@@ -3946,6 +3948,9 @@ export class NonceDO {
       oldestEntryAge: nowMs - new Date(row.oldest_received_at).getTime(),
     }));
 
+    // Global settlement percentiles (last 24h confirmed txs across all wallets)
+    const settlementTimes = this.computeSettlementPercentiles();
+
     return {
       wallets,
       senderHands,
@@ -3959,6 +3964,7 @@ export class NonceDO {
         ? new Date(lastGapDetectedMs).toISOString()
         : null,
       recommendation,
+      settlementTimes,
       timestamp: new Date().toISOString(),
     };
   }
