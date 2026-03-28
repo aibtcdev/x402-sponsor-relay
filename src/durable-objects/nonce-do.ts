@@ -3457,12 +3457,15 @@ export class NonceDO {
   /**
    * Release a nonce for the specified wallet — updates only the intent ledger.
    *
-   * txid present  → nonce was broadcast successfully; mark as 'confirmed' in ledger.
-   * txid absent   → nonce was NOT broadcast (e.g. broadcast failure).
-   *                 If a txid was previously recorded in nonce_txids for this nonce,
-   *                 mark as 'failed' (quarantine). Otherwise mark as 'expired'.
-   * walletIndex   → which wallet the nonce belongs to (default: 0)
-   * fee           → when provided with txid (broadcast succeeded), recorded in cumulative wallet stats
+   * txid present   → nonce was broadcast successfully; mark as 'confirmed' in ledger.
+   * txid absent    → nonce was NOT broadcast (e.g. broadcast failure). Priority order:
+   *   1. errorReason provided → immediate quarantine ('failed' state) + recordQuarantineEvent.
+   *      Use for contention-specific terminal failures (TooMuchChaining, nonce_conflict).
+   *   2. Prior txid in nonce_txids → quarantine (broadcast happened but release has no txid).
+   *   3. Neither → mark as 'expired' (truly unused nonce, available for gap-fill).
+   * walletIndex    → which wallet the nonce belongs to (default: 0)
+   * fee            → when provided with txid (broadcast succeeded), recorded in cumulative wallet stats
+   * errorReason    → triggers quarantine when txid is absent (feeds circuit breaker)
    */
   async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0, fee?: string, errorReason?: string): Promise<void> {
     return this.state.blockConcurrencyWhile(async () => {
@@ -6377,85 +6380,20 @@ export class NonceDO {
       });
 
       // -------------------------------------------------------------------------
-      // Backward probe: when the forward range is empty (wallet looks clean per Hiro)
-      // but the Stacks node may have ghost mempool entries at confirmed nonces.
-      // Broadcast self-transfers at nonces below last_executed to evict ghosts.
-      // - Truly confirmed nonces → node returns ConflictingNonceInMempool (harmless, no cost)
-      // - Ghost entries → self-transfer replaces them, clearing the node's mempool
+      // Backward probe needed: forward range is empty but ghost entries may exist.
+      // Return probe metadata so the caller can run the probe outside
+      // blockConcurrencyWhile — the probe only broadcasts self-transfers and
+      // doesn't mutate the nonce ledger, so no atomicity is needed, and running
+      // it inside the gate would starve payment requests for 12+ seconds.
       // -------------------------------------------------------------------------
       if (flushStart >= flushEnd && probeDepth && probeDepth > 0 && last_executed_tx_nonce !== null) {
-        const probeStart = Math.max(0, last_executed_tx_nonce - probeDepth + 1);
-        const probeEnd = last_executed_tx_nonce + 1; // exclusive — probe up to and including last_executed
-
-        this.log("info", "flush_wallet_backward_probe_start", {
-          walletIndex,
-          address,
-          probeStart,
-          probeEnd,
-          probeDepth,
-          lastExecutedTxNonce: last_executed_tx_nonce,
-        });
-
-        const probed: Array<{ nonce: number; result: "replaced" | "conflict" | "rejected"; txid?: string; reason?: string }> = [];
-        let replaced = 0;
-
-        const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
-
-        for (let nonce = probeStart; nonce < probeEnd; nonce++) {
-          try {
-            const tx = await makeSTXTokenTransfer({
-              recipient,
-              amount: GAP_FILL_AMOUNT,
-              senderKey: privateKey,
-              network,
-              nonce: BigInt(nonce),
-              fee: MIN_FLUSH_FEE,
-              memo: `probe-${nonce}`,
-            });
-            const result = await this.broadcastRawTx(tx, "backward_probe");
-            if (result.ok) {
-              // Ghost entry was replaced — this nonce had a phantom mempool entry
-              probed.push({ nonce, result: "replaced", txid: result.txid });
-              replaced++;
-            } else if (result.reason === "ConflictingNonceInMempool") {
-              // Nonce slot properly occupied — no ghost
-              probed.push({ nonce, result: "conflict" });
-            } else {
-              // Other rejection (BadNonce, etc.)
-              probed.push({ nonce, result: "rejected", reason: result.reason });
-            }
-          } catch (e) {
-            probed.push({ nonce, result: "rejected", reason: e instanceof Error ? e.message : String(e) });
-            this.log("debug", "flush_wallet_probe_nonce_error", {
-              walletIndex,
-              nonce,
-              error: e instanceof Error ? e.message : String(e),
-            });
-          }
-        }
-
-        this.log("info", "flush_wallet_backward_probe_complete", {
-          walletIndex,
-          probeStart,
-          probeEnd,
-          totalProbed: probed.length,
-          replaced,
-        });
-
         return this.jsonResponse({
-          success: true,
+          _probeNeeded: true,
           walletIndex,
-          address,
-          mode: "backward_probe",
-          probeRange: { start: probeStart, end: probeEnd },
-          probed,
-          replaced,
-          forwardRangeEmpty: true,
-          chainState: {
-            lastExecutedTxNonce: last_executed_tx_nonce,
-            possibleNextNonce: possible_next_nonce,
-            head,
-          },
+          probeDepth,
+          last_executed_tx_nonce,
+          possible_next_nonce,
+          head,
         });
       }
 
@@ -6606,6 +6544,106 @@ export class NonceDO {
     } catch (error) {
       return this.internalError(error);
     }
+  }
+
+  /**
+   * Backward probe: broadcast self-transfers at confirmed nonces to evict ghost
+   * mempool entries from the Stacks node. Runs outside blockConcurrencyWhile
+   * because it only broadcasts (no ledger mutations) and can take 12+ seconds
+   * with probeDepth=25 — holding the concurrency gate that long would starve
+   * payment requests.
+   */
+  private async handleBackwardProbe(
+    walletIndex: number,
+    probeDepth: number,
+    lastExecutedTxNonce: number,
+    possibleNextNonce: number,
+    head: number | null
+  ): Promise<Response> {
+    const address = await this.getStoredSponsorAddressForWallet(walletIndex);
+    if (!address) {
+      return this.badRequest(`Wallet ${walletIndex} not initialized`);
+    }
+    const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+    if (!privateKey) {
+      return this.badRequest(`Cannot derive key for wallet ${walletIndex}`);
+    }
+
+    const probeStart = Math.max(0, lastExecutedTxNonce - probeDepth + 1);
+    const probeEnd = lastExecutedTxNonce + 1; // exclusive — probe up to and including lastExecuted
+
+    this.log("info", "flush_wallet_backward_probe_start", {
+      walletIndex,
+      address,
+      probeStart,
+      probeEnd,
+      probeDepth,
+      lastExecutedTxNonce,
+    });
+
+    const probed: Array<{ nonce: number; result: "replaced" | "conflict" | "rejected"; txid?: string; reason?: string }> = [];
+    let replaced = 0;
+
+    const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
+
+    for (let nonce = probeStart; nonce < probeEnd; nonce++) {
+      try {
+        const tx = await makeSTXTokenTransfer({
+          recipient,
+          amount: GAP_FILL_AMOUNT,
+          senderKey: privateKey,
+          network,
+          nonce: BigInt(nonce),
+          fee: MIN_FLUSH_FEE,
+          memo: `probe-${nonce}`,
+        });
+        const result = await this.broadcastRawTx(tx, "backward_probe");
+        if (result.ok) {
+          // Ghost entry was replaced — this nonce had a phantom mempool entry
+          probed.push({ nonce, result: "replaced", txid: result.txid });
+          replaced++;
+        } else if (result.reason === "ConflictingNonceInMempool") {
+          // Nonce slot occupied in node mempool — could be a legit pending tx
+          // or a confirmed tx the node hasn't purged. Either way, our self-transfer
+          // at MIN_FLUSH_FEE wasn't enough to evict it.
+          probed.push({ nonce, result: "conflict" });
+        } else {
+          // Other rejection (BadNonce, etc.)
+          probed.push({ nonce, result: "rejected", reason: result.reason });
+        }
+      } catch (e) {
+        probed.push({ nonce, result: "rejected", reason: e instanceof Error ? e.message : String(e) });
+        this.log("debug", "flush_wallet_probe_nonce_error", {
+          walletIndex,
+          nonce,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+
+    this.log("info", "flush_wallet_backward_probe_complete", {
+      walletIndex,
+      probeStart,
+      probeEnd,
+      totalProbed: probed.length,
+      replaced,
+    });
+
+    return this.jsonResponse({
+      success: true,
+      walletIndex,
+      address,
+      mode: "backward_probe",
+      probeRange: { start: probeStart, end: probeEnd },
+      probed,
+      replaced,
+      forwardRangeEmpty: true,
+      chainState: {
+        lastExecutedTxNonce,
+        possibleNextNonce,
+        head,
+      },
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -6879,7 +6917,28 @@ export class NonceDO {
         const parsed = Number(probeDepthParam);
         probeDepth = Number.isInteger(parsed) && parsed >= 1 && parsed <= 50 ? parsed : undefined;
       }
-      return this.state.blockConcurrencyWhile(() => this.handleFlushWallet(walletIdx, probeDepth));
+
+      // Forward flush runs inside blockConcurrencyWhile (mutates ledger).
+      // If the forward range is empty and probeDepth is set, handleFlushWallet
+      // returns a _probeNeeded signal with metadata — the backward probe then
+      // runs outside the gate to avoid starving payment requests.
+      const flushResult = await this.state.blockConcurrencyWhile(
+        () => this.handleFlushWallet(walletIdx, probeDepth)
+      );
+
+      // Check if handleFlushWallet signaled a backward probe
+      const flushBody = await flushResult.clone().json() as Record<string, unknown>;
+      if (flushBody._probeNeeded) {
+        return this.handleBackwardProbe(
+          flushBody.walletIndex as number,
+          flushBody.probeDepth as number,
+          flushBody.last_executed_tx_nonce as number,
+          flushBody.possible_next_nonce as number,
+          flushBody.head as number | null,
+        );
+      }
+
+      return flushResult;
     }
 
     // GET /history/:wallet/:nonce — diagnostic endpoint for full nonce event trail.

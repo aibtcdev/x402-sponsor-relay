@@ -191,6 +191,8 @@ export class NonceReset extends BaseEndpoint {
         }
       }
       if (body.probeDepth !== undefined) {
+        // Cap at 50: TooMuchChaining triggers at 25 chained txs, 50 = 2× safety margin
+        // to cover edge cases where ghost entries span beyond the chaining window.
         if (typeof body.probeDepth === "number" && Number.isInteger(body.probeDepth) && body.probeDepth > 0 && body.probeDepth <= 50) {
           probeDepth = body.probeDepth;
         } else {

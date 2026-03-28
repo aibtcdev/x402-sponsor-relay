@@ -230,11 +230,12 @@ async function processPaymentMessage(
       return;
     }
 
-    // Terminal broadcast failure — release nonce with error reason for circuit breaker
+    // Terminal broadcast failure — only quarantine for contention-specific conditions.
+    // Generic failures (node 500, timeout) release cleanly to avoid penalizing healthy wallets.
     if (sponsorNonce !== null) {
       const reason = isTooMuchChaining ? "TooMuchChaining"
         : isNonceConflict ? "nonce_conflict"
-        : "broadcast_failed";
+        : undefined;
       await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex, undefined, reason);
     }
 
