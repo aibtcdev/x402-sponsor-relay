@@ -1464,6 +1464,12 @@ export async function recordBroadcastOutcomeDO(
  * walletIndex specifies which wallet pool to release to (default: 0).
  * Must match the walletIndex returned by the NonceDO /assign response.
  *
+ * errorReason triggers quarantine when txid is absent: the nonce transitions to
+ * 'failed' state and recordQuarantineEvent fires, feeding the per-wallet circuit
+ * breaker. Use for terminal broadcast failures (e.g. "TooMuchChaining",
+ * "nonce_conflict", "broadcast_failed") — not for retryable attempts, which
+ * should expire cleanly to avoid premature circuit breaker activation.
+ *
  * Call via executionCtx.waitUntil() as fire-and-forget — never blocks the response.
  * Never throws — all errors are logged as warnings.
  */

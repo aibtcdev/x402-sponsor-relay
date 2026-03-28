@@ -61,6 +61,14 @@ export class NonceReset extends BaseEndpoint {
                     "Wallet index for the 'flush-wallet' action (0-based, required when action is 'flush-wallet'). Ignored for other actions.",
                   example: 0,
                 },
+                probeDepth: {
+                  type: "number" as const,
+                  minimum: 1,
+                  maximum: 50,
+                  description:
+                    "Backward probe depth for 'flush-wallet' when the forward nonce range is empty. Broadcasts self-transfers at nonces below last_executed to evict ghost mempool entries from the Stacks node. Only used with 'flush-wallet'.",
+                  example: 25,
+                },
               },
               description: "Optional action to perform (defaults to 'resync')",
             },

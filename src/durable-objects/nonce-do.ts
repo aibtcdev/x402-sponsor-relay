@@ -6396,23 +6396,36 @@ export class NonceDO {
           lastExecutedTxNonce: last_executed_tx_nonce,
         });
 
-        const probed: Array<{ nonce: number; result: "replaced" | "already_confirmed" | "error" }> = [];
+        const probed: Array<{ nonce: number; result: "replaced" | "conflict" | "rejected"; txid?: string; reason?: string }> = [];
         let replaced = 0;
+
+        const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
 
         for (let nonce = probeStart; nonce < probeEnd; nonce++) {
           try {
-            const txid = await this.fillGapNonce(walletIndex, nonce, privateKey, MIN_FLUSH_FEE);
-            if (txid) {
+            const tx = await makeSTXTokenTransfer({
+              recipient,
+              amount: GAP_FILL_AMOUNT,
+              senderKey: privateKey,
+              network,
+              nonce: BigInt(nonce),
+              fee: MIN_FLUSH_FEE,
+              memo: `probe-${nonce}`,
+            });
+            const result = await this.broadcastRawTx(tx, "backward_probe");
+            if (result.ok) {
               // Ghost entry was replaced — this nonce had a phantom mempool entry
-              probed.push({ nonce, result: "replaced" });
+              probed.push({ nonce, result: "replaced", txid: result.txid });
               replaced++;
+            } else if (result.reason === "ConflictingNonceInMempool") {
+              // Nonce slot properly occupied — no ghost
+              probed.push({ nonce, result: "conflict" });
             } else {
-              // fillGapNonce returns null on ConflictingNonceInMempool or other rejection.
-              // At a confirmed nonce this means the slot is properly occupied — no ghost.
-              probed.push({ nonce, result: "already_confirmed" });
+              // Other rejection (BadNonce, etc.)
+              probed.push({ nonce, result: "rejected", reason: result.reason });
             }
           } catch (e) {
-            probed.push({ nonce, result: "error" });
+            probed.push({ nonce, result: "rejected", reason: e instanceof Error ? e.message : String(e) });
             this.log("debug", "flush_wallet_probe_nonce_error", {
               walletIndex,
               nonce,
@@ -6861,7 +6874,11 @@ export class NonceDO {
         return this.badRequest("Invalid wallet index");
       }
       const probeDepthParam = url.searchParams.get("probeDepth");
-      const probeDepth = probeDepthParam ? parseInt(probeDepthParam, 10) : undefined;
+      let probeDepth: number | undefined;
+      if (probeDepthParam !== null) {
+        const parsed = Number(probeDepthParam);
+        probeDepth = Number.isInteger(parsed) && parsed >= 1 && parsed <= 50 ? parsed : undefined;
+      }
       return this.state.blockConcurrencyWhile(() => this.handleFlushWallet(walletIdx, probeDepth));
     }
 
