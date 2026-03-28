@@ -54,6 +54,7 @@ export class NonceState extends BaseEndpoint {
                                 txid: { type: "string" as const },
                                 assignedAt: { type: "string" as const },
                                 broadcastedAt: { type: "string" as const },
+                                senderAddress: { type: "string" as const, description: "Stacks address of the transaction sender (from dispatch_queue, absent if not yet dispatched)" },
                                 originalTxid: { type: "string" as const, description: "Original sponsored txid that was replaced (present when state is 'replaced')" },
                                 replacementTxid: { type: "string" as const, description: "Txid of the relay's replacement transaction, if the relay performed the RBF (present when state is 'replaced' via head-bump/RBF)" },
                                 replacedReason: { type: "string" as const, description: "Contention reason string, e.g. 'contention:dropped_replace_by_fee' (present when state is 'replaced')" },
