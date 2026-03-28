@@ -240,6 +240,9 @@ export const dashboardCss = `
 
   /* ── Interactive ───────────────────────────────────────────── */
   .hover\\:text-white:hover { color: #ffffff; }
+  .hover\\:text-gray-300:hover { color: #d1d5db; }
+  .cursor-pointer { cursor: pointer; }
+  .select-none { user-select: none; }
 
   /* ── Responsive ────────────────────────────────────────────── */
   @media (min-width: 640px) {
