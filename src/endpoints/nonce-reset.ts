@@ -7,9 +7,9 @@ import {
   Error502Response,
 } from "../schemas";
 
-type NonceResetAction = "resync" | "reset" | "clear-pools" | "clear-conflicts";
+type NonceResetAction = "resync" | "reset" | "clear-pools" | "clear-conflicts" | "flush-wallet";
 
-const VALID_ACTIONS = new Set<string>(["resync", "reset", "clear-pools", "clear-conflicts"]);
+const VALID_ACTIONS = new Set<string>(["resync", "reset", "clear-pools", "clear-conflicts", "flush-wallet"]);
 
 /**
  * Nonce reset endpoint - trigger on-demand nonce recovery
@@ -36,7 +36,8 @@ export class NonceReset extends BaseEndpoint {
       "**resync** (default): Applies the same gap-aware logic as the alarm — GAP RECOVERY resets to lowest missing nonce, FORWARD BUMP advances to chain's possible_next_nonce, STALE DETECTION resets if idle and ahead of chain.\n\n" +
       "**reset**: Hard resets the counter to `last_executed_tx_nonce + 1` — the safe floor that cannot conflict with any confirmed transaction.\n\n" +
       "**clear-pools**: Wipes all per-wallet pool state and stored addresses. Pools reinitialize from Hiro on the next request. Use after wallet derivation changes.\n\n" +
-      "**clear-conflicts**: Zeroes out `conflictsDetected` and clears `lastGapDetected` without touching nonce pool state. Manual escape hatch when auto-clear hasn't fired yet and the health circuit breaker is blocking traffic.",
+      "**clear-conflicts**: Zeroes out `conflictsDetected` and clears `lastGapDetected` without touching nonce pool state. Manual escape hatch when auto-clear hasn't fired yet and the health circuit breaker is blocking traffic.\n\n" +
+      "**flush-wallet**: Full wallet flush for a specific wallet index (requires `walletIndex` in body). Retracts all active dispatch_queue entries to the replay buffer, fills the entire nonce range with self-transfers (RBF for occupied slots, gap-fill for empty ones), and resets the wallet head to `last_executed+1`. Use when 18+ scattered gaps cause TooMuchChaining and surgical gap-filling is insufficient. Capped at 50 nonces per flush.",
     security: [{ bearerAuth: [] }],
     request: {
       body: {
@@ -47,11 +48,18 @@ export class NonceReset extends BaseEndpoint {
               properties: {
                 action: {
                   type: "string" as const,
-                  enum: ["resync", "reset", "clear-pools", "clear-conflicts"],
+                  enum: ["resync", "reset", "clear-pools", "clear-conflicts", "flush-wallet"],
                   default: "resync",
                   description:
-                    "Recovery action to perform. 'resync' applies gap-aware reconciliation; 'reset' hard resets to last_executed_tx_nonce + 1; 'clear-pools' wipes all wallet pools for reinitialization; 'clear-conflicts' zeroes conflictsDetected and clears lastGapDetected without touching pool state.",
+                    "Recovery action to perform. 'resync' applies gap-aware reconciliation; 'reset' hard resets to last_executed_tx_nonce + 1; 'clear-pools' wipes all wallet pools for reinitialization; 'clear-conflicts' zeroes conflictsDetected and clears lastGapDetected without touching pool state; 'flush-wallet' performs a full wallet flush (requires walletIndex).",
                   example: "resync",
+                },
+                walletIndex: {
+                  type: "number" as const,
+                  minimum: 0,
+                  description:
+                    "Wallet index for the 'flush-wallet' action (0-based, required when action is 'flush-wallet'). Ignored for other actions.",
+                  example: 0,
                 },
               },
               description: "Optional action to perform (defaults to 'resync')",
@@ -76,7 +84,7 @@ export class NonceReset extends BaseEndpoint {
                 },
                 action: {
                   type: "string" as const,
-                  enum: ["resync", "reset", "clear-pools", "clear-conflicts"],
+                  enum: ["resync", "reset", "clear-pools", "clear-conflicts", "flush-wallet"],
                   description: "Action that was performed",
                 },
                 result: {
@@ -143,8 +151,9 @@ export class NonceReset extends BaseEndpoint {
     const auth = c.get("auth")!;
     const keyId = auth.metadata?.keyId ?? "unknown";
 
-    // Parse action from body (optional, defaults to "resync")
+    // Parse action and optional walletIndex from body (action defaults to "resync")
     let action: NonceResetAction = "resync";
+    let walletIndex = 0;
     try {
       const body = await c.req.json() as Record<string, unknown>;
       if (body.action !== undefined) {
@@ -159,15 +168,34 @@ export class NonceReset extends BaseEndpoint {
         }
         action = body.action as NonceResetAction;
       }
+      if (typeof body.walletIndex === "number" && Number.isInteger(body.walletIndex) && body.walletIndex >= 0) {
+        walletIndex = body.walletIndex;
+      }
     } catch (_e) {
-      // Body is optional — empty body or missing Content-Type is fine, use default
+      // Body is optional — empty body or missing Content-Type is fine, use defaults
     }
 
-    logger.info("Nonce recovery triggered", { action, keyId });
+    // flush-wallet requires a specific walletIndex to be targeted
+    if (action === "flush-wallet") {
+      if (walletIndex < 0 || !Number.isInteger(walletIndex)) {
+        return this.err(c, {
+          error: "Invalid walletIndex for flush-wallet",
+          code: "NONCE_RESET_FAILED",
+          status: 400,
+          details: "flush-wallet requires a non-negative integer walletIndex in the request body",
+          retryable: false,
+        });
+      }
+    }
+
+    logger.info("Nonce recovery triggered", { action, keyId, ...(action === "flush-wallet" && { walletIndex }) });
 
     try {
       const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
-      const doUrl = `https://nonce-do/${action}`;
+      // flush-wallet targets a specific wallet; all other actions use the action name as path
+      const doUrl = action === "flush-wallet"
+        ? `https://nonce-do/flush-wallet/${walletIndex}`
+        : `https://nonce-do/${action}`;
       const response = await stub.fetch(doUrl, { method: "POST" });
 
       if (response.status === 503) {
