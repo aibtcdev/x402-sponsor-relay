@@ -18,6 +18,7 @@ type PoolStatus = "healthy" | "degraded" | "critical";
  * - "critical": circuit breaker open OR capacity < 20%
  * - "degraded": capacity < 60% (but not critical)
  * - "healthy": capacity ≥ 60% and circuit breaker closed
+ *
  */
 function derivePoolStatus(effectiveCapacity: number, circuitBreakerOpen: boolean): PoolStatus {
   if (circuitBreakerOpen || effectiveCapacity < CAPACITY_CRITICAL_THRESHOLD) {
@@ -93,7 +94,15 @@ export class Health extends BaseEndpoint {
                   format: "uuid",
                   description: "Unique request identifier for tracking",
                 },
-                status: { type: "string" as const, example: "ok" },
+                status: {
+                  type: "string" as const,
+                  enum: ["ok", "degraded"],
+                  description:
+                    "'ok' when the nonce pool is healthy, 'degraded' when poolStatus is non-healthy " +
+                    "(circuit breaker open, capacity <60%, or capacity <20%). " +
+                    "Consumers should treat any non-'ok' value as unhealthy.",
+                  example: "ok",
+                },
                 network: { type: "string" as const, example: "testnet" },
                 version: { type: "string" as const, example: VERSION },
                 nonce: {
@@ -170,8 +179,14 @@ export class Health extends BaseEndpoint {
     const logger = this.getLogger(c);
     const nonceState = await this.fetchNonceState(c, logger);
 
+    // Reflect pool degradation in the top-level status so consumers that only
+    // check `status === "ok"` correctly detect an unhealthy relay without having
+    // to dig into nonce.* fields. When nonce state is unavailable (null) we
+    // stay "ok" — the coordinator being unreachable is logged separately.
+    const status = nonceState !== null && nonceState.poolStatus !== "healthy" ? "degraded" : "ok";
+
     return this.ok(c, {
-      status: "ok",
+      status,
       network: c.env.STACKS_NETWORK,
       version: VERSION,
       nonce: nonceState,
