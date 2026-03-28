@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.26.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.26.0...x402-sponsor-relay-v1.26.1) (2026-03-28)
+
+
+### Bug Fixes
+
+* **dashboard:** correct data wiring for balances, fees, senders, and settlement latency ([#255](https://github.com/aibtcdev/x402-sponsor-relay/issues/255)) ([30da6f6](https://github.com/aibtcdev/x402-sponsor-relay/commit/30da6f6b543fb123801d959d35790d5830ba5b82))
+* **nonce:** detect first-blocker gaps and add flush-wallet recovery ([#258](https://github.com/aibtcdev/x402-sponsor-relay/issues/258)) ([0b6ece6](https://github.com/aibtcdev/x402-sponsor-relay/commit/0b6ece6f304d5ba18325963125a220a2e4cf3990))
+* **nonce:** preserve sponsor addresses in clear-pools ([#259](https://github.com/aibtcdev/x402-sponsor-relay/issues/259)) ([019a0e2](https://github.com/aibtcdev/x402-sponsor-relay/commit/019a0e2f8d2fbf6ffed0c13271d5b34699e1807d))
+* **nonce:** quarantine TooMuchChaining wallets and add backward ghost probe ([#261](https://github.com/aibtcdev/x402-sponsor-relay/issues/261)) ([f97a5f3](https://github.com/aibtcdev/x402-sponsor-relay/commit/f97a5f37631f55660ac24441f320394c6025104e))
+
 ## [1.26.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.25.0...x402-sponsor-relay-v1.26.0) (2026-03-28)
 
 
