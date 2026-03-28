@@ -74,6 +74,8 @@ interface ReleaseNonceRequest {
   walletIndex?: number;
   /** Fee paid for this transaction in microSTX (optional, used for cumulative tracking) */
   fee?: string;
+  /** Error reason for quarantine (e.g. "TooMuchChaining", "nonce_conflict") */
+  errorReason?: string;
 }
 
 interface BroadcastOutcomeRequest {
@@ -235,6 +237,20 @@ interface SenderHandSummary {
   oldestEntryAge: number;
 }
 
+/** Backward probe queue status for ghost mempool eviction. */
+interface ProbeQueueStatus {
+  /** Number of nonces still waiting to be probed */
+  pending: number;
+  /** Number of ghost entries successfully replaced */
+  replaced: number;
+  /** Number of nonces with ConflictingNonceInMempool (slot occupied, no ghost) */
+  conflict: number;
+  /** Number of probes that failed (BadNonce, network error, etc.) */
+  rejected: number;
+  /** Per-wallet breakdown of pending probe counts */
+  wallets: Array<{ walletIndex: number; pending: number }>;
+}
+
 interface ObservableNonceState {
   wallets: ObservableWalletState[];
   /** Active sender hands — senders with held transactions waiting for gap fill (capped at 50) */
@@ -250,6 +266,8 @@ interface ObservableNonceState {
   recommendation: "fallback_to_direct" | null;
   /** Global settlement time percentiles from dispatch_queue (last 24h confirmed txs) */
   settlementTimes: SettlementTimeStats;
+  /** Backward probe queue status (null when no probes are active or completed) */
+  probeQueue: ProbeQueueStatus | null;
   timestamp: string;
 }
 
@@ -423,7 +441,10 @@ const HEAD_BUMP_FEE = MIN_FLUSH_FEE * 2n;
  * within CIRCUIT_BREAKER_WINDOW_MS, it is skipped during nonce assignment
  * and an eager resync is triggered for that wallet only.
  */
-const CIRCUIT_BREAKER_QUARANTINE_THRESHOLD = 3;
+// Single failure = immediate skip. Wallet recovers naturally when the 10-minute
+// CIRCUIT_BREAKER_WINDOW_MS expires. For a payment relay, every failed broadcast
+// is a user-facing SETTLEMENT_TIMEOUT — aggressive quarantine is correct.
+const CIRCUIT_BREAKER_QUARANTINE_THRESHOLD = 1;
 
 // ---------------------------------------------------------------------------
 // Gin rummy dealing constants (Phase 3 — fairness and bounded alarm work)
@@ -459,6 +480,8 @@ const MAX_SWEEP_SENDERS = 5;
  * Caps Hiro API calls per tick to stay within Cloudflare CPU limits.
  */
 const MAX_BROADCASTS_PER_TICK = 10;
+/** Maximum probe broadcasts per alarm tick (backward ghost eviction) */
+const MAX_PROBES_PER_TICK = 5;
 
 /** nonce_state key for the round-robin wallet reconciliation cursor */
 const ALARM_WALLET_CURSOR_KEY = "alarm_wallet_cursor";
@@ -769,6 +792,28 @@ export class NonceDO {
     this.sql.exec(`
       CREATE INDEX IF NOT EXISTS idx_replay_buffer_sender
         ON replay_buffer(sender_address);
+    `);
+
+    // Probe queue: alarm-driven backward probe for ghost mempool eviction.
+    // When flush-wallet detects an empty forward range + probeDepth, nonces are
+    // enqueued here and processed in batches by the alarm (5/tick, RBF_FEE).
+    // States: 'pending' → 'replaced' | 'conflict' | 'rejected'
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS probe_queue (
+        wallet_index  INTEGER NOT NULL,
+        nonce         INTEGER NOT NULL,
+        state         TEXT    NOT NULL DEFAULT 'pending',
+        txid          TEXT,
+        reason        TEXT,
+        created_at    TEXT    NOT NULL,
+        completed_at  TEXT,
+        PRIMARY KEY (wallet_index, nonce)
+      );
+    `);
+
+    this.sql.exec(`
+      CREATE INDEX IF NOT EXISTS idx_probe_queue_pending
+        ON probe_queue(wallet_index, state, nonce ASC);
     `);
 
     // ---------------------------------------------------------------------------
@@ -3455,14 +3500,17 @@ export class NonceDO {
   /**
    * Release a nonce for the specified wallet — updates only the intent ledger.
    *
-   * txid present  → nonce was broadcast successfully; mark as 'confirmed' in ledger.
-   * txid absent   → nonce was NOT broadcast (e.g. broadcast failure).
-   *                 If a txid was previously recorded in nonce_txids for this nonce,
-   *                 mark as 'failed' (quarantine). Otherwise mark as 'expired'.
-   * walletIndex   → which wallet the nonce belongs to (default: 0)
-   * fee           → when provided with txid (broadcast succeeded), recorded in cumulative wallet stats
+   * txid present   → nonce was broadcast successfully; mark as 'confirmed' in ledger.
+   * txid absent    → nonce was NOT broadcast (e.g. broadcast failure). Priority order:
+   *   1. errorReason provided → immediate quarantine ('failed' state) + recordQuarantineEvent.
+   *      Use for contention-specific terminal failures (TooMuchChaining, nonce_conflict).
+   *   2. Prior txid in nonce_txids → quarantine (broadcast happened but release has no txid).
+   *   3. Neither → mark as 'expired' (truly unused nonce, available for gap-fill).
+   * walletIndex    → which wallet the nonce belongs to (default: 0)
+   * fee            → when provided with txid (broadcast succeeded), recorded in cumulative wallet stats
+   * errorReason    → triggers quarantine when txid is absent (feeds circuit breaker)
    */
-  async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0, fee?: string): Promise<void> {
+  async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0, fee?: string, errorReason?: string): Promise<void> {
     return this.state.blockConcurrencyWhile(async () => {
       // Verify this nonce is actually in 'assigned' state in the ledger
       const intentRows = this.sql
@@ -3483,30 +3531,42 @@ export class NonceDO {
       let failureQuarantined = false;
 
       if (!txid) {
-        // No txid provided: check if a txid was previously recorded in nonce_txids.
-        // If so, the nonce was broadcast at some point — quarantine as failure.
-        const txidRows = this.sql
-          .exec<{ count: number }>(
-            "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
-            nonce
-          )
-          .toArray();
-        const hasPriorTxid = (txidRows[0]?.count ?? 0) > 0;
-
-        if (hasPriorTxid) {
-          // Nonce was broadcast at some point — quarantine permanently
+        // Caller-supplied error reason (e.g. TooMuchChaining, nonce_conflict from queue-consumer)
+        // takes priority — quarantine immediately so the circuit breaker fires.
+        if (errorReason) {
           failureQuarantined = true;
           this.log("warn", "nonce_quarantined", {
             walletIndex,
             nonce,
-            reason: "txid_recorded_on_failed_release",
+            reason: errorReason,
           });
-          this.ledgerRelease(walletIndex, nonce, undefined, "txid_recorded_on_failed_release");
+          this.ledgerRelease(walletIndex, nonce, undefined, errorReason);
         } else {
-          // Truly unused nonce (never broadcast) — mark expired
-          // The ledger head already advanced past this nonce on assignment,
-          // so this creates a gap that reconciliation will fill if needed.
-          this.ledgerRelease(walletIndex, nonce, undefined);
+          // No explicit error reason: check if a txid was previously recorded in nonce_txids.
+          // If so, the nonce was broadcast at some point — quarantine as failure.
+          const txidRows = this.sql
+            .exec<{ count: number }>(
+              "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
+              nonce
+            )
+            .toArray();
+          const hasPriorTxid = (txidRows[0]?.count ?? 0) > 0;
+
+          if (hasPriorTxid) {
+            // Nonce was broadcast at some point — quarantine permanently
+            failureQuarantined = true;
+            this.log("warn", "nonce_quarantined", {
+              walletIndex,
+              nonce,
+              reason: "txid_recorded_on_failed_release",
+            });
+            this.ledgerRelease(walletIndex, nonce, undefined, "txid_recorded_on_failed_release");
+          } else {
+            // Truly unused nonce (never broadcast) — mark expired
+            // The ledger head already advanced past this nonce on assignment,
+            // so this creates a gap that reconciliation will fill if needed.
+            this.ledgerRelease(walletIndex, nonce, undefined);
+          }
         }
       } else {
         // txid provided: nonce was broadcast successfully — consumed
@@ -3951,6 +4011,32 @@ export class NonceDO {
     // Global settlement percentiles (last 24h confirmed txs across all wallets)
     const settlementTimes = this.computeSettlementPercentiles();
 
+    // Probe queue status (backward ghost eviction)
+    const probeStats = this.sql
+      .exec<{ state: string; cnt: number }>(
+        "SELECT state, COUNT(*) as cnt FROM probe_queue GROUP BY state"
+      )
+      .toArray();
+    const probeTotal = probeStats.reduce((s, r) => s + r.cnt, 0);
+    let probeQueue: ProbeQueueStatus | null = null;
+    if (probeTotal > 0) {
+      const probePendingByWallet = this.sql
+        .exec<{ wallet_index: number; cnt: number }>(
+          "SELECT wallet_index, COUNT(*) as cnt FROM probe_queue WHERE state = 'pending' GROUP BY wallet_index"
+        )
+        .toArray();
+      probeQueue = {
+        pending: probeStats.find((r) => r.state === "pending")?.cnt ?? 0,
+        replaced: probeStats.find((r) => r.state === "replaced")?.cnt ?? 0,
+        conflict: probeStats.find((r) => r.state === "conflict")?.cnt ?? 0,
+        rejected: probeStats.find((r) => r.state === "rejected")?.cnt ?? 0,
+        wallets: probePendingByWallet.map((r) => ({
+          walletIndex: r.wallet_index,
+          pending: r.cnt,
+        })),
+      };
+    }
+
     return {
       wallets,
       senderHands,
@@ -3965,6 +4051,7 @@ export class NonceDO {
         : null,
       recommendation,
       settlementTimes,
+      probeQueue,
       timestamp: new Date().toISOString(),
     };
   }
@@ -4148,6 +4235,114 @@ export class NonceDO {
    * Processes up to `maxPerCycle` entries per alarm cycle to avoid blocking.
    * Never throws — all errors are logged and the cycle continues.
    */
+  /**
+   * Alarm-driven backward probe: process pending probe_queue entries in batches.
+   * Broadcasts self-transfers at confirmed nonces using RBF_FEE to evict ghost
+   * mempool entries from the Stacks node. Results stored in probe_queue for
+   * operator inspection via GET /nonce/state.
+   */
+  private async processProbeQueue(): Promise<{ processed: number; replaced: number; conflict: number; rejected: number }> {
+    const pending = this.sql
+      .exec<{ wallet_index: number; nonce: number }>(
+        `SELECT wallet_index, nonce FROM probe_queue
+         WHERE state = 'pending'
+         ORDER BY wallet_index ASC, nonce ASC
+         LIMIT ?`,
+        MAX_PROBES_PER_TICK
+      )
+      .toArray();
+
+    if (pending.length === 0) {
+      return { processed: 0, replaced: 0, conflict: 0, rejected: 0 };
+    }
+
+    let processed = 0;
+    let replaced = 0;
+    let conflict = 0;
+    let rejected = 0;
+
+    // Group by wallet to avoid re-deriving keys for each nonce
+    const byWallet = new Map<number, number[]>();
+    for (const { wallet_index, nonce } of pending) {
+      const nonces = byWallet.get(wallet_index) ?? [];
+      nonces.push(nonce);
+      byWallet.set(wallet_index, nonces);
+    }
+
+    for (const [walletIndex, nonces] of byWallet) {
+      const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+      if (!privateKey) {
+        // Can't derive key — mark all as rejected
+        const now = new Date().toISOString();
+        for (const nonce of nonces) {
+          this.sql.exec(
+            `UPDATE probe_queue SET state = 'rejected', reason = 'key_derivation_failed', completed_at = ?
+             WHERE wallet_index = ? AND nonce = ?`,
+            now, walletIndex, nonce
+          );
+          rejected++;
+          processed++;
+        }
+        continue;
+      }
+
+      const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
+
+      for (const nonce of nonces) {
+        const now = new Date().toISOString();
+        try {
+          const tx = await makeSTXTokenTransfer({
+            recipient,
+            amount: GAP_FILL_AMOUNT,
+            senderKey: privateKey,
+            network,
+            nonce: BigInt(nonce),
+            fee: RBF_FEE,
+            memo: `probe-${nonce}`,
+          });
+          const result = await this.broadcastRawTx(tx, "backward_probe");
+
+          if (result.ok) {
+            this.sql.exec(
+              `UPDATE probe_queue SET state = 'replaced', txid = ?, completed_at = ?
+               WHERE wallet_index = ? AND nonce = ?`,
+              result.txid, now, walletIndex, nonce
+            );
+            replaced++;
+          } else if (result.reason === "ConflictingNonceInMempool") {
+            this.sql.exec(
+              `UPDATE probe_queue SET state = 'conflict', reason = ?, completed_at = ?
+               WHERE wallet_index = ? AND nonce = ?`,
+              result.reason, now, walletIndex, nonce
+            );
+            conflict++;
+          } else {
+            this.sql.exec(
+              `UPDATE probe_queue SET state = 'rejected', reason = ?, completed_at = ?
+               WHERE wallet_index = ? AND nonce = ?`,
+              result.reason, now, walletIndex, nonce
+            );
+            rejected++;
+          }
+        } catch (e) {
+          this.sql.exec(
+            `UPDATE probe_queue SET state = 'rejected', reason = ?, completed_at = ?
+             WHERE wallet_index = ? AND nonce = ?`,
+            e instanceof Error ? e.message : String(e), now, walletIndex, nonce
+          );
+          rejected++;
+        }
+        processed++;
+      }
+    }
+
+    if (processed > 0) {
+      this.log("info", "probe_queue_tick", { processed, replaced, conflict, rejected });
+    }
+
+    return { processed, replaced, conflict, rejected };
+  }
+
   private async processReplayBuffer(
     initializedWallets: Array<{ walletIndex: number; address: string }>,
     maxPerCycle: number = 5
@@ -6044,10 +6239,22 @@ export class NonceDO {
           }
         }
 
+        // ---------------------------------------------------------------------------
+        // Backward probe: process pending probe_queue entries (ghost eviction).
+        // Runs after reconciliation so wallet state is current.
+        // ---------------------------------------------------------------------------
+        const probeResult = await this.processProbeQueue();
+        if (probeResult.processed > 0) {
+          this.log("info", "probe_queue_cycle_complete", probeResult);
+        }
+
         // Dynamic alarm interval: use cascade (20s) when cascade is active + in-flight nonces,
         // active (60s) when in-flight nonces present, idle (5min) when all wallets are drained.
         const totalReservedAfterCycle = this.ledgerTotalAssigned();
-        const isActive = totalReservedAfterCycle > 0;
+        const probeQueuePending = this.sql
+          .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM probe_queue WHERE state = 'pending'")
+          .toArray()[0]?.cnt ?? 0;
+        const isActive = totalReservedAfterCycle > 0 || probeQueuePending > 0;
         const intervalMs = cascadeActive && isActive
           ? ALARM_INTERVAL_CASCADE_MS
           : isActive ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
@@ -6330,7 +6537,7 @@ export class NonceDO {
    * Safety cap: MAX_ADMIN_GAP_FILLS (50) nonces per flush to prevent unbounded iteration.
    * Nonces are processed ascending (lowest first) so the chain starts confirming immediately.
    */
-  private async handleFlushWallet(walletIndex: number): Promise<Response> {
+  private async handleFlushWallet(walletIndex: number, probeDepth?: number): Promise<Response> {
     try {
       const address = await this.getStoredSponsorAddressForWallet(walletIndex);
       if (!address) {
@@ -6375,8 +6582,64 @@ export class NonceDO {
         possibleNextNonce: possible_next_nonce,
         lastExecutedTxNonce: last_executed_tx_nonce,
         head,
+        probeDepth: probeDepth ?? null,
         capped: rawFlushEnd > flushStart + MAX_ADMIN_GAP_FILLS,
       });
+
+      // -------------------------------------------------------------------------
+      // Backward probe: forward range is empty but ghost entries may exist.
+      // Enqueue nonces into probe_queue for alarm-driven batch processing.
+      // The alarm processes 5/tick with RBF_FEE to evict ghost mempool entries
+      // without blocking payment requests (CF best practice: no long I/O in fetch).
+      // -------------------------------------------------------------------------
+      if (flushStart >= flushEnd && probeDepth && probeDepth > 0 && last_executed_tx_nonce !== null) {
+        const probeStart = Math.max(0, last_executed_tx_nonce - probeDepth + 1);
+        const probeEnd = last_executed_tx_nonce + 1; // exclusive
+        const now = new Date().toISOString();
+
+        // Clear any stale probe entries for this wallet before inserting
+        this.sql.exec(
+          "DELETE FROM probe_queue WHERE wallet_index = ?",
+          walletIndex
+        );
+
+        let enqueued = 0;
+        for (let nonce = probeStart; nonce < probeEnd; nonce++) {
+          this.sql.exec(
+            `INSERT INTO probe_queue (wallet_index, nonce, state, created_at)
+             VALUES (?, ?, 'pending', ?)`,
+            walletIndex,
+            nonce,
+            now
+          );
+          enqueued++;
+        }
+
+        this.log("info", "flush_wallet_probe_enqueued", {
+          walletIndex,
+          probeStart,
+          probeEnd,
+          enqueued,
+          probeDepth,
+          lastExecutedTxNonce: last_executed_tx_nonce,
+        });
+
+        return this.jsonResponse({
+          success: true,
+          walletIndex,
+          address,
+          mode: "backward_probe_enqueued",
+          probeRange: { start: probeStart, end: probeEnd },
+          enqueued,
+          forwardRangeEmpty: true,
+          chainState: {
+            lastExecutedTxNonce: last_executed_tx_nonce,
+            possibleNextNonce: possible_next_nonce,
+            head,
+          },
+          note: "Probe nonces enqueued for alarm-driven processing (5/tick, RBF_FEE). Check GET /nonce/state for progress.",
+        });
+      }
 
       // -------------------------------------------------------------------------
       // Step 1: Index active dispatch_queue entries by sponsor nonce.
@@ -6619,8 +6882,12 @@ export class NonceDO {
       // fee is optional; only recorded when present and txid is also present
       const fee = typeof body.fee === "string" && body.fee.length > 0 ? body.fee : undefined;
 
+      const errorReason = typeof body.errorReason === "string" && body.errorReason.length > 0
+        ? body.errorReason
+        : undefined;
+
       try {
-        await this.releaseNonce(body.nonce, body.txid, walletIndex, fee);
+        await this.releaseNonce(body.nonce, body.txid, walletIndex, fee, errorReason);
         return this.jsonResponse({ success: true });
       } catch (error) {
         return this.internalError(error);
@@ -6788,7 +7055,20 @@ export class NonceDO {
       if (!Number.isInteger(walletIdx) || walletIdx < 0 || walletIdx >= ABSOLUTE_MAX_WALLET_COUNT) {
         return this.badRequest("Invalid wallet index");
       }
-      return this.state.blockConcurrencyWhile(() => this.handleFlushWallet(walletIdx));
+      const probeDepthParam = url.searchParams.get("probeDepth");
+      let probeDepth: number | undefined;
+      if (probeDepthParam !== null) {
+        const parsed = Number(probeDepthParam);
+        probeDepth = Number.isInteger(parsed) && parsed >= 1 && parsed <= 50 ? parsed : undefined;
+      }
+
+      // Forward flush + probe enqueue both run inside blockConcurrencyWhile
+      // (both mutate SQLite). When probeDepth is set and the forward range is
+      // empty, handleFlushWallet enqueues nonces into probe_queue and returns
+      // immediately — the alarm processes them in batches (5/tick, RBF_FEE).
+      return this.state.blockConcurrencyWhile(
+        () => this.handleFlushWallet(walletIdx, probeDepth)
+      );
     }
 
     // GET /history/:wallet/:nonce — diagnostic endpoint for full nonce event trail.

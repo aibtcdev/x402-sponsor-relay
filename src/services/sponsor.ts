@@ -1464,6 +1464,13 @@ export async function recordBroadcastOutcomeDO(
  * walletIndex specifies which wallet pool to release to (default: 0).
  * Must match the walletIndex returned by the NonceDO /assign response.
  *
+ * errorReason triggers quarantine when txid is absent: the nonce transitions to
+ * 'failed' state and recordQuarantineEvent fires, feeding the per-wallet circuit
+ * breaker. Use only for contention-specific terminal failures (e.g.
+ * "TooMuchChaining", "nonce_conflict"). Do NOT set for generic broadcast errors
+ * (HTTP 5xx, timeouts) — those should expire cleanly to avoid penalizing
+ * healthy wallets or prematurely tripping the circuit breaker.
+ *
  * Call via executionCtx.waitUntil() as fire-and-forget — never blocks the response.
  * Never throws — all errors are logged as warnings.
  */
@@ -1473,7 +1480,8 @@ export async function releaseNonceDO(
   nonce: number,
   txid?: string,
   walletIndex: number = 0,
-  fee?: string
+  fee?: string,
+  errorReason?: string
 ): Promise<void> {
   if (!env.NONCE_DO) {
     return;
@@ -1489,6 +1497,7 @@ export async function releaseNonceDO(
         walletIndex,
         ...(txid ? { txid } : {}),
         ...(fee ? { fee } : {}),
+        ...(errorReason ? { errorReason } : {}),
       }),
     });
 
@@ -1501,6 +1510,7 @@ export async function releaseNonceDO(
         walletIndex,
         ...(txid ? { txid } : {}),
         ...(fee ? { fee } : {}),
+        ...(errorReason ? { errorReason } : {}),
       });
     }
   } catch (e) {
@@ -1510,6 +1520,7 @@ export async function releaseNonceDO(
       walletIndex,
       ...(txid ? { txid } : {}),
       ...(fee ? { fee } : {}),
+      ...(errorReason ? { errorReason } : {}),
     });
   }
 }

@@ -61,6 +61,14 @@ export class NonceReset extends BaseEndpoint {
                     "Wallet index for the 'flush-wallet' action (0-based, required when action is 'flush-wallet'). Ignored for other actions.",
                   example: 0,
                 },
+                probeDepth: {
+                  type: "number" as const,
+                  minimum: 1,
+                  maximum: 50,
+                  description:
+                    "Backward probe depth for 'flush-wallet' when the forward nonce range is empty. Broadcasts self-transfers at nonces below last_executed to evict ghost mempool entries from the Stacks node. Only used with 'flush-wallet'.",
+                  example: 25,
+                },
               },
               description: "Optional action to perform (defaults to 'resync')",
             },
@@ -151,9 +159,10 @@ export class NonceReset extends BaseEndpoint {
     const auth = c.get("auth")!;
     const keyId = auth.metadata?.keyId ?? "unknown";
 
-    // Parse action and optional walletIndex from body (action defaults to "resync")
+    // Parse action, optional walletIndex, and optional probeDepth from body (action defaults to "resync")
     let action: NonceResetAction = "resync";
     let walletIndex: number | undefined;
+    let probeDepth: number | undefined;
     try {
       const body = await c.req.json() as Record<string, unknown>;
       if (body.action !== undefined) {
@@ -181,6 +190,21 @@ export class NonceReset extends BaseEndpoint {
           });
         }
       }
+      if (body.probeDepth !== undefined) {
+        // Cap at 50: TooMuchChaining triggers at 25 chained txs, 50 = 2× safety margin
+        // to cover edge cases where ghost entries span beyond the chaining window.
+        if (typeof body.probeDepth === "number" && Number.isInteger(body.probeDepth) && body.probeDepth > 0 && body.probeDepth <= 50) {
+          probeDepth = body.probeDepth;
+        } else {
+          return this.err(c, {
+            error: "Invalid probeDepth",
+            code: "NONCE_RESET_FAILED",
+            status: 400,
+            details: `probeDepth must be an integer between 1 and 50; got '${body.probeDepth}'`,
+            retryable: false,
+          });
+        }
+      }
     } catch (_e) {
       // Body is optional — empty body or missing Content-Type is fine, use defaults
     }
@@ -196,13 +220,13 @@ export class NonceReset extends BaseEndpoint {
       });
     }
 
-    logger.info("Nonce recovery triggered", { action, keyId, ...(walletIndex !== undefined && { walletIndex }) });
+    logger.info("Nonce recovery triggered", { action, keyId, ...(walletIndex !== undefined && { walletIndex }), ...(probeDepth !== undefined && { probeDepth }) });
 
     try {
       const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
       // flush-wallet targets a specific wallet; all other actions use the action name as path
       const doUrl = action === "flush-wallet"
-        ? `https://nonce-do/flush-wallet/${walletIndex!}`
+        ? `https://nonce-do/flush-wallet/${walletIndex!}${probeDepth ? `?probeDepth=${probeDepth}` : ""}`
         : `https://nonce-do/${action}`;
       const response = await stub.fetch(doUrl, { method: "POST" });
 

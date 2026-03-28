@@ -206,7 +206,9 @@ async function processPaymentMessage(
     const isTooMuchChaining = broadcastResult.tooMuchChaining === true;
 
     if ((isNonceConflict || isTooMuchChaining) && attempt < MAX_ATTEMPTS) {
-      // Release the sponsor nonce back to pool
+      // Release the sponsor nonce back to pool — no errorReason here so the nonce
+      // expires cleanly without feeding the circuit breaker on every retry attempt.
+      // Quarantine only happens on the terminal path when retries are exhausted.
       if (sponsorNonce !== null) {
         await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
       }
@@ -228,9 +230,13 @@ async function processPaymentMessage(
       return;
     }
 
-    // Terminal broadcast failure — release nonce and clear in-flight marker
+    // Terminal broadcast failure — only quarantine for contention-specific conditions.
+    // Generic failures (node 500, timeout) release cleanly to avoid penalizing healthy wallets.
     if (sponsorNonce !== null) {
-      await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
+      const reason = isTooMuchChaining ? "TooMuchChaining"
+        : isNonceConflict ? "nonce_conflict"
+        : undefined;
+      await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex, undefined, reason);
     }
 
     if (record.senderNonce !== undefined) {
