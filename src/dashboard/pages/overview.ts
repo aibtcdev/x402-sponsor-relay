@@ -507,11 +507,14 @@ ${footer(utcTimestamp())}
         config.data.labels = localizeLabels(hourlyData.map(function(d) { return d.hour; }));
         config.data.datasets[0].data = hourlyData.map(function(d) { return d.success; });
         config.data.datasets[1].data = hourlyData.map(function(d) {
-          var failed = d.transactions - d.success;
-          var ce = d.clientErrors || 0;
-          return Math.max(0, failed - ce);
+          var failed = Math.max(0, d.transactions - d.success);
+          var ce = Math.max(0, Math.min(d.clientErrors || 0, failed));
+          return failed - ce;
         });
-        config.data.datasets[2].data = hourlyData.map(function(d) { return d.clientErrors || 0; });
+        config.data.datasets[2].data = hourlyData.map(function(d) {
+          var failed = Math.max(0, d.transactions - d.success);
+          return Math.max(0, Math.min(d.clientErrors || 0, failed));
+        });
         config.options.plugins.tooltip.callbacks = { footer: tooltipFooterCallback };
         this.chartInstance = new Chart(canvas, config);
       }

@@ -56,10 +56,11 @@ function deriveChartSeries(
   const relayErrors: number[] = [];
   const clientErrors: number[] = [];
   for (const d of data) {
-    const ce = d.clientErrors ?? 0;
+    const failed = Math.max(0, d.transactions - d.success);
+    const ce = Math.max(0, Math.min(d.clientErrors ?? 0, failed));
     success.push(d.success);
     clientErrors.push(ce);
-    relayErrors.push(Math.max(0, d.transactions - d.success - ce));
+    relayErrors.push(failed - ce);
   }
   return { success, relayErrors, clientErrors };
 }
