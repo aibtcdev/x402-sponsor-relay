@@ -505,16 +505,19 @@ ${footer(utcTimestamp())}
         if (!canvas || typeof Chart === 'undefined') return;
         var config = JSON.parse(JSON.stringify(_chartConfig));
         config.data.labels = localizeLabels(hourlyData.map(function(d) { return d.hour; }));
-        config.data.datasets[0].data = hourlyData.map(function(d) { return d.success; });
-        config.data.datasets[1].data = hourlyData.map(function(d) {
-          var failed = Math.max(0, d.transactions - d.success);
-          var ce = Math.max(0, Math.min(d.clientErrors || 0, failed));
-          return failed - ce;
-        });
-        config.data.datasets[2].data = hourlyData.map(function(d) {
-          var failed = Math.max(0, d.transactions - d.success);
-          return Math.max(0, Math.min(d.clientErrors || 0, failed));
-        });
+        // Derive series (mirrors server-side deriveChartSeries in charts.ts)
+        var series = (function(data) {
+          var s = [], re = [], ce = [];
+          data.forEach(function(d) {
+            var failed = Math.max(0, d.transactions - d.success);
+            var clientErr = Math.max(0, Math.min(d.clientErrors || 0, failed));
+            s.push(d.success); re.push(failed - clientErr); ce.push(clientErr);
+          });
+          return { success: s, relayErrors: re, clientErrors: ce };
+        })(hourlyData);
+        config.data.datasets[0].data = series.success;
+        config.data.datasets[1].data = series.relayErrors;
+        config.data.datasets[2].data = series.clientErrors;
         config.options.plugins.tooltip.callbacks = { footer: tooltipFooterCallback };
         this.chartInstance = new Chart(canvas, config);
       }
