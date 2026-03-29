@@ -217,7 +217,7 @@ export class StatsService {
    */
   async getDailyChartData(
     days: number
-  ): Promise<Array<{ hour: string; transactions: number; success: number }>> {
+  ): Promise<Array<{ hour: string; transactions: number; success: number; clientErrors?: number }>> {
     const daily = await this.getDailyStats(days);
     return daily.map((d) => {
       const [year, month, day] = d.date.split("-").map(Number);
@@ -229,6 +229,7 @@ export class StatsService {
         hour: label,
         transactions: d.transactions.total,
         success: d.transactions.success,
+        clientErrors: d.transactions.clientErrors ?? 0,
       };
     });
   }

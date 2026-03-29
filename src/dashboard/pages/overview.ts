@@ -37,7 +37,7 @@ function utcTimestamp(): string {
  * Check whether hourly data has any non-zero transaction counts
  */
 function hasTransactionChartData(
-  hourlyData: Array<{ hour: string; transactions: number; success: number }>
+  hourlyData: Array<{ hour: string; transactions: number; success: number; clientErrors?: number }>
 ): boolean {
   return hourlyData.some((h) => h.transactions > 0);
 }
@@ -457,6 +457,14 @@ ${footer(utcTimestamp())}
   // Localize the server-rendered config labels before first render
   _chartConfig.data.labels = localizeLabels(_chartConfig.data.labels);
 
+  // Tooltip footer showing stacked total (functions can't survive JSON serialization,
+  // so this must be attached client-side after parse and after each rebuild clone)
+  function tooltipFooterCallback(items) {
+    var total = items.reduce(function(sum, item) { return sum + item.parsed.y; }, 0);
+    return 'Total: ' + total;
+  }
+  _chartConfig.options.plugins.tooltip.callbacks = { footer: tooltipFooterCallback };
+
   // Alpine.js component for the transaction volume chart with period toggle
   function txChartApp() {
     return {
@@ -497,8 +505,20 @@ ${footer(utcTimestamp())}
         if (!canvas || typeof Chart === 'undefined') return;
         var config = JSON.parse(JSON.stringify(_chartConfig));
         config.data.labels = localizeLabels(hourlyData.map(function(d) { return d.hour; }));
-        config.data.datasets[0].data = hourlyData.map(function(d) { return d.transactions; });
-        config.data.datasets[1].data = hourlyData.map(function(d) { return d.success; });
+        // Derive series (mirrors server-side deriveChartSeries in charts.ts)
+        var series = (function(data) {
+          var s = [], re = [], ce = [];
+          data.forEach(function(d) {
+            var failed = Math.max(0, d.transactions - d.success);
+            var clientErr = Math.max(0, Math.min(d.clientErrors || 0, failed));
+            s.push(d.success); re.push(failed - clientErr); ce.push(clientErr);
+          });
+          return { success: s, relayErrors: re, clientErrors: ce };
+        })(hourlyData);
+        config.data.datasets[0].data = series.success;
+        config.data.datasets[1].data = series.relayErrors;
+        config.data.datasets[2].data = series.clientErrors;
+        config.options.plugins.tooltip.callbacks = { footer: tooltipFooterCallback };
         this.chartInstance = new Chart(canvas, config);
       }
     };
