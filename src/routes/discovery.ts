@@ -1912,9 +1912,19 @@ Success (HTTP 200):
   "success": true,
   "txid": "0x...",
   "settlement": { "success": true, "status": "confirmed|pending|failed", "blockHeight": 12345 },
-  "receiptId": "uuid",
+  "receiptId": "uuid",     // may be absent if KV storage fails — use txid as fallback
   "sponsoredTx": "0x..."
 }
+
+Held (HTTP 202) — sender nonce gap detected, tx queued but not yet dispatched:
+{
+  "success": true,
+  "status": "held",
+  "requestId": "uuid",
+  "queue": { "position": 1, "missingNonces": [5], "estimatedDispatchMs": 30000 }
+}
+Submit the missing nonces to unblock dispatch, or wait Retry-After seconds.
+No txid or receiptId in this response — the tx has not been broadcast yet.
 
 Error (HTTP 4xx/5xx):
 {

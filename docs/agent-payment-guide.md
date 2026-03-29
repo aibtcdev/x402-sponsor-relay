@@ -31,10 +31,14 @@ Agent                    Relay                    Stacks Network
   |                        | 5. Broadcasts ──────────► |
   |                        | 6. Polls up to 60s ◄───── |
   |                        |                           |
-  | ◄── 7. Response ────── |                           |
+  | ◄── 7a. 200 OK ─────── |                           |
   |    { txid,             |                           |
   |      settlement,       |                           |
-  |      receiptId }       |                           |
+  |      receiptId? }      |                           |
+  |                        |                           |
+  | ◄── 7b. 202 Held ──── |  (if sender nonce gap)    |
+  |    { status: "held",   |                           |
+  |      queue }           |                           |
 ```
 
 Key facts:
@@ -42,7 +46,7 @@ Key facts:
 - Your transaction must be built with `sponsored: true`. The relay fills the sponsor slot.
 - You pay the *service* (the recipient) in STX, sBTC, or USDCx. The relay pays the *network fee*.
 - The `settle` field tells the relay what to verify: who gets paid, how much, which token.
-- `receiptId` is your proof of payment. Store it to gate downstream resources.
+- `receiptId` is your proof of payment. Store it to gate downstream resources. Note: `receiptId` is best-effort — it may be absent if relay KV storage fails. If missing, use `txid` as your reference.
 
 ---
 
@@ -68,6 +72,7 @@ Use `@stacks/transactions` (or `x402-stacks`) to build a transfer or contract ca
 
 ```typescript
 import { makeSTXTokenTransfer, AnchorMode, PostConditionMode } from "@stacks/transactions";
+import { bytesToHex } from "@stacks/common";
 
 const tx = await makeSTXTokenTransfer({
   recipient: "SP_RECIPIENT_ADDRESS",
@@ -154,21 +159,29 @@ const response = await fetch("https://x402-relay.aibtc.dev/settle", {
 ### Step 3: Handle the response
 
 ```typescript
-if (!response.ok) {
+if (!response.ok && response.status !== 202) {
   // HTTP 4xx/5xx — check result.code and result.retryable
   const { code, error, retryable, retryAfter } = result;
   // See error table below for exact action per code
   return handleError(code, retryable, retryAfter);
 }
 
-// POST /relay success shape:
+// HTTP 202 — transaction held due to sender nonce gap (no txid, no receiptId)
+if (response.status === 202) {
+  const { status, queue } = result;  // status === "held"
+  // queue contains: { position, missingNonces, estimatedDispatchMs }
+  // Submit the missing nonces to unblock dispatch, or wait retryAfter seconds.
+  return handleHeld(queue, response.headers.get("Retry-After"));
+}
+
+// HTTP 200 — POST /relay success shape:
 const {
   success,          // true
   txid,             // "0x..."
   explorerUrl,      // "https://explorer.hiro.so/txid/0x..."
   settlement,       // { success, status, sender, recipient, amount, blockHeight? }
   sponsoredTx,      // fully-sponsored tx hex (keep for dedup retries)
-  receiptId,        // "uuid" — your proof of payment
+  receiptId,        // "uuid" — proof of payment (may be absent if KV storage failed; use txid as fallback)
 } = result;
 
 // POST /settle success shape (HTTP 200 for both success and failure per V2 spec):
@@ -284,12 +297,12 @@ If `settlement.status === "failed"` (only for `abort_*` on-chain rejections), po
 | `BROADCAST_REJECTED` | 422 | true | Stacks node rejected the tx for a client reason; inspect `details`, correct the transaction, and resubmit |
 | `NONCE_CONFLICT` | 409 | true | Relay sponsor nonce conflict in mempool; rebuild and resubmit a new transaction (different serialized bytes) |
 | `CLIENT_NONCE_CONFLICT` | 409 | true | Agent nonce conflicts in mempool; wait for the conflicting pending tx, then re-sign with the correct nonce |
-| `TRANSACTION_HELD` | 200 | true | Transaction is queued pending a nonce gap fill; submit the missing nonces listed in `details`, or poll `GET /verify/:receiptId` for eventual dispatch |
-| `TOO_MUCH_CHAINING` | 409 | true | Relay sponsor wallet has too many in-flight transactions; wait ~30s and retry (relay will recover automatically) |
+| `TRANSACTION_HELD` | 202 | true | Transaction accepted but queued due to a sender nonce gap. Returned as HTTP 202 with `status: "held"` and `queue` info (no `receiptId`). `POST /sponsor` returns `SENDER_NONCE_GAP` (400) instead. Submit the missing nonces listed in `queue.missingNonces` or wait for the gap to clear. |
+| `TOO_MUCH_CHAINING` | 429 | true | Relay sponsor wallet has too many in-flight transactions; wait for `retryAfter` seconds (check `Retry-After` header); relay will recover automatically |
 | `RATE_LIMIT_EXCEEDED` | 429 | true | 10 req/min per sender on free tier; wait for `retryAfter` seconds (check `Retry-After` header) |
 | `DAILY_LIMIT_EXCEEDED` | 429 | true | Daily request quota reached for your API key; wait until the quota resets at midnight UTC |
 | `SPENDING_CAP_EXCEEDED` | 429 | true | Daily sponsor fee cap reached for your API key tier; wait until midnight UTC |
-| `BROADCAST_FAILED` | 500 | true | Broadcast attempt failed internally; retry with exponential backoff |
+| `BROADCAST_FAILED` | 400 / 502 | true | Emitted by `POST /sponsor` when broadcast fails (400 = client/tx error, 502 = node/network issue); `POST /relay` uses `SETTLEMENT_BROADCAST_FAILED` instead. Inspect `details` and retry with backoff. |
 | `SPONSOR_CONFIG_ERROR` | 500 | false | Relay misconfigured (no mnemonic); contact relay operator |
 | `SPONSOR_FAILED` | 500 | true | Sponsor step failed transiently; retry after 5s |
 | `SETTLEMENT_BROADCAST_FAILED` | 502 | true | Stacks node rejected broadcast; wait `retryAfter` seconds (default 5s) and retry |
@@ -454,10 +467,21 @@ async function payAndSettle(opts: {
 
   const body = await res.json();
 
-  // 3. Handle errors
-  if (!res.ok || !body.success) {
+  // 3. Handle errors and 202/held
+  if (!res.ok && res.status !== 202) {
     const { code, retryable, retryAfter, error } = body;
     throw Object.assign(new Error(error ?? "relay_error"), { code, retryable, retryAfter });
+  }
+
+  if (res.status === 202) {
+    // Sender nonce gap — tx is queued but not yet dispatched (no txid, no receiptId)
+    const retryAfter = Number(res.headers.get("Retry-After") ?? 30);
+    throw Object.assign(new Error("transaction_held"), {
+      code: "TRANSACTION_HELD",
+      retryable: true,
+      retryAfter,
+      queue: body.queue,
+    });
   }
 
   // 4. Handle settlement status
