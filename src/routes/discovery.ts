@@ -880,7 +880,7 @@ discovery.get("/topics", (c) => {
     {
       topic: "agent-payments",
       description:
-        "Complete payment guide for agents: mental model, per-service flows, error-to-action tables for all relay and V2 error codes, settlement status interpretation, and network constants. Canonical runtime reference for making x402 payments across aibtc services.",
+        "Payment guide for agents: mental model, per-service flows, settlement status interpretation, common errors and fixes, and network constants. Cross-references /topics/errors for the complete error code reference.",
       url: `${baseUrl}/topics/agent-payments`,
     },
   ];
@@ -1935,112 +1935,26 @@ failed    — abort_* on-chain rejection. Definitive. Re-sign with corrected par
 Polling endpoint: GET https://x402-relay.aibtc.com/verify/:receiptId
 Strategy: exponential backoff starting at 5s (5s, 7.5s, 11.25s, ...), max 12 attempts.
 
-## Error-to-Action: POST /relay and POST /sponsor
+## Most Common Errors and Fixes
 
-Code                          | HTTP | Retryable | Action
-------------------------------|------|-----------|-------
-MISSING_TRANSACTION           | 400  | false     | Add transaction field
-MISSING_SETTLE_OPTIONS        | 400  | false     | Add settle field with expectedRecipient and minAmount
-INVALID_SETTLE_OPTIONS        | 400  | false     | Fix expectedRecipient (valid SP/ST address) or minAmount (numeric string)
-INVALID_TRANSACTION           | 400  | false     | Tx hex is malformed — rebuild the transaction
-NOT_SPONSORED                 | 400  | false     | Set sponsored: true when building the transaction
-SETTLEMENT_VERIFICATION_FAILED| 400  | false     | Tx recipient or amount does not match settle options
-INVALID_PAYLOAD               | 400  | false     | Request body is structurally invalid — check JSON shape
-MALFORMED_PAYLOAD             | 400  | false     | Payload cannot be parsed — check encoding and Content-Type
-SENDER_NONCE_GAP              | 400  | false     | Your account nonce has a gap; submit missing nonces listed in details
-SIGNATURE_VALIDATION_FAILED   | 422  | false     | Invalid tx signature — wrong network or mismatched key; rebuild and re-sign
-SETTLEMENT_FAILED             | 422  | false     | abort_* on-chain rejection; rebuild with corrected parameters
-CLIENT_INSUFFICIENT_FUNDS     | 422  | false     | Agent wallet lacks funds; top up, then re-sign and retry
-CLIENT_BAD_NONCE              | 422  | true      | Stale nonce; fetch possible_next_nonce from Hiro API, re-sign, resubmit
-BROADCAST_REJECTED            | 422  | true      | Node rejected tx for client reason; inspect details, fix, resubmit
-NONCE_CONFLICT                | 409  | true      | Relay sponsor nonce conflict; rebuild and resubmit a new transaction
-CLIENT_NONCE_CONFLICT         | 409  | true      | Agent nonce conflict; wait for pending tx, then re-sign with correct nonce
-TRANSACTION_HELD              | 200  | true      | Tx queued pending nonce gap fill; submit missing nonces in details
-TOO_MUCH_CHAINING             | 409  | true      | Relay sponsor wallet has too many in-flight txs; wait ~30s and retry
-RATE_LIMIT_EXCEEDED           | 429  | true      | 10 req/min limit; wait retryAfter seconds
-DAILY_LIMIT_EXCEEDED          | 429  | true      | Daily quota reached; wait until midnight UTC
-SPENDING_CAP_EXCEEDED         | 429  | true      | Daily fee cap reached for your tier; wait until midnight UTC
-BROADCAST_FAILED              | 500  | true      | Internal broadcast failure; retry with exponential backoff
-SPONSOR_CONFIG_ERROR          | 500  | false     | Relay misconfigured; contact relay operator
-SPONSOR_FAILED                | 500  | true      | Sponsor step failed transiently; retry after 5s
-SETTLEMENT_BROADCAST_FAILED   | 502  | true      | Node rejected broadcast; wait retryAfter seconds (default 5s)
-SERVICE_DEGRADED              | 503  | true      | All sponsor wallets circuit-broken; retry after retryAfter (~30s)
-LOW_HEADROOM                  | 503  | true      | Sponsor nonce pool near capacity; retry after retryAfter
-NONCE_DO_UNAVAILABLE          | 503  | true      | Nonce coordinator unavailable; retry after backoff
+These are the errors agents hit most often. For the complete error reference with
+all codes, HTTP statuses, and retry behavior, see: https://x402-relay.aibtc.com/topics/errors
 
-## Error-to-Action: API Key Errors
+Code                           | Fix
+-------------------------------|----
+NOT_SPONSORED                  | Set sponsored: true when building the transaction
+SETTLEMENT_VERIFICATION_FAILED | Make settle.expectedRecipient exactly match the tx recipient
+CLIENT_BAD_NONCE               | Fetch possible_next_nonce from Hiro API, re-sign, resubmit
+CLIENT_INSUFFICIENT_FUNDS      | Top up agent wallet, then re-sign and retry
+TOO_MUCH_CHAINING              | Wait ~30s and retry (relay recovers automatically)
+RATE_LIMIT_EXCEEDED            | Wait retryAfter seconds (10 req/min on free tier)
+SERVICE_DEGRADED               | Wait retryAfter seconds (~30s); relay recovers automatically
+SETTLEMENT_FAILED              | abort_* on-chain rejection; rebuild with corrected parameters
 
-Code                | HTTP | Retryable | Action
---------------------|------|-----------|-------
-MISSING_API_KEY     | 401  | false     | Add Authorization: Bearer x402_sk_... header
-INVALID_API_KEY     | 401  | false     | Key format wrong or not found; verify key storage
-EXPIRED_API_KEY     | 401  | false     | Key past expiresAt; provision a new key via POST /keys/provision
-REVOKED_API_KEY     | 401  | false     | Key deactivated; provision a new key
-
-## Error-to-Action: SIP-018 Auth Errors
-
-Code                    | HTTP | Retryable | Action
-------------------------|------|-----------|-------
-INVALID_AUTH_SIGNATURE  | 401  | false     | Signature invalid or action mismatch; rebuild SIP-018 message and re-sign
-AUTH_EXPIRED            | 401  | false     | expiry in the past; rebuild with future expiry (60s minimum) and re-sign
-
-## Error-to-Action: Key Provisioning
-
-Code                    | HTTP | Retryable | Action
-------------------------|------|-----------|-------
-MISSING_BTC_ADDRESS     | 400  | false     | Add btcAddress field
-MISSING_STX_ADDRESS     | 400  | false     | Add stxAddress field
-MISSING_SIGNATURE       | 400  | false     | Add signature field
-INVALID_MESSAGE_FORMAT  | 400  | false     | message must match required format including timestamp
-INVALID_SIGNATURE       | 400  | false     | BIP-137/BIP-322 verification failed; verify message and signing method
-INVALID_STX_SIGNATURE   | 400  | false     | Stacks RSV verification failed; verify message and key
-STALE_TIMESTAMP         | 400  | false     | Timestamp more than 5 minutes old; re-sign with fresh timestamp
-ALREADY_PROVISIONED     | 409  | false     | Address already has active key; use existing key or wait for expiry
-UNSUPPORTED_ADDRESS_TYPE| 400  | false     | Address type not supported for this endpoint
-INVALID_BTC_ADDRESS     | 400  | false     | BTC address format invalid
-
-## Error-to-Action: Receipt and Access
-
-Code              | HTTP | Retryable | Action
-------------------|------|-----------|-------
-MISSING_RECEIPT_ID| 400  | false     | Provide receiptId in the request
-INVALID_RECEIPT   | 404  | false     | Receipt not found; check receiptId value
-RECEIPT_EXPIRED   | 404  | false     | Receipt past 30-day TTL; re-submit a new payment
-RECEIPT_CONSUMED  | 409  | false     | Receipt already consumed; pay again for a new receipt
-RESOURCE_MISMATCH | 400  | false     | resource param does not match stored receipt
-PROXY_FAILED      | 502  | true      | Downstream targetUrl unreachable; retry after backoff
-
-## x402 V2 Error Codes (POST /settle errorReason, POST /verify invalidReason)
-
-HTTP is always 200 per V2 spec — check success or isValid field.
-
-Code                        | Action
-----------------------------|-------
-invalid_payload             | Required fields missing from request; check paymentPayload and paymentRequirements
-invalid_payment_requirements| network, payTo, or amount missing from paymentRequirements
-invalid_network             | network mismatch (testnet: stacks:2147483648, mainnet: stacks:1)
-unrecognized_asset          | Use "STX", "sBTC", or valid CAIP-19 contract address
-invalid_scheme              | Scheme must be "exact"
-unsupported_scheme          | Scheme valid but not supported by this relay
-invalid_x402_version        | x402Version must be 2
-invalid_transaction_state   | Tx cannot be deserialized or fails local verification
-recipient_mismatch          | Tx recipient does not match paymentRequirements.payTo
-amount_insufficient         | Tx transfer amount less than paymentRequirements.amount
-sender_mismatch             | Tx token type does not match declared asset
-insufficient_funds          | Sender wallet has insufficient balance
-broadcast_failed            | Node rejected broadcast; rebuild and resubmit
-conflicting_nonce           | Nonce conflict (agent or sponsor); rebuild and resubmit
-transaction_not_found       | Broadcast succeeded but tx not found during polling
-transaction_pending         | Tx in flight but not yet confirmed
-transaction_failed          | abort_* on-chain rejection; rebuild with corrected parameters
-client_insufficient_funds   | Sender lacks funds; top up the wallet
-client_bad_nonce            | Agent nonce stale; fetch correct nonce and re-sign
-signature_validation_failed | Tx signature invalid; rebuild and re-sign
-transaction_held            | Tx queued pending agent nonce gap fill; submit missing nonces
-payment_identifier_conflict | Same payment-identifier id used with different tx payload (HTTP 409)
-payment_identifier_required | Service requires payment-identifier extension but none provided
-unexpected_verify_error     | Internal verification error; retry
-unexpected_settle_error     | Internal settlement error; retry
+General retry rules:
+- If retryable: true, wait retryAfter seconds (or Retry-After header), then retry.
+- If retryable: false, fix the request before resubmitting.
+- POST /relay is idempotent for the same tx hex (5-min dedup window) — safe to retry on network errors.
 
 ## Network Constants
 
@@ -2052,18 +1966,6 @@ Mainnet (production)| https://x402-relay.aibtc.com      | stacks:1             |
 SIP-018 domain constants (both networks):
 - name: "x402-sponsor-relay", version: "1"
 - mainnet chainId: 1 | testnet chainId: 2147483648
-
-## Common Pitfalls
-
-Symptom                                | Root Cause                    | Fix
----------------------------------------|-------------------------------|----
-NOT_SPONSORED                          | Built tx without sponsored:true | Set sponsored: true in transaction builder
-SETTLEMENT_VERIFICATION_FAILED        | expectedRecipient does not match tx recipient | Make settle.expectedRecipient exactly match the transfer recipient
-CLIENT_BAD_NONCE                       | Stale nonce                   | Fetch possible_next_nonce from Hiro API and re-sign
-SETTLEMENT_FAILED                      | abort_* on-chain              | Check tx parameters; ensure agent wallet has enough tokens
-settlement.status "pending" as failure | Misread pending as failed     | Pending means in-flight — poll /verify/:receiptId
-ALREADY_PROVISIONED on key provision   | Same address used twice       | Use existing API key or wait for expiry
-AUTH_EXPIRED on SIP-018 auth           | expiry in the past            | Set expiry to at least 60s in the future from Date.now()
 `,
   };
 
@@ -2329,10 +2231,9 @@ discovery.get("/.well-known/agent.json", (c) => {
         id: "agent-payment-guide",
         name: "Agent Payment Guide",
         description:
-          "Runtime payment reference for agents making x402 payments across aibtc services. " +
+          "Payment guide for agents making x402 payments across aibtc services. " +
           "Covers mental model (you sign, relay pays fee), per-service flows (inbox, news, MCP tools, skills), " +
-          "error-to-action tables for all relay error codes and x402 V2 error codes, " +
-          "settlement status interpretation (confirmed/pending/failed), and network constants. " +
+          "settlement status interpretation (confirmed/pending/failed), common errors, and network constants. " +
           "GET /topics/agent-payments for condensed plaintext. " +
           "Full guide: https://github.com/aibtcdev/x402-sponsor-relay/blob/main/docs/agent-payment-guide.md",
         tags: ["x402", "payment", "guide", "errors", "settlement", "stacks"],
