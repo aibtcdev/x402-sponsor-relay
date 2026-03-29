@@ -46,35 +46,54 @@ export function formatTrend(
 }
 
 /**
- * Generate Chart.js config for transaction line chart
+ * Derive stacked bar chart series from hourly/daily data.
+ * Returns { success, relayErrors, clientErrors } arrays.
+ */
+function deriveChartSeries(
+  data: Array<{ transactions: number; success: number; clientErrors?: number }>
+): { success: number[]; relayErrors: number[]; clientErrors: number[] } {
+  const success: number[] = [];
+  const relayErrors: number[] = [];
+  const clientErrors: number[] = [];
+  for (const d of data) {
+    const ce = d.clientErrors ?? 0;
+    success.push(d.success);
+    clientErrors.push(ce);
+    relayErrors.push(Math.max(0, d.transactions - d.success - ce));
+  }
+  return { success, relayErrors, clientErrors };
+}
+
+/**
+ * Generate Chart.js config for transaction stacked bar chart.
+ * Shows Success, Relay Errors, and Client Errors as stacked segments.
+ * Total is implied by the stack height.
  */
 export function transactionChartConfig(
-  hourlyData: Array<{ hour: string; transactions: number; success: number }>
+  hourlyData: Array<{ hour: string; transactions: number; success: number; clientErrors?: number }>
 ): string {
   const labels = hourlyData.map((d) => d.hour);
-  const transactions = hourlyData.map((d) => d.transactions);
-  const success = hourlyData.map((d) => d.success);
+  const { success, relayErrors, clientErrors } = deriveChartSeries(hourlyData);
 
   return JSON.stringify({
-    type: "line",
+    type: "bar",
     data: {
       labels,
       datasets: [
         {
-          label: "Total",
-          data: transactions,
-          borderColor: colors.brand.orange,
-          backgroundColor: `${colors.brand.orange}20`,
-          fill: true,
-          tension: 0.3,
-        },
-        {
           label: "Success",
           data: success,
-          borderColor: colors.status.healthy,
-          backgroundColor: `${colors.status.healthy}20`,
-          fill: true,
-          tension: 0.3,
+          backgroundColor: colors.status.healthy,
+        },
+        {
+          label: "Relay Errors",
+          data: relayErrors,
+          backgroundColor: colors.status.down,
+        },
+        {
+          label: "Client Errors",
+          data: clientErrors,
+          backgroundColor: colors.status.degraded,
         },
       ],
     },
@@ -86,13 +105,18 @@ export function transactionChartConfig(
           position: "top",
           labels: { color: "#9CA3AF" },
         },
+        tooltip: {
+          mode: "index",
+        },
       },
       scales: {
         x: {
+          stacked: true,
           grid: { color: "#374151" },
           ticks: { color: "#9CA3AF" },
         },
         y: {
+          stacked: true,
           grid: { color: "#374151" },
           ticks: { color: "#9CA3AF" },
           beginAtZero: true,
