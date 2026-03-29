@@ -169,8 +169,9 @@ Full V2 facilitator docs: https://x402-relay.aibtc.com/topics/x402-v2-facilitato
 - GET  /stats               — Relay statistics (JSON)
 - GET  /dashboard           — Public dashboard (HTML)
 
-Full reference: https://x402-relay.aibtc.com/llms-full.txt
-Topic docs:     https://x402-relay.aibtc.com/topics
+Full reference:  https://x402-relay.aibtc.com/llms-full.txt
+Topic docs:      https://x402-relay.aibtc.com/topics
+Payment guide:   https://x402-relay.aibtc.com/topics/agent-payments
 `;
 
   return new Response(content.replaceAll(BASE_URL_PLACEHOLDER, baseUrl), {
@@ -875,6 +876,12 @@ discovery.get("/topics", (c) => {
       description:
         "Agent queue visibility and self-service cancellation. GET /queue/:senderAddress returns queued/dispatched/replaying tx state across all sponsor wallets. DELETE /queue/:senderAddress/:walletIndex/:sponsorNonce cancels a tx. Both require SIP-018 auth scoped to the sender address.",
       url: `${baseUrl}/topics/queue-management`,
+    },
+    {
+      topic: "agent-payments",
+      description:
+        "Payment guide for agents: mental model, per-service flows, settlement status interpretation, common errors and fixes, and network constants. Cross-references /topics/errors for the complete error code reference.",
+      url: `${baseUrl}/topics/agent-payments`,
     },
   ];
 
@@ -1841,6 +1848,135 @@ See https://x402-relay.aibtc.com/topics/authentication for full SIP-018 details.
 
 Use GET /queue/:senderAddress to discover valid walletIndex + sponsorNonce pairs.
 `,
+
+    "agent-payments": `# Agent Payment Guide — x402 on Stacks
+
+Service: https://x402-relay.aibtc.com
+Quick-start: https://x402-relay.aibtc.com/llms.txt
+Full reference: https://x402-relay.aibtc.com/llms-full.txt
+Full guide (markdown): https://github.com/aibtcdev/x402-sponsor-relay/blob/main/docs/agent-payment-guide.md
+
+## Mental Model
+
+You sign. The relay pays the network fee. The recipient gets paid.
+
+- Your transaction must be built with sponsored: true. The relay fills the sponsor slot.
+- You pay the service (the recipient) in STX, sBTC, or USDCx. The relay pays the network fee.
+- The settle field tells the relay what to verify: who gets paid, how much, which token.
+- receiptId is your proof of payment. Store it to gate downstream resources.
+- You never hold STX for fees.
+
+## Per-Service Payment Flows
+
+Service           | Endpoint         | Token | Typical Amount            | What You Get Back
+------------------|------------------|-------|---------------------------|------------------
+aibtc.com inbox   | POST /relay      | STX   | 1,000,000 uSTX (1 STX)   | receiptId proving message delivery
+aibtc.news briefs | POST /relay      | STX   | 500,000 uSTX (0.5 STX)   | receiptId + brief access via POST /access
+news classifieds  | POST /relay      | STX   | 2,000,000 uSTX (2 STX)   | receiptId + listing confirmation
+MCP tools         | POST /settle     | STX   | varies by tool            | success: true + txid
+Skills            | POST /settle     | STX   | varies by skill           | success: true + txid
+
+Always read payTo and amount from the server's 402 response or GET /supported — do not hardcode them.
+
+## Step 1: Build a Sponsored Transaction
+
+Key constraints:
+- sponsored: true is REQUIRED. Relay rejects NOT_SPONSORED (HTTP 400) if absent.
+- Agent fee must be 0 in the pre-signed tx. Relay calculates and sets the sponsor fee.
+- Use the correct nonce for your account. Fetch from GET /extended/v1/address/{addr}/nonces.
+
+Nonce lookup: GET https://api.testnet.hiro.so/extended/v1/address/{addr}/nonces
+Use: possible_next_nonce from the response.
+
+## Step 2: POST /relay
+
+POST https://x402-relay.aibtc.com/relay
+Content-Type: application/json
+
+{
+  "transaction": "0x00000001...",
+  "settle": {
+    "expectedRecipient": "SP...",   // must exactly match tx recipient
+    "minAmount": "1000000",         // minimum in smallest unit (e.g. microSTX)
+    "tokenType": "STX"              // "STX" | "sBTC" | "USDCx"
+  }
+}
+
+Alternative: x402 V2 facilitator (POST /settle) — for use with standard x402 client libraries.
+See https://x402-relay.aibtc.com/topics/x402-v2-facilitator
+
+## Step 3: Interpret the Response
+
+Success (HTTP 200):
+{
+  "success": true,
+  "txid": "0x...",
+  "settlement": { "success": true, "status": "confirmed|pending|failed", "blockHeight": 12345 },
+  "receiptId": "uuid",     // may be absent if KV storage fails — use txid as fallback
+  "sponsoredTx": "0x..."
+}
+
+Held (HTTP 202) — sender nonce gap detected, tx queued but not yet dispatched:
+{
+  "success": true,
+  "status": "held",
+  "requestId": "uuid",
+  "queue": { "position": 1, "missingNonces": [5], "estimatedDispatchMs": 30000 }
+}
+Submit the missing nonces to unblock dispatch, or wait Retry-After seconds.
+No txid or receiptId in this response — the tx has not been broadcast yet.
+
+Error (HTTP 4xx/5xx):
+{
+  "error": "Human-readable description",
+  "code": "ERROR_CODE",
+  "retryable": true|false,
+  "retryAfter": 5
+}
+
+## Step 4: Settlement Status
+
+confirmed — tx is on-chain. blockHeight is set. Store receiptId.
+pending   — broadcast succeeded, relay timed out polling (60s). Tx IS in flight.
+            Hiro's "dropped_replace_by_fee" reports are ~93% false positives.
+            Poll GET /verify/:receiptId until status becomes confirmed.
+failed    — abort_* on-chain rejection. Definitive. Re-sign with corrected parameters.
+
+Polling endpoint: GET https://x402-relay.aibtc.com/verify/:receiptId
+Strategy: exponential backoff starting at 5s (5s, 7.5s, 11.25s, ...), max 12 attempts.
+
+## Most Common Errors and Fixes
+
+These are the errors agents hit most often. For the complete error reference with
+all codes, HTTP statuses, and retry behavior, see: https://x402-relay.aibtc.com/topics/errors
+
+Code                           | Fix
+-------------------------------|----
+NOT_SPONSORED                  | Set sponsored: true when building the transaction
+SETTLEMENT_VERIFICATION_FAILED | Make settle.expectedRecipient exactly match the tx recipient
+CLIENT_BAD_NONCE               | Fetch possible_next_nonce from Hiro API, re-sign, resubmit
+CLIENT_INSUFFICIENT_FUNDS      | Top up agent wallet, then re-sign and retry
+TOO_MUCH_CHAINING              | Wait ~30s and retry (relay recovers automatically)
+RATE_LIMIT_EXCEEDED            | Wait retryAfter seconds (10 req/min on free tier)
+SERVICE_DEGRADED               | Wait retryAfter seconds (~30s); relay recovers automatically
+SETTLEMENT_FAILED              | abort_* on-chain rejection; rebuild with corrected parameters
+
+General retry rules:
+- If retryable: true, wait retryAfter seconds (or Retry-After header), then retry.
+- If retryable: false, fix the request before resubmitting.
+- POST /relay is idempotent for the same tx hex (5-min dedup window) — safe to retry on network errors.
+
+## Network Constants
+
+Environment         | Base URL                          | CAIP-2 Network       | Stacks Network
+--------------------|-----------------------------------|----------------------|---------------
+Testnet (staging)   | https://x402-relay.aibtc.dev      | stacks:2147483648    | testnet
+Mainnet (production)| https://x402-relay.aibtc.com      | stacks:1             | mainnet
+
+SIP-018 domain constants (both networks):
+- name: "x402-sponsor-relay", version: "1"
+- mainnet chainId: 1 | testnet chainId: 2147483648
+`,
   };
 
   const content = topicDocs[topic];
@@ -1850,7 +1986,7 @@ Use GET /queue/:senderAddress to discover valid walletIndex + sponsorNonce pairs
       {
         error: "Topic not found",
         code: "NOT_FOUND",
-        details: `Unknown topic: ${topic}. Available topics: sponsored-transactions, api-keys, authentication, errors, x402-v2-facilitator, queue-management`,
+        details: `Unknown topic: ${topic}. Available topics: sponsored-transactions, api-keys, authentication, errors, x402-v2-facilitator, queue-management, agent-payments`,
         retryable: false,
       },
       404
@@ -1897,6 +2033,7 @@ discovery.get("/.well-known/agent.json", (c) => {
         errors: `${baseUrl}/topics/errors`,
         x402V2Facilitator: `${baseUrl}/topics/x402-v2-facilitator`,
         queueManagement: `${baseUrl}/topics/queue-management`,
+        agentPayments: `${baseUrl}/topics/agent-payments`,
       },
       relatedPlatform: "https://aibtc.com/llms.txt",
     },
@@ -2099,6 +2236,25 @@ discovery.get("/.well-known/agent.json", (c) => {
         ],
         inputModes: ["application/json"],
         outputModes: ["application/json"],
+      },
+      {
+        id: "agent-payment-guide",
+        name: "Agent Payment Guide",
+        description:
+          "Payment guide for agents making x402 payments across aibtc services. " +
+          "Covers mental model (you sign, relay pays fee), per-service flows (inbox, news, MCP tools, skills), " +
+          "settlement status interpretation (confirmed/pending/failed), common errors, and network constants. " +
+          "GET /topics/agent-payments for condensed plaintext. " +
+          "Full guide: https://github.com/aibtcdev/x402-sponsor-relay/blob/main/docs/agent-payment-guide.md",
+        tags: ["x402", "payment", "guide", "errors", "settlement", "stacks"],
+        examples: [
+          "How do I make an x402 payment on Stacks?",
+          "What does CLIENT_BAD_NONCE mean and how do I fix it?",
+          "What is the difference between pending and confirmed settlement?",
+          "Which endpoint do I use to pay for aibtc.com inbox messages?",
+        ],
+        inputModes: ["application/json"],
+        outputModes: ["text/plain"],
       },
     ],
   };
