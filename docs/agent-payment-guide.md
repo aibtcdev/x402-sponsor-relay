@@ -68,13 +68,12 @@ Use `@stacks/transactions` (or `x402-stacks`) to build a transfer or contract ca
 
 ```typescript
 import { makeSTXTokenTransfer, AnchorMode, PostConditionMode } from "@stacks/transactions";
-import { StacksTestnet } from "@stacks/network";
 
 const tx = await makeSTXTokenTransfer({
   recipient: "SP_RECIPIENT_ADDRESS",
   amount: BigInt(1_000_000),           // 1 STX in microSTX
   senderKey: agentPrivateKey,          // agent signs the tx
-  network: new StacksTestnet(),
+  network: "testnet",                   // or "mainnet" for production
   sponsored: true,                      // REQUIRED: leaves sponsor slot open
   anchorMode: AnchorMode.Any,
   postConditionMode: PostConditionMode.Allow,
@@ -412,7 +411,6 @@ import {
   makeSTXTokenTransfer,
   AnchorMode,
   PostConditionMode,
-  broadcastTransaction,
 } from "@stacks/transactions";
 import { bytesToHex } from "@stacks/common";
 
