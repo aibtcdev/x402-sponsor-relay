@@ -170,11 +170,13 @@ describe("sponsor status freshness helpers", () => {
 });
 
 describe("SponsorStatus schema", () => {
-  it("documents the canonical cached sponsor status shape", () => {
+  it("documents the canonical cached sponsor status shape inside the standard success envelope", () => {
     const endpoint = new SponsorStatus();
     const properties =
       endpoint.schema.responses["200"].content["application/json"].schema.properties;
 
+    expect(properties.success.example).toBe(true);
+    expect(properties).toHaveProperty("requestId");
     expect(properties).toHaveProperty("noncePool");
     expect(properties).toHaveProperty("reconciliation");
     expect(properties).toHaveProperty("snapshot");
@@ -186,6 +188,8 @@ describe("SponsorStatus schema", () => {
     const properties =
       endpoint.schema.responses["503"].content["application/json"].schema.properties;
 
+    expect(properties.success.example).toBe(true);
+    expect(properties).toHaveProperty("requestId");
     expect(properties.status.enum).toEqual(["unavailable"]);
     expect(properties).toHaveProperty("canSponsor");
     expect(properties).toHaveProperty("noncePool");

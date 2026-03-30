@@ -22,6 +22,12 @@ export class SponsorStatus extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                },
                 status: {
                   type: "string" as const,
                   enum: ["healthy", "degraded"],
@@ -93,6 +99,12 @@ export class SponsorStatus extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                },
                 status: { type: "string" as const, enum: ["unavailable"] },
                 canSponsor: { type: "boolean" as const },
                 walletCount: { type: "number" as const },
@@ -192,7 +204,12 @@ export class SponsorStatus extends BaseEndpoint {
         });
       }
 
-      return c.json(JSON.parse(body), response.status as 200 | 503);
+      return this.ok(
+        c,
+        JSON.parse(body) as Record<string, unknown>,
+        undefined,
+        response.status as 200 | 503
+      );
     } catch (e) {
       logger.error("Sponsor status request failed", {
         error: e instanceof Error ? e.message : "Unknown error",

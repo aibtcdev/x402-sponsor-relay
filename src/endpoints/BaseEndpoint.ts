@@ -39,7 +39,8 @@ export class BaseEndpoint extends OpenAPIRoute {
   protected ok<T extends object>(
     c: AppContext,
     data: T,
-    headers?: Record<string, string>
+    headers?: Record<string, string>,
+    status: 200 | 201 | 202 | 204 | 206 | 503 = 200
   ) {
     const response = {
       success: true as const,
@@ -51,7 +52,7 @@ export class BaseEndpoint extends OpenAPIRoute {
         c.header(key, value);
       }
     }
-    return c.json(response);
+    return c.json(response, status);
   }
 
   /**

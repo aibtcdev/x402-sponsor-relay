@@ -741,6 +741,16 @@ See https://x402-relay.aibtc.com/topics/x402-v2-facilitator for full details.
 Returns the relay service health summary with network and version.
 This is not the canonical sponsor status contract and does not include sponsor readiness, wallet inventory, or balances.
 
+### Response
+
+{
+  "success": true,
+  "requestId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "ok",
+  "network": "testnet",
+  "version": "0.3.0"
+}
+
 ## GET /status/sponsor — Cached Sponsor Status
 
 Returns the relay-owned cached sponsor readiness snapshot used by public and internal consumers.
