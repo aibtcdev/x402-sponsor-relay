@@ -1092,6 +1092,25 @@ export class NonceDO {
   }
 
   /**
+   * Retire a queued dispatch entry when the node reports BadNonce, which means
+   * the sponsor nonce slot was already consumed elsewhere and will never succeed
+   * on future bounded-broadcast retries.
+   */
+  private retireQueuedBadNonce(walletIndex: number, sponsorNonce: number): void {
+    const now = new Date().toISOString();
+    this.transitionQueueEntry(walletIndex, sponsorNonce, "confirmed");
+    this.sql.exec(
+      `UPDATE wallet_hand
+       SET state = 'confirmed', confirmed_at = COALESCE(confirmed_at, ?)
+       WHERE wallet_index = ? AND sponsor_nonce = ?`,
+      now,
+      walletIndex,
+      sponsorNonce
+    );
+    this.ledgerRelease(walletIndex, sponsorNonce, undefined, "BadNonce");
+  }
+
+  /**
    * Move a sender tx into the replay buffer.
    * Called when its sponsor nonce slot is being flushed with a self-transfer.
    * The entry will be picked up by the next alarm cycle for re-sponsoring.
@@ -5920,13 +5939,23 @@ export class NonceDO {
             txid: result.txid,
           });
         } else {
-          // On failure, leave in 'queued' state — next tick will retry
-          this.log("warn", "bounded_broadcast_failed", {
-            walletIndex: entry.wallet_index,
-            sponsorNonce: entry.sponsor_nonce,
-            httpStatus: result.status,
-            reason: result.reason,
-          });
+          if (result.reason === "BadNonce") {
+            this.retireQueuedBadNonce(entry.wallet_index, entry.sponsor_nonce);
+            this.log("info", "bounded_broadcast_retired_bad_nonce", {
+              walletIndex: entry.wallet_index,
+              sponsorNonce: entry.sponsor_nonce,
+              httpStatus: result.status,
+              reason: result.reason,
+            });
+          } else {
+            // On failure, leave in 'queued' state — next tick will retry
+            this.log("warn", "bounded_broadcast_failed", {
+              walletIndex: entry.wallet_index,
+              sponsorNonce: entry.sponsor_nonce,
+              httpStatus: result.status,
+              reason: result.reason,
+            });
+          }
           errors++;
         }
       } catch (e) {

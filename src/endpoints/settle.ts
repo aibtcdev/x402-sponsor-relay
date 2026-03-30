@@ -212,7 +212,7 @@ export class Settle extends BaseEndpoint {
     c.executionCtx.waitUntil(
       (async () => {
         try {
-          const pollResult = await settlementService.pollForConfirmationPublic(txid);
+          const pollResult = await settlementService.awaitConfirmationPublic(txid);
           if ("error" in pollResult) {
             await settlementService.updateTxStatus(txid, {
               status: "failed",
