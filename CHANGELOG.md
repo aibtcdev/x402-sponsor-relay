@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.27.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.26.1...x402-sponsor-relay-v1.27.0) (2026-03-30)
+
+
+### Features
+
+* **dashboard:** stacked bar chart for tx volume breakdown ([#269](https://github.com/aibtcdev/x402-sponsor-relay/issues/269)) ([9dee80e](https://github.com/aibtcdev/x402-sponsor-relay/commit/9dee80e3ad5cf6c7b34824a6f1f2e2667a4759d4))
+* drain confirmation polling with Hiro tx streaming ([#275](https://github.com/aibtcdev/x402-sponsor-relay/issues/275)) ([6ac3ff2](https://github.com/aibtcdev/x402-sponsor-relay/commit/6ac3ff2c3f0893d8a0a79006a5bf202890e1808c))
+
 ## [1.26.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.26.0...x402-sponsor-relay-v1.26.1) (2026-03-28)
 
 
