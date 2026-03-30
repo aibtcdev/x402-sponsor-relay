@@ -161,7 +161,7 @@ Full V2 facilitator docs: https://x402-relay.aibtc.com/topics/x402-v2-facilitato
 
 ## Other Endpoints
 
-- GET  /health              — Thin service health summary
+- GET  /health              — Service health summary
 - GET  /status/sponsor      — Cached sponsor readiness snapshot
 - GET  /fees                — Clamped fee estimates (no auth required)
 - GET  /verify/:receiptId   — Verify a payment receipt
@@ -738,8 +738,18 @@ See https://x402-relay.aibtc.com/topics/x402-v2-facilitator for full details.
 
 ## GET /health — Health Check
 
-Returns a thin service-readiness summary with network, version, and condensed nonce pool readiness.
-This is not the canonical sponsor status contract and does not include sponsor wallet inventory or balances.
+Returns the relay service health summary with network and version.
+This is not the canonical sponsor status contract and does not include sponsor readiness, wallet inventory, or balances.
+
+### Response
+
+{
+  "success": true,
+  "requestId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "ok",
+  "network": "testnet",
+  "version": "0.3.0"
+}
 
 ## GET /status/sponsor — Cached Sponsor Status
 

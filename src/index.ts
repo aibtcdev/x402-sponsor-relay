@@ -142,7 +142,7 @@ app.get("/", (c) => {
       provisionStx: "POST /keys/provision-stx - Provision API key via Stacks signature",
       fees: "GET /fees - Get clamped fee estimates",
       feesConfig: "POST /fees/config - Update fee clamps (admin, requires API key)",
-      health: "GET /health - Thin service health summary with condensed nonce pool readiness",
+      health: "GET /health - Service health summary",
       sponsorStatus: "GET /status/sponsor - Cached sponsor readiness snapshot",
       stats: "GET /stats - Relay statistics (JSON)",
       transactionLog: "GET /stats/transactions - Recent individual transactions",

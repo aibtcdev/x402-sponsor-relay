@@ -22,9 +22,15 @@ export class SponsorStatus extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                },
                 status: {
                   type: "string" as const,
-                  enum: ["healthy", "degraded", "unavailable"],
+                  enum: ["healthy", "degraded"],
                 },
                 canSponsor: { type: "boolean" as const },
                 walletCount: { type: "number" as const },
@@ -93,7 +99,68 @@ export class SponsorStatus extends BaseEndpoint {
             schema: {
               type: "object" as const,
               properties: {
+                success: { type: "boolean" as const, example: true },
+                requestId: {
+                  type: "string" as const,
+                  format: "uuid",
+                  description: "Unique request identifier for tracking",
+                },
                 status: { type: "string" as const, enum: ["unavailable"] },
+                canSponsor: { type: "boolean" as const },
+                walletCount: { type: "number" as const },
+                recommendation: {
+                  type: "string" as const,
+                  nullable: true,
+                  enum: ["fallback_to_direct"],
+                },
+                reasons: {
+                  type: "array" as const,
+                  items: {
+                    type: "string" as const,
+                    enum: [
+                      "NO_AVAILABLE_NONCES",
+                      "ALL_WALLETS_DEGRADED",
+                      "RECENT_CONFLICT",
+                      "HEAL_IN_PROGRESS",
+                      "RECONCILIATION_STALE",
+                      "SNAPSHOT_STALE",
+                    ],
+                  },
+                },
+                noncePool: {
+                  type: "object" as const,
+                  properties: {
+                    totalAvailable: { type: "number" as const },
+                    totalReserved: { type: "number" as const },
+                    totalCapacity: { type: "number" as const },
+                    poolAvailabilityRatio: { type: "number" as const },
+                    conflictsDetected: { type: "number" as const },
+                    lastConflictAt: { type: "string" as const, nullable: true },
+                    healInProgress: { type: "boolean" as const },
+                  },
+                },
+                reconciliation: {
+                  type: "object" as const,
+                  properties: {
+                    source: { type: "string" as const, enum: ["hiro"] },
+                    lastSuccessfulAt: { type: "string" as const, nullable: true },
+                    freshness: {
+                      type: "string" as const,
+                      enum: ["fresh", "stale", "unavailable"],
+                    },
+                  },
+                },
+                snapshot: {
+                  type: "object" as const,
+                  properties: {
+                    asOf: { type: "string" as const },
+                    ageMs: { type: "number" as const },
+                    freshness: {
+                      type: "string" as const,
+                      enum: ["expired"],
+                    },
+                  },
+                },
               },
             },
           },
@@ -137,7 +204,12 @@ export class SponsorStatus extends BaseEndpoint {
         });
       }
 
-      return c.json(JSON.parse(body), response.status as 200 | 503);
+      return this.ok(
+        c,
+        JSON.parse(body) as Record<string, unknown>,
+        undefined,
+        response.status as 200 | 503
+      );
     } catch (e) {
       logger.error("Sponsor status request failed", {
         error: e instanceof Error ? e.message : "Unknown error",
