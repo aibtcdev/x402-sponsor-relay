@@ -1,4 +1,5 @@
 export { Health } from "./health";
+export { SponsorStatus } from "./sponsor-status";
 export { Relay } from "./relay";
 export { Sponsor } from "./sponsor";
 export { DashboardStats } from "./DashboardStats";

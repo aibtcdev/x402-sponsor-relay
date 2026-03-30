@@ -11,19 +11,22 @@ const CAPACITY_HEALTHY_THRESHOLD = 0.6;
 const CAPACITY_CRITICAL_THRESHOLD = 0.2;
 
 /** Machine-readable pool health status for agent circuit-breaker gating */
-type PoolStatus = "healthy" | "degraded" | "critical";
+export type PoolStatus = "healthy" | "degraded" | "critical";
 
 /**
- * Derive a PoolStatus from effective capacity and circuit-breaker state.
- * - "critical": circuit breaker open OR capacity < 20%
- * - "degraded": capacity < 60% (but not critical)
- * - "healthy": capacity ≥ 60% and circuit breaker closed
+ * Derive a PoolStatus from the available share of the nonce pool and circuit-breaker state.
+ * - "critical": circuit breaker open OR available ratio < 20%
+ * - "degraded": available ratio < 60% (but not critical)
+ * - "healthy": available ratio ≥ 60% and circuit breaker closed
  */
-function derivePoolStatus(effectiveCapacity: number, circuitBreakerOpen: boolean): PoolStatus {
-  if (circuitBreakerOpen || effectiveCapacity < CAPACITY_CRITICAL_THRESHOLD) {
+export function derivePoolStatus(
+  poolAvailabilityRatio: number,
+  circuitBreakerOpen: boolean
+): PoolStatus {
+  if (circuitBreakerOpen || poolAvailabilityRatio < CAPACITY_CRITICAL_THRESHOLD) {
     return "critical";
   }
-  if (effectiveCapacity < CAPACITY_HEALTHY_THRESHOLD) {
+  if (poolAvailabilityRatio < CAPACITY_HEALTHY_THRESHOLD) {
     return "degraded";
   }
   return "healthy";
@@ -33,7 +36,7 @@ function derivePoolStatus(effectiveCapacity: number, circuitBreakerOpen: boolean
  * Condensed nonce pool state surfaced by /health.
  * Derived from the full NonceStatsResponse returned by NonceDO GET /stats.
  */
-interface NonceHealthState {
+export interface NonceHealthState {
   /** Number of nonces available in the pool (wallet 0, backward compat) */
   poolAvailable: number;
   /** Number of nonces currently in-flight across all wallets */
@@ -48,12 +51,8 @@ interface NonceHealthState {
   circuitBreakerOpen: boolean;
   /** ISO timestamp of last gap/conflict detection, or null if none */
   lastConflictAt: string | null;
-  /**
-   * Fraction of total pool capacity currently available (0.0–1.0).
-   * Computed as poolAvailable / (poolAvailable + poolReserved).
-   * 1.0 when pool is empty (no reserved nonces) — idle is healthy.
-   */
-  effectiveCapacity: number;
+  /** Fraction of total pool capacity currently available (0.0-1.0). */
+  poolAvailabilityRatio: number;
   /**
    * Machine-readable pool health for agent circuit-breaker gating.
    * "healthy" ≥60% capacity, "degraded" <60%, "critical" <20% or circuit open.
@@ -69,6 +68,54 @@ interface NonceHealthState {
   recommendation?: "fallback_to_direct" | null;
 }
 
+interface RawNonceStats {
+  poolAvailable: number;
+  poolReserved: number;
+  conflictsDetected: number;
+  lastGapDetected: string | null;
+}
+
+export function buildNonceHealthState(
+  raw: RawNonceStats,
+  now = Date.now(),
+  recommendation: "fallback_to_direct" | null = null
+): NonceHealthState {
+  const lastConflictAt = raw.lastGapDetected ?? null;
+  const recentConflict =
+    lastConflictAt !== null &&
+    now - new Date(lastConflictAt).getTime() <= RECENT_CONFLICT_WINDOW_MS;
+
+  // Pool exhausted by conflicts: both available and reserved are 0 but conflicts
+  // were detected — this means the pool drained without recovering (e.g. all
+  // wallets hit conflict state and nonces flushed). Phase 1 auto-resets
+  // conflictsDetected when resync finds all wallets consistent, so this
+  // condition only fires during genuinely unresolved conflict windows.
+  const poolExhaustedByConflicts =
+    raw.poolAvailable === 0 && raw.poolReserved === 0 && raw.conflictsDetected > 0;
+
+  const circuitBreakerOpen =
+    recentConflict ||
+    (raw.poolAvailable === 0 && raw.poolReserved > 0) ||
+    poolExhaustedByConflicts;
+
+  const totalPool = raw.poolAvailable + raw.poolReserved;
+  // When pool is idle (nothing reserved), treat as fully available
+  const poolAvailabilityRatio =
+    totalPool === 0 ? 1.0 : Math.round((raw.poolAvailable / totalPool) * 100) / 100;
+  const poolStatus = derivePoolStatus(poolAvailabilityRatio, circuitBreakerOpen);
+
+  return {
+    poolAvailable: raw.poolAvailable,
+    poolReserved: raw.poolReserved,
+    conflictsDetected: raw.conflictsDetected,
+    circuitBreakerOpen,
+    lastConflictAt,
+    poolAvailabilityRatio,
+    poolStatus,
+    recommendation,
+  };
+}
+
 /**
  * Health check endpoint
  * GET /health
@@ -76,9 +123,9 @@ interface NonceHealthState {
 export class Health extends BaseEndpoint {
   schema = {
     tags: ["Health"],
-    summary: "Health check with network info and nonce pool state",
+    summary: "Thin service health summary with condensed nonce pool state",
     description:
-      "Returns service status, network, version, and a condensed view of the nonce pool state from the NonceDO coordinator. The `nonce` field is null when the coordinator is unavailable.",
+      "Returns service status, network, version, and a condensed nonce pool readiness summary from the NonceDO coordinator. Use GET /status/sponsor for the full cached sponsor status contract. The `nonce` field is null when the coordinator is unavailable.",
     responses: {
       "200": {
         description: "Service health status",
@@ -130,10 +177,10 @@ export class Health extends BaseEndpoint {
                         "ISO timestamp of the most recent nonce gap/conflict detection, or null",
                       example: null,
                     },
-                    effectiveCapacity: {
+                    poolAvailabilityRatio: {
                       type: "number" as const,
                       description:
-                        "Fraction of pool capacity currently available (0.0–1.0). " +
+                        "Fraction of pool capacity currently available (0.0-1.0). " +
                         "Computed as poolAvailable / (poolAvailable + poolReserved). " +
                         "1.0 when pool is idle (no reserved nonces).",
                       example: 0.88,
@@ -201,64 +248,31 @@ export class Health extends BaseEndpoint {
         return null;
       }
 
-      const raw = (await statsResponse.json()) as {
-        poolAvailable: number;
-        poolReserved: number;
-        conflictsDetected: number;
-        lastGapDetected: string | null;
-      };
-
-      const lastConflictAt = raw.lastGapDetected ?? null;
-      const recentConflict =
-        lastConflictAt !== null &&
-        Date.now() - new Date(lastConflictAt).getTime() <= RECENT_CONFLICT_WINDOW_MS;
-
-      // Pool exhausted by conflicts: both available and reserved are 0 but conflicts
-      // were detected — this means the pool drained without recovering (e.g. all
-      // wallets hit conflict state and nonces flushed). Phase 1 auto-resets
-      // conflictsDetected when resync finds all wallets consistent, so this
-      // condition only fires during genuinely unresolved conflict windows.
-      const poolExhaustedByConflicts =
-        raw.poolAvailable === 0 && raw.poolReserved === 0 && raw.conflictsDetected > 0;
-
-      const circuitBreakerOpen =
-        recentConflict || (raw.poolAvailable === 0 && raw.poolReserved > 0) || poolExhaustedByConflicts;
-
-      const totalPool = raw.poolAvailable + raw.poolReserved;
-      // When pool is idle (nothing reserved), treat as fully available
-      const effectiveCapacity =
-        totalPool === 0 ? 1.0 : Math.round((raw.poolAvailable / totalPool) * 100) / 100;
-      const poolStatus = derivePoolStatus(effectiveCapacity, circuitBreakerOpen);
+      const raw = (await statsResponse.json()) as RawNonceStats;
+      const now = Date.now();
+      const baseState = buildNonceHealthState(raw, now);
 
       // Only fetch nonce-state when pool looks unhealthy — avoids adding
       // two SQL queries + Promise.all to every pre-flight health check.
       // recommendation is derived inside the DO (single source of truth).
-      let recommendation: "fallback_to_direct" | null = null;
-
-      if (poolStatus !== "healthy") {
+      if (baseState.poolStatus !== "healthy") {
         try {
           const nonceStateResponse = await stub.fetch("https://nonce-do/nonce-state");
           if (nonceStateResponse.ok) {
             const nonceState = (await nonceStateResponse.json()) as {
               recommendation: "fallback_to_direct" | null;
             };
-            recommendation = nonceState.recommendation;
+            return {
+              ...baseState,
+              recommendation: nonceState.recommendation,
+            };
           }
         } catch {
           // best-effort — don't block health response
         }
       }
 
-      return {
-        poolAvailable: raw.poolAvailable,
-        poolReserved: raw.poolReserved,
-        conflictsDetected: raw.conflictsDetected,
-        circuitBreakerOpen,
-        lastConflictAt,
-        effectiveCapacity,
-        poolStatus,
-        recommendation,
-      };
+      return baseState;
     } catch (e) {
       logger.warn("Failed to fetch nonce state for health check", {
         error: e instanceof Error ? e.message : "Unknown error",

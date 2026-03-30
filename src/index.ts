@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceState, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook, QueueRead, QueueCancel } from "./endpoints";
+import { Health, SponsorStatus, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceState, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook, QueueRead, QueueCancel } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -86,6 +86,7 @@ const openapi = fromHono(app, {
 
 // Register endpoints with Chanfana (casts needed for extended endpoint classes)
 openapi.get("/health", Health as unknown as typeof Health);
+openapi.get("/status/sponsor", SponsorStatus as unknown as typeof SponsorStatus);
 openapi.post("/relay", Relay as unknown as typeof Relay);
 openapi.post("/sponsor", Sponsor as unknown as typeof Sponsor);
 openapi.get("/verify/:receiptId", Verify as unknown as typeof Verify);
@@ -141,7 +142,8 @@ app.get("/", (c) => {
       provisionStx: "POST /keys/provision-stx - Provision API key via Stacks signature",
       fees: "GET /fees - Get clamped fee estimates",
       feesConfig: "POST /fees/config - Update fee clamps (admin, requires API key)",
-      health: "GET /health - Health check with network info",
+      health: "GET /health - Thin service health summary with condensed nonce pool readiness",
+      sponsorStatus: "GET /status/sponsor - Cached sponsor readiness snapshot",
       stats: "GET /stats - Relay statistics (JSON)",
       transactionLog: "GET /stats/transactions - Recent individual transactions",
       nonceStats: "GET /nonce/stats - Nonce coordinator stats",
