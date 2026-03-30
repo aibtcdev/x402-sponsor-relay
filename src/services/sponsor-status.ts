@@ -5,9 +5,9 @@ import type {
   SponsorStatusResult,
 } from "../types";
 
-export const SPONSOR_STATUS_SNAPSHOT_FRESH_MS = 30 * 1000;
-export const SPONSOR_STATUS_SNAPSHOT_EXPIRED_MS = 5 * 60 * 1000;
-export const SPONSOR_STATUS_RECONCILIATION_FRESH_MS = 2 * 60 * 1000;
+export const SPONSOR_STATUS_SNAPSHOT_FRESH_MS = 5 * 60 * 1000;
+export const SPONSOR_STATUS_SNAPSHOT_EXPIRED_MS = 10 * 60 * 1000;
+export const SPONSOR_STATUS_RECONCILIATION_FRESH_MS = 5 * 60 * 1000;
 export const SPONSOR_STATUS_RECENT_CONFLICT_WINDOW_MS = 10 * 60 * 1000;
 
 export interface StoredSponsorStatusSnapshot {

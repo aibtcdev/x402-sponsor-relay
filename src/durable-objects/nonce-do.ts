@@ -3741,12 +3741,14 @@ export class NonceDO {
         const activeQuarantines = recentQuarantines.filter(
           (ts) => new Date(ts).getTime() >= cutoff
         );
-        const available = this.walletHeadroom(walletIndex);
+        const rawAvailable = this.walletHeadroom(walletIndex);
+        const available = Math.max(0, Math.min(CHAINING_LIMIT, rawAvailable));
+        const reserved = CHAINING_LIMIT - available;
         return {
           circuitBreakerOpen:
             activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
           available,
-          reserved: CHAINING_LIMIT - available,
+          reserved,
         };
       })
     );
