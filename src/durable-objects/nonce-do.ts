@@ -6362,16 +6362,19 @@ export class NonceDO {
             txid: result.txid,
           });
         } else {
+          // BadNonce means this sponsor nonce was already confirmed on-chain — it can never
+          // succeed on retry.  Transition to 'replaying' (terminal) so the entry leaves the
+          // queued pool and stops generating noise on every tick.
           if (result.reason === "BadNonce") {
-            this.retireQueuedBadNonce(entry.wallet_index, entry.sponsor_nonce);
-            this.log("info", "bounded_broadcast_retired_bad_nonce", {
+            this.transitionQueueEntry(entry.wallet_index, entry.sponsor_nonce, "replaying");
+            this.log("info", "bounded_broadcast_nonce_consumed", {
               walletIndex: entry.wallet_index,
               sponsorNonce: entry.sponsor_nonce,
               httpStatus: result.status,
               reason: result.reason,
             });
           } else {
-            // On failure, leave in 'queued' state — next tick will retry
+            // On other failures, leave in 'queued' state — next tick will retry
             this.log("warn", "bounded_broadcast_failed", {
               walletIndex: entry.wallet_index,
               sponsorNonce: entry.sponsor_nonce,
