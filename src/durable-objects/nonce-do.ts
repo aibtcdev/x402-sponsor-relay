@@ -707,9 +707,11 @@ export class NonceDO {
     // Dispatch queue: tracks (senderTx, sponsorNonce) pairs flowing through the relay.
     // The relay owns the sponsor nonce sequence — this table is the authoritative record
     // of what has been dispatched (broadcast) and what is waiting (queued).
-    // States: 'queued' → 'dispatched' → 'confirmed' | 'replaying'
+    // States: 'queued' → 'dispatched' → 'confirmed' | 'replaying' | 'retired'
     // 'replaying' means the sponsor nonce slot was stuck and is being flushed; the sender tx
     // will be moved to replay_buffer for re-sponsoring with a fresh nonce.
+    // 'retired' means the queued row is terminal because the sponsor nonce was already
+    // consumed elsewhere (e.g. bounded-broadcast hit BadNonce before first dispatch).
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS dispatch_queue (
         wallet_index    INTEGER NOT NULL,
@@ -921,7 +923,7 @@ export class NonceDO {
   }
 
   /**
-   * Return all non-confirmed dispatch_queue rows for a wallet, ordered by sponsor_nonce ASC.
+   * Return all active dispatch_queue rows for a wallet, ordered by sponsor_nonce ASC.
    */
   private getQueuedForWallet(walletIndex: number): Array<{
     sender_tx_hex: string;
@@ -945,7 +947,7 @@ export class NonceDO {
         `SELECT sender_tx_hex, sender_address, sender_nonce, sponsor_nonce,
                 state, queued_at, dispatched_at
          FROM dispatch_queue
-         WHERE wallet_index = ? AND state != 'confirmed'
+         WHERE wallet_index = ? AND state NOT IN ('confirmed', 'retired')
          ORDER BY sponsor_nonce ASC`,
         walletIndex
       )
@@ -953,8 +955,8 @@ export class NonceDO {
   }
 
   /**
-   * Fast O(1) count of non-confirmed dispatch_queue rows per state for a wallet.
-   * The `total` field is the sum of all non-confirmed states (queued + dispatched + replaying).
+   * Fast O(1) count of active dispatch_queue rows per state for a wallet.
+   * The `total` field is the sum of active states (queued + dispatched + replaying).
    */
   private getDispatchQueueDepth(walletIndex: number): {
     queued: number;
@@ -965,7 +967,7 @@ export class NonceDO {
     const rows = this.sql
       .exec<{ state: string; cnt: number }>(
         `SELECT state, COUNT(*) as cnt FROM dispatch_queue
-         WHERE wallet_index = ? AND state != 'confirmed'
+         WHERE wallet_index = ? AND state NOT IN ('confirmed', 'retired')
          GROUP BY state`,
         walletIndex
       )
@@ -1033,7 +1035,7 @@ export class NonceDO {
   private transitionQueueEntry(
     walletIndex: number,
     sponsorNonce: number,
-    newState: "dispatched" | "confirmed" | "replaying"
+    newState: "dispatched" | "confirmed" | "replaying" | "retired"
   ): void {
     const now = new Date().toISOString();
 
@@ -1079,6 +1081,13 @@ export class NonceDO {
         walletIndex,
         sponsorNonce
       );
+    } else if (newState === "retired") {
+      this.sql.exec(
+        `UPDATE dispatch_queue SET state = 'retired'
+         WHERE wallet_index = ? AND sponsor_nonce = ?`,
+        walletIndex,
+        sponsorNonce
+      );
     } else {
       // replaying — no timestamp column to set
       this.sql.exec(
@@ -1089,6 +1098,23 @@ export class NonceDO {
         sponsorNonce
       );
     }
+  }
+
+  /**
+   * Retire a queued dispatch entry when the node reports BadNonce, which means
+   * the sponsor nonce slot was already consumed elsewhere and will never succeed
+   * on future bounded-broadcast retries.
+   */
+  private retireQueuedBadNonce(walletIndex: number, sponsorNonce: number): void {
+    this.transitionQueueEntry(walletIndex, sponsorNonce, "retired");
+    this.sql.exec(
+      `UPDATE wallet_hand
+       SET state = 'retired'
+       WHERE wallet_index = ? AND sponsor_nonce = ?`,
+      walletIndex,
+      sponsorNonce
+    );
+    this.ledgerRelease(walletIndex, sponsorNonce, undefined, "BadNonce");
   }
 
   /**
@@ -5479,7 +5505,7 @@ export class NonceDO {
   /**
    * One-time migration: backfill wallet_hand and sender_state from existing tables.
    *
-   * Detection: wallet_hand has zero rows AND dispatch_queue has non-confirmed rows.
+   * Detection: wallet_hand has zero rows AND dispatch_queue has active rows.
    * Runs at start of each alarm cycle; is a no-op after the first successful run.
    */
   private runGinRummyMigration(): void {
@@ -5493,7 +5519,7 @@ export class NonceDO {
 
     const activeDqCount = this.sql
       .exec<{ cnt: number }>(
-        "SELECT COUNT(*) as cnt FROM dispatch_queue WHERE state != 'confirmed'"
+        "SELECT COUNT(*) as cnt FROM dispatch_queue WHERE state NOT IN ('confirmed', 'retired')"
       )
       .toArray()[0]?.cnt ?? 0;
 
@@ -5502,7 +5528,7 @@ export class NonceDO {
       // Log skip reason on first few alarms for observability
       if (walletHandCount === 0 && totalDqCount > 0) {
         this.log("info", "gin_rummy_migration_skipped", {
-          reason: "dispatch_queue has only confirmed rows — no active work to migrate",
+          reason: "dispatch_queue has only terminal rows — no active work to migrate",
           walletHandCount,
           totalDqCount,
           activeDqCount,
@@ -5520,7 +5546,7 @@ export class NonceDO {
     const now = new Date().toISOString();
 
     // 1. Backfill wallet_hand from ALL dispatch_queue rows
-    //    Non-confirmed → 'dispatched', confirmed → 'confirmed'
+    //    Active rows → 'dispatched', confirmed → 'confirmed', retired → 'retired'
     //    INSERT OR IGNORE: safe to re-run if interrupted
     this.sql.exec(
       `INSERT OR IGNORE INTO wallet_hand
@@ -5529,7 +5555,11 @@ export class NonceDO {
        SELECT
          wallet_index,
          sponsor_nonce,
-         CASE WHEN state = 'confirmed' THEN 'confirmed' ELSE 'dispatched' END,
+         CASE
+           WHEN state = 'confirmed' THEN 'confirmed'
+           WHEN state = 'retired' THEN 'retired'
+           ELSE 'dispatched'
+         END,
          sender_address,
          sender_nonce,
          original_fee,
@@ -5920,13 +5950,23 @@ export class NonceDO {
             txid: result.txid,
           });
         } else {
-          // On failure, leave in 'queued' state — next tick will retry
-          this.log("warn", "bounded_broadcast_failed", {
-            walletIndex: entry.wallet_index,
-            sponsorNonce: entry.sponsor_nonce,
-            httpStatus: result.status,
-            reason: result.reason,
-          });
+          if (result.reason === "BadNonce") {
+            this.retireQueuedBadNonce(entry.wallet_index, entry.sponsor_nonce);
+            this.log("info", "bounded_broadcast_retired_bad_nonce", {
+              walletIndex: entry.wallet_index,
+              sponsorNonce: entry.sponsor_nonce,
+              httpStatus: result.status,
+              reason: result.reason,
+            });
+          } else {
+            // On failure, leave in 'queued' state — next tick will retry
+            this.log("warn", "bounded_broadcast_failed", {
+              walletIndex: entry.wallet_index,
+              sponsorNonce: entry.sponsor_nonce,
+              httpStatus: result.status,
+              reason: result.reason,
+            });
+          }
           errors++;
         }
       } catch (e) {
@@ -6678,7 +6718,7 @@ export class NonceDO {
       const sponsoredNonceSet = new Set(
         this.sql
           .exec<{ sponsor_nonce: number }>(
-            `SELECT sponsor_nonce FROM dispatch_queue WHERE wallet_index = ? AND state NOT IN ('confirmed')`,
+            `SELECT sponsor_nonce FROM dispatch_queue WHERE wallet_index = ? AND state NOT IN ('confirmed', 'retired')`,
             walletIndex
           )
           .toArray()
@@ -7177,7 +7217,7 @@ export class NonceDO {
             `SELECT wallet_index, sponsor_nonce, sender_nonce, state,
                     queued_at, dispatched_at
              FROM dispatch_queue
-             WHERE sender_address = ? AND state != 'confirmed'
+             WHERE sender_address = ? AND state NOT IN ('confirmed', 'retired')
              ORDER BY sponsor_nonce ASC
              LIMIT 100`,
             senderAddress

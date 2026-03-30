@@ -1320,12 +1320,13 @@ export interface SenderState {
 
 /**
  * A single slot in a sponsor wallet's nonce hand (wallet_hand table row).
- * Tracks the lifecycle of each sponsor nonce slot from available to confirmed.
+ * Tracks the lifecycle of each sponsor nonce slot from available to a terminal state.
  *
  * State machine:
  *   available → allocated → dispatched → confirmed
  *                                     → stuck
  *                                     → flushed
+ *                                     → retired
  */
 export interface WalletSlot {
   /** Sponsor wallet index (0-based) */
@@ -1340,8 +1341,9 @@ export interface WalletSlot {
    * - 'confirmed': transaction confirmed on-chain, slot is reusable
    * - 'stuck': broadcast tx has not confirmed beyond stuck threshold
    * - 'flushed': slot was gap-filled with a self-transfer (slot recycled)
+   * - 'retired': queued slot was terminated because the sponsor nonce was already consumed elsewhere
    */
-  state: "available" | "allocated" | "dispatched" | "confirmed" | "stuck" | "flushed";
+  state: "available" | "allocated" | "dispatched" | "confirmed" | "stuck" | "flushed" | "retired";
   /** Sender's Stacks address (null for available/flushed slots) */
   sender_address: string | null;
   /** Sender's account nonce (null for available/flushed slots) */

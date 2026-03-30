@@ -26,6 +26,7 @@ import type {
 import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, CLIENT_REJECTION_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
 import { extractSponsorNonce } from "./sponsor";
+import { waitForHiroTxConfirmationViaStream } from "./hiro-tx-stream";
 
 // Known SIP-010 token contract addresses
 const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
@@ -54,6 +55,8 @@ const MAX_POLL_DELAY_MS = 8_000;
  *  After broadcasting, if the first polling round times out, we retry
  *  polling (without re-broadcasting) since the tx is already in mempool. */
 const POLL_RETRY_ROUNDS = 2;
+/** Reserve a tail window for degraded REST polling if tx streaming is unavailable. */
+const STREAM_FALLBACK_TAIL_MS = 30_000;
 
 // Hiro API timeout configuration
 /** Timeout for each broadcast attempt POST to Hiro /v2/transactions (ms).
@@ -149,6 +152,37 @@ export class SettlementService {
   /** Truncate a hex hash to a short prefix for log context. */
   private truncateHash(hash: string): string {
     return hash.slice(0, 16) + "...";
+  }
+
+  /**
+   * Map a Hiro tx_status into a terminal confirmation result when possible.
+   * Non-terminal statuses return null so callers can keep waiting.
+   */
+  private interpretHiroStatus(
+    txid: string,
+    txStatus: string | undefined,
+    blockHeight?: number
+  ): BroadcastAndConfirmResult | null {
+    if (txStatus === "success") {
+      if (typeof blockHeight === "number") {
+        return {
+          txid,
+          status: "confirmed",
+          blockHeight,
+        };
+      }
+      return null;
+    }
+
+    if (this.isTxAborted(txStatus)) {
+      return {
+        error: "Transaction failed on-chain",
+        details: `tx_status: ${txStatus}`,
+        retryable: false,
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -604,6 +638,65 @@ export class SettlementService {
     return { txid, status: "pending" };
   }
 
+  /**
+   * Prefer Hiro's tx-update WebSocket stream, then fall back to REST polling with
+   * the remaining tail budget if the stream is unavailable or incomplete.
+   */
+  async awaitConfirmationPublic(
+    txid: string,
+    maxPollTimeMs?: number,
+  ): Promise<BroadcastAndConfirmResult> {
+    const effectivePollTimeMs = maxPollTimeMs != null && maxPollTimeMs > 0
+      ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
+      : DEFAULT_POLL_TIME_MS;
+
+    const fallbackBudgetMs = Math.min(
+      STREAM_FALLBACK_TAIL_MS,
+      effectivePollTimeMs,
+      Math.max(10_000, Math.floor(effectivePollTimeMs / 3))
+    );
+    const streamBudgetMs = Math.max(0, effectivePollTimeMs - fallbackBudgetMs);
+
+    const initialStatus = await this.fetchHiroTxStatus(txid);
+    if (initialStatus) {
+      const immediateResult = this.interpretHiroStatus(
+        txid,
+        initialStatus.txStatus,
+        initialStatus.blockHeight
+      );
+      if (immediateResult !== null) {
+        this.logger.info("Transaction reached terminal state before tx stream subscription", {
+          txid,
+          txStatus: initialStatus.txStatus,
+          blockHeight: initialStatus.blockHeight,
+        });
+        return immediateResult;
+      }
+    }
+
+    if (streamBudgetMs > 0) {
+      const streamResult = await waitForHiroTxConfirmationViaStream({
+        txid,
+        network: this.env.STACKS_NETWORK,
+        timeoutMs: streamBudgetMs,
+        logger: this.logger,
+      });
+      if (streamResult !== null) {
+        return streamResult;
+      }
+    }
+
+    if (fallbackBudgetMs <= 0) {
+      return { txid, status: "pending" };
+    }
+
+    this.logger.info("Falling back to Hiro REST polling after tx stream", {
+      txid,
+      fallbackBudgetMs,
+    });
+    return await this.pollForConfirmationPublic(txid, fallbackBudgetMs);
+  }
+
   async broadcastAndConfirm(
     transaction: StacksTransactionWire,
     maxPollTimeMs?: number
@@ -932,66 +1025,7 @@ export class SettlementService {
       return { txid, status: "pending" };
     }
 
-    // Poll for confirmation with exponential backoff and retry rounds.
-    // Polling uses the Hiro extended API (/extended/v1/*), which is Hiro-specific
-    // and not available on arbitrary Stacks nodes — always use the primary Hiro URL.
-    // If the first polling round times out, we retry polling (without
-    // re-broadcasting) since the tx is already in the mempool. This handles
-    // mainnet conditions where block times can exceed the initial poll window.
-    // The per-round budget is effectivePollTimeMs / POLL_RETRY_ROUNDS so the
-    // total time stays within the caller's budget.
-    const hiroHeaders = getHiroHeaders(this.env.HIRO_API_KEY);
-    const hiroPollBaseUrl = getHiroBaseUrl(this.env.STACKS_NETWORK);
-    const pollUrl = `${hiroPollBaseUrl}/extended/v1/tx/${txid}`;
-    const perRoundBudgetMs = Math.floor(effectivePollTimeMs / POLL_RETRY_ROUNDS);
-    const overallStartTime = Date.now();
-
-    for (let round = 1; round <= POLL_RETRY_ROUNDS; round++) {
-      const roundStartTime = Date.now();
-      // Cap this round's budget by the remaining overall budget
-      const overallRemaining = effectivePollTimeMs - (Date.now() - overallStartTime);
-      if (overallRemaining <= 0) break;
-      const roundBudgetMs = Math.min(perRoundBudgetMs, overallRemaining);
-
-      let delay = round === 1 ? 0 : INITIAL_POLL_DELAY_MS; // First poll is immediate on round 1
-
-      if (round > 1) {
-        this.logger.info("Retrying confirmation polling (tx already broadcast)", {
-          txid,
-          round,
-          maxRounds: POLL_RETRY_ROUNDS,
-          roundBudgetMs,
-        });
-      }
-
-      const roundResult = await this.pollForConfirmation(
-        txid, pollUrl, hiroHeaders, roundBudgetMs, delay
-      );
-
-      if (roundResult !== null) {
-        // Got a terminal result (confirmed, aborted, or error) — return immediately
-        return roundResult;
-      }
-
-      // Polling round timed out — log and retry if rounds remain
-      const roundElapsed = Date.now() - roundStartTime;
-      this.logger.info("Confirmation polling round timed out", {
-        txid,
-        round,
-        maxRounds: POLL_RETRY_ROUNDS,
-        roundElapsedMs: roundElapsed,
-        totalElapsedMs: Date.now() - overallStartTime,
-      });
-    }
-
-    // All polling rounds exhausted — return pending with txid for caller verification
-    this.logger.info("Transaction confirmation timeout after all polling rounds, returning pending", {
-      txid,
-      totalElapsedMs: Date.now() - overallStartTime,
-      maxPollTimeMs: effectivePollTimeMs,
-      rounds: POLL_RETRY_ROUNDS,
-    });
-    return { txid, status: "pending" };
+    return await this.awaitConfirmationPublic(txid, effectivePollTimeMs);
   }
 
   /**
