@@ -56,7 +56,7 @@ const MAX_POLL_DELAY_MS = 8_000;
  *  polling (without re-broadcasting) since the tx is already in mempool. */
 const POLL_RETRY_ROUNDS = 2;
 /** Reserve a tail window for degraded REST polling if tx streaming is unavailable. */
-const STREAM_FALLBACK_TAIL_MS = 60_000;
+const STREAM_FALLBACK_TAIL_MS = 30_000;
 
 // Hiro API timeout configuration
 /** Timeout for each broadcast attempt POST to Hiro /v2/transactions (ms).
@@ -152,6 +152,37 @@ export class SettlementService {
   /** Truncate a hex hash to a short prefix for log context. */
   private truncateHash(hash: string): string {
     return hash.slice(0, 16) + "...";
+  }
+
+  /**
+   * Map a Hiro tx_status into a terminal confirmation result when possible.
+   * Non-terminal statuses return null so callers can keep waiting.
+   */
+  private interpretHiroStatus(
+    txid: string,
+    txStatus: string | undefined,
+    blockHeight?: number
+  ): BroadcastAndConfirmResult | null {
+    if (txStatus === "success") {
+      if (typeof blockHeight === "number") {
+        return {
+          txid,
+          status: "confirmed",
+          blockHeight,
+        };
+      }
+      return null;
+    }
+
+    if (this.isTxAborted(txStatus)) {
+      return {
+        error: "Transaction failed on-chain",
+        details: `tx_status: ${txStatus}`,
+        retryable: false,
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -624,6 +655,23 @@ export class SettlementService {
       Math.max(10_000, Math.floor(effectivePollTimeMs / 3))
     );
     const streamBudgetMs = Math.max(0, effectivePollTimeMs - fallbackBudgetMs);
+
+    const initialStatus = await this.fetchHiroTxStatus(txid);
+    if (initialStatus) {
+      const immediateResult = this.interpretHiroStatus(
+        txid,
+        initialStatus.txStatus,
+        initialStatus.blockHeight
+      );
+      if (immediateResult !== null) {
+        this.logger.info("Transaction reached terminal state before tx stream subscription", {
+          txid,
+          txStatus: initialStatus.txStatus,
+          blockHeight: initialStatus.blockHeight,
+        });
+        return immediateResult;
+      }
+    }
 
     if (streamBudgetMs > 0) {
       const streamResult = await waitForHiroTxConfirmationViaStream({

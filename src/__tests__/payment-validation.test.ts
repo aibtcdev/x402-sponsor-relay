@@ -10,7 +10,7 @@
  * Cloudflare Worker runtime and without mocking fetch.
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { SettlementService } from "../services/settlement";
 import { stripHexPrefix } from "../utils/stacks";
 import type { Env, Logger } from "../types";
@@ -220,5 +220,49 @@ describe("SettlementService.mapAssetToTokenType", () => {
 
   it("returns null for an empty string", () => {
     expect(service.mapAssetToTokenType("")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SettlementService.awaitConfirmationPublic
+// ---------------------------------------------------------------------------
+
+describe("SettlementService.awaitConfirmationPublic", () => {
+  let service: SettlementService;
+
+  beforeEach(() => {
+    service = makeService("mainnet");
+  });
+
+  it("returns immediately when the first Hiro status check is already confirmed", async () => {
+    const fetchSpy = vi
+      .spyOn(service, "fetchHiroTxStatus")
+      .mockResolvedValue({ txStatus: "success", blockHeight: 12345 });
+    const pollSpy = vi.spyOn(service, "pollForConfirmationPublic");
+
+    await expect(service.awaitConfirmationPublic("0xabc")).resolves.toEqual({
+      txid: "0xabc",
+      status: "confirmed",
+      blockHeight: 12345,
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith("0xabc");
+    expect(pollSpy).not.toHaveBeenCalled();
+  });
+
+  it("returns immediately when the first Hiro status check is already aborted", async () => {
+    const fetchSpy = vi
+      .spyOn(service, "fetchHiroTxStatus")
+      .mockResolvedValue({ txStatus: "abort_by_response" });
+    const pollSpy = vi.spyOn(service, "pollForConfirmationPublic");
+
+    await expect(service.awaitConfirmationPublic("0xdef")).resolves.toEqual({
+      error: "Transaction failed on-chain",
+      details: "tx_status: abort_by_response",
+      retryable: false,
+    });
+
+    expect(fetchSpy).toHaveBeenCalledWith("0xdef");
+    expect(pollSpy).not.toHaveBeenCalled();
   });
 });
