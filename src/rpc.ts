@@ -4,9 +4,10 @@
  * Provides type-safe RPC methods for same-account workers (landing-page, agent-news).
  * No auth required — service binding = trusted caller.
  *
- * Two public methods:
+ * Public methods:
  * - submitPayment(txHex, settle) — validate tx, check sender nonce, enqueue, return paymentId
  * - checkPayment(paymentId)      — return current payment status from KV
+ * - getSponsorStatus()           — return the cached relay-owned sponsor status snapshot
  */
 
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -19,7 +20,7 @@ import {
   addressToString,
 } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
-import type { Env, SettleOptions } from "./types";
+import type { Env, SettleOptions, SponsorStatusResult } from "./types";
 import { stripHexPrefix } from "./utils";
 import {
   generatePaymentId,
@@ -95,6 +96,7 @@ export interface CheckPaymentResult {
  * // wrangler.jsonc: "services": [{ "binding": "X402_RELAY", "service": "x402-sponsor-relay", "entrypoint": "RelayRPC" }]
  * const result = await env.X402_RELAY.submitPayment(txHex, settle);
  * const status = await env.X402_RELAY.checkPayment(result.paymentId);
+ * const sponsorStatus = await env.X402_RELAY.getSponsorStatus();
  * ```
  */
 export class RelayRPC extends WorkerEntrypoint<Env> {
@@ -387,5 +389,25 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       retryable: record.retryable,
       senderNonceInfo: record.senderNonceInfo,
     };
+  }
+
+  /**
+   * Return the cached relay-owned sponsor status snapshot.
+   * Reads from NonceDO cached state only and never triggers live Hiro fan-out.
+   */
+  async getSponsorStatus(): Promise<SponsorStatusResult> {
+    if (!this.env.NONCE_DO) {
+      throw new Error("Nonce coordinator unavailable");
+    }
+
+    const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch("https://nonce-do/sponsor-status");
+
+    if (!response.ok && response.status !== 503) {
+      const body = await response.text();
+      throw new Error(body || `NonceDO sponsor status failed with ${response.status}`);
+    }
+
+    return (await response.json()) as SponsorStatusResult;
   }
 }

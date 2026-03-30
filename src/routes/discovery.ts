@@ -161,7 +161,8 @@ Full V2 facilitator docs: https://x402-relay.aibtc.com/topics/x402-v2-facilitato
 
 ## Other Endpoints
 
-- GET  /health              — Health check with network info
+- GET  /health              — Thin service health summary
+- GET  /status/sponsor      — Cached sponsor readiness snapshot
 - GET  /fees                — Clamped fee estimates (no auth required)
 - GET  /verify/:receiptId   — Verify a payment receipt
 - POST /access              — Access a receipt-gated resource
@@ -737,16 +738,41 @@ See https://x402-relay.aibtc.com/topics/x402-v2-facilitator for full details.
 
 ## GET /health — Health Check
 
-Returns service health, Stacks network connectivity, and sponsor wallet info.
+Returns a thin service-readiness summary with network, version, and condensed nonce pool readiness.
+This is not the canonical sponsor status contract and does not include sponsor wallet inventory or balances.
+
+## GET /status/sponsor — Cached Sponsor Status
+
+Returns the relay-owned cached sponsor readiness snapshot used by public and internal consumers.
+This is the canonical sponsor status surface. Reads do not trigger live Hiro fan-out.
 
 ### Response
 
 {
-  "success": true,
-  "requestId": "uuid",
-  "status": "ok",
-  "version": "1.4.0",
-  "network": "mainnet"
+  "status": "healthy",
+  "canSponsor": true,
+  "walletCount": 4,
+  "recommendation": null,
+  "reasons": [],
+  "noncePool": {
+    "totalAvailable": 72,
+    "totalReserved": 8,
+    "totalCapacity": 80,
+    "poolAvailabilityRatio": 0.9,
+    "conflictsDetected": 0,
+    "lastConflictAt": null,
+    "healInProgress": false
+  },
+  "reconciliation": {
+    "source": "hiro",
+    "lastSuccessfulAt": "2026-03-30T18:20:00.000Z",
+    "freshness": "fresh"
+  },
+  "snapshot": {
+    "asOf": "2026-03-30T18:20:05.000Z",
+    "ageMs": 412,
+    "freshness": "fresh"
+  }
 }
 
 ---
@@ -2183,8 +2209,8 @@ discovery.get("/.well-known/agent.json", (c) => {
         id: "health-check",
         name: "Service Health Check",
         description:
-          "Check relay health, network, and sponsor wallet status. " +
-          "GET /health returns status, version, network, and sponsorAddress. " +
+          "Check relay health and cached sponsor readiness. " +
+          "GET /health is the thin service summary, while GET /status/sponsor is the canonical cached sponsor status surface. " +
           "Use before sending transactions to verify the relay is operational.",
         tags: ["health", "monitoring", "status"],
         examples: [

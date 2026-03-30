@@ -15,7 +15,8 @@ export class Wallets extends BaseEndpoint {
       "Returns current STX balance, cumulative fees spent, transaction counts, live nonce pool state, " +
       "and health status for each configured sponsor wallet. " +
       "Balances are cached for 60 seconds. " +
-      "Use this endpoint to identify wallets that need funding.",
+      "Use this endpoint to identify wallets that need funding. " +
+      "This is the detailed operator/debugging path; use GET /status/sponsor for the canonical cached sponsor readiness surface.",
     responses: {
       "200": {
         description: "Wallet statuses retrieved successfully",

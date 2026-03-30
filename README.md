@@ -201,16 +201,35 @@ Access a protected resource using a payment receipt. Validates the receipt (exis
 
 ### GET /health
 
-Health check endpoint.
+Thin service health summary. Use `GET /status/sponsor` for the canonical cached sponsor status contract.
 
 **Response:**
 ```json
 {
+  "success": true,
+  "requestId": "550e8400-e29b-41d4-a716-446655440000",
   "status": "ok",
   "network": "testnet",
-  "version": "0.3.0"
+  "version": "0.3.0",
+  "nonce": {
+    "poolAvailable": 15,
+    "poolReserved": 2,
+    "conflictsDetected": 0,
+    "circuitBreakerOpen": false,
+    "lastConflictAt": null,
+    "poolAvailabilityRatio": 0.88,
+    "poolStatus": "healthy",
+    "recommendation": null
+  }
 }
 ```
+
+### Status Surfaces
+
+- `RelayRPC.getSponsorStatus()` is the canonical internal sponsor status read for trusted same-account consumers such as `landing-page`.
+- `GET /status/sponsor` is the canonical public sponsor status read for autonomous agents and other HTTP consumers.
+- `GET /health` is only a thin service-readiness summary.
+- `GET /wallets` remains the detailed operator/debugging path for per-wallet balance and inventory and is intentionally separate from sponsor readiness.
 
 ### GET /docs
 
@@ -285,7 +304,8 @@ if (receiptId) {
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | GET | `/` | None | Service info |
-| GET | `/health` | None | Health check with version and network |
+| GET | `/health` | None | Thin service health summary with condensed nonce pool readiness |
+| GET | `/status/sponsor` | None | Canonical cached sponsor readiness snapshot |
 | GET | `/docs` | None | Swagger UI documentation |
 | GET | `/openapi.json` | None | OpenAPI specification |
 | POST | `/relay` | None | Submit transaction via x402 facilitator |

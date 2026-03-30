@@ -8,13 +8,26 @@ import type { StacksTransactionWire } from "@stacks/transactions";
 import { hexToBytes } from "@stacks/common";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
 import { generateNewAccount, generateWallet } from "@stacks/wallet-sdk";
-import type { Env, LogsRPC, PoolHealthResponse, WalletHealthSnapshot, HandSubmitResult, RunDispatchResult } from "../types";
+import type {
+  Env,
+  LogsRPC,
+  PoolHealthResponse,
+  SponsorStatusResult,
+  WalletHealthSnapshot,
+  HandSubmitResult,
+  RunDispatchResult,
+} from "../types";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 import {
   getPaymentRecord,
   putPaymentRecord,
   transitionPayment,
 } from "../services/payment-status";
+import {
+  SPONSOR_STATUS_RECENT_CONFLICT_WINDOW_MS,
+  toSponsorStatusResult,
+  type StoredSponsorStatusSnapshot,
+} from "../services/sponsor-status";
 
 const APP_ID = "x402-relay";
 
@@ -531,6 +544,7 @@ const STATE_KEYS = {
 
 /** Round-robin wallet index storage key */
 const NEXT_WALLET_INDEX_KEY = "next_wallet_index";
+const SPONSOR_STATUS_SNAPSHOT_STORAGE_KEY = "sponsor_status_snapshot";
 
 /**
  * Structured error thrown when all sponsor wallets are at the chaining limit.
@@ -2883,6 +2897,7 @@ export class NonceDO {
     errorReason: string | undefined
   ): Promise<void> {
     this.ledgerBroadcastOutcome(walletIndex, nonce, txid, httpStatus, nodeUrl, errorReason);
+    await this.refreshSponsorStatusSnapshot();
   }
 
   // ---------------------------------------------------------------------------
@@ -3519,6 +3534,8 @@ export class NonceDO {
         poolCapacity: effectiveWalletCount * CHAINING_LIMIT,
       });
 
+      await this.refreshSponsorStatusSnapshot();
+
       return { nonce: assignedNonce, walletIndex, totalReserved };
     });
   }
@@ -3615,6 +3632,8 @@ export class NonceDO {
       if (failureQuarantined) {
         await this.recordQuarantineEvent(walletIndex);
       }
+
+      await this.refreshSponsorStatusSnapshot();
     });
   }
 
@@ -3708,6 +3727,91 @@ export class NonceDO {
       initializedWallets.length > 0 && degradedCount === initializedWallets.length;
 
     return { allWalletsDegraded, totalReserved, totalCapacity, wallets };
+  }
+
+  private async buildSponsorStatusSnapshot(): Promise<StoredSponsorStatusSnapshot> {
+    const initializedWallets = await this.getInitializedWallets();
+    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+    const walletSnapshots = await Promise.all(
+      initializedWallets.map(async ({ walletIndex }) => {
+        const recentQuarantines =
+          (await this.state.storage.get<string[]>(
+            this.walletQuarantineRecentKey(walletIndex)
+          )) ?? [];
+        const activeQuarantines = recentQuarantines.filter(
+          (ts) => new Date(ts).getTime() >= cutoff
+        );
+        const available = this.walletHeadroom(walletIndex);
+        return {
+          circuitBreakerOpen:
+            activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
+          available,
+          reserved: CHAINING_LIMIT - available,
+        };
+      })
+    );
+    const walletCount = walletSnapshots.length;
+    const totalAvailable = walletSnapshots.reduce((sum, wallet) => sum + wallet.available, 0);
+    const totalReserved = walletSnapshots.reduce((sum, wallet) => sum + wallet.reserved, 0);
+    const totalCapacity = walletCount * CHAINING_LIMIT;
+    const allWalletsDegraded =
+      walletCount > 0 && walletSnapshots.every((wallet) => wallet.circuitBreakerOpen);
+    const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
+    const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
+    const healInProgress =
+      lastGapDetectedMs !== null &&
+      Date.now() - lastGapDetectedMs < ALARM_INTERVAL_ACTIVE_MS * 2;
+    const recentConflict =
+      lastGapDetectedMs !== null &&
+      Date.now() - lastGapDetectedMs <= SPONSOR_STATUS_RECENT_CONFLICT_WINDOW_MS;
+    const poolAvailabilityRatio =
+      totalCapacity === 0
+        ? 0
+        : Math.round((totalAvailable / totalCapacity) * 100) / 100;
+
+    return {
+      asOf: new Date().toISOString(),
+      walletCount,
+      allWalletsDegraded,
+      recommendation:
+        totalAvailable === 0 ||
+        allWalletsDegraded ||
+        recentConflict ||
+        healInProgress
+          ? "fallback_to_direct"
+          : null,
+      noncePool: {
+        totalAvailable,
+        totalReserved,
+        totalCapacity,
+        poolAvailabilityRatio,
+        conflictsDetected: this.getStoredCount(STATE_KEYS.conflictsDetected),
+        lastConflictAt: lastGapDetectedMs ? new Date(lastGapDetectedMs).toISOString() : null,
+        healInProgress,
+      },
+      reconciliation: {
+        lastSuccessfulAt: lastHiroSyncMs ? new Date(lastHiroSyncMs).toISOString() : null,
+      },
+    };
+  }
+
+  private async refreshSponsorStatusSnapshot(): Promise<StoredSponsorStatusSnapshot> {
+    const snapshot = await this.buildSponsorStatusSnapshot();
+    await this.state.storage.put(SPONSOR_STATUS_SNAPSHOT_STORAGE_KEY, snapshot);
+    return snapshot;
+  }
+
+  async getSponsorStatus(): Promise<SponsorStatusResult> {
+    let snapshot =
+      await this.state.storage.get<StoredSponsorStatusSnapshot>(
+        SPONSOR_STATUS_SNAPSHOT_STORAGE_KEY
+      );
+
+    if (!snapshot) {
+      snapshot = await this.refreshSponsorStatusSnapshot();
+    }
+
+    return toSponsorStatusResult(snapshot);
   }
 
   async getStats(): Promise<NonceStatsResponse> {
@@ -6288,6 +6392,8 @@ export class NonceDO {
           this.log("info", "probe_queue_cycle_complete", probeResult);
         }
 
+        await this.refreshSponsorStatusSnapshot();
+
         // Dynamic alarm interval: use cascade (20s) when cascade is active + in-flight nonces,
         // active (60s) when in-flight nonces present, idle (5min) when all wallets are drained.
         const totalReservedAfterCycle = this.ledgerTotalAssigned();
@@ -6332,6 +6438,7 @@ export class NonceDO {
       const result = action === "reset"
         ? await this.state.blockConcurrencyWhile(() => this.performReset())
         : await this.state.blockConcurrencyWhile(() => this.performResync());
+      await this.refreshSponsorStatusSnapshot();
       return this.jsonResponse(result);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
@@ -6369,8 +6476,9 @@ export class NonceDO {
    * without touching any nonce pool state. Used when auto-clear hasn't fired yet
    * and operators need to unblock the health circuit breaker immediately.
    */
-  private handleClearConflicts(): Response {
+  private async handleClearConflicts(): Promise<Response> {
     const previousConflicts = this.clearConflictCounters("manual_operator_clear");
+    await this.refreshSponsorStatusSnapshot();
     return this.jsonResponse({ cleared: true, previousConflicts });
   }
 
@@ -6429,6 +6537,7 @@ export class NonceDO {
         reason,
       };
       this.log("info", "clear_pools", { action: result.action, changed: result.changed, reason: result.reason });
+      await this.refreshSponsorStatusSnapshot();
       return this.jsonResponse(result);
     });
   }
@@ -6992,6 +7101,18 @@ export class NonceDO {
       }
     }
 
+    if (request.method === "GET" && url.pathname === "/sponsor-status") {
+      try {
+        const sponsorStatus = await this.getSponsorStatus();
+        return this.jsonResponse(
+          sponsorStatus,
+          sponsorStatus.status === "unavailable" ? 503 : 200
+        );
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
     // GET /wallet-fees/:walletIndex — returns fee stats for a specific wallet
     const walletFeesMatch = url.pathname.match(/^\/wallet-fees\/(\d+)$/);
     if (request.method === "GET" && walletFeesMatch) {
@@ -7083,7 +7204,11 @@ export class NonceDO {
     const fillGapsMatch = url.pathname.match(/^\/fill-gaps\/(\d+)$/);
     if (request.method === "POST" && fillGapsMatch) {
       const walletIdx = parseInt(fillGapsMatch[1], 10);
-      return this.state.blockConcurrencyWhile(() => this.handleFillGaps(walletIdx));
+      const response = await this.state.blockConcurrencyWhile(() => this.handleFillGaps(walletIdx));
+      if (response.ok) {
+        await this.refreshSponsorStatusSnapshot();
+      }
+      return response;
     }
 
     // POST /flush-wallet/:walletIndex — admin: full wallet flush when surgical gap-filling fails.
@@ -7106,9 +7231,13 @@ export class NonceDO {
       // (both mutate SQLite). When probeDepth is set and the forward range is
       // empty, handleFlushWallet enqueues nonces into probe_queue and returns
       // immediately — the alarm processes them in batches (5/tick, RBF_FEE).
-      return this.state.blockConcurrencyWhile(
+      const response = await this.state.blockConcurrencyWhile(
         () => this.handleFlushWallet(walletIdx, probeDepth)
       );
+      if (response.ok) {
+        await this.refreshSponsorStatusSnapshot();
+      }
+      return response;
     }
 
     // GET /history/:wallet/:nonce — diagnostic endpoint for full nonce event trail.
