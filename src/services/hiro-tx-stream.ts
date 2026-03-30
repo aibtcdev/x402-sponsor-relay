@@ -28,8 +28,7 @@ interface JsonRpcNotificationMessage {
 type JsonRpcMessage =
   | JsonRpcSuccessMessage
   | JsonRpcErrorMessage
-  | JsonRpcNotificationMessage
-  | JsonRpcMessage[];
+  | JsonRpcNotificationMessage;
 
 export interface WebSocketLike {
   addEventListener(type: string, listener: (event: unknown) => void): void;
@@ -100,7 +99,6 @@ export async function waitForHiroTxConfirmationViaStream(
   return await new Promise<BroadcastAndConfirmResult | null>((resolve) => {
     let socket: WebSocketLike;
     let settled = false;
-    let subscribeAcked = false;
 
     const cleanup = () => {
       clearTimeout(timeoutHandle);
@@ -173,7 +171,6 @@ export async function waitForHiroTxConfirmationViaStream(
           }
 
           if ("id" in message && message.id === SUBSCRIBE_REQUEST_ID && "result" in message) {
-            subscribeAcked = true;
             continue;
           }
 
@@ -245,7 +242,6 @@ export async function waitForHiroTxConfirmationViaStream(
         txid,
         code: closeEvent?.code ?? null,
         reason: closeEvent?.reason ?? null,
-        subscribed: subscribeAcked,
       });
       finish(null, "closed");
     };

@@ -652,6 +652,7 @@ export class SettlementService {
 
     const fallbackBudgetMs = Math.min(
       STREAM_FALLBACK_TAIL_MS,
+      effectivePollTimeMs,
       Math.max(10_000, Math.floor(effectivePollTimeMs / 3))
     );
     const streamBudgetMs = Math.max(0, effectivePollTimeMs - fallbackBudgetMs);

@@ -265,4 +265,18 @@ describe("SettlementService.awaitConfirmationPublic", () => {
     expect(fetchSpy).toHaveBeenCalledWith("0xdef");
     expect(pollSpy).not.toHaveBeenCalled();
   });
+
+  it("clamps the fallback poll budget to the caller budget for very small waits", async () => {
+    vi.spyOn(service, "fetchHiroTxStatus").mockResolvedValue({ txStatus: "pending" });
+    const pollSpy = vi
+      .spyOn(service, "pollForConfirmationPublic")
+      .mockResolvedValue({ txid: "0xsmall", status: "pending" });
+
+    await expect(service.awaitConfirmationPublic("0xsmall", 5_000)).resolves.toEqual({
+      txid: "0xsmall",
+      status: "pending",
+    });
+
+    expect(pollSpy).toHaveBeenCalledWith("0xsmall", 5_000);
+  });
 });
