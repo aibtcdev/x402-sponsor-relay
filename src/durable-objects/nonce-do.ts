@@ -173,6 +173,7 @@ interface SenderStateRow {
   seeded_at: string;
   last_advanced_at: string | null;
   last_refresh_attempt_at: string | null;
+  last_refresh_failure_at: string | null;
 }
 
 interface SenderHandRow {
@@ -431,6 +432,7 @@ const MAX_ADMIN_GAP_FILLS = 50;
 const HAND_HOLD_TIMEOUT_MS = 15 * 60 * 1000;
 const STALE_SENDER_REPAIR_HOLD_AGE_MS = 5 * 60 * 1000;
 const SENDER_REFRESH_COOLDOWN_MS = 10 * 60 * 1000;
+const SENDER_REFRESH_FAILURE_BACKOFF_MS = 2 * 60 * 1000;
 /**
  * Age threshold for considering a mempool transaction "stuck" (15 minutes).
  * Transactions that remain pending beyond this window have a very low confirmation
@@ -811,7 +813,7 @@ export class NonceDO {
       }
     } catch (err) {
       console.warn(
-        "[nonce-do] Failed to ensure sender_state.last_refresh_attempt_at column exists; continuing without migration:",
+        "[nonce-do] Failed to ensure dispatch_queue.settlement_ms column exists; continuing without migration:",
         err
       );
     }
@@ -876,7 +878,8 @@ export class NonceDO {
         seeded_from          TEXT    NOT NULL,
         seeded_at            TEXT    NOT NULL,
         last_advanced_at     TEXT,
-        last_refresh_attempt_at TEXT
+        last_refresh_attempt_at TEXT,
+        last_refresh_failure_at TEXT
       );
     `);
 
@@ -892,6 +895,22 @@ export class NonceDO {
     } catch (err) {
       console.warn(
         "[nonce-do] Failed to ensure sender_state.last_refresh_attempt_at column exists; continuing without migration:",
+        err
+      );
+    }
+
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>(
+          "SELECT name FROM pragma_table_info('sender_state') WHERE name = 'last_refresh_failure_at'"
+        )
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE sender_state ADD COLUMN last_refresh_failure_at TEXT");
+      }
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to ensure sender_state.last_refresh_failure_at column exists; continuing without migration:",
         err
       );
     }
@@ -1395,8 +1414,9 @@ export class NonceDO {
         seeded_at: string;
         last_advanced_at: string | null;
         last_refresh_attempt_at: string | null;
+        last_refresh_failure_at: string | null;
       }>(
-        `SELECT next_expected_nonce, seeded_from, seeded_at, last_advanced_at, last_refresh_attempt_at
+        `SELECT next_expected_nonce, seeded_from, seeded_at, last_advanced_at, last_refresh_attempt_at, last_refresh_failure_at
          FROM sender_state
          WHERE sender_address = ? LIMIT 1`,
         senderAddress
@@ -1406,7 +1426,7 @@ export class NonceDO {
   }
 
   private evaluateStaleSenderRepairCandidate(
-    stateRow: Pick<SenderStateRow, "next_expected_nonce" | "last_refresh_attempt_at"> | null,
+    stateRow: Pick<SenderStateRow, "next_expected_nonce" | "last_refresh_attempt_at" | "last_refresh_failure_at"> | null,
     hand: Array<Pick<SenderHandRow, "sender_nonce" | "received_at" | "expires_at">>,
     nowMs: number
   ): StaleSenderRepairCandidate | null {
@@ -1450,6 +1470,17 @@ export class NonceDO {
       return null;
     }
 
+    const lastRefreshFailureMs = stateRow.last_refresh_failure_at
+      ? new Date(stateRow.last_refresh_failure_at).getTime()
+      : null;
+    if (
+      lastRefreshFailureMs !== null &&
+      Number.isFinite(lastRefreshFailureMs) &&
+      nowMs - lastRefreshFailureMs < SENDER_REFRESH_FAILURE_BACKOFF_MS
+    ) {
+      return null;
+    }
+
     return {
       nextExpectedNonce: stateRow.next_expected_nonce,
       lowestHeldNonce,
@@ -1462,7 +1493,8 @@ export class NonceDO {
     try {
       this.sql.exec(
         `UPDATE sender_state
-         SET last_refresh_attempt_at = ?
+         SET last_refresh_attempt_at = ?,
+             last_refresh_failure_at = NULL
          WHERE sender_address = ?`,
         attemptedAt,
         senderAddress
@@ -1470,6 +1502,23 @@ export class NonceDO {
     } catch (err) {
       console.warn(
         "[nonce-do] Failed to record sender refresh attempt; proceeding without cooldown update:",
+        err
+      );
+    }
+  }
+
+  private recordSenderRefreshFailure(senderAddress: string, failedAt: string): void {
+    try {
+      this.sql.exec(
+        `UPDATE sender_state
+         SET last_refresh_failure_at = ?
+         WHERE sender_address = ?`,
+        failedAt,
+        senderAddress
+      );
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to record sender refresh failure; proceeding without failure backoff:",
         err
       );
     }
@@ -1562,6 +1611,7 @@ export class NonceDO {
       });
       return true;
     } catch (error) {
+      this.recordSenderRefreshFailure(senderAddress, new Date(nowMs).toISOString());
       this.log("warn", "sender_frontier_refresh_failed", {
         senderAddress,
         nextExpectedNonce: candidate.nextExpectedNonce,
