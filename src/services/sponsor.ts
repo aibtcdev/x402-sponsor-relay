@@ -613,9 +613,10 @@ export class SponsorService {
    *
    * Checks:
    * 1. Valid hex string (even length, only 0-9a-fA-F chars)
-   * 2. Minimum length (at least 2 bytes = 4 hex chars)
+   * 2. Minimum length (at least 6 bytes = 12 hex chars)
    * 3. Version byte (byte 0): 0x00 for mainnet, 0x80 for testnet
-   * 4. Auth type byte (byte 1): 0x04 (Standard) or 0x05 (Sponsored)
+   * 4. Auth type byte (byte 5): 0x04 (Standard) or 0x05 (Sponsored)
+   *    Stacks tx layout: byte[0]=version, bytes[1-4]=chain_id, byte[5]=auth_type
    *
    * Input must already have the 0x prefix stripped (use stripHexPrefix first).
    */
@@ -631,9 +632,9 @@ export class SponsorService {
       return { valid: false, reason: "Transaction hex contains non-hex characters" };
     }
 
-    // Must have at least 2 bytes (version + auth type)
-    if (cleanHex.length < 4) {
-      return { valid: false, reason: "Transaction hex too short — must be at least 2 bytes" };
+    // Must have at least 6 bytes (version + chain_id + auth_type)
+    if (cleanHex.length < 12) {
+      return { valid: false, reason: "Transaction hex too short — must be at least 6 bytes" };
     }
 
     // Check version byte (byte 0)
@@ -647,8 +648,9 @@ export class SponsorService {
       };
     }
 
-    // Check auth type byte (byte 1): 0x04 = Standard, 0x05 = Sponsored
-    const authTypeByte = parseInt(cleanHex.slice(2, 4), 16);
+    // Check auth type byte (byte 5): 0x04 = Standard, 0x05 = Sponsored
+    // Stacks tx layout: byte[0]=version, bytes[1-4]=chain_id (4 bytes), byte[5]=auth_type
+    const authTypeByte = parseInt(cleanHex.slice(10, 12), 16);
     if (authTypeByte !== 0x04 && authTypeByte !== 0x05) {
       return {
         valid: false,
