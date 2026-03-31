@@ -116,6 +116,30 @@ Submit a sponsored transaction for relay and settlement.
 }
 ```
 
+**Response (held / sender nonce gap):**
+```json
+{
+  "success": true,
+  "status": "held",
+  "requestId": "550e8400-e29b-41d4-a716-446655440000",
+  "queue": {
+    "senderNonce": 8,
+    "nextExpectedNonce": 5,
+    "missingNonces": [5, 6, 7],
+    "handSize": 1,
+    "estimatedDispatchMs": null,
+    "expiresAt": "2026-03-31T20:25:00.000Z",
+    "help": "Verify your account nonce at /fees or via the Stacks API, then submit transactions with nonces 5, 6, 7 to unblock dispatch"
+  }
+}
+```
+
+Held queue behavior:
+- `POST /relay` returns HTTP `202` when the sender has a nonce gap.
+- Held entries remain queued for up to 15 minutes.
+- The alarm may conservatively repair stale-low sender frontiers after 5 minutes, with at most one Hiro refresh per sender every 10 minutes.
+- If the missing nonces arrive first, dispatch proceeds immediately without waiting for repair.
+
 > **Note:** `sponsoredTx` contains the fully-sponsored transaction hex (usable as `X-PAYMENT` header). `receiptId` is only returned when receipt storage succeeds (requires `RELAY_KV` binding).
 
 **Response (error):**

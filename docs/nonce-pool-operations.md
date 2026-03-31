@@ -18,6 +18,9 @@ The relay uses a pool of sponsor wallets to sign and broadcast Stacks transactio
 | Alarm interval (active) | 60s | `ALARM_INTERVAL_ACTIVE_MS` |
 | Alarm interval (idle) | 5 min | `ALARM_INTERVAL_IDLE_MS` |
 | Stale assignment threshold | 10 min | `STALE_THRESHOLD_MS` |
+| Sender hand repair age | 5 min | `STALE_SENDER_REPAIR_HOLD_AGE_MS` |
+| Sender refresh cooldown | 10 min | `SENDER_REFRESH_COOLDOWN_MS` |
+| Sender hand expiry | 15 min | `HAND_HOLD_TIMEOUT_MS` |
 | RBF fee | 90,000 uSTX | `RBF_FEE` |
 | Gap-fill fee | 30,000 uSTX | `GAP_FILL_FEE` |
 | Max gap-fills per alarm cycle | 5 per wallet | `MAX_GAP_FILLS_PER_ALARM` |
@@ -25,6 +28,8 @@ The relay uses a pool of sponsor wallets to sign and broadcast Stacks transactio
 | Max RBF attempts per nonce | 3 | `MAX_RBF_ATTEMPTS` |
 
 **Wallet assignment:** round-robin across initialized wallets. Each wallet has independent nonce state and circuit breakers.
+
+**Sender hand recovery:** when a sender frontier looks stale-low locally, the alarm may perform a bounded Hiro refresh after the oldest held entry has waited at least 5 minutes. Recovery is conservative: it only bumps when `possible_next_nonce >= lowestHeldNonce`, bumps exactly to `lowestHeldNonce`, prunes only stale-low hand rows below that frontier, and retries dispatch immediately. Refresh attempts are limited to once per sender every 10 minutes.
 
 ---
 
@@ -109,6 +114,20 @@ All 422 responses have `retryable: false`. Do not retry automatically.
 - `SETTLEMENT_FAILED`: The transaction reached the chain and was aborted (`abort_*` status). This is a terminal state — surface the error to the user.
 - `CLIENT_BAD_NONCE` / `CLIENT_NONCE_CONFLICT`: The agent's own transaction nonce is wrong. Fetch the agent's current nonce from Hiro, re-build the transaction, and retry.
 - `SETTLEMENT_VERIFICATION_FAILED`: The transaction's payment parameters do not match the `settle` requirements sent with the request. Fix the transaction construction.
+
+### Handling 202 TRANSACTION_HELD
+
+The relay accepted the tx but could not dispatch it yet because the sender nonce sequence has a gap.
+
+**Required caller steps:**
+1. Read `queue.missingNonces` and submit those sender nonces first.
+2. Treat `queue.expiresAt` as the held-entry deadline.
+3. If the sender advanced outside the relay, allow the alarm to self-repair the stale-low frontier after 5 minutes.
+
+**Timing model:**
+- Held entries remain in `sender_hand` for up to 15 minutes.
+- Conservative stale-low repair becomes eligible after 5 minutes.
+- After a refresh attempt, the same sender waits 10 minutes before another Hiro refresh.
 
 ### Drop vs Abort — Dropped Is Not Failed
 
@@ -244,6 +263,9 @@ The NonceDO emits structured logs via worker-logs. Key log messages:
 | `all_wallets_degraded_using_least_degraded` | WARN | All wallets circuit-broken; using fallback |
 | `nonce_reconcile_stale` | WARN | Wallet head was ahead of chain and idle; reset |
 | `nonce_alarm_failed` | ERROR | Alarm cycle threw; will reschedule at idle interval |
+| `sender_frontier_refresh_skipped` | INFO | Sender hand looked stale-low locally, but Hiro had not advanced to the lowest held nonce yet |
+| `sender_frontier_repaired` | INFO | Sender frontier bumped exactly to the lowest held nonce and stale-low hand rows below it were pruned |
+| `sender_frontier_refresh_failed` | WARN | Alarm-side Hiro refresh for a held sender failed; sender stays queued until the next eligible attempt |
 | `surge_started` | INFO | Pool pressure > 80%; check `pressure_pct`, `totalReserved` |
 | `surge_resolved` | INFO | Pressure back below 80%; check `duration_ms` |
 

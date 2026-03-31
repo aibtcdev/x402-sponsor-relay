@@ -1305,7 +1305,7 @@ export interface TxStatusRecord {
  * Info about recently expired hand entries for a sender.
  * Included in HandSubmitResult (held branch) and QueueInfo to help agents
  * understand why previously-submitted nonces disappeared from the queue
- * after the 5-minute hold timeout expired.
+ * after the 15-minute hold timeout expired.
  */
 export interface RecentExpiryInfo {
   /** Sender nonces that expired from the hand */
@@ -1510,7 +1510,7 @@ export interface QueueInfo {
   /**
    * Recently expired nonces for this sender, if any expired before this submission.
    * Helps agents understand why previously-submitted nonces are missing from the queue.
-   * Format: "Your nonces N, M expired after 5 minutes waiting for the gap to be filled."
+   * Format: "Your nonces N, M expired after 15 minutes waiting for the gap to be filled."
    */
   recentlyExpired?: RecentExpiryInfo;
 }
