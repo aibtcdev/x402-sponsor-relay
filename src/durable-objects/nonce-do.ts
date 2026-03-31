@@ -809,7 +809,12 @@ export class NonceDO {
       if (cols.length === 0) {
         this.sql.exec("ALTER TABLE dispatch_queue ADD COLUMN settlement_ms INTEGER");
       }
-    } catch { /* already present or error — fail-open */ }
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to ensure sender_state.last_refresh_attempt_at column exists; continuing without migration:",
+        err
+      );
+    }
 
     // Replay buffer: sender txs waiting for a fresh sponsor nonce assignment.
     // Populated when a dispatched slot is stuck and needs to be flushed.
@@ -884,7 +889,12 @@ export class NonceDO {
       if (cols.length === 0) {
         this.sql.exec("ALTER TABLE sender_state ADD COLUMN last_refresh_attempt_at TEXT");
       }
-    } catch { /* already present or error — fail-open */ }
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to ensure sender_state.last_refresh_attempt_at column exists; continuing without migration:",
+        err
+      );
+    }
 
     // sender_hand: per-sender queue of transactions waiting to form a gapless run
     this.sql.exec(`
@@ -1449,13 +1459,20 @@ export class NonceDO {
   }
 
   private recordSenderRefreshAttempt(senderAddress: string, attemptedAt: string): void {
-    this.sql.exec(
-      `UPDATE sender_state
-       SET last_refresh_attempt_at = ?
-       WHERE sender_address = ?`,
-      attemptedAt,
-      senderAddress
-    );
+    try {
+      this.sql.exec(
+        `UPDATE sender_state
+         SET last_refresh_attempt_at = ?
+         WHERE sender_address = ?`,
+        attemptedAt,
+        senderAddress
+      );
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to record sender refresh attempt; proceeding without cooldown update:",
+        err
+      );
+    }
   }
 
   private conservativeBumpSenderFrontier(
@@ -1511,9 +1528,6 @@ export class NonceDO {
       return false;
     }
 
-    const attemptedAt = new Date(nowMs).toISOString();
-    this.recordSenderRefreshAttempt(senderAddress, attemptedAt);
-
     try {
       const hiroNonceInfo = await this.fetchNonceInfo(senderAddress);
       if (hiroNonceInfo.possible_next_nonce < candidate.lowestHeldNonce) {
@@ -1527,6 +1541,9 @@ export class NonceDO {
         });
         return false;
       }
+
+      const attemptedAt = new Date(nowMs).toISOString();
+      this.recordSenderRefreshAttempt(senderAddress, attemptedAt);
 
       const bump = this.conservativeBumpSenderFrontier(senderAddress, candidate.lowestHeldNonce);
       if (!bump.advanced) {
@@ -6539,7 +6556,7 @@ export class NonceDO {
         await this.sweepHeldHands();
 
         // ---------------------------------------------------------------------------
-        // Expiry sweep: delete sender_hand entries past their 5-minute hold timeout.
+        // Expiry sweep: delete sender_hand entries past their 15-minute hold timeout.
         // Capped at 100 deletions per tick; records to sender_expiry_log for feedback.
         // ---------------------------------------------------------------------------
         this.sweepExpiredHands();

@@ -238,7 +238,7 @@ describe("NonceDO stale sender repair helpers", () => {
     }, "ST789");
 
     expect(hiroLagged).toBe(false);
-    expect(recordSenderRefreshAttempt).toHaveBeenCalledWith("ST789", "2026-03-31T20:10:00.000Z");
+    expect(recordSenderRefreshAttempt).not.toHaveBeenCalled();
     expect(conservativeBumpSenderFrontier).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith(
       "info",
@@ -249,5 +249,47 @@ describe("NonceDO stale sender repair helpers", () => {
         hiroPossibleNextNonce: 6,
       })
     );
+  });
+
+  it("records the cooldown only after Hiro confirms the held frontier is reachable", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-31T20:10:00.000Z"));
+
+    const repair = (NonceDO as any).prototype.maybeRepairStaleSenderFrontier;
+    const recordSenderRefreshAttempt = vi.fn();
+    const conservativeBumpSenderFrontier = vi.fn().mockReturnValue({
+      advanced: false,
+      previousFrontier: 7,
+      prunedCount: 0,
+    });
+    const fetchNonceInfo = vi.fn().mockResolvedValue({
+      possible_next_nonce: 7,
+      last_executed_tx_nonce: 6,
+      last_mempool_tx_nonce: null,
+      detected_missing_nonces: [],
+      detected_mempool_nonces: [],
+    });
+
+    const repaired = await repair.call({
+      getSenderState: () => ({
+        next_expected_nonce: 3,
+        last_refresh_attempt_at: null,
+      }),
+      getHand: () => [
+        {
+          sender_nonce: 7,
+          received_at: "2026-03-31T20:04:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+      ],
+      evaluateStaleSenderRepairCandidate: (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate,
+      recordSenderRefreshAttempt,
+      fetchNonceInfo,
+      conservativeBumpSenderFrontier,
+      log: vi.fn(),
+    }, "ST999");
+
+    expect(repaired).toBe(false);
+    expect(recordSenderRefreshAttempt).toHaveBeenCalledWith("ST999", "2026-03-31T20:10:00.000Z");
+    expect(conservativeBumpSenderFrontier).toHaveBeenCalledWith("ST999", 7);
   });
 });
