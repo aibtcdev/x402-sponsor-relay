@@ -647,8 +647,10 @@ export class SponsorService {
       };
     }
 
-    // Check auth type byte (byte 1): 0x04 = Standard, 0x05 = Sponsored
-    const authTypeByte = parseInt(cleanHex.slice(2, 4), 16);
+    // Check auth type byte (byte 5): 0x04 = Standard, 0x05 = Sponsored
+    // Stacks tx wire format: version(1 byte) + chain_id(4 bytes) + auth_type(1 byte) + ...
+    // For mainnet chain_id=0x00000001, byte 1 is 0x00 (not auth type). Auth type is at byte 5.
+    const authTypeByte = parseInt(cleanHex.slice(10, 12), 16);
     if (authTypeByte !== 0x04 && authTypeByte !== 0x05) {
       return {
         valid: false,
