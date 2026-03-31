@@ -169,8 +169,9 @@ if (!response.ok && response.status !== 202) {
 // HTTP 202 — transaction held due to sender nonce gap (no txid, no receiptId)
 if (response.status === 202) {
   const { status, queue } = result;  // status === "held"
-  // queue contains: { position, missingNonces, estimatedDispatchMs }
-  // Submit the missing nonces to unblock dispatch, or wait retryAfter seconds.
+  // queue contains: { senderNonce, nextExpectedNonce, missingNonces, handSize, estimatedDispatchMs, expiresAt, help }
+  // Submit the missing nonces to unblock dispatch. Held entries remain queued for up to 15 minutes.
+  // After 5 minutes, the alarm may conservatively repair a stale-low sender frontier.
   return handleHeld(queue, response.headers.get("Retry-After"));
 }
 
@@ -297,7 +298,7 @@ If `settlement.status === "failed"` (only for `abort_*` on-chain rejections), po
 | `BROADCAST_REJECTED` | 422 | true | Stacks node rejected the tx for a client reason; inspect `details`, correct the transaction, and resubmit |
 | `NONCE_CONFLICT` | 409 | true | Relay sponsor nonce conflict in mempool; rebuild and resubmit a new transaction (different serialized bytes) |
 | `CLIENT_NONCE_CONFLICT` | 409 | true | Agent nonce conflicts in mempool; wait for the conflicting pending tx, then re-sign with the correct nonce |
-| `TRANSACTION_HELD` | 202 | true | Transaction accepted but queued due to a sender nonce gap. Returned as HTTP 202 with `status: "held"` and `queue` info (no `receiptId`). `POST /sponsor` returns `SENDER_NONCE_GAP` (400) instead. Submit the missing nonces listed in `queue.missingNonces` or wait for the gap to clear. |
+| `TRANSACTION_HELD` | 202 | true | Transaction accepted but queued due to a sender nonce gap. Returned as HTTP 202 with `status: "held"` and `queue` info (no `receiptId`). `POST /sponsor` returns `SENDER_NONCE_GAP` (400) instead. Submit the missing nonces listed in `queue.missingNonces`. Held entries remain queued for up to 15 minutes, and the alarm can conservatively repair stale-low sender frontiers after 5 minutes. |
 | `TOO_MUCH_CHAINING` | 429 | true | Relay sponsor wallet has too many in-flight transactions; wait for `retryAfter` seconds (check `Retry-After` header); relay will recover automatically |
 | `RATE_LIMIT_EXCEEDED` | 429 | true | 10 req/min per sender on free tier; wait for `retryAfter` seconds (check `Retry-After` header) |
 | `DAILY_LIMIT_EXCEEDED` | 429 | true | Daily request quota reached for your API key; wait until the quota resets at midnight UTC |
@@ -407,7 +408,7 @@ These appear in the `errorReason` (POST /settle) or `invalidReason` (POST /verif
 | `client_insufficient_funds` | Sender lacks funds for the transfer; top up the wallet |
 | `client_bad_nonce` | Agent nonce is stale; fetch correct nonce and re-sign |
 | `signature_validation_failed` | Tx signature is invalid; rebuild and re-sign |
-| `transaction_held` | Tx queued pending agent nonce gap fill; submit missing nonces |
+| `transaction_held` | Tx queued pending agent nonce gap fill; submit missing nonces. Held entries expire after 15 minutes unless dispatched earlier. |
 | `payment_identifier_conflict` | Same payment-identifier `id` was used with a different transaction payload (HTTP 409) |
 | `payment_identifier_required` | Service requires a `payment-identifier` extension but none was provided |
 | `unexpected_verify_error` | Internal error during local verification; retry |
@@ -474,7 +475,9 @@ async function payAndSettle(opts: {
   }
 
   if (res.status === 202) {
-    // Sender nonce gap — tx is queued but not yet dispatched (no txid, no receiptId)
+    // Sender nonce gap — tx is queued but not yet dispatched (no txid, no receiptId).
+    // The queue entry expires after 15 minutes. After 5 minutes the alarm may
+    // conservatively repair a stale-low sender frontier if Hiro confirms the sender advanced.
     const retryAfter = Number(res.headers.get("Retry-After") ?? 30);
     throw Object.assign(new Error("transaction_held"), {
       code: "TRANSACTION_HELD",

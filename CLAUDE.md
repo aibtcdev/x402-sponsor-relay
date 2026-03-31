@@ -93,6 +93,12 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `POST /verify` - x402 V2 facilitator verify (local validation only, no broadcast)
 - `GET /supported` - x402 V2 supported payment kinds (static config)
 
+**Nonce queue semantics:**
+- `POST /relay` can return HTTP `202` with `status: "held"` when the sender has a nonce gap.
+- Held sender-hand entries live for 15 minutes.
+- The alarm may conservatively repair stale-low sender frontiers after 5 minutes, with a 10 minute per-sender Hiro refresh cooldown.
+- Repair only bumps to the lowest held nonce when Hiro reports `possible_next_nonce >= lowestHeldNonce`; it must never speculate past locally held work.
+
 **Agent Discovery (AX) — `src/routes/discovery.ts`:**
 - `GET /llms.txt` - Quick-start guide: what the relay does, key provisioning, /relay and /sponsor examples
 - `GET /llms-full.txt` - Full reference: all endpoints with schemas, SIP-018 auth, receipt system, error codes

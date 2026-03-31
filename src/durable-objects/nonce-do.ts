@@ -167,6 +167,31 @@ interface WalletPoolStats {
   sponsorAddress: string | null;
 }
 
+interface SenderStateRow {
+  next_expected_nonce: number;
+  seeded_from: string;
+  seeded_at: string;
+  last_advanced_at: string | null;
+  last_refresh_attempt_at: string | null;
+  last_refresh_failure_at: string | null;
+}
+
+interface SenderHandRow {
+  sender_address: string;
+  sender_nonce: number;
+  tx_hex: string;
+  source: string;
+  received_at: string;
+  expires_at: string;
+}
+
+interface StaleSenderRepairCandidate {
+  nextExpectedNonce: number;
+  lowestHeldNonce: number;
+  oldestHeldAgeMs: number;
+  handSize: number;
+}
+
 /**
  * Per-wallet utilization metrics over the last hour.
  * Counts nonce_intents rows by state with assigned_at within the last 60 minutes.
@@ -401,9 +426,13 @@ const MAX_GAP_FILLS_PER_ALARM = 5;
 const MAX_ADMIN_GAP_FILLS = 50;
 /**
  * How long a sender transaction stays in the hand queue before expiry.
- * After this window, the entry is pruned and the sender must resubmit.
+ * Keep this comfortably above the stale-sender repair hold age so the alarm
+ * gets multiple chances to repair and re-dispatch before expiry.
  */
-const HAND_HOLD_TIMEOUT_MS = 5 * 60 * 1000;
+const HAND_HOLD_TIMEOUT_MS = 15 * 60 * 1000;
+const STALE_SENDER_REPAIR_HOLD_AGE_MS = 5 * 60 * 1000;
+const SENDER_REFRESH_COOLDOWN_MS = 10 * 60 * 1000;
+const SENDER_REFRESH_FAILURE_BACKOFF_MS = 2 * 60 * 1000;
 /**
  * Age threshold for considering a mempool transaction "stuck" (15 minutes).
  * Transactions that remain pending beyond this window have a very low confirmation
@@ -782,7 +811,12 @@ export class NonceDO {
       if (cols.length === 0) {
         this.sql.exec("ALTER TABLE dispatch_queue ADD COLUMN settlement_ms INTEGER");
       }
-    } catch { /* already present or error — fail-open */ }
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to ensure dispatch_queue.settlement_ms column exists; continuing without migration:",
+        err
+      );
+    }
 
     // Replay buffer: sender txs waiting for a fresh sponsor nonce assignment.
     // Populated when a dispatched slot is stuck and needs to be flushed.
@@ -843,9 +877,43 @@ export class NonceDO {
         next_expected_nonce  INTEGER NOT NULL,
         seeded_from          TEXT    NOT NULL,
         seeded_at            TEXT    NOT NULL,
-        last_advanced_at     TEXT
+        last_advanced_at     TEXT,
+        last_refresh_attempt_at TEXT,
+        last_refresh_failure_at TEXT
       );
     `);
+
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>(
+          "SELECT name FROM pragma_table_info('sender_state') WHERE name = 'last_refresh_attempt_at'"
+        )
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE sender_state ADD COLUMN last_refresh_attempt_at TEXT");
+      }
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to ensure sender_state.last_refresh_attempt_at column exists; continuing without migration:",
+        err
+      );
+    }
+
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>(
+          "SELECT name FROM pragma_table_info('sender_state') WHERE name = 'last_refresh_failure_at'"
+        )
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE sender_state ADD COLUMN last_refresh_failure_at TEXT");
+      }
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to ensure sender_state.last_refresh_failure_at column exists; continuing without migration:",
+        err
+      );
+    }
 
     // sender_hand: per-sender queue of transactions waiting to form a gapless run
     this.sql.exec(`
@@ -1288,14 +1356,7 @@ export class NonceDO {
   /**
    * Return all entries in a sender's hand, ordered by sender_nonce ASC.
    */
-  private getHand(senderAddress: string): Array<{
-    sender_address: string;
-    sender_nonce: number;
-    tx_hex: string;
-    source: string;
-    received_at: string;
-    expires_at: string;
-  }> {
+  private getHand(senderAddress: string): SenderHandRow[] {
     return this.sql
       .exec<{
         sender_address: string;
@@ -1345,14 +1406,258 @@ export class NonceDO {
    * Read a sender's current state row (next_expected_nonce).
    * Returns null if the sender has never been seeded.
    */
-  private getSenderState(senderAddress: string): { next_expected_nonce: number } | null {
-    const rows = this.sql
-      .exec<{ next_expected_nonce: number }>(
-        "SELECT next_expected_nonce FROM sender_state WHERE sender_address = ? LIMIT 1",
+  private getSenderState(senderAddress: string): SenderStateRow | null {
+    try {
+      const rows = this.sql
+        .exec<{
+          next_expected_nonce: number;
+          seeded_from: string;
+          seeded_at: string;
+          last_advanced_at: string | null;
+          last_refresh_attempt_at: string | null;
+          last_refresh_failure_at: string | null;
+        }>(
+          `SELECT next_expected_nonce, seeded_from, seeded_at, last_advanced_at, last_refresh_attempt_at, last_refresh_failure_at
+           FROM sender_state
+           WHERE sender_address = ? LIMIT 1`,
+          senderAddress
+        )
+        .toArray();
+      return rows[0] ?? null;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes("no such column")) {
+        throw err;
+      }
+
+      console.warn(
+        "[nonce-do] sender_state refresh columns unavailable; falling back to legacy sender_state SELECT:",
+        err
+      );
+
+      const legacyRows = this.sql
+        .exec<{
+          next_expected_nonce: number;
+          seeded_from: string;
+          seeded_at: string;
+          last_advanced_at: string | null;
+        }>(
+          `SELECT next_expected_nonce, seeded_from, seeded_at, last_advanced_at
+           FROM sender_state
+           WHERE sender_address = ? LIMIT 1`,
+          senderAddress
+        )
+        .toArray();
+
+      const legacyRow = legacyRows[0];
+      if (!legacyRow) {
+        return null;
+      }
+
+      return {
+        ...legacyRow,
+        last_refresh_attempt_at: null,
+        last_refresh_failure_at: null,
+      };
+    }
+  }
+
+  private evaluateStaleSenderRepairCandidate(
+    stateRow: Pick<SenderStateRow, "next_expected_nonce" | "last_refresh_attempt_at" | "last_refresh_failure_at"> | null,
+    hand: Array<Pick<SenderHandRow, "sender_nonce" | "received_at" | "expires_at">>,
+    nowMs: number
+  ): StaleSenderRepairCandidate | null {
+    if (!stateRow || hand.length === 0) {
+      return null;
+    }
+
+    const activeHand = hand
+      .filter((entry) => new Date(entry.expires_at).getTime() > nowMs)
+      .sort((a, b) => a.sender_nonce - b.sender_nonce);
+    if (activeHand.length === 0) {
+      return null;
+    }
+
+    const lowestHeldNonce = activeHand[0]?.sender_nonce;
+    if (lowestHeldNonce === undefined || lowestHeldNonce <= stateRow.next_expected_nonce) {
+      return null;
+    }
+
+    const oldestHeldAt = activeHand.reduce((min, entry) => {
+      const receivedAtMs = new Date(entry.received_at).getTime();
+      return Number.isFinite(receivedAtMs) ? Math.min(min, receivedAtMs) : min;
+    }, Number.MAX_SAFE_INTEGER);
+    if (!Number.isFinite(oldestHeldAt) || oldestHeldAt === Number.MAX_SAFE_INTEGER) {
+      return null;
+    }
+
+    const oldestHeldAgeMs = Math.max(0, nowMs - oldestHeldAt);
+    if (oldestHeldAgeMs < STALE_SENDER_REPAIR_HOLD_AGE_MS) {
+      return null;
+    }
+
+    const lastRefreshAttemptMs = stateRow.last_refresh_attempt_at
+      ? new Date(stateRow.last_refresh_attempt_at).getTime()
+      : null;
+    if (
+      lastRefreshAttemptMs !== null &&
+      Number.isFinite(lastRefreshAttemptMs) &&
+      nowMs - lastRefreshAttemptMs < SENDER_REFRESH_COOLDOWN_MS
+    ) {
+      return null;
+    }
+
+    const lastRefreshFailureMs = stateRow.last_refresh_failure_at
+      ? new Date(stateRow.last_refresh_failure_at).getTime()
+      : null;
+    if (
+      lastRefreshFailureMs !== null &&
+      Number.isFinite(lastRefreshFailureMs) &&
+      nowMs - lastRefreshFailureMs < SENDER_REFRESH_FAILURE_BACKOFF_MS
+    ) {
+      return null;
+    }
+
+    return {
+      nextExpectedNonce: stateRow.next_expected_nonce,
+      lowestHeldNonce,
+      oldestHeldAgeMs,
+      handSize: activeHand.length,
+    };
+  }
+
+  private recordSenderRefreshAttempt(senderAddress: string, attemptedAt: string): void {
+    try {
+      this.sql.exec(
+        `UPDATE sender_state
+         SET last_refresh_attempt_at = ?,
+             last_refresh_failure_at = NULL
+         WHERE sender_address = ?`,
+        attemptedAt,
         senderAddress
+      );
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to record sender refresh attempt; proceeding without cooldown update:",
+        err
+      );
+    }
+  }
+
+  private recordSenderRefreshFailure(senderAddress: string, failedAt: string): void {
+    try {
+      this.sql.exec(
+        `UPDATE sender_state
+         SET last_refresh_failure_at = ?
+         WHERE sender_address = ?`,
+        failedAt,
+        senderAddress
+      );
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to record sender refresh failure; proceeding without failure backoff:",
+        err
+      );
+    }
+  }
+
+  private conservativeBumpSenderFrontier(
+    senderAddress: string,
+    newFrontier: number
+  ): { advanced: boolean; previousFrontier: number | null; prunedCount: number } {
+    const stateRow = this.getSenderState(senderAddress);
+    const previousFrontier = stateRow?.next_expected_nonce ?? null;
+    if (previousFrontier !== null && previousFrontier >= newFrontier) {
+      return { advanced: false, previousFrontier, prunedCount: 0 };
+    }
+
+    const staleLowRows = this.sql
+      .exec<{ cnt: number }>(
+        `SELECT COUNT(*) as cnt
+         FROM sender_hand
+         WHERE sender_address = ? AND sender_nonce < ?`,
+        senderAddress,
+        newFrontier
       )
       .toArray();
-    return rows[0] ?? null;
+    const prunedCount = staleLowRows[0]?.cnt ?? 0;
+    const now = new Date().toISOString();
+
+    this.sql.exec(
+      `UPDATE sender_state
+       SET next_expected_nonce = ?,
+           last_advanced_at = ?
+       WHERE sender_address = ?`,
+      newFrontier,
+      now,
+      senderAddress
+    );
+    this.sql.exec(
+      `DELETE FROM sender_hand
+       WHERE sender_address = ? AND sender_nonce < ?`,
+      senderAddress,
+      newFrontier
+    );
+
+    return { advanced: true, previousFrontier, prunedCount };
+  }
+
+  private async maybeRepairStaleSenderFrontier(senderAddress: string): Promise<boolean> {
+    const nowMs = Date.now();
+    const stateRow = this.getSenderState(senderAddress);
+    const candidate = this.evaluateStaleSenderRepairCandidate(
+      stateRow,
+      this.getHand(senderAddress),
+      nowMs
+    );
+    if (!candidate) {
+      return false;
+    }
+
+    try {
+      const hiroNonceInfo = await this.fetchNonceInfo(senderAddress);
+      const attemptedAt = new Date(nowMs).toISOString();
+      this.recordSenderRefreshAttempt(senderAddress, attemptedAt);
+
+      if (hiroNonceInfo.possible_next_nonce < candidate.lowestHeldNonce) {
+        this.log("info", "sender_frontier_refresh_skipped", {
+          senderAddress,
+          nextExpectedNonce: candidate.nextExpectedNonce,
+          lowestHeldNonce: candidate.lowestHeldNonce,
+          hiroPossibleNextNonce: hiroNonceInfo.possible_next_nonce,
+          oldestHeldAgeMs: candidate.oldestHeldAgeMs,
+          handSize: candidate.handSize,
+        });
+        return false;
+      }
+
+      const bump = this.conservativeBumpSenderFrontier(senderAddress, candidate.lowestHeldNonce);
+      if (!bump.advanced) {
+        return false;
+      }
+
+      this.log("info", "sender_frontier_repaired", {
+        senderAddress,
+        previousNextExpectedNonce: bump.previousFrontier,
+        newNextExpectedNonce: candidate.lowestHeldNonce,
+        lowestHeldNonce: candidate.lowestHeldNonce,
+        hiroPossibleNextNonce: hiroNonceInfo.possible_next_nonce,
+        prunedStaleLowEntries: bump.prunedCount,
+        oldestHeldAgeMs: candidate.oldestHeldAgeMs,
+        handSize: candidate.handSize,
+      });
+      return true;
+    } catch (error) {
+      this.recordSenderRefreshFailure(senderAddress, new Date(nowMs).toISOString());
+      this.log("warn", "sender_frontier_refresh_failed", {
+        senderAddress,
+        nextExpectedNonce: candidate.nextExpectedNonce,
+        lowestHeldNonce: candidate.lowestHeldNonce,
+        oldestHeldAgeMs: candidate.oldestHeldAgeMs,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
   }
 
   /**
@@ -5822,7 +6127,7 @@ export class NonceDO {
    * Uses a round-robin cursor (alarm_sender_cursor) so no single sender is always skipped.
    * For each sender with a non-empty hand, calls checkAndAssignRun() to try to assign runs.
    */
-  private sweepHeldHands(): void {
+  private async sweepHeldHands(): Promise<void> {
     const now = new Date().toISOString();
 
     // Count total senders with non-empty hands
@@ -5856,6 +6161,7 @@ export class NonceDO {
     let swept = 0;
     for (const { sender_address } of senders) {
       try {
+        await this.maybeRepairStaleSenderFrontier(sender_address);
         this.checkAndAssignRun(sender_address);
         swept++;
       } catch (e) {
@@ -6334,10 +6640,10 @@ export class NonceDO {
         // ---------------------------------------------------------------------------
         // Sweep held sender hands: try to dispatch pending runs (bounded per tick)
         // ---------------------------------------------------------------------------
-        this.sweepHeldHands();
+        await this.sweepHeldHands();
 
         // ---------------------------------------------------------------------------
-        // Expiry sweep: delete sender_hand entries past their 5-minute hold timeout.
+        // Expiry sweep: delete sender_hand entries past their 15-minute hold timeout.
         // Capped at 100 deletions per tick; records to sender_expiry_log for feedback.
         // ---------------------------------------------------------------------------
         this.sweepExpiredHands();

@@ -47,3 +47,386 @@ describe("NonceDO sponsor status snapshot clamp", () => {
     expect(snapshot.noncePool.poolAvailabilityRatio).toBe(1);
   });
 });
+
+describe("NonceDO stale sender repair helpers", () => {
+  it("falls back to the legacy sender_state SELECT when refresh columns are unavailable", () => {
+    const getSenderState = (NonceDO as any).prototype.getSenderState;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const exec = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error("no such column: last_refresh_failure_at");
+      })
+      .mockReturnValueOnce({
+        toArray: () => [{
+          next_expected_nonce: 3,
+          seeded_from: "hiro",
+          seeded_at: "2026-03-31T20:00:00.000Z",
+          last_advanced_at: null,
+        }],
+      });
+
+    const state = getSenderState.call({
+      sql: { exec },
+    }, "STLEGACY");
+
+    expect(state).toEqual({
+      next_expected_nonce: 3,
+      seeded_from: "hiro",
+      seeded_at: "2026-03-31T20:00:00.000Z",
+      last_advanced_at: null,
+      last_refresh_attempt_at: null,
+      last_refresh_failure_at: null,
+    });
+    expect(warn).toHaveBeenCalledWith(
+      "[nonce-do] sender_state refresh columns unavailable; falling back to legacy sender_state SELECT:",
+      expect.any(Error)
+    );
+  });
+
+  it("only produces a stale-low repair candidate after the hold-age threshold and outside cooldown", () => {
+    const nowMs = Date.parse("2026-03-31T20:10:00.000Z");
+    const evaluate = (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate;
+
+    const candidate = evaluate.call(
+      {},
+      {
+        next_expected_nonce: 3,
+        last_refresh_attempt_at: null,
+        last_refresh_failure_at: null,
+      },
+      [
+        {
+          sender_nonce: 7,
+          received_at: "2026-03-31T20:04:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+        {
+          sender_nonce: 8,
+          received_at: "2026-03-31T20:05:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+      ],
+      nowMs
+    );
+
+    expect(candidate).toEqual({
+      nextExpectedNonce: 3,
+      lowestHeldNonce: 7,
+      oldestHeldAgeMs: 6 * 60 * 1000,
+      handSize: 2,
+    });
+
+    expect(
+      evaluate.call(
+        {},
+        {
+          next_expected_nonce: 3,
+          last_refresh_attempt_at: "2026-03-31T20:02:00.000Z",
+          last_refresh_failure_at: null,
+        },
+        [
+          {
+            sender_nonce: 7,
+            received_at: "2026-03-31T20:04:00.000Z",
+            expires_at: "2026-03-31T20:11:00.000Z",
+          },
+        ],
+        nowMs
+      )
+    ).toBeNull();
+
+    expect(
+      evaluate.call(
+        {},
+        {
+          next_expected_nonce: 7,
+          last_refresh_attempt_at: null,
+          last_refresh_failure_at: null,
+        },
+        [
+          {
+            sender_nonce: 7,
+            received_at: "2026-03-31T20:04:00.000Z",
+            expires_at: "2026-03-31T20:11:00.000Z",
+          },
+        ],
+        nowMs
+      )
+    ).toBeNull();
+  });
+
+  it("repairs a stale-low sender frontier only up to the lowest held nonce", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-31T20:10:00.000Z"));
+
+    const repair = (NonceDO as any).prototype.maybeRepairStaleSenderFrontier;
+    const recordSenderRefreshAttempt = vi.fn();
+    const conservativeBumpSenderFrontier = vi.fn().mockReturnValue({
+      advanced: true,
+      previousFrontier: 3,
+      prunedCount: 2,
+    });
+    const log = vi.fn();
+    const fetchNonceInfo = vi.fn().mockResolvedValue({
+      possible_next_nonce: 12,
+      last_executed_tx_nonce: 11,
+      last_mempool_tx_nonce: null,
+      detected_missing_nonces: [],
+      detected_mempool_nonces: [],
+    });
+
+    const repaired = await repair.call({
+      getSenderState: () => ({
+        next_expected_nonce: 3,
+        last_refresh_attempt_at: null,
+        last_refresh_failure_at: null,
+      }),
+      getHand: () => [
+        {
+          sender_nonce: 7,
+          received_at: "2026-03-31T20:04:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+        {
+          sender_nonce: 8,
+          received_at: "2026-03-31T20:05:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+      ],
+      evaluateStaleSenderRepairCandidate: (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate,
+      recordSenderRefreshAttempt,
+      fetchNonceInfo,
+      conservativeBumpSenderFrontier,
+      log,
+    }, "ST123");
+
+    expect(repaired).toBe(true);
+    expect(recordSenderRefreshAttempt).toHaveBeenCalledWith("ST123", "2026-03-31T20:10:00.000Z");
+    expect(fetchNonceInfo).toHaveBeenCalledWith("ST123");
+    expect(conservativeBumpSenderFrontier).toHaveBeenCalledWith("ST123", 7);
+    expect(log).toHaveBeenCalledWith(
+      "info",
+      "sender_frontier_repaired",
+      expect.objectContaining({
+        senderAddress: "ST123",
+        previousNextExpectedNonce: 3,
+        newNextExpectedNonce: 7,
+        lowestHeldNonce: 7,
+        hiroPossibleNextNonce: 12,
+        prunedStaleLowEntries: 2,
+      })
+    );
+  });
+
+  it("skips stale-low repair when cooldown blocks refresh or Hiro is not yet at the held frontier", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-31T20:10:00.000Z"));
+
+    const repair = (NonceDO as any).prototype.maybeRepairStaleSenderFrontier;
+    const log = vi.fn();
+
+    const cooldownFetch = vi.fn();
+    const cooldownResult = await repair.call({
+      getSenderState: () => ({
+        next_expected_nonce: 3,
+        last_refresh_attempt_at: "2026-03-31T20:05:30.000Z",
+        last_refresh_failure_at: null,
+      }),
+      getHand: () => [
+        {
+          sender_nonce: 7,
+          received_at: "2026-03-31T20:04:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+      ],
+      evaluateStaleSenderRepairCandidate: (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate,
+      recordSenderRefreshAttempt: vi.fn(),
+      recordSenderRefreshFailure: vi.fn(),
+      fetchNonceInfo: cooldownFetch,
+      conservativeBumpSenderFrontier: vi.fn(),
+      log,
+    }, "ST456");
+
+    expect(cooldownResult).toBe(false);
+    expect(cooldownFetch).not.toHaveBeenCalled();
+
+    const recordSenderRefreshAttempt = vi.fn();
+    const recordSenderRefreshFailure = vi.fn();
+    const conservativeBumpSenderFrontier = vi.fn();
+    const fetchNonceInfo = vi.fn().mockResolvedValue({
+      possible_next_nonce: 6,
+      last_executed_tx_nonce: 5,
+      last_mempool_tx_nonce: null,
+      detected_missing_nonces: [],
+      detected_mempool_nonces: [],
+    });
+
+    const hiroLagged = await repair.call({
+      getSenderState: () => ({
+        next_expected_nonce: 3,
+        last_refresh_attempt_at: null,
+        last_refresh_failure_at: null,
+      }),
+      getHand: () => [
+        {
+          sender_nonce: 7,
+          received_at: "2026-03-31T20:04:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+      ],
+      evaluateStaleSenderRepairCandidate: (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate,
+      recordSenderRefreshAttempt,
+      recordSenderRefreshFailure,
+      fetchNonceInfo,
+      conservativeBumpSenderFrontier,
+      log,
+    }, "ST789");
+
+    expect(hiroLagged).toBe(false);
+    expect(recordSenderRefreshAttempt).toHaveBeenCalledWith("ST789", "2026-03-31T20:10:00.000Z");
+    expect(recordSenderRefreshFailure).not.toHaveBeenCalled();
+    expect(conservativeBumpSenderFrontier).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      "info",
+      "sender_frontier_refresh_skipped",
+      expect.objectContaining({
+        senderAddress: "ST789",
+        lowestHeldNonce: 7,
+        hiroPossibleNextNonce: 6,
+      })
+    );
+  });
+
+  it("records the cooldown only after Hiro confirms the held frontier is reachable", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-31T20:10:00.000Z"));
+
+    const repair = (NonceDO as any).prototype.maybeRepairStaleSenderFrontier;
+    const recordSenderRefreshAttempt = vi.fn();
+    const conservativeBumpSenderFrontier = vi.fn().mockReturnValue({
+      advanced: false,
+      previousFrontier: 7,
+      prunedCount: 0,
+    });
+    const fetchNonceInfo = vi.fn().mockResolvedValue({
+      possible_next_nonce: 7,
+      last_executed_tx_nonce: 6,
+      last_mempool_tx_nonce: null,
+      detected_missing_nonces: [],
+      detected_mempool_nonces: [],
+    });
+
+    const repaired = await repair.call({
+      getSenderState: () => ({
+        next_expected_nonce: 3,
+        last_refresh_attempt_at: null,
+        last_refresh_failure_at: null,
+      }),
+      getHand: () => [
+        {
+          sender_nonce: 7,
+          received_at: "2026-03-31T20:04:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+      ],
+      evaluateStaleSenderRepairCandidate: (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate,
+      recordSenderRefreshAttempt,
+      recordSenderRefreshFailure: vi.fn(),
+      fetchNonceInfo,
+      conservativeBumpSenderFrontier,
+      log: vi.fn(),
+    }, "ST999");
+
+    expect(repaired).toBe(false);
+    expect(recordSenderRefreshAttempt).toHaveBeenCalledWith("ST999", "2026-03-31T20:10:00.000Z");
+    expect(conservativeBumpSenderFrontier).toHaveBeenCalledWith("ST999", 7);
+  });
+
+  it("applies a short failure backoff after a Hiro refresh error", () => {
+    const nowMs = Date.parse("2026-03-31T20:10:00.000Z");
+    const evaluate = (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate;
+
+    expect(
+      evaluate.call(
+        {},
+        {
+          next_expected_nonce: 3,
+          last_refresh_attempt_at: null,
+          last_refresh_failure_at: "2026-03-31T20:09:00.000Z",
+        },
+        [
+          {
+            sender_nonce: 7,
+            received_at: "2026-03-31T20:04:00.000Z",
+            expires_at: "2026-03-31T20:11:00.000Z",
+          },
+        ],
+        nowMs
+      )
+    ).toBeNull();
+
+    expect(
+      evaluate.call(
+        {},
+        {
+          next_expected_nonce: 3,
+          last_refresh_attempt_at: null,
+          last_refresh_failure_at: "2026-03-31T20:07:30.000Z",
+        },
+        [
+          {
+            sender_nonce: 7,
+            received_at: "2026-03-31T20:04:00.000Z",
+            expires_at: "2026-03-31T20:11:00.000Z",
+          },
+        ],
+        nowMs
+      )
+    ).toEqual({
+      nextExpectedNonce: 3,
+      lowestHeldNonce: 7,
+      oldestHeldAgeMs: 6 * 60 * 1000,
+      handSize: 1,
+    });
+  });
+
+  it("records a failed refresh timestamp when Hiro refresh throws", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-31T20:10:00.000Z"));
+
+    const repair = (NonceDO as any).prototype.maybeRepairStaleSenderFrontier;
+    const recordSenderRefreshAttempt = vi.fn();
+    const recordSenderRefreshFailure = vi.fn();
+    const fetchNonceInfo = vi.fn().mockRejectedValue(new Error("hiro unavailable"));
+    const log = vi.fn();
+
+    const repaired = await repair.call({
+      getSenderState: () => ({
+        next_expected_nonce: 3,
+        last_refresh_attempt_at: null,
+        last_refresh_failure_at: null,
+      }),
+      getHand: () => [
+        {
+          sender_nonce: 7,
+          received_at: "2026-03-31T20:04:00.000Z",
+          expires_at: "2026-03-31T20:11:00.000Z",
+        },
+      ],
+      evaluateStaleSenderRepairCandidate: (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate,
+      recordSenderRefreshAttempt,
+      recordSenderRefreshFailure,
+      fetchNonceInfo,
+      conservativeBumpSenderFrontier: vi.fn(),
+      log,
+    }, "STERR");
+
+    expect(repaired).toBe(false);
+    expect(recordSenderRefreshAttempt).not.toHaveBeenCalled();
+    expect(recordSenderRefreshFailure).toHaveBeenCalledWith("STERR", "2026-03-31T20:10:00.000Z");
+    expect(log).toHaveBeenCalledWith(
+      "warn",
+      "sender_frontier_refresh_failed",
+      expect.objectContaining({
+        senderAddress: "STERR",
+        error: "hiro unavailable",
+      })
+    );
+  });
+});

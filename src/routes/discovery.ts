@@ -1957,9 +1957,18 @@ Held (HTTP 202) — sender nonce gap detected, tx queued but not yet dispatched:
   "success": true,
   "status": "held",
   "requestId": "uuid",
-  "queue": { "position": 1, "missingNonces": [5], "estimatedDispatchMs": 30000 }
+  "queue": {
+    "senderNonce": 8,
+    "nextExpectedNonce": 5,
+    "missingNonces": [5, 6, 7],
+    "handSize": 1,
+    "estimatedDispatchMs": null,
+    "expiresAt": "2026-03-31T20:25:00.000Z"
+  }
 }
-Submit the missing nonces to unblock dispatch, or wait Retry-After seconds.
+Submit the missing nonces to unblock dispatch.
+Held entries live for up to 15 minutes. After 5 minutes, the alarm may conservatively
+repair a stale-low sender frontier if Hiro shows possible_next_nonce >= lowestHeldNonce.
 No txid or receiptId in this response — the tx has not been broadcast yet.
 
 Error (HTTP 4xx/5xx):
