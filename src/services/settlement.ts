@@ -1208,6 +1208,19 @@ export class SettlementService {
         return false;
       }
 
+      // 429 (rate-limit) and 503 (service unavailable): Hiro cannot confirm the txid.
+      // Treat as dead to invalidate the dedup entry and allow a fresh broadcast retry.
+      // This prevents phantom txids from stale dedup entries being served when Hiro is
+      // transiently unavailable. Worst case: a valid pending tx gets invalidated and
+      // the caller retries — the fresh broadcast will fail with nonce conflict (retryable).
+      if (response.status === 429 || response.status === 503) {
+        this.logger.debug("Hiro API rate-limited/unavailable during liveness check, invalidating", {
+          txid,
+          status: response.status,
+        });
+        return false;
+      }
+
       if (!response.ok) {
         this.logger.debug("Hiro API error during liveness check, assuming alive", {
           txid,
