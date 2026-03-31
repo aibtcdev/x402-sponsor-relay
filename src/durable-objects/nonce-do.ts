@@ -1407,22 +1407,59 @@ export class NonceDO {
    * Returns null if the sender has never been seeded.
    */
   private getSenderState(senderAddress: string): SenderStateRow | null {
-    const rows = this.sql
-      .exec<{
-        next_expected_nonce: number;
-        seeded_from: string;
-        seeded_at: string;
-        last_advanced_at: string | null;
-        last_refresh_attempt_at: string | null;
-        last_refresh_failure_at: string | null;
-      }>(
-        `SELECT next_expected_nonce, seeded_from, seeded_at, last_advanced_at, last_refresh_attempt_at, last_refresh_failure_at
-         FROM sender_state
-         WHERE sender_address = ? LIMIT 1`,
-        senderAddress
-      )
-      .toArray();
-    return rows[0] ?? null;
+    try {
+      const rows = this.sql
+        .exec<{
+          next_expected_nonce: number;
+          seeded_from: string;
+          seeded_at: string;
+          last_advanced_at: string | null;
+          last_refresh_attempt_at: string | null;
+          last_refresh_failure_at: string | null;
+        }>(
+          `SELECT next_expected_nonce, seeded_from, seeded_at, last_advanced_at, last_refresh_attempt_at, last_refresh_failure_at
+           FROM sender_state
+           WHERE sender_address = ? LIMIT 1`,
+          senderAddress
+        )
+        .toArray();
+      return rows[0] ?? null;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes("no such column")) {
+        throw err;
+      }
+
+      console.warn(
+        "[nonce-do] sender_state refresh columns unavailable; falling back to legacy sender_state SELECT:",
+        err
+      );
+
+      const legacyRows = this.sql
+        .exec<{
+          next_expected_nonce: number;
+          seeded_from: string;
+          seeded_at: string;
+          last_advanced_at: string | null;
+        }>(
+          `SELECT next_expected_nonce, seeded_from, seeded_at, last_advanced_at
+           FROM sender_state
+           WHERE sender_address = ? LIMIT 1`,
+          senderAddress
+        )
+        .toArray();
+
+      const legacyRow = legacyRows[0];
+      if (!legacyRow) {
+        return null;
+      }
+
+      return {
+        ...legacyRow,
+        last_refresh_attempt_at: null,
+        last_refresh_failure_at: null,
+      };
+    }
   }
 
   private evaluateStaleSenderRepairCandidate(
@@ -1579,6 +1616,9 @@ export class NonceDO {
 
     try {
       const hiroNonceInfo = await this.fetchNonceInfo(senderAddress);
+      const attemptedAt = new Date(nowMs).toISOString();
+      this.recordSenderRefreshAttempt(senderAddress, attemptedAt);
+
       if (hiroNonceInfo.possible_next_nonce < candidate.lowestHeldNonce) {
         this.log("info", "sender_frontier_refresh_skipped", {
           senderAddress,
@@ -1590,9 +1630,6 @@ export class NonceDO {
         });
         return false;
       }
-
-      const attemptedAt = new Date(nowMs).toISOString();
-      this.recordSenderRefreshAttempt(senderAddress, attemptedAt);
 
       const bump = this.conservativeBumpSenderFrontier(senderAddress, candidate.lowestHeldNonce);
       if (!bump.advanced) {

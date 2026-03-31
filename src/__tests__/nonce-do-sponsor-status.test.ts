@@ -49,6 +49,40 @@ describe("NonceDO sponsor status snapshot clamp", () => {
 });
 
 describe("NonceDO stale sender repair helpers", () => {
+  it("falls back to the legacy sender_state SELECT when refresh columns are unavailable", () => {
+    const getSenderState = (NonceDO as any).prototype.getSenderState;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const exec = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error("no such column: last_refresh_failure_at");
+      })
+      .mockReturnValueOnce({
+        toArray: () => [{
+          next_expected_nonce: 3,
+          seeded_from: "hiro",
+          seeded_at: "2026-03-31T20:00:00.000Z",
+          last_advanced_at: null,
+        }],
+      });
+
+    const state = getSenderState.call({
+      sql: { exec },
+    }, "STLEGACY");
+
+    expect(state).toEqual({
+      next_expected_nonce: 3,
+      seeded_from: "hiro",
+      seeded_at: "2026-03-31T20:00:00.000Z",
+      last_advanced_at: null,
+      last_refresh_attempt_at: null,
+      last_refresh_failure_at: null,
+    });
+    expect(warn).toHaveBeenCalledWith(
+      "[nonce-do] sender_state refresh columns unavailable; falling back to legacy sender_state SELECT:",
+      expect.any(Error)
+    );
+  });
+
   it("only produces a stale-low repair candidate after the hold-age threshold and outside cooldown", () => {
     const nowMs = Date.parse("2026-03-31T20:10:00.000Z");
     const evaluate = (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate;
@@ -247,7 +281,7 @@ describe("NonceDO stale sender repair helpers", () => {
     }, "ST789");
 
     expect(hiroLagged).toBe(false);
-    expect(recordSenderRefreshAttempt).not.toHaveBeenCalled();
+    expect(recordSenderRefreshAttempt).toHaveBeenCalledWith("ST789", "2026-03-31T20:10:00.000Z");
     expect(recordSenderRefreshFailure).not.toHaveBeenCalled();
     expect(conservativeBumpSenderFrontier).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith(
