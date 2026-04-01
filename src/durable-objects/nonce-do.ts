@@ -7218,32 +7218,40 @@ export class NonceDO {
 
       // -------------------------------------------------------------------------
       // Step 4: Backward probe for failed nonces (ghost eviction).
-      // If the forward flush produced failed nonces (broadcast rejected / already
-      // occupied) and probeDepth is set, enqueue them into probe_queue for
-      // alarm-driven RBF processing at RBF_FEE.
+      // Only nonces that failed because the slot was already occupied by another
+      // transaction are probe-eligible. Generic failures (network errors, transient
+      // broadcast rejections) must NOT be enqueued — the probe issues a self-transfer
+      // at RBF_FEE which wastes a sponsor slot and is wrong for non-ghost failures.
       //
       // Why INSERT OR IGNORE (not DELETE + INSERT): the empty-range path wipes
       // the queue before bulk-inserting a range. Here we only add the specific
       // nonces that just failed, preserving any pending entries that may already
       // be queued from a previous probe cycle.
       // -------------------------------------------------------------------------
+      const PROBE_ELIGIBLE_REASONS = new Set([
+        "broadcast rejected or already occupied",
+        "rbf and gap-fill both failed or already occupied",
+      ]);
+      const probeEligibleNonces = failedNonces.filter((f) =>
+        PROBE_ELIGIBLE_REASONS.has(f.reason)
+      );
       let probeEnqueued = 0;
-      if (probeDepth && probeDepth > 0 && failedNonces.length > 0) {
+      if (probeDepth && probeDepth > 0 && probeEligibleNonces.length > 0) {
         const now = new Date().toISOString();
-        for (const { nonce } of failedNonces) {
-          this.sql.exec(
+        for (const { nonce } of probeEligibleNonces) {
+          const result = this.sql.exec(
             `INSERT OR IGNORE INTO probe_queue (wallet_index, nonce, state, created_at)
              VALUES (?, ?, 'pending', ?)`,
             walletIndex,
             nonce,
             now
           );
-          probeEnqueued++;
+          probeEnqueued += result.rowsWritten;
         }
         this.log("info", "flush_wallet_failed_enqueued_for_probe", {
           walletIndex,
           probeEnqueued,
-          nonces: failedNonces.map((f) => f.nonce),
+          nonces: probeEligibleNonces.map((f) => f.nonce),
         });
       }
 
