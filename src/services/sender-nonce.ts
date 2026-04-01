@@ -20,6 +20,20 @@ const SENDER_NONCE_TTL_SECONDS = 86_400; // 24 hours
 const SENDER_INFLIGHT_KEY_PREFIX = "sender_inflight:";
 const SENDER_INFLIGHT_TTL_SECONDS = 300; // 5 minutes — self-healing if consumer crashes
 
+/**
+ * Structured in-flight marker stored in KV for idempotent duplicate detection.
+ * Replaces the bare "1" marker so callers can distinguish exact-same-tx retries
+ * from different txs competing for the same sender nonce.
+ */
+export interface SenderInflightRecord {
+  /** Payment ID assigned at acceptance time */
+  paymentId: string;
+  /** SHA-256 of the normalized (0x-stripped) tx hex */
+  txHash: string;
+  /** ISO timestamp of when the in-flight marker was written */
+  submittedAt: string;
+}
+
 /** Timeout for Hiro nonce seed query (ms) */
 const HIRO_NONCE_SEED_TIMEOUT_MS = 8_000;
 
@@ -90,18 +104,47 @@ function inFlightKey(signerHash: string, nonce: number): string {
 
 /**
  * Write a short-lived KV marker indicating this sender/nonce is in-flight.
- * Called at RPC acceptance time, before the payment is enqueued.
+ * Stores structured metadata so callers can perform exact-tx idempotency checks.
  * TTL of 5 minutes is self-healing: if the queue consumer crashes without
  * calling clearInFlight, the marker expires automatically.
+ *
+ * @param paymentId - The payment ID assigned to this submission
+ * @param txHash - SHA-256 of the normalized tx hex, for idempotency checks
  */
 export async function markInFlight(
   kv: KVNamespace,
   signerHash: string,
-  nonce: number
+  nonce: number,
+  paymentId: string,
+  txHash: string
 ): Promise<void> {
-  await kv.put(inFlightKey(signerHash, nonce), "1", {
+  const record: SenderInflightRecord = {
+    paymentId,
+    txHash,
+    submittedAt: new Date().toISOString(),
+  };
+  await kv.put(inFlightKey(signerHash, nonce), JSON.stringify(record), {
     expirationTtl: SENDER_INFLIGHT_TTL_SECONDS,
   });
+}
+
+/**
+ * Read the structured in-flight record for a sender/nonce.
+ * Returns null if no marker exists or if the marker is a legacy bare "1".
+ * Used by callers to implement idempotent duplicate handling.
+ */
+export async function getInFlight(
+  kv: KVNamespace,
+  signerHash: string,
+  nonce: number
+): Promise<SenderInflightRecord | null> {
+  const raw = await kv.get(inFlightKey(signerHash, nonce), "text");
+  if (!raw || raw === "1") return null;
+  try {
+    return JSON.parse(raw) as SenderInflightRecord;
+  } catch {
+    return null;
+  }
 }
 
 /**

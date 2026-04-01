@@ -34,9 +34,22 @@ import {
 import {
   checkSenderNonce,
   clearInFlight,
+  getInFlight,
   markInFlight,
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
+
+/**
+ * Compute a SHA-256 hex digest of a normalized tx hex string.
+ * Used to distinguish exact-same-tx retries from different txs with the same sender nonce.
+ */
+async function computeTxHash(cleanHex: string): Promise<string> {
+  const data = new TextEncoder().encode(cleanHex);
+  const buf = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(buf)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 /**
  * Result returned by submitPayment.
@@ -219,8 +232,32 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
 
-    // Duplicate nonce — reject to avoid wasting a sponsor slot
+    // Duplicate nonce — check if exact same tx for idempotent recovery
     if (nonceCheck.outcome === "duplicate") {
+      const inFlightRecord = await getInFlight(kv, signerHash, senderNonce);
+      if (inFlightRecord) {
+        const incomingHash = await computeTxHash(cleanHex);
+        if (incomingHash === inFlightRecord.txHash) {
+          // Exact same tx resubmitted — return existing paymentId (idempotent)
+          const baseUrl =
+            this.env.RELAY_BASE_URL ??
+            (network === "mainnet"
+              ? "https://x402-relay.aibtc.com"
+              : "https://x402-relay.aibtc.dev");
+          return {
+            accepted: true,
+            paymentId: inFlightRecord.paymentId,
+            status: "queued",
+            senderNonce: {
+              provided: nonceCheck.provided,
+              expected: nonceCheck.lastSeen + 1,
+              healthy: false,
+            },
+            checkStatusUrl: `${baseUrl}/payment/${inFlightRecord.paymentId}`,
+          };
+        }
+      }
+      // Different tx with same sender nonce — reject to avoid wasting a sponsor slot
       return {
         accepted: false,
         error: `Your transaction uses nonce ${nonceCheck.provided}, which is already in-flight (last seen: ${nonceCheck.lastSeen}). Wait for the previous transaction to confirm or expire before resubmitting.`,
@@ -271,13 +308,15 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
 
+    // Generate paymentId and compute tx hash before writing the in-flight marker
+    // so the marker carries idempotency metadata for exact-tx duplicate detection.
+    const paymentId = generatePaymentId();
+    const txHashStr = await computeTxHash(cleanHex);
+
     // Write in-flight marker before enqueuing so concurrent requests for the
     // same sender/nonce are rejected by checkSenderNonce() (#234).
     // TTL of 5 minutes is self-healing if the consumer crashes.
-    await markInFlight(kv, signerHash, senderNonce);
-
-    // Generate paymentId and write initial status
-    const paymentId = generatePaymentId();
+    await markInFlight(kv, signerHash, senderNonce, paymentId, txHashStr);
     let record = createPaymentRecord(paymentId, network, senderNonceInfo);
     record.senderAddress = senderAddress;
     record.senderNonce = senderNonce;
