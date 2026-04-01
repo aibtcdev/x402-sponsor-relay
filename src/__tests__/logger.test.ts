@@ -42,4 +42,37 @@ describe("createWorkerLogger", () => {
       code: "NONCE_DO_UNAVAILABLE",
     });
   });
+
+  it("swallows synchronous LOGS binding failures", () => {
+    const logs: LogsRPC = {
+      info: vi.fn(() => {
+        throw new Error("stub exploded");
+      }),
+      warn: vi.fn(async () => {}),
+      error: vi.fn(async () => {}),
+      debug: vi.fn(async () => {}),
+    };
+    const waitUntil = vi.fn();
+    const logger = createWorkerLogger(logs, { waitUntil }, { paymentId: "p_789" });
+
+    expect(() => logger.info("Queue log")).not.toThrow();
+    expect(waitUntil).not.toHaveBeenCalled();
+  });
+
+  it("swallows waitUntil failures after starting an RPC log call", () => {
+    const logs: LogsRPC = {
+      info: vi.fn(async () => {}),
+      warn: vi.fn(async () => {}),
+      error: vi.fn(async () => {}),
+      debug: vi.fn(async () => {}),
+    };
+    const waitUntil = vi.fn(() => {
+      throw new Error("bad waitUntil");
+    });
+    const logger = createWorkerLogger(logs, { waitUntil }, { paymentId: "p_999" });
+
+    expect(() => logger.info("Queue log")).not.toThrow();
+    expect(logs.info).toHaveBeenCalledTimes(1);
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+  });
 });

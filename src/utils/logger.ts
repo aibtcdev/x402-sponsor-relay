@@ -3,6 +3,7 @@ import type { Logger, LogsRPC } from "../types";
 const APP_ID = "x402-relay";
 
 type WaitUntilLike = Pick<ExecutionContext, "waitUntil">;
+type LogLevel = keyof Logger;
 
 /**
  * Type guard to check if LOGS binding has required RPC methods.
@@ -23,22 +24,39 @@ function createRpcLogger(
   ctx: WaitUntilLike,
   baseContext: Record<string, unknown>
 ): Logger {
+  const enqueueLog = (
+    level: LogLevel,
+    message: string,
+    context?: Record<string, unknown>
+  ) => {
+    try {
+      const result = logs[level](APP_ID, message, {
+        ...baseContext,
+        ...context,
+      });
+      const promise = Promise.resolve(result).catch(() => {});
+      try {
+        ctx.waitUntil(promise);
+      } catch {
+        // Logging must never affect request or queue behavior.
+      }
+    } catch {
+      // Logging must never affect request or queue behavior.
+    }
+  };
+
   return {
     info: (message, context) => {
-      ctx.waitUntil(logs.info(APP_ID, message, { ...baseContext, ...context }));
+      enqueueLog("info", message, context);
     },
     warn: (message, context) => {
-      ctx.waitUntil(logs.warn(APP_ID, message, { ...baseContext, ...context }));
+      enqueueLog("warn", message, context);
     },
     error: (message, context) => {
-      ctx.waitUntil(
-        logs.error(APP_ID, message, { ...baseContext, ...context })
-      );
+      enqueueLog("error", message, context);
     },
     debug: (message, context) => {
-      ctx.waitUntil(
-        logs.debug(APP_ID, message, { ...baseContext, ...context })
-      );
+      enqueueLog("debug", message, context);
     },
   };
 }
