@@ -202,6 +202,27 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       );
     }
 
+    // Gap detected — may be a stale relay frontier caused by direct Stacks node submissions.
+    // Eagerly refresh from Hiro before treating this as a true gap: if possible_next_nonce
+    // has advanced past the relay's lastSeen, the "missing" nonces were broadcast outside
+    // the relay and the submitted nonce is actually healthy. (#290)
+    if (nonceCheck.outcome === "gap") {
+      await seedSenderNonceFromHiro(
+        kv,
+        signerHash,
+        senderAddress,
+        network,
+        this.env.HIRO_API_KEY
+      );
+      nonceCheck = await checkSenderNonce(
+        kv,
+        signerHash,
+        senderNonce,
+        senderAddress,
+        network
+      );
+    }
+
     // Stale nonce — reject immediately, no sponsor slot wasted
     if (nonceCheck.outcome === "stale") {
       return {
