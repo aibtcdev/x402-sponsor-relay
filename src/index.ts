@@ -246,8 +246,9 @@ export default {
    */
   async queue(
     batch: MessageBatch<PaymentQueueMessage>,
-    env: Env
+    env: Env,
+    ctx: ExecutionContext
   ): Promise<void> {
-    await handlePaymentQueue(batch, env);
+    await handlePaymentQueue(batch, env, ctx);
   },
 };

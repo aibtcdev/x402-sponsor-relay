@@ -14,6 +14,7 @@
 
 import { deserializeTransaction } from "@stacks/transactions";
 import type { Env, Logger } from "./types";
+import { createWorkerLogger } from "./utils";
 import {
   getPaymentRecord,
   putPaymentRecord,
@@ -33,19 +34,6 @@ const TRANSIENT_ERROR_FIELDS: Partial<PaymentRecord> = {
   errorCode: undefined,
   retryable: undefined,
 };
-
-/**
- * Create a minimal logger that writes to console (queue context has no LOGS binding easily).
- */
-function createQueueLogger(paymentId: string): Logger {
-  const prefix = `[queue:${paymentId}]`;
-  return {
-    info: (msg, ctx) => console.log(prefix, msg, ctx ?? ""),
-    warn: (msg, ctx) => console.warn(prefix, msg, ctx ?? ""),
-    error: (msg, ctx) => console.error(prefix, msg, ctx ?? ""),
-    debug: (msg, ctx) => console.debug(prefix, msg, ctx ?? ""),
-  };
-}
 
 /**
  * Process a single payment queue message.
@@ -336,17 +324,22 @@ async function processPaymentMessage(
  */
 export async function handlePaymentQueue(
   batch: MessageBatch<PaymentQueueMessage>,
-  env: Env
+  env: Env,
+  ctx: ExecutionContext
 ): Promise<void> {
   // Process messages serially within each batch for nonce safety
   for (const message of batch.messages) {
-    const logger = createQueueLogger(message.body.paymentId);
+    const logger = createWorkerLogger(env.LOGS, ctx, {
+      component: "payment_queue",
+      queue: "PAYMENT_QUEUE",
+      paymentId: message.body.paymentId,
+      attempt: message.attempts,
+    });
     try {
       await processPaymentMessage(env, message, logger);
     } catch (e) {
       logger.error("Unhandled error processing payment message", {
         error: e instanceof Error ? e.message : String(e),
-        paymentId: message.body.paymentId,
       });
       // Retry on unexpected errors if under attempt limit
       if (message.attempts < MAX_ATTEMPTS) {
