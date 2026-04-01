@@ -7,6 +7,15 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.27.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.0...x402-sponsor-relay-v1.27.1) (2026-03-31)
+
+
+### Bug Fixes
+
+* recover stale sender frontiers in the alarm cycle ([#285](https://github.com/aibtcdev/x402-sponsor-relay/issues/285)) ([55f7814](https://github.com/aibtcdev/x402-sponsor-relay/commit/55f78147225d2d618896607e9f54da4397d9161a))
+* **sponsor:** read byte[5] for auth_type in preValidateTxHex (closes [#282](https://github.com/aibtcdev/x402-sponsor-relay/issues/282)) ([#283](https://github.com/aibtcdev/x402-sponsor-relay/issues/283)) ([6458edf](https://github.com/aibtcdev/x402-sponsor-relay/commit/6458edf5754fcf9f1290cd933ef231aaa14be9e6))
+* **sponsor:** read byte[5] for auth_type in preValidateTxHex (closes [#282](https://github.com/aibtcdev/x402-sponsor-relay/issues/282)) ([#283](https://github.com/aibtcdev/x402-sponsor-relay/issues/283)) ([d3a1fa8](https://github.com/aibtcdev/x402-sponsor-relay/commit/d3a1fa8a89d843f3769df3e1b695f7fafdb9d6bc))
+
 ## [1.27.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.26.1...x402-sponsor-relay-v1.27.0) (2026-03-30)
 
 
