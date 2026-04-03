@@ -41,6 +41,10 @@ export type PaymentStatus =
   | "replaced";
 
 export type PublicPaymentStatus = Exclude<TrackedPaymentState, "submitted">;
+export type ReusablePaymentStatus = Extract<
+  PublicPaymentStatus,
+  "queued" | "broadcasting" | "mempool"
+>;
 
 /**
  * Sender nonce health info returned alongside payment status.
@@ -164,6 +168,21 @@ export function projectCallerFacingPaymentStatus(
   status: PaymentStatus
 ): PublicPaymentStatus {
   return status === "submitted" ? "queued" : status;
+}
+
+export function projectReusablePaymentStatus(
+  status: PaymentStatus
+): ReusablePaymentStatus {
+  const projected = projectCallerFacingPaymentStatus(status);
+
+  switch (projected) {
+    case "queued":
+    case "broadcasting":
+    case "mempool":
+      return projected;
+    default:
+      throw new Error(`Payment status ${projected} is not reusable`);
+  }
 }
 
 export function inferReplacementTerminalReason(

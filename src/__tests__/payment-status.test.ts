@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   PaymentStatusHttpResponseSchema,
   RpcCheckPaymentResultSchema,
+  RpcSubmitPaymentResultSchema,
 } from "@aibtc/tx-schemas";
 import { AnchorMode, makeRandomPrivKey, makeSTXTokenTransfer } from "@stacks/transactions";
 
@@ -246,10 +247,24 @@ describe("submitPayment duplicate reuse", () => {
     } as Env;
 
     const rpc = new RelayRPC(executionContext, env);
-    const result = await rpc.submitPayment(txHex);
+    const result = RpcSubmitPaymentResultSchema.parse(
+      await rpc.submitPayment(txHex)
+    );
 
     return { result, record };
   }
+
+  it("collapses internal submitted to queued for duplicate reuse responses", async () => {
+    const { result, record } = await submitDuplicateForStatus("submitted");
+
+    expect(result).toEqual({
+      accepted: true,
+      paymentId: record.paymentId,
+      status: "queued",
+      senderNonce: record.senderNonceInfo,
+      checkStatusUrl: "https://x402-relay.aibtc.dev/payment/pay_duplicate",
+    });
+  });
 
   it("reuses the same paymentId and returns queued while the active record is queued", async () => {
     const { result, record } = await submitDuplicateForStatus("queued");
@@ -448,6 +463,9 @@ describe("payment polling runtime alignment", () => {
     expect(rpcResult.checkStatusUrl).toBe(
       "https://x402-relay.aibtc.dev/payment/pay_missing"
     );
+    expect(httpBody.checkStatusUrl).toBe(
+      "https://x402-relay.aibtc.dev/payment/pay_missing"
+    );
     expect(rpcResult.terminalReason).toBe("unknown_payment_identity");
     expect(httpResult.terminalReason).toBe("unknown_payment_identity");
   });
@@ -475,6 +493,7 @@ describe("PaymentStatus endpoint schema", () => {
       "expired",
       "unknown_payment_identity",
     ]);
+    expect(notFoundProperties).toHaveProperty("checkStatusUrl");
   });
 
   it("keeps generated openapi and llms docs aligned on caller-facing payment polling fields", async () => {

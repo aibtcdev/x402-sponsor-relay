@@ -41,6 +41,7 @@ import {
   getPaymentRecord,
   getReusablePaymentRecord,
   projectPaymentRecord,
+  projectReusablePaymentStatus,
   type PaymentQueueMessage,
   type SenderNonceInfo,
   putPaymentArtifact,
@@ -136,6 +137,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     const txArtifactHash = await computePaymentArtifactHash(cleanHex);
     const existingRecord = await getReusablePaymentRecord(kv, txArtifactHash);
     if (existingRecord) {
+      const reusedStatus = projectReusablePaymentStatus(existingRecord.status);
       const projected = projectPaymentRecord(existingRecord);
       const checkStatusUrl = buildPaymentCheckStatusUrl(this.env, projected.paymentId);
 
@@ -149,17 +151,13 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
         compatShimUsed: false,
       });
 
-      // The installed tx-schemas package still narrows accepted submit statuses to
-      // queued / queued_with_warning. Runtime duplicate reuse must return the
-      // current caller-facing status for the reused paymentId until that package
-      // catches up with the canonical lifecycle contract.
       return {
         accepted: true,
         paymentId: projected.paymentId,
-        status: projected.status,
+        status: reusedStatus,
         senderNonce: projected.senderNonceInfo,
         checkStatusUrl,
-      } as SubmitPaymentResult;
+      };
     }
 
     // Must be a sponsored transaction

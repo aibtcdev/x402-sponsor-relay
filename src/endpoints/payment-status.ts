@@ -86,6 +86,7 @@ export class PaymentStatus extends BaseEndpoint {
                 },
                 error: { type: "string" as const },
                 retryable: { type: "boolean" as const },
+                checkStatusUrl: { type: "string" as const },
               },
             },
           },
@@ -135,13 +136,14 @@ export class PaymentStatus extends BaseEndpoint {
     const record = await getPaymentRecord(kv, paymentId);
     if (!record) {
       const notFound = buildNotFoundPaymentRecord(paymentId);
+      const checkStatusUrl = buildPaymentCheckStatusUrl(c.env, paymentId);
       emitPaymentLifecycleEvent(logger, "payment.poll", {
         route: "GET /payment/:id",
         paymentId: notFound.paymentId,
         status: notFound.status,
         terminalReason: notFound.terminalReason,
         action: "return_not_found",
-        checkStatusUrlPresent: false,
+        checkStatusUrlPresent: true,
         compatShimUsed: false,
       });
       return c.json(
@@ -149,6 +151,7 @@ export class PaymentStatus extends BaseEndpoint {
           success: true,
           requestId: this.getRequestId(c),
           ...notFound,
+          checkStatusUrl,
         },
         404
       );
