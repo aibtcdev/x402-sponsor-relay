@@ -57,6 +57,7 @@ export function emitPaymentLifecycleEvent(
     ...extra
   } = context;
   logger[level](event, {
+    ...extra,
     service: "relay",
     route,
     paymentId,
@@ -66,7 +67,6 @@ export function emitPaymentLifecycleEvent(
     checkStatusUrl_present: checkStatusUrlPresent,
     compat_shim_used: compatShimUsed,
     repo_version: VERSION,
-    ...extra,
   });
 }
 

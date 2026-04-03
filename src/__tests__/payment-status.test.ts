@@ -20,6 +20,7 @@ vi.mock("cloudflare:workers", () => ({
 
 import worker, { RelayRPC } from "../index";
 import { PaymentStatus as PaymentStatusEndpoint } from "../endpoints/payment-status";
+import { MemoryKV } from "./helpers/memory-kv";
 import {
   buildNotFoundPaymentRecord,
   computePaymentArtifactHash,
@@ -35,66 +36,6 @@ import {
   type PaymentRecord,
 } from "../services/payment-status";
 import type { Env } from "../types";
-
-class MemoryKV implements KVNamespace {
-  private readonly store = new Map<string, string>();
-
-  async get(
-    key: string,
-    type?: "text" | "json" | "arrayBuffer" | "stream"
-  ): Promise<string | null>;
-  async get<T>(
-    key: string,
-    type: "json"
-  ): Promise<T | null>;
-  async get(
-    key: string,
-    _type: "arrayBuffer"
-  ): Promise<ArrayBuffer | null>;
-  async get(
-    key: string,
-    _type: "stream"
-  ): Promise<ReadableStream | null>;
-  async get<T>(
-    key: string,
-    type: "text" | "json" | "arrayBuffer" | "stream" = "text"
-  ): Promise<T | string | ArrayBuffer | ReadableStream | null> {
-    const value = this.store.get(key) ?? null;
-    if (value === null) {
-      return null;
-    }
-
-    if (type === "json") {
-      return JSON.parse(value) as T;
-    }
-
-    if (type === "arrayBuffer") {
-      return new TextEncoder().encode(value).buffer;
-    }
-
-    if (type === "stream") {
-      return null;
-    }
-
-    return value;
-  }
-
-  async getWithMetadata(): Promise<KVNamespaceGetWithMetadataResult<unknown, string>> {
-    throw new Error("not implemented");
-  }
-
-  async put(key: string, value: string): Promise<void> {
-    this.store.set(key, value);
-  }
-
-  async delete(key: string): Promise<void> {
-    this.store.delete(key);
-  }
-
-  async list(): Promise<KVNamespaceListResult<unknown>> {
-    throw new Error("not implemented");
-  }
-}
 
 const executionContext = {
   waitUntil: (_promise: Promise<unknown>) => {},
@@ -164,6 +105,13 @@ describe("payment status projection", () => {
     const afterTerminal = await getReusablePaymentRecord(kv, txArtifactHash);
     expect(afterTerminal).toBeNull();
     expect(await getPaymentIdByArtifact(kv, txArtifactHash)).toBeNull();
+  });
+
+  it("normalizes transaction hex case before computing artifact hashes", async () => {
+    const lowerHash = await computePaymentArtifactHash("0xdeadbeef");
+    const upperHash = await computePaymentArtifactHash("0xDEADBEEF");
+
+    expect(lowerHash).toBe(upperHash);
   });
 
   it("keeps RPC and HTTP polling on canonical public status while terminalReason stays additive", () => {

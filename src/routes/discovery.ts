@@ -28,6 +28,62 @@ function getBaseUrl(c: { req: { url: string } }): string {
 // Placeholder used in template strings, replaced with actual base URL at runtime
 const BASE_URL_PLACEHOLDER = "https://x402-relay.aibtc.com";
 
+function buildQueuePaymentPollingDoc(includeArtifactDedupeDetail = false): string {
+  return `## Queue Payment Polling
+
+For relay-owned queue submissions made through the internal payment flow, store the
+returned paymentId and poll:
+
+GET ${BASE_URL_PLACEHOLDER}/payment/pay_<id>
+
+Canonical public statuses:
+- queued
+- broadcasting
+- mempool
+- confirmed
+- failed
+- replaced
+- not_found
+
+The relay may still use submitted internally, but callers never see it.
+Both RPC checkPayment() and GET /payment/:id project submitted to queued.
+When the canonical poll endpoint is known, polling responses may include
+checkStatusUrl as the canonical poll hint for that same paymentId.
+
+Terminal outcomes include terminalReason when known:
+- sender_nonce_stale
+- sender_nonce_gap
+- sender_nonce_duplicate
+- queue_unavailable
+- sponsor_failure
+- broadcast_failure
+- chain_abort
+- nonce_replacement
+- superseded
+- expired
+- unknown_payment_identity
+
+Example terminal response:
+{
+  "success": true,
+  "requestId": "req_123",
+  "paymentId": "pay_01J...",
+  "status": "failed",
+  "terminalReason": "sender_nonce_gap",
+  "error": "Sender nonce gap: waiting for nonce 5",
+  "retryable": false,
+  "checkStatusUrl": "${BASE_URL_PLACEHOLDER}/payment/pay_01J..."
+}
+
+${includeArtifactDedupeDetail ? `Duplicate submission of the same payment artifact reuses the same paymentId until
+that payment reaches a terminal outcome. The duplicate submission response returns the
+current caller-facing status for that reused paymentId: submitted projects to queued,
+while later in-flight states remain broadcasting or mempool. Use paymentId as the
+stable polling handle.
+
+` : ""}---`;
+}
+
 // ---------------------------------------------------------------------------
 // /llms.txt — Quick-start guide
 // ---------------------------------------------------------------------------
@@ -824,59 +880,7 @@ https://x402-relay.aibtc.com/topics/sponsored-transactions
 
 ---
 
-## Queue Payment Polling
-
-For relay-owned queue submissions made through the internal payment flow, store the
-returned paymentId and poll:
-
-GET https://x402-relay.aibtc.com/payment/pay_<id>
-
-Canonical public statuses:
-- queued
-- broadcasting
-- mempool
-- confirmed
-- failed
-- replaced
-- not_found
-
-The relay may still use submitted internally, but callers never see it.
-Both RPC checkPayment() and GET /payment/:id project submitted to queued.
-When the canonical poll endpoint is known, polling responses may include
-checkStatusUrl as the canonical poll hint for that same paymentId.
-
-Terminal outcomes include terminalReason when known:
-- sender_nonce_stale
-- sender_nonce_gap
-- sender_nonce_duplicate
-- queue_unavailable
-- sponsor_failure
-- broadcast_failure
-- chain_abort
-- nonce_replacement
-- superseded
-- expired
-- unknown_payment_identity
-
-Example terminal response:
-{
-  "success": true,
-  "requestId": "req_123",
-  "paymentId": "pay_01J...",
-  "status": "failed",
-  "terminalReason": "sender_nonce_gap",
-  "error": "Sender nonce gap: waiting for nonce 5",
-  "retryable": false,
-  "checkStatusUrl": "https://x402-relay.aibtc.com/payment/pay_01J..."
-}
-
-Duplicate submission of the same payment artifact reuses the same paymentId until
-that payment reaches a terminal outcome. The duplicate submission response returns the
-current caller-facing status for that reused paymentId: submitted projects to queued,
-while later in-flight states remain broadcasting or mempool. Use paymentId as the
-stable polling handle.
-
----
+${buildQueuePaymentPollingDoc(false)}
 
 ## Error Response Shape
 
@@ -2046,57 +2050,7 @@ failed    — abort_* on-chain rejection. Definitive. Re-sign with corrected par
 Polling endpoint: GET https://x402-relay.aibtc.com/verify/:receiptId
 Strategy: exponential backoff starting at 5s (5s, 7.5s, 11.25s, ...), max 12 attempts.
 
-## Queue Payment Polling
-
-For relay-owned queue submissions made through the internal payment flow, store the
-returned paymentId and poll:
-
-GET https://x402-relay.aibtc.com/payment/pay_<id>
-
-Canonical public statuses:
-- queued
-- broadcasting
-- mempool
-- confirmed
-- failed
-- replaced
-- not_found
-
-The relay may still use submitted internally, but callers never see it.
-Both RPC checkPayment() and GET /payment/:id project submitted to queued.
-When the canonical poll endpoint is known, polling responses may include
-checkStatusUrl as the canonical poll hint for that same paymentId.
-
-Terminal outcomes include terminalReason when known:
-- sender_nonce_stale
-- sender_nonce_gap
-- sender_nonce_duplicate
-- queue_unavailable
-- sponsor_failure
-- broadcast_failure
-- chain_abort
-- nonce_replacement
-- superseded
-- expired
-- unknown_payment_identity
-
-Example terminal response:
-{
-  "success": true,
-  "requestId": "req_123",
-  "paymentId": "pay_01J...",
-  "status": "failed",
-  "terminalReason": "sender_nonce_gap",
-  "error": "Sender nonce gap: waiting for nonce 5",
-  "retryable": false,
-  "checkStatusUrl": "https://x402-relay.aibtc.com/payment/pay_01J..."
-}
-
-Duplicate submission of the same payment artifact reuses the same paymentId until
-that payment reaches a terminal outcome. The duplicate submission response returns the
-current caller-facing status for that reused paymentId: submitted projects to queued,
-while later in-flight states remain broadcasting or mempool. Use paymentId as the
-stable polling handle.
+${buildQueuePaymentPollingDoc(true)}
 
 ## Most Common Errors and Fixes
 
