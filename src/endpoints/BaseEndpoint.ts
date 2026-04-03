@@ -40,7 +40,7 @@ export class BaseEndpoint extends OpenAPIRoute {
     c: AppContext,
     data: T,
     headers?: Record<string, string>,
-    status: 200 | 201 | 202 | 204 | 206 | 503 = 200
+    status: 200 | 201 | 202 | 206 | 503 = 200
   ) {
     const response = {
       success: true as const,

@@ -56,6 +56,7 @@ Use this relay when your agent needs to:
 - Settle x402 payments (POST /relay) with automatic fee sponsorship
 - Broadcast a sponsored transaction directly (POST /sponsor, requires API key)
 - Verify that a payment receipt is valid (GET /verify/:receiptId)
+- Poll a queue-based payment by paymentId (RPC checkPayment() or GET /payment/:id)
 - Access a receipt-gated resource (POST /access)
 - Provision a free-tier API key via Bitcoin or Stacks signature
 - Inspect or cancel your own pending queue entries (GET/DELETE /queue/:address)
@@ -164,6 +165,7 @@ Full V2 facilitator docs: https://x402-relay.aibtc.com/topics/x402-v2-facilitato
 - GET  /health              — Service health summary
 - GET  /status/sponsor      — Cached sponsor readiness snapshot
 - GET  /fees                — Clamped fee estimates (no auth required)
+- GET  /payment/:id         — Poll queue-based payment status by relay-owned paymentId
 - GET  /verify/:receiptId   — Verify a payment receipt
 - POST /access              — Access a receipt-gated resource
 - POST /fees/config         — Update fee clamps (admin, API key required)
@@ -819,6 +821,54 @@ by a one-time-use access grant.
 
 For complete receipt and access flow:
 https://x402-relay.aibtc.com/topics/sponsored-transactions
+
+---
+
+## Queue Payment Polling
+
+For relay-owned queue submissions made through the internal payment flow, store the
+returned paymentId and poll:
+
+GET https://x402-relay.aibtc.com/payment/pay_<id>
+
+Canonical public statuses:
+- queued
+- broadcasting
+- mempool
+- confirmed
+- failed
+- replaced
+- not_found
+
+The relay may still use submitted internally, but callers never see it.
+Both RPC checkPayment() and GET /payment/:id project submitted to queued.
+When the canonical poll endpoint is known, polling responses may include
+checkStatusUrl as the canonical poll hint for that same paymentId.
+
+Terminal outcomes include terminalReason when known:
+- sender_nonce_stale
+- sender_nonce_gap
+- sender_nonce_duplicate
+- queue_unavailable
+- sponsor_failure
+- broadcast_failure
+- chain_abort
+- nonce_replacement
+- superseded
+- expired
+- unknown_payment_identity
+
+Example terminal response:
+{
+  "success": true,
+  "requestId": "req_123",
+  "paymentId": "pay_01J...",
+  "status": "failed",
+  "terminalReason": "sender_nonce_gap",
+  "error": "Sender nonce gap: waiting for nonce 5",
+  "retryable": false,
+  "checkStatusUrl": "https://x402-relay.aibtc.com/payment/pay_01J..."
+}
 
 ---
 
@@ -1989,6 +2039,55 @@ failed    — abort_* on-chain rejection. Definitive. Re-sign with corrected par
 
 Polling endpoint: GET https://x402-relay.aibtc.com/verify/:receiptId
 Strategy: exponential backoff starting at 5s (5s, 7.5s, 11.25s, ...), max 12 attempts.
+
+## Queue Payment Polling
+
+For relay-owned queue submissions made through the internal payment flow, store the
+returned paymentId and poll:
+
+GET https://x402-relay.aibtc.com/payment/pay_<id>
+
+Canonical public statuses:
+- queued
+- broadcasting
+- mempool
+- confirmed
+- failed
+- replaced
+- not_found
+
+The relay may still use submitted internally, but callers never see it.
+Both RPC checkPayment() and GET /payment/:id project submitted to queued.
+When the canonical poll endpoint is known, polling responses may include
+checkStatusUrl as the canonical poll hint for that same paymentId.
+
+Terminal outcomes include terminalReason when known:
+- sender_nonce_stale
+- sender_nonce_gap
+- sender_nonce_duplicate
+- queue_unavailable
+- sponsor_failure
+- broadcast_failure
+- chain_abort
+- nonce_replacement
+- superseded
+- expired
+- unknown_payment_identity
+
+Example terminal response:
+{
+  "success": true,
+  "requestId": "req_123",
+  "paymentId": "pay_01J...",
+  "status": "failed",
+  "terminalReason": "sender_nonce_gap",
+  "error": "Sender nonce gap: waiting for nonce 5",
+  "retryable": false,
+  "checkStatusUrl": "https://x402-relay.aibtc.com/payment/pay_01J..."
+}
+
+Duplicate submission of the same payment artifact reuses the same paymentId until
+that payment reaches a terminal outcome. Use paymentId as the stable polling handle.
 
 ## Most Common Errors and Fixes
 

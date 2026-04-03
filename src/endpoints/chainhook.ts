@@ -16,6 +16,7 @@ import {
   transitionPayment,
 } from "../services/payment-status";
 import { updateSenderNonceOnConfirm } from "../services/sender-nonce";
+import { emitPaymentLifecycleEvent } from "../utils";
 
 /**
  * Shape of a Hiro chainhook transaction event.
@@ -173,13 +174,29 @@ export class Chainhook extends BaseEndpoint {
 
           if (paymentId) {
             const record = await getPaymentRecord(kv, paymentId);
-            if (record && record.status !== "confirmed" && record.status !== "failed") {
+            if (
+              record &&
+              record.status !== "confirmed" &&
+              record.status !== "failed" &&
+              record.status !== "replaced"
+            ) {
               if (isSuccess) {
                 const updatedRecord = transitionPayment(record, "confirmed", {
                   blockHeight: blockHeight ?? undefined,
                 });
                 await putPaymentRecord(kv, updatedRecord);
                 updated++;
+                emitPaymentLifecycleEvent(logger, "payment.finalized", {
+                  route: "POST /webhook/chainhook",
+                  paymentId,
+                  status: updatedRecord.status,
+                  terminalReason: updatedRecord.terminalReason,
+                  action: "confirmed_onchain",
+                  checkStatusUrlPresent: false,
+                  compatShimUsed: false,
+                  txid,
+                  blockHeight,
+                });
 
                 logger.info("Chainhook: payment confirmed", {
                   paymentId,
@@ -190,10 +207,22 @@ export class Chainhook extends BaseEndpoint {
                 const updatedRecord = transitionPayment(record, "failed", {
                   error: `Transaction aborted on-chain: ${tx.metadata?.result ?? "unknown"}`,
                   errorCode: "SETTLEMENT_FAILED",
+                  terminalReason: "chain_abort",
                   retryable: false,
                 });
                 await putPaymentRecord(kv, updatedRecord);
                 updated++;
+                emitPaymentLifecycleEvent(logger, "payment.finalized", {
+                  route: "POST /webhook/chainhook",
+                  paymentId,
+                  status: updatedRecord.status,
+                  terminalReason: updatedRecord.terminalReason,
+                  action: "failed_onchain_abort",
+                  checkStatusUrlPresent: false,
+                  compatShimUsed: false,
+                  txid,
+                  blockHeight,
+                }, "warn");
 
                 logger.warn("Chainhook: payment failed (abort)", {
                   paymentId,

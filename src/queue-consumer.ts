@@ -14,7 +14,7 @@
 
 import { deserializeTransaction } from "@stacks/transactions";
 import type { Env, Logger } from "./types";
-import { createWorkerLogger } from "./utils";
+import { createWorkerLogger, emitPaymentLifecycleEvent } from "./utils";
 import {
   getPaymentRecord,
   putPaymentRecord,
@@ -64,7 +64,21 @@ async function processPaymentMessage(
   }
 
   // Guard: if already in a terminal state, skip
-  if (record.status === "confirmed" || record.status === "failed") {
+  if (
+    record.status === "confirmed" ||
+    record.status === "failed" ||
+    record.status === "replaced"
+  ) {
+    emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
+      route: "PAYMENT_QUEUE",
+      paymentId,
+      status: record.status,
+      terminalReason: record.terminalReason,
+      action: "skip_terminal_payment",
+      checkStatusUrlPresent: false,
+      compatShimUsed: false,
+      attempt,
+    });
     logger.info("Payment already terminal, skipping", {
       paymentId,
       status: record.status,
@@ -76,6 +90,17 @@ async function processPaymentMessage(
   // Guard: if txid already set, a prior attempt broadcast this tx successfully.
   // Skip re-sponsoring to avoid burning a fresh nonce slot.
   if (record.txid) {
+    emitPaymentLifecycleEvent(logger, "payment.fallback_used", {
+      route: "PAYMENT_QUEUE",
+      paymentId,
+      status: record.status,
+      terminalReason: record.terminalReason,
+      action: "reuse_existing_broadcast_state",
+      checkStatusUrlPresent: false,
+      compatShimUsed: false,
+      txid: record.txid,
+      attempt,
+    }, "warn");
     logger.warn("Payment already has txid, skipping re-sponsor", {
       paymentId,
       txid: record.txid,
@@ -99,9 +124,20 @@ async function processPaymentMessage(
     record = transitionPayment(record, "failed", {
       error: "Could not deserialize transaction",
       errorCode: "INVALID_TRANSACTION",
+      terminalReason: "invalid_transaction",
       retryable: false,
     });
     await putPaymentRecord(kv, record);
+    emitPaymentLifecycleEvent(logger, "payment.finalized", {
+      route: "PAYMENT_QUEUE",
+      paymentId,
+      status: record.status,
+      terminalReason: record.terminalReason,
+      action: "deserialization_failed",
+      checkStatusUrlPresent: false,
+      compatShimUsed: false,
+      attempt,
+    }, "warn");
     message.ack();
     return;
   }
@@ -114,18 +150,56 @@ async function processPaymentMessage(
   const sponsorResult = await sponsorService.sponsorTransaction(transaction);
 
   if (!sponsorResult.success) {
-    // Gin rummy: held result — tx is queued in sender hand, not a failure
     if ("held" in sponsorResult && sponsorResult.held) {
       logger.info("Transaction held in sender hand (queue consumer)", {
         paymentId,
+        holdReason: sponsorResult.holdReason,
         nextExpected: sponsorResult.nextExpected,
         missingNonces: sponsorResult.missingNonces,
       });
-      // Treat as retryable — the sender needs to submit missing nonces first
+      if (sponsorResult.holdReason === "gap") {
+        if (record.senderNonce !== undefined) {
+          await clearInFlight(kv, signerHash, record.senderNonce).catch((e) =>
+            logger.warn("Failed to clear in-flight marker on sender gap", {
+              error: String(e),
+            })
+          );
+        }
+
+        record = transitionPayment(record, "failed", {
+          error: `Sender nonce gap: waiting for nonce ${sponsorResult.nextExpected}`,
+          errorCode: "SENDER_NONCE_GAP",
+          terminalReason: "sender_nonce_gap",
+          retryable: false,
+        });
+        await putPaymentRecord(kv, record);
+        emitPaymentLifecycleEvent(logger, "payment.finalized", {
+          route: "PAYMENT_QUEUE",
+          paymentId,
+          status: record.status,
+          terminalReason: record.terminalReason,
+          action: "sender_nonce_gap_terminal",
+          checkStatusUrlPresent: false,
+          compatShimUsed: false,
+          attempt,
+        }, "warn");
+        message.ack();
+        return;
+      }
+
       record = transitionPayment(record, "queued", {
-        error: `Transaction held: nonce gap at ${sponsorResult.nextExpected}`,
+        error: "Sponsor pool temporarily has no dispatch capacity",
       });
       await putPaymentRecord(kv, record);
+      emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
+        route: "PAYMENT_QUEUE",
+        paymentId,
+        status: record.status,
+        action: "queue_retry_capacity_hold",
+        checkStatusUrlPresent: false,
+        compatShimUsed: false,
+        attempt,
+      }, "warn");
       message.retry({
         delaySeconds: Math.min(30, Math.pow(2, attempt)),
       });
@@ -143,6 +217,17 @@ async function processPaymentMessage(
 
     if (isRetryable && attempt < MAX_ATTEMPTS) {
       // Let the queue retry with backoff
+      emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
+        route: "PAYMENT_QUEUE",
+        paymentId,
+        status: "queued",
+        action: "queue_retry_sponsor_contention",
+        checkStatusUrlPresent: false,
+        compatShimUsed: false,
+        terminalReason: undefined,
+        attempt,
+        code,
+      }, "warn");
       logger.warn("Sponsor contention, retrying via queue", {
         paymentId,
         code,
@@ -169,9 +254,22 @@ async function processPaymentMessage(
     record = transitionPayment(record, "failed", {
       error: failResult.error,
       errorCode: code ?? "SPONSOR_FAILED",
+      terminalReason:
+        code === "STALE_SENDER_NONCE" ? "sender_nonce_stale" : "sponsor_failure",
       retryable: false,
     });
     await putPaymentRecord(kv, record);
+    emitPaymentLifecycleEvent(logger, "payment.finalized", {
+      route: "PAYMENT_QUEUE",
+      paymentId,
+      status: record.status,
+      terminalReason: record.terminalReason,
+      action: "sponsor_failed_terminal",
+      checkStatusUrlPresent: false,
+      compatShimUsed: false,
+      attempt,
+      code,
+    }, "warn");
     message.ack();
     return;
   }
@@ -201,6 +299,17 @@ async function processPaymentMessage(
         await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
       }
 
+      emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
+        route: "PAYMENT_QUEUE",
+        paymentId,
+        status: "queued",
+        action: isTooMuchChaining
+          ? "queue_retry_too_much_chaining"
+          : "queue_retry_nonce_conflict",
+        checkStatusUrlPresent: false,
+        compatShimUsed: false,
+        attempt,
+      }, "warn");
       logger.warn("Broadcast contention, retrying via queue", {
         paymentId,
         nonceConflict: isNonceConflict,
@@ -238,9 +347,23 @@ async function processPaymentMessage(
       errorCode: broadcastResult.clientRejection
         ? `CLIENT_${broadcastResult.clientRejection.toUpperCase()}`
         : "BROADCAST_FAILED",
+      terminalReason:
+        isTooMuchChaining || isNonceConflict
+          ? "sponsor_failure"
+          : "broadcast_failure",
       retryable: broadcastResult.retryable,
     });
     await putPaymentRecord(kv, record);
+    emitPaymentLifecycleEvent(logger, "payment.finalized", {
+      route: "PAYMENT_QUEUE",
+      paymentId,
+      status: record.status,
+      terminalReason: record.terminalReason,
+      action: "broadcast_failed_terminal",
+      checkStatusUrlPresent: false,
+      compatShimUsed: false,
+      attempt,
+    }, "warn");
     message.ack();
     return;
   }
