@@ -20,6 +20,7 @@ import type {
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 import {
   getPaymentRecord,
+  inferReplacementTerminalReason,
   putPaymentRecord,
   transitionPayment,
 } from "../services/payment-status";
@@ -5883,7 +5884,9 @@ export class NonceDO {
             // Skip terminal states — don't regress confirmed/failed records
             const TERMINAL_STATUSES = new Set(["confirmed", "failed", "replaced"]);
             if (record && !TERMINAL_STATUSES.has(record.status)) {
-              const updated = transitionPayment(record, "replaced");
+              const updated = transitionPayment(record, "replaced", {
+                terminalReason: inferReplacementTerminalReason(metadata.reason),
+              });
               updated.replacementTxid = metadata.replacementTxid;
               updated.replacedReason = metadata.reason;
               updated.resubmittable = true;

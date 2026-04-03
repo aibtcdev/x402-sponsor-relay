@@ -38,16 +38,26 @@ export { SettlementHealthService } from "./settlement-health";
 export { PaymentIdService } from "./payment-identifier";
 
 export {
+  buildNotFoundPaymentRecord,
+  computePaymentArtifactHash,
   generatePaymentId,
   createPaymentRecord,
-  transitionPayment,
+  getReusablePaymentRecord,
   getPaymentRecord,
+  inferReplacementTerminalReason,
+  isTerminalPaymentStatus,
+  projectCallerFacingPaymentStatus,
+  projectPaymentRecord,
+  putPaymentArtifact,
   putPaymentRecord,
+  transitionPayment,
 } from "./payment-status";
 export type {
   PaymentStatus,
   PaymentRecord,
   PaymentQueueMessage,
+  PublicPaymentRecord,
+  PublicPaymentStatus,
   SenderNonceInfo,
 } from "./payment-status";
 

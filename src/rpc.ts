@@ -20,16 +20,33 @@ import {
   addressToString,
 } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
+import type {
+  RpcCheckPaymentResult as CheckPaymentResult,
+  RpcSubmitPaymentResult as SubmitPaymentResult,
+} from "@aibtc/tx-schemas/rpc";
+import { RPC_ERROR_CODES } from "@aibtc/tx-schemas/rpc";
 import type { Env, SettleOptions, SponsorStatusResult } from "./types";
-import { stripHexPrefix } from "./utils";
 import {
+  buildPaymentCheckStatusUrl,
+  createWorkerLogger,
+  emitPaymentLifecycleEvent,
+  emitProjectedPaymentPollEvents,
+  stripHexPrefix,
+} from "./utils";
+import {
+  buildNotFoundPaymentRecord,
+  computePaymentArtifactHash,
   generatePaymentId,
   createPaymentRecord,
-  transitionPayment,
-  putPaymentRecord,
   getPaymentRecord,
+  getReusablePaymentRecord,
+  projectPaymentRecord,
+  projectReusablePaymentStatus,
   type PaymentQueueMessage,
   type SenderNonceInfo,
+  putPaymentArtifact,
+  putPaymentRecord,
+  transitionPayment,
 } from "./services/payment-status";
 import {
   checkSenderNonce,
@@ -38,54 +55,18 @@ import {
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
 
-/**
- * Result returned by submitPayment.
- */
-export interface SubmitPaymentResult {
-  /** Whether the submission was accepted */
-  accepted: boolean;
-  /** Unique payment identifier (pay_ prefix) */
-  paymentId?: string;
-  /** Current status */
-  status?: string;
-  /** Sender nonce health info */
-  senderNonce?: SenderNonceInfo;
-  /** Warning for nonce gaps (accepted but flagged) */
-  warning?: {
-    code: string;
-    detail: string;
-    senderNonce: { provided: number; expected: number; lastSeen: number };
-    help: string;
-    action: string;
-  };
-  /** Error (only when accepted=false) */
-  error?: string;
-  /** Error code (only when accepted=false) */
-  code?: string;
-  /** Whether the error is retryable */
-  retryable?: boolean;
-  /** Help URL for the agent */
-  help?: string;
-  /** Action the agent should take */
-  action?: string;
-  /** Status check URL */
-  checkStatusUrl?: string;
-}
+export type { SubmitPaymentResult, CheckPaymentResult };
 
-/**
- * Result returned by checkPayment.
- */
-export interface CheckPaymentResult {
-  paymentId: string;
-  status: string;
-  txid?: string;
-  blockHeight?: number;
-  confirmedAt?: string;
-  explorerUrl?: string;
-  error?: string;
-  errorCode?: string;
-  retryable?: boolean;
-  senderNonceInfo?: SenderNonceInfo;
+type PublicRpcErrorCode = (typeof RPC_ERROR_CODES)[number];
+
+function projectRpcErrorCode(errorCode?: string): PublicRpcErrorCode | undefined {
+  if (!errorCode) {
+    return undefined;
+  }
+
+  return (RPC_ERROR_CODES as readonly string[]).includes(errorCode)
+    ? (errorCode as PublicRpcErrorCode)
+    : undefined;
 }
 
 /**
@@ -113,6 +94,10 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     txHex: string,
     settle?: SettleOptions
   ): Promise<SubmitPaymentResult> {
+    const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
+      component: "rpc",
+      route: "rpc.submitPayment",
+    });
     const network = this.env.STACKS_NETWORK;
     const kv = this.env.RELAY_KV;
 
@@ -146,6 +131,32 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
         error: "Could not deserialize transaction",
         code: "INVALID_TRANSACTION",
         retryable: false,
+      };
+    }
+
+    const txArtifactHash = await computePaymentArtifactHash(cleanHex);
+    const existingRecord = await getReusablePaymentRecord(kv, txArtifactHash);
+    if (existingRecord) {
+      const reusedStatus = projectReusablePaymentStatus(existingRecord.status);
+      const projected = projectPaymentRecord(existingRecord);
+      const checkStatusUrl = buildPaymentCheckStatusUrl(this.env, projected.paymentId);
+
+      emitPaymentLifecycleEvent(logger, "payment.accepted", {
+        route: "rpc.submitPayment",
+        paymentId: projected.paymentId,
+        status: projected.status,
+        terminalReason: projected.terminalReason,
+        action: "reuse_active_payment",
+        checkStatusUrlPresent: true,
+        compatShimUsed: false,
+      });
+
+      return {
+        accepted: true,
+        paymentId: projected.paymentId,
+        status: reusedStatus,
+        senderNonce: projected.senderNonceInfo,
+        checkStatusUrl,
       };
     }
 
@@ -236,7 +247,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
 
     // Build sender nonce info for the response
     let senderNonceInfo: SenderNonceInfo;
-    let warning: SubmitPaymentResult["warning"];
+    let warning: Extract<SubmitPaymentResult, { accepted: true }>["warning"];
 
     if (nonceCheck.outcome === "gap") {
       senderNonceInfo = {
@@ -285,6 +296,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     // Transition to queued
     record = transitionPayment(record, "queued");
     await putPaymentRecord(kv, record);
+    await putPaymentArtifact(kv, txArtifactHash, paymentId);
 
     // Enqueue to PAYMENT_QUEUE
     const queue = this.env.PAYMENT_QUEUE;
@@ -294,6 +306,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       record = transitionPayment(record, "failed", {
         error: "Payment queue not configured",
         errorCode: "INTERNAL_ERROR",
+        terminalReason: "queue_unavailable",
+        retryable: true,
       });
       await putPaymentRecord(kv, record);
       return {
@@ -325,6 +339,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       record = transitionPayment(record, "failed", {
         error: `Payment queue send failed: ${errorMessage}`,
         errorCode: "INTERNAL_ERROR",
+        terminalReason: "queue_unavailable",
         retryable: true,
       });
       await putPaymentRecord(kv, record);
@@ -337,18 +352,34 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
 
-    // Build the status check URL from env or default by network
-    const baseUrl =
-      this.env.RELAY_BASE_URL ??
-      (network === "mainnet"
-        ? "https://x402-relay.aibtc.com"
-        : "https://x402-relay.aibtc.dev");
-    const checkStatusUrl = `${baseUrl}/payment/${paymentId}`;
+    const checkStatusUrl = buildPaymentCheckStatusUrl(this.env, paymentId);
+    const acceptedStatus = warning ? "queued_with_warning" : "queued";
+
+    emitPaymentLifecycleEvent(logger, "payment.accepted", {
+      route: "rpc.submitPayment",
+      paymentId,
+      status: acceptedStatus,
+      action: warning ? "accepted_with_warning" : "accepted_new_payment",
+      checkStatusUrlPresent: true,
+      compatShimUsed: Boolean(warning),
+    });
+
+    if (warning) {
+      emitPaymentLifecycleEvent(logger, "payment.fallback_used", {
+        route: "rpc.submitPayment",
+        paymentId,
+        status: acceptedStatus,
+        action: "queued_with_warning_projection",
+        checkStatusUrlPresent: true,
+        compatShimUsed: true,
+        warningCode: warning.code,
+      }, "warn");
+    }
 
     return {
       accepted: true,
       paymentId,
-      status: warning ? "queued_with_warning" : "queued",
+      status: acceptedStatus,
       senderNonce: senderNonceInfo,
       warning,
       checkStatusUrl,
@@ -359,35 +390,65 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
    * Check the status of a previously submitted payment.
    */
   async checkPayment(paymentId: string): Promise<CheckPaymentResult> {
+    const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
+      component: "rpc",
+      route: "rpc.checkPayment",
+      paymentId,
+    });
     const kv = this.env.RELAY_KV;
+    const checkStatusUrl = buildPaymentCheckStatusUrl(this.env, paymentId);
     if (!kv) {
       return {
         paymentId,
-        status: "unknown",
+        status: "failed",
         error: "Storage not configured",
+        terminalReason: "internal_error",
+        retryable: true,
+        checkStatusUrl,
       };
     }
 
     const record = await getPaymentRecord(kv, paymentId);
     if (!record) {
-      return {
+      const notFound = buildNotFoundPaymentRecord(paymentId);
+      emitPaymentLifecycleEvent(logger, "payment.poll", {
+        route: "rpc.checkPayment",
         paymentId,
-        status: "not_found",
-        error: `Payment ${paymentId} not found or expired`,
+        status: notFound.status,
+        terminalReason: notFound.terminalReason,
+        action: "return_not_found",
+        checkStatusUrlPresent: true,
+        compatShimUsed: false,
+      });
+      return {
+        ...notFound,
+        checkStatusUrl,
       };
     }
 
+    const projected = projectPaymentRecord(record);
+    const compatShimUsed = record.status === "submitted";
+
+    emitProjectedPaymentPollEvents(
+      logger,
+      "rpc.checkPayment",
+      projected,
+      compatShimUsed
+    );
+
     return {
-      paymentId: record.paymentId,
-      status: record.status,
-      txid: record.txid,
-      blockHeight: record.blockHeight,
-      confirmedAt: record.confirmedAt,
-      explorerUrl: record.explorerUrl,
-      error: record.error,
-      errorCode: record.errorCode,
-      retryable: record.retryable,
-      senderNonceInfo: record.senderNonceInfo,
+      paymentId: projected.paymentId,
+      status: projected.status,
+      terminalReason: projected.terminalReason,
+      txid: projected.txid,
+      blockHeight: projected.blockHeight,
+      confirmedAt: projected.confirmedAt,
+      explorerUrl: projected.explorerUrl,
+      error: projected.error,
+      errorCode: projectRpcErrorCode(projected.errorCode),
+      retryable: projected.retryable,
+      senderNonceInfo: projected.senderNonceInfo,
+      checkStatusUrl,
     };
   }
 

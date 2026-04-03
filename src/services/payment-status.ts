@@ -2,14 +2,22 @@
  * Payment status tracking for queue-based transaction processing.
  *
  * Stores payment records in RELAY_KV with 24h TTL, keyed by paymentId.
- * Status flows: submitted → queued → broadcasting → mempool → confirmed | failed
+ * Relay internals may use the transient submitted state, but caller-facing
+ * polling always projects submitted to queued.
  */
 
+import type {
+  NotFoundTerminalReason,
+  ReplacedTerminalReason,
+  TerminalReason,
+  TrackedPaymentState,
+} from "@aibtc/tx-schemas/core";
 import type { SettleOptions } from "../types";
-import { buildExplorerUrl } from "../utils";
+import { buildExplorerUrl, stripHexPrefix } from "../utils";
 
 // KV key prefix and TTL
 const PAYMENT_KEY_PREFIX = "payment:";
+const PAYMENT_ARTIFACT_KEY_PREFIX = "payment_artifact:";
 const PAYMENT_TTL_SECONDS = 86_400; // 24 hours
 
 /**
@@ -31,6 +39,12 @@ export type PaymentStatus =
   | "confirmed"
   | "failed"
   | "replaced";
+
+export type PublicPaymentStatus = Exclude<TrackedPaymentState, "submitted">;
+export type ReusablePaymentStatus = Extract<
+  PublicPaymentStatus,
+  "queued" | "broadcasting" | "mempool"
+>;
 
 /**
  * Sender nonce health info returned alongside payment status.
@@ -76,6 +90,8 @@ export interface PaymentRecord {
   errorCode?: string;
   /** Whether the failure is retryable */
   retryable?: boolean;
+  /** Canonical terminal reason for terminal outcomes */
+  terminalReason?: TerminalReason;
   /** ISO timestamp when submitted */
   submittedAt: string;
   /** ISO timestamp when queued */
@@ -104,6 +120,12 @@ export interface PaymentRecord {
   attempts?: number;
 }
 
+export interface PublicPaymentRecord
+  extends Omit<PaymentRecord, "status" | "terminalReason"> {
+  status: PublicPaymentStatus;
+  terminalReason?: TerminalReason;
+}
+
 /**
  * Queue message body for PAYMENT_QUEUE.
  */
@@ -125,6 +147,95 @@ export interface PaymentQueueMessage {
 
 function paymentKey(paymentId: string): string {
   return `${PAYMENT_KEY_PREFIX}${paymentId}`;
+}
+
+function paymentArtifactKey(txArtifactHash: string): string {
+  return `${PAYMENT_ARTIFACT_KEY_PREFIX}${txArtifactHash}`;
+}
+
+export function isTerminalPaymentStatus(
+  status: PaymentStatus | PublicPaymentStatus
+): status is "confirmed" | "failed" | "replaced" | "not_found" {
+  return (
+    status === "confirmed" ||
+    status === "failed" ||
+    status === "replaced" ||
+    status === "not_found"
+  );
+}
+
+export function projectCallerFacingPaymentStatus(
+  status: PaymentStatus
+): PublicPaymentStatus {
+  return status === "submitted" ? "queued" : status;
+}
+
+export function projectReusablePaymentStatus(
+  status: PaymentStatus
+): ReusablePaymentStatus {
+  const projected = projectCallerFacingPaymentStatus(status);
+
+  switch (projected) {
+    case "queued":
+    case "broadcasting":
+    case "mempool":
+      return projected;
+    default:
+      throw new Error(`Payment status ${projected} is not reusable`);
+  }
+}
+
+export function inferReplacementTerminalReason(
+  replacedReason?: string
+): ReplacedTerminalReason {
+  switch (replacedReason) {
+    case "rbf":
+    case "head_bump":
+      return "nonce_replacement";
+    default:
+      return "superseded";
+  }
+}
+
+export function projectPaymentRecord(record: PaymentRecord): PublicPaymentRecord {
+  const projectedStatus = projectCallerFacingPaymentStatus(record.status);
+  const { terminalReason, ...rest } = record;
+  return {
+    ...rest,
+    status: projectedStatus,
+    ...(isTerminalPaymentStatus(projectedStatus) && terminalReason
+      ? { terminalReason }
+      : {}),
+  };
+}
+
+export function buildNotFoundPaymentRecord(
+  paymentId: string,
+  detail?: string,
+  terminalReason: NotFoundTerminalReason = "unknown_payment_identity"
+): {
+  paymentId: string;
+  status: "not_found";
+  terminalReason: NotFoundTerminalReason;
+  error: string;
+  retryable: false;
+} {
+  return {
+    paymentId,
+    status: "not_found",
+    terminalReason,
+    error: detail ?? `Payment ${paymentId} not found or expired`,
+    retryable: false,
+  };
+}
+
+export async function computePaymentArtifactHash(txHex: string): Promise<string> {
+  const normalizedHex = stripHexPrefix(txHex).toLowerCase();
+  const data = new TextEncoder().encode(normalizedHex);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0")
+  ).join("");
 }
 
 /**
@@ -153,6 +264,46 @@ export async function putPaymentRecord(
   await kv.put(paymentKey(record.paymentId), JSON.stringify(record), {
     expirationTtl: PAYMENT_TTL_SECONDS,
   });
+}
+
+export async function getPaymentIdByArtifact(
+  kv: KVNamespace,
+  txArtifactHash: string
+): Promise<string | null> {
+  return kv.get(paymentArtifactKey(txArtifactHash), "text");
+}
+
+export async function putPaymentArtifact(
+  kv: KVNamespace,
+  txArtifactHash: string,
+  paymentId: string
+): Promise<void> {
+  await kv.put(paymentArtifactKey(txArtifactHash), paymentId, {
+    expirationTtl: PAYMENT_TTL_SECONDS,
+  });
+}
+
+export async function getReusablePaymentRecord(
+  kv: KVNamespace,
+  txArtifactHash: string
+): Promise<PaymentRecord | null> {
+  const paymentId = await getPaymentIdByArtifact(kv, txArtifactHash);
+  if (!paymentId) {
+    return null;
+  }
+
+  const record = await getPaymentRecord(kv, paymentId);
+  if (!record) {
+    await kv.delete(paymentArtifactKey(txArtifactHash)).catch(() => {});
+    return null;
+  }
+
+  if (isTerminalPaymentStatus(record.status)) {
+    await kv.delete(paymentArtifactKey(txArtifactHash)).catch(() => {});
+    return null;
+  }
+
+  return record;
 }
 
 /**

@@ -84,6 +84,16 @@ stateDiagram-v2
 | **RecordStats** | Recording metrics to KV storage | < 100ms |
 | **Completed** | Transaction processed, response returned | Terminal |
 
+## Queue Polling Contract
+
+Queue-based polling follows the shared `@aibtc/tx-schemas` contract.
+
+- Public states are `requires_payment`, `queued`, `broadcasting`, `mempool`, `confirmed`, `failed`, `replaced`, and `not_found`.
+- Relay-internal `submitted` is never caller-facing. Both RPC and `GET /payment/:id` project it to `queued`.
+- Terminal outcomes emit canonical `terminalReason` values. Use that field as the semantic source of truth for retry and recovery decisions.
+- Polling adapters may surface `checkStatusUrl` as the canonical poll hint for the same `paymentId`.
+- Duplicate submission of the same payment artifact reuses the same relay-owned `paymentId` until that payment reaches a terminal outcome.
+
 ## Error States
 
 | Error State | HTTP Code | Cause | Recovery |

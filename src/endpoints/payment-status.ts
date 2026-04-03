@@ -1,6 +1,15 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import type { AppContext } from "../types";
-import { getPaymentRecord } from "../services/payment-status";
+import {
+  buildNotFoundPaymentRecord,
+  getPaymentRecord,
+  projectPaymentRecord,
+} from "../services/payment-status";
+import {
+  buildPaymentCheckStatusUrl,
+  emitPaymentLifecycleEvent,
+  emitProjectedPaymentPollEvents,
+} from "../utils";
 
 /**
  * GET /payment/:id — Public payment status endpoint.
@@ -28,11 +37,13 @@ export class PaymentStatus extends BaseEndpoint {
                 paymentId: { type: "string" as const },
                 status: {
                   type: "string" as const,
-                  enum: ["submitted", "queued", "broadcasting", "mempool", "confirmed", "failed", "replaced"],
+                  enum: ["queued", "broadcasting", "mempool", "confirmed", "failed", "replaced"],
                 },
+                terminalReason: { type: "string" as const },
                 txid: { type: "string" as const },
                 blockHeight: { type: "number" as const },
                 explorerUrl: { type: "string" as const },
+                checkStatusUrl: { type: "string" as const },
                 senderAddress: { type: "string" as const },
                 senderNonce: { type: "number" as const },
                 sponsorFee: { type: "string" as const },
@@ -56,20 +67,60 @@ export class PaymentStatus extends BaseEndpoint {
       },
       "404": {
         description: "Payment not found or expired",
+        content: {
+          "application/json": {
+            schema: {
+              type: "object" as const,
+              required: ["success", "requestId", "paymentId", "status", "terminalReason", "error", "retryable"],
+              properties: {
+                success: { type: "boolean" as const },
+                requestId: { type: "string" as const },
+                paymentId: { type: "string" as const },
+                status: {
+                  type: "string" as const,
+                  enum: ["not_found"],
+                },
+                terminalReason: {
+                  type: "string" as const,
+                  enum: ["expired", "unknown_payment_identity"],
+                },
+                error: { type: "string" as const },
+                retryable: { type: "boolean" as const },
+                checkStatusUrl: { type: "string" as const },
+              },
+            },
+          },
+        },
       },
     },
   };
 
   async handle(c: AppContext) {
     const paymentId = c.req.param("id");
+    const logger = this.getLogger(c);
 
     if (!paymentId || !paymentId.startsWith("pay_")) {
-      return this.err(c, {
-        error: "Invalid payment ID format",
-        code: "NOT_FOUND",
-        status: 404,
-        retryable: false,
+      const notFound = buildNotFoundPaymentRecord(
+        paymentId ?? "unknown",
+        "Invalid payment ID format"
+      );
+      emitPaymentLifecycleEvent(logger, "payment.poll", {
+        route: "GET /payment/:id",
+        paymentId: notFound.paymentId,
+        status: notFound.status,
+        terminalReason: notFound.terminalReason,
+        action: "return_invalid_payment_id",
+        checkStatusUrlPresent: false,
+        compatShimUsed: false,
       });
+      return c.json(
+        {
+          success: true,
+          requestId: this.getRequestId(c),
+          ...notFound,
+        },
+        404
+      );
     }
 
     const kv = c.env.RELAY_KV;
@@ -84,41 +135,70 @@ export class PaymentStatus extends BaseEndpoint {
 
     const record = await getPaymentRecord(kv, paymentId);
     if (!record) {
-      return this.err(c, {
-        error: `Payment ${paymentId} not found or expired`,
-        code: "NOT_FOUND",
-        status: 404,
-        retryable: false,
+      const notFound = buildNotFoundPaymentRecord(paymentId);
+      const checkStatusUrl = buildPaymentCheckStatusUrl(c.env, paymentId);
+      emitPaymentLifecycleEvent(logger, "payment.poll", {
+        route: "GET /payment/:id",
+        paymentId: notFound.paymentId,
+        status: notFound.status,
+        terminalReason: notFound.terminalReason,
+        action: "return_not_found",
+        checkStatusUrlPresent: true,
+        compatShimUsed: false,
       });
+      return c.json(
+        {
+          success: true,
+          requestId: this.getRequestId(c),
+          ...notFound,
+          checkStatusUrl,
+        },
+        404
+      );
     }
 
+    const projected = projectPaymentRecord(record);
+    const checkStatusUrl = buildPaymentCheckStatusUrl(c.env, projected.paymentId);
+    const compatShimUsed = record.status === "submitted";
+
+    emitProjectedPaymentPollEvents(
+      logger,
+      "GET /payment/:id",
+      projected,
+      compatShimUsed
+    );
+
     return this.ok(c, {
-      paymentId: record.paymentId,
-      status: record.status,
-      ...(record.txid && { txid: record.txid }),
-      ...(record.blockHeight && { blockHeight: record.blockHeight }),
-      ...(record.confirmedAt && { confirmedAt: record.confirmedAt }),
-      ...(record.explorerUrl && { explorerUrl: record.explorerUrl }),
-      ...(record.senderAddress && { senderAddress: record.senderAddress }),
-      ...(record.senderNonce !== undefined && {
-        senderNonce: record.senderNonce,
+      paymentId: projected.paymentId,
+      status: projected.status,
+      ...(projected.terminalReason && {
+        terminalReason: projected.terminalReason,
       }),
-      ...(record.sponsorFee && { sponsorFee: record.sponsorFee }),
-      ...(record.error && { error: record.error }),
-      ...(record.errorCode && { errorCode: record.errorCode }),
-      ...(record.retryable !== undefined && { retryable: record.retryable }),
-      ...(record.senderNonceInfo && {
-        senderNonceInfo: record.senderNonceInfo,
+      ...(projected.txid && { txid: projected.txid }),
+      ...(projected.blockHeight && { blockHeight: projected.blockHeight }),
+      ...(projected.confirmedAt && { confirmedAt: projected.confirmedAt }),
+      ...(projected.explorerUrl && { explorerUrl: projected.explorerUrl }),
+      checkStatusUrl,
+      ...(projected.senderAddress && { senderAddress: projected.senderAddress }),
+      ...(projected.senderNonce !== undefined && {
+        senderNonce: projected.senderNonce,
       }),
-      submittedAt: record.submittedAt,
-      ...(record.queuedAt && { queuedAt: record.queuedAt }),
-      ...(record.mempoolAt && { mempoolAt: record.mempoolAt }),
-      ...(record.failedAt && { failedAt: record.failedAt }),
-      ...(record.replacedAt && { replacedAt: record.replacedAt }),
-      ...(record.replacedReason && { replacedReason: record.replacedReason }),
-      ...(record.replacementTxid && { replacementTxid: record.replacementTxid }),
-      ...(record.resubmittable !== undefined && {
-        resubmittable: record.resubmittable,
+      ...(projected.sponsorFee && { sponsorFee: projected.sponsorFee }),
+      ...(projected.error && { error: projected.error }),
+      ...(projected.errorCode && { errorCode: projected.errorCode }),
+      ...(projected.retryable !== undefined && { retryable: projected.retryable }),
+      ...(projected.senderNonceInfo && {
+        senderNonceInfo: projected.senderNonceInfo,
+      }),
+      submittedAt: projected.submittedAt,
+      ...(projected.queuedAt && { queuedAt: projected.queuedAt }),
+      ...(projected.mempoolAt && { mempoolAt: projected.mempoolAt }),
+      ...(projected.failedAt && { failedAt: projected.failedAt }),
+      ...(projected.replacedAt && { replacedAt: projected.replacedAt }),
+      ...(projected.replacedReason && { replacedReason: projected.replacedReason }),
+      ...(projected.replacementTxid && { replacementTxid: projected.replacementTxid }),
+      ...(projected.resubmittable !== undefined && {
+        resubmittable: projected.resubmittable,
       }),
     });
   }
