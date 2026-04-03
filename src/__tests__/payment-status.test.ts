@@ -3,6 +3,7 @@ import {
   PaymentStatusHttpResponseSchema,
   RpcCheckPaymentResultSchema,
 } from "@aibtc/tx-schemas";
+import { AnchorMode, makeRandomPrivKey, makeSTXTokenTransfer } from "@stacks/transactions";
 
 vi.mock("cloudflare:workers", () => ({
   WorkerEntrypoint: class {
@@ -98,6 +99,29 @@ const executionContext = {
   waitUntil: (_promise: Promise<unknown>) => {},
   passThroughOnException: () => {},
 } as ExecutionContext;
+
+let duplicateReuseTxHexPromise: Promise<string> | undefined;
+
+async function getDuplicateReuseTxHex(): Promise<string> {
+  if (!duplicateReuseTxHexPromise) {
+    duplicateReuseTxHexPromise = (async () => {
+      const transaction = await makeSTXTokenTransfer({
+        recipient: "ST37NMC4HGFQ1H2JSFP4H3TMNQBF4PY0MVSD1GV7Z",
+        amount: 1n,
+        senderKey: makeRandomPrivKey(),
+        network: "testnet",
+        memo: "dup-reuse",
+        anchorMode: AnchorMode.Any,
+        sponsored: true,
+        fee: 0n,
+        nonce: 0n,
+      });
+      return transaction.serialize();
+    })();
+  }
+
+  return duplicateReuseTxHexPromise;
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -198,6 +222,90 @@ describe("payment status projection", () => {
 
     expect(queuedProjection.status).toBe("queued");
     expect(queuedProjection.terminalReason).toBeUndefined();
+  });
+});
+
+describe("submitPayment duplicate reuse", () => {
+  async function submitDuplicateForStatus(status: PaymentRecord["status"]) {
+    const kv = new MemoryKV();
+    const txHex = await getDuplicateReuseTxHex();
+    const txArtifactHash = await computePaymentArtifactHash(txHex);
+    const senderNonceInfo = { provided: 7, expected: 7, healthy: true } as const;
+    const record = transitionPayment(
+      createPaymentRecord("pay_duplicate", "testnet", senderNonceInfo),
+      status
+    );
+
+    await putPaymentRecord(kv, record);
+    await putPaymentArtifact(kv, txArtifactHash, record.paymentId);
+
+    const env = {
+      RELAY_KV: kv,
+      STACKS_NETWORK: "testnet",
+      RELAY_BASE_URL: "https://x402-relay.aibtc.dev",
+    } as Env;
+
+    const rpc = new RelayRPC(executionContext, env);
+    const result = await rpc.submitPayment(txHex);
+
+    return { result, record };
+  }
+
+  it("reuses the same paymentId and returns queued while the active record is queued", async () => {
+    const { result, record } = await submitDuplicateForStatus("queued");
+
+    expect(result).toEqual({
+      accepted: true,
+      paymentId: record.paymentId,
+      status: "queued",
+      senderNonce: record.senderNonceInfo,
+      checkStatusUrl: "https://x402-relay.aibtc.dev/payment/pay_duplicate",
+    });
+  });
+
+  it("reuses the same paymentId and preserves broadcasting for active in-flight payments", async () => {
+    const { result, record } = await submitDuplicateForStatus("broadcasting");
+
+    expect(result).toEqual({
+      accepted: true,
+      paymentId: record.paymentId,
+      status: "broadcasting",
+      senderNonce: record.senderNonceInfo,
+      checkStatusUrl: "https://x402-relay.aibtc.dev/payment/pay_duplicate",
+    });
+  });
+
+  it("reuses the same paymentId and preserves mempool for active in-flight payments", async () => {
+    const { result, record } = await submitDuplicateForStatus("mempool");
+
+    expect(result).toEqual({
+      accepted: true,
+      paymentId: record.paymentId,
+      status: "mempool",
+      senderNonce: record.senderNonceInfo,
+      checkStatusUrl: "https://x402-relay.aibtc.dev/payment/pay_duplicate",
+    });
+  });
+
+  it("stops duplicate reuse once the prior payment reaches a terminal outcome", async () => {
+    const kv = new MemoryKV();
+    const txHex = await getDuplicateReuseTxHex();
+    const txArtifactHash = await computePaymentArtifactHash(txHex);
+    const terminalRecord = transitionPayment(
+      transitionPayment(createPaymentRecord("pay_terminal", "testnet"), "queued"),
+      "failed",
+      {
+        error: "Sender nonce stale",
+        errorCode: "SENDER_NONCE_STALE",
+        terminalReason: "sender_nonce_stale",
+        retryable: false,
+      }
+    );
+
+    await putPaymentRecord(kv, terminalRecord);
+    await putPaymentArtifact(kv, txArtifactHash, terminalRecord.paymentId);
+    expect(await getReusablePaymentRecord(kv, txArtifactHash)).toBeNull();
+    expect(await getPaymentIdByArtifact(kv, txArtifactHash)).toBeNull();
   });
 });
 
@@ -416,5 +524,6 @@ describe("PaymentStatus endpoint schema", () => {
     expect(llms).toContain("Canonical public statuses:");
     expect(llms).toContain("\"terminalReason\": \"sender_nonce_gap\"");
     expect(llms).toContain("\"checkStatusUrl\": \"https://x402-relay.aibtc.dev/payment/pay_01J...\"");
+    expect(llms).toContain("The duplicate submission response returns the");
   });
 });

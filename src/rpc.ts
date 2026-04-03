@@ -149,13 +149,17 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
         compatShimUsed: false,
       });
 
+      // The installed tx-schemas package still narrows accepted submit statuses to
+      // queued / queued_with_warning. Runtime duplicate reuse must return the
+      // current caller-facing status for the reused paymentId until that package
+      // catches up with the canonical lifecycle contract.
       return {
         accepted: true,
         paymentId: projected.paymentId,
-        status: "queued",
+        status: projected.status,
         senderNonce: projected.senderNonceInfo,
         checkStatusUrl,
-      };
+      } as SubmitPaymentResult;
     }
 
     // Must be a sponsored transaction

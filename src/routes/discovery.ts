@@ -870,6 +870,12 @@ Example terminal response:
   "checkStatusUrl": "https://x402-relay.aibtc.com/payment/pay_01J..."
 }
 
+Duplicate submission of the same payment artifact reuses the same paymentId until
+that payment reaches a terminal outcome. The duplicate submission response returns the
+current caller-facing status for that reused paymentId: submitted projects to queued,
+while later in-flight states remain broadcasting or mempool. Use paymentId as the
+stable polling handle.
+
 ---
 
 ## Error Response Shape
@@ -2087,7 +2093,10 @@ Example terminal response:
 }
 
 Duplicate submission of the same payment artifact reuses the same paymentId until
-that payment reaches a terminal outcome. Use paymentId as the stable polling handle.
+that payment reaches a terminal outcome. The duplicate submission response returns the
+current caller-facing status for that reused paymentId: submitted projects to queued,
+while later in-flight states remain broadcasting or mempool. Use paymentId as the
+stable polling handle.
 
 ## Most Common Errors and Fixes
 
