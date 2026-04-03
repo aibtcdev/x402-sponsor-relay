@@ -12,6 +12,13 @@
  * the message is retried by the queue with backoff.
  */
 
+// NOTE: This file uses dual logging intentionally.
+// - emitPaymentLifecycleEvent() emits structured telemetry with standardized fields
+//   (compatShimUsed, checkStatusUrlPresent, terminalReason, etc.) for dashboards and alerting.
+// - logger.info/warn() calls emit human-readable operational logs for debugging.
+// Both are needed: lifecycle events are machine-parseable and follow a fixed schema;
+// operational logs carry ad-hoc context (txid, nonce, attempt) that doesn't fit the schema.
+
 import { deserializeTransaction } from "@stacks/transactions";
 import type { Env, Logger } from "./types";
 import { createWorkerLogger, emitPaymentLifecycleEvent } from "./utils";

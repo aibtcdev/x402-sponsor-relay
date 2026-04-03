@@ -880,7 +880,7 @@ https://x402-relay.aibtc.com/topics/sponsored-transactions
 
 ---
 
-${buildQueuePaymentPollingDoc(false)}
+${buildQueuePaymentPollingDoc(true)}
 
 ## Error Response Shape
 
