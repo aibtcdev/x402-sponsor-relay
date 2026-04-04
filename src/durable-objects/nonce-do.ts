@@ -2133,11 +2133,15 @@ export class NonceDO {
     feeOverride?: bigint
   ): Promise<string | null> {
     const fee = feeOverride ?? GAP_FILL_FEE;
-    // Track gap-fill attempts for this nonce (used for fee escalation logging)
+    // Track gap-fill attempts for this nonce (used for fee escalation).
+    // Uses INSERT ON CONFLICT so the counter is created even when no nonce_intents
+    // row exists (e.g. gap nonces discovered by Hiro that the relay never assigned).
     try {
       this.sql.exec(
-        `UPDATE nonce_intents SET gap_fill_attempts = COALESCE(gap_fill_attempts, 0) + 1
-         WHERE wallet_index = ? AND nonce = ?`,
+        `INSERT INTO nonce_intents (wallet_index, nonce, state, assigned_at, gap_fill_attempts)
+         VALUES (?, ?, 'gap_fill', datetime('now'), 1)
+         ON CONFLICT (wallet_index, nonce)
+         DO UPDATE SET gap_fill_attempts = COALESCE(gap_fill_attempts, 0) + 1`,
         walletIndex,
         gapNonce
       );
@@ -7301,6 +7305,7 @@ export class NonceDO {
           this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
           this.incrementCounter(STATE_KEYS.gapsFilled);
           await this.recordGapFillFee(walletIndex, escalatedFee.toString());
+          this.resetGhostState(walletIndex);
         } else {
           failed.push({ nonce: gapNonce, reason: "broadcast rejected or already occupied" });
         }
@@ -7500,6 +7505,7 @@ export class NonceDO {
                 this.ledgerInsertGapFill(walletIndex, nonce, gapTxid);
                 this.incrementCounter(STATE_KEYS.gapsFilled);
                 await this.recordGapFillFee(walletIndex, flushFee.toString());
+                this.resetGhostState(walletIndex);
                 filled.push({ nonce, txid: gapTxid, method: "gap_fill" });
               } else {
                 failedNonces.push({ nonce, reason: "rbf and gap-fill both failed or already occupied" });
@@ -7536,6 +7542,7 @@ export class NonceDO {
               this.ledgerInsertGapFill(walletIndex, nonce, txid);
               this.incrementCounter(STATE_KEYS.gapsFilled);
               await this.recordGapFillFee(walletIndex, gapFlushFee.toString());
+              this.resetGhostState(walletIndex);
               filled.push({ nonce, txid, method: "gap_fill" });
             } else {
               // ConflictingNonceInMempool means already occupied — not a hard failure
