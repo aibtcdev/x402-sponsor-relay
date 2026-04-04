@@ -832,6 +832,18 @@ export class NonceDO {
       );
     }
 
+    // Migration: add gap_fill_attempts column to nonce_intents (nullable INTEGER, default 0).
+    // Tracks how many gap-fill broadcasts have been attempted for a conflict nonce,
+    // used to escalate the fee by +1 uSTX per attempt (30000, 30001, 30002, ...).
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'gap_fill_attempts'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN gap_fill_attempts INTEGER DEFAULT 0");
+      }
+    } catch { /* already present or error — fail-open */ }
+
     // Replay buffer: sender txs waiting for a fresh sponsor nonce assignment.
     // Populated when a dispatched slot is stuck and needs to be flushed.
     // The relay will re-sponsor these txs with new nonces in the next alarm cycle.
@@ -2121,6 +2133,15 @@ export class NonceDO {
     feeOverride?: bigint
   ): Promise<string | null> {
     const fee = feeOverride ?? GAP_FILL_FEE;
+    // Track gap-fill attempts for this nonce (used for fee escalation logging)
+    try {
+      this.sql.exec(
+        `UPDATE nonce_intents SET gap_fill_attempts = COALESCE(gap_fill_attempts, 0) + 1
+         WHERE wallet_index = ? AND nonce = ?`,
+        walletIndex,
+        gapNonce
+      );
+    } catch { /* fail-open — counter is advisory */ }
     const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
     try {
       const tx = await makeSTXTokenTransfer({
@@ -4271,12 +4292,16 @@ export class NonceDO {
         const activeQuarantines = recentQuarantines.filter(
           (ts) => new Date(ts).getTime() >= cutoff
         );
+        const ghostDegraded =
+          (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
         const rawAvailable = this.walletHeadroom(walletIndex);
-        const available = Math.max(0, Math.min(CHAINING_LIMIT, rawAvailable));
+        // Ghost-degraded wallets are skipped by assignNonce, so report 0 available
+        const available = ghostDegraded ? 0 : Math.max(0, Math.min(CHAINING_LIMIT, rawAvailable));
         const reserved = CHAINING_LIMIT - available;
         return {
           circuitBreakerOpen:
             activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
+          ghostDegraded,
           available,
           reserved,
         };
@@ -4287,7 +4312,8 @@ export class NonceDO {
     const totalReserved = walletSnapshots.reduce((sum, wallet) => sum + wallet.reserved, 0);
     const totalCapacity = walletCount * CHAINING_LIMIT;
     const allWalletsDegraded =
-      walletCount > 0 && walletSnapshots.every((wallet) => wallet.circuitBreakerOpen);
+      walletCount > 0 &&
+      walletSnapshots.every((wallet) => wallet.circuitBreakerOpen || wallet.ghostDegraded);
     const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
     const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
     const healInProgress =
@@ -5744,13 +5770,35 @@ export class NonceDO {
         .slice(0, Math.min(effectiveMaxGapFills, gapFillBudget));
       if (privateKey) {
         for (const gapNonce of gapsToFill) {
-          const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
+          // Fee escalation: conflict retries use GAP_FILL_FEE + prior attempts (+1 uSTX each)
+          let feeOverride: bigint | undefined;
+          try {
+            const rows = this.sql
+              .exec<{ gap_fill_attempts: number | null }>(
+                "SELECT gap_fill_attempts FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+                walletIndex,
+                gapNonce
+              )
+              .toArray();
+            const priorAttempts = rows[0]?.gap_fill_attempts ?? 0;
+            if (priorAttempts > 0) {
+              feeOverride = GAP_FILL_FEE + BigInt(priorAttempts);
+              if (feeOverride > MAX_BROADCAST_FEE) feeOverride = MAX_BROADCAST_FEE;
+            }
+          } catch { /* fail-open — use default fee */ }
+          const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey, feeOverride);
           if (txid) {
-            this.log("info", "gap_filled", { walletIndex, nonce: gapNonce, txid });
+            const actualFee = feeOverride ?? GAP_FILL_FEE;
+            this.log("info", "gap_filled", {
+              walletIndex,
+              nonce: gapNonce,
+              txid,
+              fee: actualFee.toString(),
+            });
             this.incrementCounter(STATE_KEYS.gapsFilled);
             gapFillFilled.push(gapNonce);
             this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
-            await this.recordGapFillFee(walletIndex, GAP_FILL_FEE.toString());
+            await this.recordGapFillFee(walletIndex, actualFee.toString());
           }
         }
       }
