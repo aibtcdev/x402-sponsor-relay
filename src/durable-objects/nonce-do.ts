@@ -7219,6 +7219,45 @@ export class NonceDO {
       this.ledgerAdvanceWalletHead(walletIndex, flushEnd);
       const replayBufferDepth = this.getReplayBufferDepth(walletIndex);
 
+      // -------------------------------------------------------------------------
+      // Step 4: Backward probe for failed nonces (ghost eviction).
+      // Only nonces that failed because the slot was already occupied by another
+      // transaction are probe-eligible. Generic failures (network errors, transient
+      // broadcast rejections) must NOT be enqueued — the probe issues a self-transfer
+      // at RBF_FEE which wastes a sponsor slot and is wrong for non-ghost failures.
+      //
+      // Why INSERT OR IGNORE (not DELETE + INSERT): the empty-range path wipes
+      // the queue before bulk-inserting a range. Here we only add the specific
+      // nonces that just failed, preserving any pending entries that may already
+      // be queued from a previous probe cycle.
+      // -------------------------------------------------------------------------
+      const PROBE_ELIGIBLE_REASONS = new Set([
+        "broadcast rejected or already occupied",
+        "rbf and gap-fill both failed or already occupied",
+      ]);
+      const probeEligibleNonces = failedNonces.filter((f) =>
+        PROBE_ELIGIBLE_REASONS.has(f.reason)
+      );
+      let probeEnqueued = 0;
+      if (probeDepth && probeDepth > 0 && probeEligibleNonces.length > 0) {
+        const now = new Date().toISOString();
+        for (const { nonce } of probeEligibleNonces) {
+          const result = this.sql.exec(
+            `INSERT OR IGNORE INTO probe_queue (wallet_index, nonce, state, created_at)
+             VALUES (?, ?, 'pending', ?)`,
+            walletIndex,
+            nonce,
+            now
+          );
+          probeEnqueued += result.rowsWritten;
+        }
+        this.log("info", "flush_wallet_failed_enqueued_for_probe", {
+          walletIndex,
+          probeEnqueued,
+          nonces: probeEligibleNonces.map((f) => f.nonce),
+        });
+      }
+
       this.log("info", "flush_wallet_complete", {
         walletIndex,
         flushStart,
@@ -7226,6 +7265,7 @@ export class NonceDO {
         retracted,
         filledCount: filled.length,
         failedCount: failedNonces.length,
+        probeEnqueued,
         newHead: flushEnd,
         replayBufferDepth,
       });
@@ -7238,6 +7278,10 @@ export class NonceDO {
         retracted,
         filled,
         failed: failedNonces,
+        ...(probeEnqueued > 0 && {
+          probeEnqueued,
+          probeNote: "Failed nonces enqueued for alarm-driven RBF (backward probe). Check GET /nonce/state for progress.",
+        }),
         newHead: flushEnd,
         replayBufferDepth,
         ...(rawFlushEnd > flushStart + MAX_ADMIN_GAP_FILLS && {
