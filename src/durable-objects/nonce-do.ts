@@ -2885,6 +2885,29 @@ export class NonceDO {
     }
   }
 
+  /**
+   * Compute the escalated gap-fill fee for a nonce based on prior attempts.
+   * Returns baseFee + priorAttempts (capped at MAX_BROADCAST_FEE), or baseFee if no prior attempts.
+   * Fail-open: returns baseFee on SQL errors.
+   */
+  private computeEscalatedFee(walletIndex: number, nonce: number, baseFee: bigint = GAP_FILL_FEE): bigint {
+    try {
+      const rows = this.sql
+        .exec<{ gap_fill_attempts: number | null }>(
+          "SELECT gap_fill_attempts FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+          walletIndex,
+          nonce
+        )
+        .toArray();
+      const priorAttempts = rows[0]?.gap_fill_attempts ?? 0;
+      if (priorAttempts > 0) {
+        const escalated = baseFee + BigInt(priorAttempts);
+        return escalated > MAX_BROADCAST_FEE ? MAX_BROADCAST_FEE : escalated;
+      }
+    } catch { /* fail-open — use base fee */ }
+    return baseFee;
+  }
+
   /** KV key for cross-wallet cascade quarantine tracking */
   private readonly cascadeQuarantineKey = "cascade_quarantine_window";
 
@@ -5813,24 +5836,11 @@ export class NonceDO {
       if (privateKey) {
         for (const gapNonce of gapsToFill) {
           // Fee escalation: conflict retries use GAP_FILL_FEE + prior attempts (+1 uSTX each)
-          let feeOverride: bigint | undefined;
-          try {
-            const rows = this.sql
-              .exec<{ gap_fill_attempts: number | null }>(
-                "SELECT gap_fill_attempts FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
-                walletIndex,
-                gapNonce
-              )
-              .toArray();
-            const priorAttempts = rows[0]?.gap_fill_attempts ?? 0;
-            if (priorAttempts > 0) {
-              feeOverride = GAP_FILL_FEE + BigInt(priorAttempts);
-              if (feeOverride > MAX_BROADCAST_FEE) feeOverride = MAX_BROADCAST_FEE;
-            }
-          } catch { /* fail-open — use default fee */ }
+          const escalatedFee = this.computeEscalatedFee(walletIndex, gapNonce);
+          const feeOverride = escalatedFee > GAP_FILL_FEE ? escalatedFee : undefined;
           const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey, feeOverride);
           if (txid) {
-            const actualFee = feeOverride ?? GAP_FILL_FEE;
+            const actualFee = escalatedFee;
             this.log("info", "gap_filled", {
               walletIndex,
               nonce: gapNonce,
@@ -7283,12 +7293,14 @@ export class NonceDO {
       const failed: Array<{ nonce: number; reason: string }> = [];
 
       for (const gapNonce of gaps) {
-        const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey);
+        const escalatedFee = this.computeEscalatedFee(walletIndex, gapNonce);
+        const feeOverride = escalatedFee > GAP_FILL_FEE ? escalatedFee : undefined;
+        const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey, feeOverride);
         if (txid) {
           filled.push({ nonce: gapNonce, txid });
           this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
           this.incrementCounter(STATE_KEYS.gapsFilled);
-          await this.recordGapFillFee(walletIndex, GAP_FILL_FEE.toString());
+          await this.recordGapFillFee(walletIndex, escalatedFee.toString());
         } else {
           failed.push({ nonce: gapNonce, reason: "broadcast rejected or already occupied" });
         }
@@ -7481,12 +7493,13 @@ export class NonceDO {
               filled.push({ nonce, txid, method: "rbf" });
             } else {
               // RBF failed (max attempts or network error) — fall back to gap-fill
-              const gapTxid = await this.fillGapNonce(walletIndex, nonce, privateKey, MIN_FLUSH_FEE);
+              const flushFee = this.computeEscalatedFee(walletIndex, nonce, MIN_FLUSH_FEE);
+              const gapTxid = await this.fillGapNonce(walletIndex, nonce, privateKey, flushFee);
               if (gapTxid) {
                 txid = gapTxid;
                 this.ledgerInsertGapFill(walletIndex, nonce, gapTxid);
                 this.incrementCounter(STATE_KEYS.gapsFilled);
-                await this.recordGapFillFee(walletIndex, MIN_FLUSH_FEE.toString());
+                await this.recordGapFillFee(walletIndex, flushFee.toString());
                 filled.push({ nonce, txid: gapTxid, method: "gap_fill" });
               } else {
                 failedNonces.push({ nonce, reason: "rbf and gap-fill both failed or already occupied" });
@@ -7517,11 +7530,12 @@ export class NonceDO {
             }
           } else {
             // Gap or unknown slot — use gap-fill self-transfer
-            const txid = await this.fillGapNonce(walletIndex, nonce, privateKey, MIN_FLUSH_FEE);
+            const gapFlushFee = this.computeEscalatedFee(walletIndex, nonce, MIN_FLUSH_FEE);
+            const txid = await this.fillGapNonce(walletIndex, nonce, privateKey, gapFlushFee);
             if (txid) {
               this.ledgerInsertGapFill(walletIndex, nonce, txid);
               this.incrementCounter(STATE_KEYS.gapsFilled);
-              await this.recordGapFillFee(walletIndex, MIN_FLUSH_FEE.toString());
+              await this.recordGapFillFee(walletIndex, gapFlushFee.toString());
               filled.push({ nonce, txid, method: "gap_fill" });
             } else {
               // ConflictingNonceInMempool means already occupied — not a hard failure
