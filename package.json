@@ -30,6 +30,9 @@
     "vitest": "^4.0.18",
     "wrangler": "^4.75.0"
   },
+  "overrides": {
+    "lodash": "4.18.0"
+  },
   "dependencies": {
     "@noble/curves": "^2.0.1",
     "@scure/btc-signer": "^2.0.1",
