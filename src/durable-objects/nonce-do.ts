@@ -6692,16 +6692,19 @@ export class NonceDO {
             txid: result.txid,
           });
         } else {
+          // BadNonce means this sponsor nonce was already confirmed on-chain — it can never
+          // succeed on retry.  Transition to 'replaying' (terminal) so the entry leaves the
+          // queued pool and stops generating noise on every tick.
           if (result.reason === "BadNonce") {
-            this.retireQueuedBadNonce(entry.wallet_index, entry.sponsor_nonce);
-            this.log("info", "bounded_broadcast_retired_bad_nonce", {
+            this.transitionQueueEntry(entry.wallet_index, entry.sponsor_nonce, "replaying");
+            this.log("info", "bounded_broadcast_nonce_consumed", {
               walletIndex: entry.wallet_index,
               sponsorNonce: entry.sponsor_nonce,
               httpStatus: result.status,
               reason: result.reason,
             });
           } else {
-            // On failure, leave in 'queued' state — next tick will retry
+            // On other failures, leave in 'queued' state — next tick will retry
             this.log("warn", "bounded_broadcast_failed", {
               walletIndex: entry.wallet_index,
               sponsorNonce: entry.sponsor_nonce,
@@ -7546,6 +7549,37 @@ export class NonceDO {
       this.ledgerAdvanceWalletHead(walletIndex, flushEnd);
       const replayBufferDepth = this.getReplayBufferDepth(walletIndex);
 
+      // -------------------------------------------------------------------------
+      // Step 4: Backward probe for failed nonces (ghost eviction).
+      // If the forward flush produced failed nonces (broadcast rejected / already
+      // occupied) and probeDepth is set, enqueue them into probe_queue for
+      // alarm-driven RBF processing at RBF_FEE.
+      //
+      // Why INSERT OR IGNORE (not DELETE + INSERT): the empty-range path wipes
+      // the queue before bulk-inserting a range. Here we only add the specific
+      // nonces that just failed, preserving any pending entries that may already
+      // be queued from a previous probe cycle.
+      // -------------------------------------------------------------------------
+      let probeEnqueued = 0;
+      if (probeDepth && probeDepth > 0 && failedNonces.length > 0) {
+        const now = new Date().toISOString();
+        for (const { nonce } of failedNonces) {
+          this.sql.exec(
+            `INSERT OR IGNORE INTO probe_queue (wallet_index, nonce, state, created_at)
+             VALUES (?, ?, 'pending', ?)`,
+            walletIndex,
+            nonce,
+            now
+          );
+          probeEnqueued++;
+        }
+        this.log("info", "flush_wallet_failed_enqueued_for_probe", {
+          walletIndex,
+          probeEnqueued,
+          nonces: failedNonces.map((f) => f.nonce),
+        });
+      }
+
       this.log("info", "flush_wallet_complete", {
         walletIndex,
         flushStart,
@@ -7553,6 +7587,7 @@ export class NonceDO {
         retracted,
         filledCount: filled.length,
         failedCount: failedNonces.length,
+        probeEnqueued,
         newHead: flushEnd,
         replayBufferDepth,
       });
@@ -7565,6 +7600,10 @@ export class NonceDO {
         retracted,
         filled,
         failed: failedNonces,
+        ...(probeEnqueued > 0 && {
+          probeEnqueued,
+          probeNote: "Failed nonces enqueued for alarm-driven RBF (backward probe). Check GET /nonce/state for progress.",
+        }),
         newHead: flushEnd,
         replayBufferDepth,
         ...(rawFlushEnd > flushStart + MAX_ADMIN_GAP_FILLS && {
