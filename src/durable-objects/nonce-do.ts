@@ -254,6 +254,10 @@ interface ObservableWalletState {
   replayBufferDepth?: number;
   /** Settlement time percentiles for this wallet (last 24h, null if no data) */
   settlementTimes?: SettlementTimeStats;
+  /** True when the wallet has accumulated GHOST_FAILURE_THRESHOLD consecutive ghost failures */
+  ghostDegraded?: boolean;
+  /** Number of consecutive ghost broadcast failures (ConflictingNonceInMempool with no Hiro-visible occupant) */
+  ghostFailures?: number;
 }
 
 /**
@@ -488,6 +492,15 @@ const HEAD_BUMP_FEE = MIN_FLUSH_FEE * 2n;
 // CIRCUIT_BREAKER_WINDOW_MS expires. For a payment relay, every failed broadcast
 // is a user-facing SETTLEMENT_TIMEOUT — aggressive quarantine is correct.
 const CIRCUIT_BREAKER_QUARANTINE_THRESHOLD = 1;
+/**
+ * Number of consecutive ghost broadcast failures before a wallet is marked ghost_degraded.
+ * A "ghost" failure is a ConflictingNonceInMempool where fetchOccupantFee returns null —
+ * the node holds a transaction that Hiro cannot see (invisible mempool entry).
+ * Ghost-degraded wallets are skipped during nonce assignment until they self-clear.
+ */
+const GHOST_FAILURE_THRESHOLD = 5;
+/** Maximum fee cap for gap-fill escalation and RBF broadcasts (90,000 uSTX) */
+const MAX_BROADCAST_FEE = 90_000n;
 
 // ---------------------------------------------------------------------------
 // Gin rummy dealing constants (Phase 3 — fairness and bounded alarm work)
@@ -2124,7 +2137,64 @@ export class NonceDO {
         return result.txid;
       }
       if (result.reason === "ConflictingNonceInMempool") {
-        // Nonce already occupied — not an error, just skip
+        // Nonce already occupied — update ledger to prevent re-queuing on next alarm cycle.
+        // Three cases:
+        //   (a) We have a prior gap-fill txid: our own fill is still pending → mark broadcasted.
+        //   (b) No ledger entry at all: unknown occupant → insert a conflict entry.
+        //   (c) Ledger entry exists but no txid: genuine conflict, no txid to discover → mark conflict.
+        try {
+          const existingRows = this.sql
+            .exec<{ txid: string | null; state: string }>(
+              "SELECT txid, state FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+              walletIndex,
+              gapNonce
+            )
+            .toArray();
+          const existingTxid = existingRows[0]?.txid ?? null;
+          const existingState = existingRows[0]?.state ?? null;
+
+          if (existingTxid !== null) {
+            // Case (a): our own prior gap-fill is still pending in the mempool
+            this.log("info", "gap_fill_conflict_own_pending", {
+              walletIndex,
+              nonce: gapNonce,
+              existingTxid,
+              existingState,
+            });
+            this.sql.exec(
+              `UPDATE nonce_intents SET state = 'broadcasted'
+               WHERE wallet_index = ? AND nonce = ?
+               AND state NOT IN ('confirmed', 'broadcasted')`,
+              walletIndex,
+              gapNonce
+            );
+          } else if (existingState === null) {
+            // Case (b): no ledger entry — insert a conflict entry so reconciler can handle it
+            this.log("info", "gap_fill_conflict_unknown_occupant", { walletIndex, nonce: gapNonce });
+            const now = new Date().toISOString();
+            this.sql.exec(
+              `INSERT OR IGNORE INTO nonce_intents (wallet_index, nonce, state, assigned_at)
+               VALUES (?, ?, 'conflict', ?)`,
+              walletIndex,
+              gapNonce,
+              now
+            );
+          } else {
+            // Case (c): ledger entry with no txid — mark conflict to stop re-queuing
+            this.log("info", "gap_fill_conflict_no_txid", {
+              walletIndex,
+              nonce: gapNonce,
+              existingState,
+            });
+            this.sql.exec(
+              `UPDATE nonce_intents SET state = 'conflict', error_reason = 'gap_fill_conflict_no_txid'
+               WHERE wallet_index = ? AND nonce = ?
+               AND state NOT IN ('confirmed', 'broadcasted')`,
+              walletIndex,
+              gapNonce
+            );
+          }
+        } catch { /* fail-open */ }
         return null;
       }
       this.log("warn", "gap_fill_rejected", {
@@ -2141,6 +2211,52 @@ export class NonceDO {
         nonce: gapNonce,
         error: e instanceof Error ? e.message : String(e),
       });
+      return null;
+    }
+  }
+
+  /**
+   * Fetch the fee paid by the current occupant of a sponsor nonce slot.
+   * Used by broadcastRbfForNonce to compute the minimum fee needed to replace the occupant.
+   *
+   * Strategy:
+   * - Look up txid from nonce_intents for (walletIndex, sponsorNonce).
+   * - If txid found: GET /extended/v1/tx/{txid} from Hiro → extract fee_rate.
+   *   This works for mempool txs (Hiro returns fee_rate for pending txs).
+   * - If no txid: return null — the occupant is a "ghost" (node holds a tx invisible to Hiro).
+   *
+   * Fail-open: returns null on any network/parse error.
+   */
+  private async fetchOccupantFee(
+    walletIndex: number,
+    sponsorNonce: number
+  ): Promise<{ fee: bigint; source: "hiro" } | null> {
+    try {
+      const rows = this.sql
+        .exec<{ txid: string | null }>(
+          "SELECT txid FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+          walletIndex,
+          sponsorNonce
+        )
+        .toArray();
+      const txid = rows[0]?.txid ?? null;
+      if (!txid) return null;
+
+      const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+      const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+      const response = await fetch(`${base}/extended/v1/tx/${txid}`, {
+        headers,
+        signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
+      });
+      if (!response.ok) return null;
+      const data = (await response.json()) as Record<string, unknown>;
+      const feeRate = data.fee_rate;
+      if (typeof feeRate === "string" || typeof feeRate === "number") {
+        const fee = BigInt(feeRate);
+        if (fee > 0n) return { fee, source: "hiro" };
+      }
+      return null;
+    } catch {
       return null;
     }
   }
@@ -2212,7 +2328,13 @@ export class NonceDO {
     const attemptNum = state.rbfAttempts + 1;
 
     try {
-      // Fetch original_fee from dispatch_queue to compute minimal RBF fee
+      // Discover the occupant's fee via Hiro API (preferred) or fall back to dispatch_queue.
+      // Using the actual occupant fee prevents "guaranteed failure" attempts where our fee
+      // is too low to replace the occupant — those should not burn the attempt counter.
+      const occupantResult = await this.fetchOccupantFee(walletIndex, nonce);
+      const occupantFee = occupantResult?.fee ?? null;
+
+      // Also read original_fee from dispatch_queue as fallback
       const dispatchRow = this.sql
         .exec<{ original_fee: string | null }>(
           "SELECT original_fee FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
@@ -2220,15 +2342,24 @@ export class NonceDO {
           nonce
         )
         .toArray()[0];
-      const originalFeeStr = dispatchRow?.original_fee ?? null;
-      const rbfFee = computeRbfFee(originalFeeStr);
+      const dispatchFeeStr = dispatchRow?.original_fee ?? null;
+      const dispatchFee = dispatchFeeStr ? (() => { try { return BigInt(dispatchFeeStr); } catch { return null; } })() : null;
+
+      // RBF fee = max(occupant_fee, dispatch_fee) + 1, capped at MAX_BROADCAST_FEE
+      const baseFee = occupantFee !== null && dispatchFee !== null
+        ? (occupantFee > dispatchFee ? occupantFee : dispatchFee)
+        : (occupantFee ?? dispatchFee);
+      const rbfFee = baseFee !== null
+        ? (baseFee + 1n > MAX_BROADCAST_FEE ? MAX_BROADCAST_FEE : baseFee + 1n)
+        : MIN_FLUSH_FEE;
 
       this.log("info", "rbf_fee_used", {
         walletIndex,
         nonce,
         rbfFee: rbfFee.toString(),
-        originalFee: originalFeeStr,
-        hadOriginalFee: originalFeeStr !== null,
+        occupantFee: occupantFee?.toString() ?? null,
+        dispatchFee: dispatchFeeStr,
+        feeSource: occupantResult?.source ?? (dispatchFeeStr ? "dispatch_queue" : "floor"),
         attemptNum,
       });
 
@@ -2243,15 +2374,16 @@ export class NonceDO {
       });
       const result = await this.broadcastRawTx(tx, "rbf");
 
-      // Update state regardless of outcome (increment attempt count to prevent runaway)
       state.lastSeen = now;
-      state.rbfAttempts = attemptNum;
       state.originalTxid = state.originalTxid ?? originalTxid;
 
       if (result.ok) {
+        // Broadcast succeeded — increment attempt counter and reset ghost state
+        state.rbfAttempts = attemptNum;
         state.lastRbfTxid = result.txid;
         await this.state.storage.put(key, state);
         this.incrementCounter(STATE_KEYS.stuckTxRbfBroadcast);
+        this.resetGhostState(walletIndex);
         // Update the ledger txid so reconciliation tracks the replacement
         try {
           this.sql.exec(
@@ -2270,7 +2402,6 @@ export class NonceDO {
           nonce,
           txid: result.txid,
           fee: rbfFee.toString(),
-          originalFee: originalFeeStr,
           attemptNum,
           originalTxid: state.originalTxid,
         });
@@ -2282,7 +2413,9 @@ export class NonceDO {
       // last_executed_tx_nonce check will mark it confirmed on the next cycle.
       if (result.reason === "BadNonce") {
         // Terminal — delete stuck-tx state entirely to avoid orphaned entries
+        state.rbfAttempts = attemptNum;
         await this.state.storage.delete(key);
+        this.resetGhostState(walletIndex);
         this.log("info", "rbf_nonce_consumed", {
           walletIndex,
           nonce,
@@ -2293,7 +2426,37 @@ export class NonceDO {
         return null;
       }
 
-      // Other rejection — persist incremented attempt count and log details
+      if (result.reason === "ConflictingNonceInMempool") {
+        // Our RBF fee was not high enough to replace the occupant, OR the occupant is a ghost.
+        // Detect ghost: occupantFee === null means Hiro can't see the occupant.
+        const isGhost = occupantFee === null;
+        if (isGhost) {
+          // True ghost — node holds something invisible to Hiro: increment ghost counter.
+          // Do NOT increment rbfAttempts — this is a guaranteed failure, not a real attempt.
+          this.incrementGhostFailures(walletIndex);
+          this.log("warn", "rbf_ghost_conflict", {
+            walletIndex,
+            nonce,
+            ghostFailures: this.getStateValue(this.walletGhostFailuresKey(walletIndex)),
+            rbfFee: rbfFee.toString(),
+          });
+        } else {
+          // Fee too low (occupant fee discovered but our fee wasn't enough) — increment counter
+          state.rbfAttempts = attemptNum;
+          this.log("warn", "rbf_fee_too_low", {
+            walletIndex,
+            nonce,
+            rbfFee: rbfFee.toString(),
+            occupantFee: occupantFee.toString(),
+            attemptNum,
+          });
+        }
+        await this.state.storage.put(key, state);
+        return null;
+      }
+
+      // Other rejection — increment attempt count to prevent runaway and log details
+      state.rbfAttempts = attemptNum;
       await this.state.storage.put(key, state);
       this.log("warn", "rbf_broadcast_rejected", {
         walletIndex,
@@ -2610,6 +2773,53 @@ export class NonceDO {
   /** KV key for per-wallet recent quarantine timestamps (circuit breaker window) */
   private walletQuarantineRecentKey(walletIndex: number): string {
     return `wallet_quarantine_recent:${walletIndex}`;
+  }
+
+  /** nonce_state key for per-wallet ghost failure counter */
+  private walletGhostFailuresKey(walletIndex: number): string {
+    return `wallet_ghost_failures:${walletIndex}`;
+  }
+
+  /** nonce_state key for per-wallet ghost-degraded flag (0 = healthy, 1 = degraded) */
+  private walletGhostDegradedKey(walletIndex: number): string {
+    return `wallet_ghost_degraded:${walletIndex}`;
+  }
+
+  /**
+   * Increment the ghost failure counter for a wallet.
+   * When the counter reaches GHOST_FAILURE_THRESHOLD, marks the wallet as ghost_degraded.
+   * Ghost-degraded wallets are skipped during nonce assignment.
+   * Returns true if the wallet just became ghost_degraded.
+   */
+  private incrementGhostFailures(walletIndex: number): boolean {
+    const count = (this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0) + 1;
+    this.setStateValue(this.walletGhostFailuresKey(walletIndex), count);
+    if (count >= GHOST_FAILURE_THRESHOLD) {
+      const alreadyDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+      this.setStateValue(this.walletGhostDegradedKey(walletIndex), 1);
+      if (!alreadyDegraded) {
+        this.log("warn", "ghost_wallet_degraded", {
+          walletIndex,
+          ghostFailures: count,
+          threshold: GHOST_FAILURE_THRESHOLD,
+        });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Reset ghost failure state for a wallet on any successful broadcast.
+   * Called after a successful RBF or gap-fill broadcast for the wallet.
+   */
+  private resetGhostState(walletIndex: number): void {
+    const wasDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+    this.setStateValue(this.walletGhostFailuresKey(walletIndex), 0);
+    this.setStateValue(this.walletGhostDegradedKey(walletIndex), 0);
+    if (wasDegraded) {
+      this.log("info", "ghost_wallet_recovered", { walletIndex });
+    }
   }
 
   /** KV key for cross-wallet cascade quarantine tracking */
@@ -3712,6 +3922,20 @@ export class NonceDO {
           continue;
         }
 
+        // Check ghost-degraded state: skip wallets where broadcast failures indicate
+        // the node holds transactions invisible to Hiro (ghost mempool entries).
+        const isGhostDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+        if (isGhostDegraded) {
+          this.log("warn", "ghost_degraded_skip", {
+            walletIndex,
+            ghostFailures: this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0,
+          });
+          degradedWallets.push({ walletIndex, cycleCount: 0 });
+          walletIndex = (walletIndex + 1) % effectiveWalletCount;
+          attempts++;
+          continue;
+        }
+
         const headroom = this.walletHeadroom(walletIndex);
         if (headroom > 0) {
           // Collect all eligible wallets; select by headroom after full scan
@@ -4380,6 +4604,10 @@ export class NonceDO {
         // Settlement time percentiles for this wallet (last 24h)
         const settlementTimes = this.computeSettlementPercentiles(walletIndex);
 
+        // Ghost degraded state
+        const ghostDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+        const ghostFailures = this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0;
+
         return {
           walletIndex,
           sponsorAddress: address,
@@ -4390,10 +4618,12 @@ export class NonceDO {
           available,
           reserved,
           circuitBreakerOpen,
-          healthy: gaps.length === 0 && !circuitBreakerOpen && available > 0,
+          healthy: gaps.length === 0 && !circuitBreakerOpen && !ghostDegraded && available > 0,
           queueDepth: queueState.total,
           replayBufferDepth: replayDepth,
           settlementTimes,
+          ghostDegraded,
+          ghostFailures,
         };
       })
     );
@@ -5617,6 +5847,12 @@ export class NonceDO {
     const flushResult = await this.runFlushAndReplayCycle(walletIndex, effectiveStuckTxAge);
 
     // -------------------------------------------------------------------------
+    // Auto-clear ghost_degraded when wallet shows confirmed transactions this cycle.
+    // If nonces are confirming, the wallet is broadcasting successfully — ghost state is stale.
+    if (verdictConfirmed > 0) {
+      this.resetGhostState(walletIndex);
+    }
+
     // Log reconciliation_summary for this wallet
     // -------------------------------------------------------------------------
     this.log("info", "reconciliation_summary", {
