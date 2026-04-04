@@ -2251,7 +2251,10 @@ export class NonceDO {
   private async fetchOccupantFee(
     walletIndex: number,
     sponsorNonce: number
-  ): Promise<{ fee: bigint; source: "hiro" } | null> {
+  ): Promise<
+    | { fee: bigint; source: "hiro"; reason?: undefined }
+    | { fee: null; source?: undefined; reason: "no_txid" | "not_found" | "hiro_error" }
+  > {
     try {
       const rows = this.sql
         .exec<{ txid: string | null }>(
@@ -2261,7 +2264,7 @@ export class NonceDO {
         )
         .toArray();
       const txid = rows[0]?.txid ?? null;
-      if (!txid) return null;
+      if (!txid) return { fee: null, reason: "no_txid" };
 
       const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
       const headers = getHiroHeaders(this.env.HIRO_API_KEY);
@@ -2269,16 +2272,19 @@ export class NonceDO {
         headers,
         signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
       });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        // 404 = tx not in Hiro's index (evicted/unknown). Other errors = transient Hiro failure.
+        return { fee: null, reason: response.status === 404 ? "not_found" : "hiro_error" };
+      }
       const data = (await response.json()) as Record<string, unknown>;
       const feeRate = data.fee_rate;
       if (typeof feeRate === "string" || typeof feeRate === "number") {
         const fee = BigInt(feeRate);
         if (fee > 0n) return { fee, source: "hiro" };
       }
-      return null;
+      return { fee: null, reason: "not_found" };
     } catch {
-      return null;
+      return { fee: null, reason: "hiro_error" };
     }
   }
 
@@ -2353,7 +2359,7 @@ export class NonceDO {
       // Using the actual occupant fee prevents "guaranteed failure" attempts where our fee
       // is too low to replace the occupant — those should not burn the attempt counter.
       const occupantResult = await this.fetchOccupantFee(walletIndex, nonce);
-      const occupantFee = occupantResult?.fee ?? null;
+      const occupantFee = occupantResult.fee;
 
       // Also read original_fee from dispatch_queue as fallback
       const dispatchRow = this.sql
@@ -2370,8 +2376,25 @@ export class NonceDO {
       const baseFee = occupantFee !== null && dispatchFee !== null
         ? (occupantFee > dispatchFee ? occupantFee : dispatchFee)
         : (occupantFee ?? dispatchFee);
+
+      // Short-circuit: if baseFee already at/above cap, broadcast can never succeed
+      if (baseFee !== null && baseFee >= MAX_BROADCAST_FEE) {
+        this.log("warn", "rbf_fee_cap_reached", {
+          walletIndex,
+          nonce,
+          baseFee: baseFee.toString(),
+          maxBroadcastFee: MAX_BROADCAST_FEE.toString(),
+          occupantFee: occupantFee?.toString() ?? null,
+          dispatchFee: dispatchFeeStr,
+          attemptNum,
+        });
+        state.rbfAttempts = attemptNum;
+        await this.state.storage.put(key, state);
+        return null;
+      }
+
       const rbfFee = baseFee !== null
-        ? (baseFee + 1n > MAX_BROADCAST_FEE ? MAX_BROADCAST_FEE : baseFee + 1n)
+        ? baseFee + 1n
         : MIN_FLUSH_FEE;
 
       this.log("info", "rbf_fee_used", {
@@ -2380,7 +2403,8 @@ export class NonceDO {
         rbfFee: rbfFee.toString(),
         occupantFee: occupantFee?.toString() ?? null,
         dispatchFee: dispatchFeeStr,
-        feeSource: occupantResult?.source ?? (dispatchFeeStr ? "dispatch_queue" : "floor"),
+        feeSource: occupantResult.source ?? (dispatchFeeStr ? "dispatch_queue" : "floor"),
+        occupantLookupReason: occupantResult.reason ?? null,
         attemptNum,
       });
 
@@ -2448,9 +2472,14 @@ export class NonceDO {
       }
 
       if (result.reason === "ConflictingNonceInMempool") {
-        // Our RBF fee was not high enough to replace the occupant, OR the occupant is a ghost.
-        // Detect ghost: occupantFee === null means Hiro can't see the occupant.
-        const isGhost = occupantFee === null;
+        // Classify the conflict based on why occupant fee lookup failed:
+        //   no_txid/not_found = true ghost (node holds tx invisible to Hiro)
+        //   hiro_error = transient Hiro failure — don't penalize the wallet
+        //   fee discovered = our fee was too low
+        const occupantReason = occupantResult.reason;
+        const isGhost = occupantReason === "no_txid" || occupantReason === "not_found";
+        const isHiroError = occupantReason === "hiro_error";
+
         if (isGhost) {
           // True ghost — node holds something invisible to Hiro: increment ghost counter.
           // Do NOT increment rbfAttempts — this is a guaranteed failure, not a real attempt.
@@ -2460,15 +2489,27 @@ export class NonceDO {
             nonce,
             ghostFailures: this.getStateValue(this.walletGhostFailuresKey(walletIndex)),
             rbfFee: rbfFee.toString(),
+            occupantReason,
+          });
+        } else if (isHiroError) {
+          // Hiro was unavailable — we can't determine occupant fee, don't blame the wallet.
+          // Do NOT increment rbfAttempts or ghost counter.
+          this.log("warn", "rbf_conflict_hiro_unavailable", {
+            walletIndex,
+            nonce,
+            rbfFee: rbfFee.toString(),
+            attemptNum,
           });
         } else {
-          // Fee too low (occupant fee discovered but our fee wasn't enough) — increment counter
+          // Fee too low (occupant fee discovered but our fee wasn't enough) — increment counter.
+          // This is a non-ghost outcome: reset ghost state if accumulated.
           state.rbfAttempts = attemptNum;
+          this.resetGhostState(walletIndex);
           this.log("warn", "rbf_fee_too_low", {
             walletIndex,
             nonce,
             rbfFee: rbfFee.toString(),
-            occupantFee: occupantFee.toString(),
+            occupantFee: occupantFee!.toString(),
             attemptNum,
           });
         }
@@ -2831,8 +2872,9 @@ export class NonceDO {
   }
 
   /**
-   * Reset ghost failure state for a wallet on any successful broadcast.
-   * Called after a successful RBF or gap-fill broadcast for the wallet.
+   * Reset ghost failure state for a wallet on any non-ghost broadcast outcome.
+   * Called after: successful RBF, successful gap-fill, BadNonce (consumed),
+   * or fee-too-low (occupant fee was discovered, so not a ghost).
    */
   private resetGhostState(walletIndex: number): void {
     const wasDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
@@ -5799,6 +5841,7 @@ export class NonceDO {
             gapFillFilled.push(gapNonce);
             this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
             await this.recordGapFillFee(walletIndex, actualFee.toString());
+            this.resetGhostState(walletIndex);
           }
         }
       }
