@@ -2834,7 +2834,11 @@ export class NonceDO {
         value: info.possible_next_nonce,
         expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
       });
-      this.advanceChainFrontier(walletIndex, info.possible_next_nonce);
+      // Advance frontier based on confirmed state, not mempool state
+      const confirmedFrontier = info.last_executed_tx_nonce !== null
+        ? info.last_executed_tx_nonce + 1
+        : info.possible_next_nonce;
+      this.advanceChainFrontier(walletIndex, confirmedFrontier);
       return info.possible_next_nonce;
     } catch (_e) {
       this.log("debug", "nonce_lookahead_check_skipped", {
@@ -3410,13 +3414,18 @@ export class NonceDO {
 
   /**
    * Advance the chain frontier for a wallet. Only moves forward (monotonic).
-   * Called on every Hiro observation to absorb the highest confirmed nonce,
-   * filtering out load-balanced inconsistency where a stale node returns a
-   * lower value.
+   *
+   * IMPORTANT: The frontier must reflect *confirmed* state, not mempool state.
+   * Use `last_executed_tx_nonce + 1` (what's actually confirmed on-chain), NOT
+   * `possible_next_nonce` (which includes mempool txs and can leap past gaps).
+   *
+   * Using `possible_next_nonce` caused "frontier drift" — when high-nonce txs
+   * hit the mempool, the frontier advanced past unconfirmed gaps, making them
+   * invisible to headroom calculations and the reconciliation loop.
    */
-  private advanceChainFrontier(walletIndex: number, hiroNextNonce: number): void {
+  private advanceChainFrontier(walletIndex: number, confirmedNextNonce: number): void {
     const current = this.getChainFrontier(walletIndex);
-    const next = current !== null ? Math.max(current, hiroNextNonce) : hiroNextNonce;
+    const next = current !== null ? Math.max(current, confirmedNextNonce) : confirmedNextNonce;
     if (current === next) return; // no change
     this.chainFrontierCache.set(walletIndex, next);
     this.setStateValue(this.chainFrontierKey(walletIndex), next);
@@ -4996,11 +5005,19 @@ export class NonceDO {
       value: nonceInfo.possible_next_nonce,
       expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
     });
-    this.advanceChainFrontier(walletIndex, nonceInfo.possible_next_nonce);
+    // Advance frontier based on confirmed state, not mempool state.
+    // This prevents "frontier drift" where the frontier leaps past unconfirmed
+    // gaps when high-nonce txs land in the mempool.
+    const confirmedFrontier = nonceInfo.last_executed_tx_nonce !== null
+      ? nonceInfo.last_executed_tx_nonce + 1
+      : nonceInfo.possible_next_nonce; // fallback for fresh addresses with no confirmed txs
+    this.advanceChainFrontier(walletIndex, confirmedFrontier);
 
     const previousNonce = this.ledgerGetWalletHead(walletIndex);
 
-    // First-time initialization: seed head from Hiro when no local state exists
+    // First-time initialization: seed head from Hiro when no local state exists.
+    // Use possible_next_nonce for the head (need to assign above mempool),
+    // but frontier is already set to confirmed state above.
     if (previousNonce === null) {
       this.ledgerAdvanceWalletHead(walletIndex, nonceInfo.possible_next_nonce);
       return {
@@ -5647,6 +5664,8 @@ export class NonceDO {
     // for one cycle to let the replacement confirm.
     // -------------------------------------------------------------------------
 
+    // Track whether a forward bump occurred — used in the return value below.
+    let forwardBumped = false;
     if (previousNonce !== null && possible_next_nonce > previousNonce) {
       // Chain has advanced past our stored head — forward bump the head.
       this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
@@ -5658,14 +5677,13 @@ export class NonceDO {
         newNonce: possible_next_nonce,
         hiroNextNonce: possible_next_nonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
+        gapFillNonces: gapFillNonces.length,
       });
 
-      return {
-        previousNonce,
-        newNonce: possible_next_nonce,
-        changed: true,
-        reason: `FORWARD BUMP: chain advanced to ${possible_next_nonce}`,
-      };
+      // NOTE: Previously this returned early, skipping gap-fill execution.
+      // This caused "frontier drift" — gaps below the head were never filled
+      // because the function exited before reaching the gap-fill broadcast loop.
+      forwardBumped = true;
     }
 
     const lastAssignedAtMs = this.getStateValue(STATE_KEYS.lastAssignedAt);
@@ -5741,11 +5759,15 @@ export class NonceDO {
     const headBumpSummary = headBumpNonce !== null
       ? ` head_bump [${headBumpNonce}]`
       : "";
+    const forwardBumpSummary = forwardBumped
+      ? ` forward_bump [${previousNonce} → ${possible_next_nonce}]`
+      : "";
+    const effectiveNewNonce = forwardBumped ? possible_next_nonce : previousNonce;
     return {
       previousNonce,
-      newNonce: previousNonce,
-      changed: gapFillFilled.length > 0 || rbfAttempted.length > 0 || headBumpNonce !== null,
-      reason: `nonce is consistent with chain state${gapFilledSummary}${rbfSummary}${headBumpSummary}`,
+      newNonce: effectiveNewNonce,
+      changed: forwardBumped || gapFillFilled.length > 0 || rbfAttempted.length > 0 || headBumpNonce !== null,
+      reason: `nonce is consistent with chain state${forwardBumpSummary}${gapFilledSummary}${rbfSummary}${headBumpSummary}`,
     };
   }
 
