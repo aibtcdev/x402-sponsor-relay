@@ -512,6 +512,11 @@ const GHOST_FAILURE_THRESHOLD = 5;
  * Chaining-degraded wallets are skipped during nonce assignment until a probe confirms recovery.
  */
 const CHAINING_FAILURE_THRESHOLD = 3;
+/**
+ * Cooldown (ms) after a wallet becomes chaining_degraded before attempting a recovery probe.
+ * Gives pending mempool transactions time to drain before probing.
+ */
+const CHAINING_PROBE_COOLDOWN_MS = 5 * 60 * 1000;
 /** Maximum fee cap for gap-fill escalation and RBF broadcasts (90,000 uSTX) */
 const MAX_BROADCAST_FEE = 90_000n;
 
@@ -2966,6 +2971,16 @@ export class NonceDO {
     }
   }
 
+  /** True when a wallet is marked ghost-degraded (invisible mempool entries). */
+  private isGhostDegraded(walletIndex: number): boolean {
+    return (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+  }
+
+  /** True when a wallet is marked chaining-degraded (TooMuchChaining rejections). */
+  private isChainingDegraded(walletIndex: number): boolean {
+    return (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
+  }
+
   /**
    * Compute the escalated gap-fill fee for a nonce based on prior attempts.
    * Returns baseFee + priorAttempts (capped at MAX_BROADCAST_FEE), or baseFee if no prior attempts.
@@ -4119,8 +4134,7 @@ export class NonceDO {
 
         // Check ghost-degraded state: skip wallets where broadcast failures indicate
         // the node holds transactions invisible to Hiro (ghost mempool entries).
-        const isGhostDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
-        if (isGhostDegraded) {
+        if (this.isGhostDegraded(walletIndex)) {
           this.log("warn", "ghost_degraded_skip", {
             walletIndex,
             ghostFailures: this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0,
@@ -4134,8 +4148,7 @@ export class NonceDO {
         // Check chaining-degraded state: skip wallets stuck in TooMuchChaining loops.
         // These wallets have hit the Stacks node's 25-tx chaining limit and can't accept new txs.
         // The alarm reconciliation loop will probe recovery after a 5-minute cooldown.
-        const isChainingDegraded = (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
-        if (isChainingDegraded) {
+        if (this.isChainingDegraded(walletIndex)) {
           this.log("warn", "chaining_degraded_skip", {
             walletIndex,
             chainingFailures: this.getStateValue(this.walletChainingFailuresKey(walletIndex)) ?? 0,
@@ -4481,10 +4494,8 @@ export class NonceDO {
         const activeQuarantines = recentQuarantines.filter(
           (ts) => new Date(ts).getTime() >= cutoff
         );
-        const ghostDegraded =
-          (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
-        const chainingDegraded =
-          (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
+        const ghostDegraded = this.isGhostDegraded(walletIndex);
+        const chainingDegraded = this.isChainingDegraded(walletIndex);
         const rawAvailable = this.walletHeadroom(walletIndex);
         // Ghost-degraded or chaining-degraded wallets are skipped by assignNonce, so report 0 available
         const available = (ghostDegraded || chainingDegraded) ? 0 : Math.max(0, Math.min(CHAINING_LIMIT, rawAvailable));
@@ -4823,11 +4834,11 @@ export class NonceDO {
         const settlementTimes = this.computeSettlementPercentiles(walletIndex);
 
         // Ghost degraded state
-        const ghostDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+        const ghostDegraded = this.isGhostDegraded(walletIndex);
         const ghostFailures = this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0;
 
         // Chaining degraded state
-        const chainingDegraded = (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
+        const chainingDegraded = this.isChainingDegraded(walletIndex);
         const chainingFailures = this.getStateValue(this.walletChainingFailuresKey(walletIndex)) ?? 0;
 
         // Mempool diagnostic: last known Hiro mempool tx count (populated during reconciliation)
@@ -6207,8 +6218,7 @@ export class NonceDO {
       walletCircuitOpen || (headroom === 0 && detected_mempool_nonces.length === 0);
     if (isStuckWallet) {
       const mempoolCount = await this.fetchMempoolTxCount(sponsorAddress);
-      const ghostDegradedNow =
-        (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+      const ghostDegradedNow = this.isGhostDegraded(walletIndex);
       if (mempoolCount !== null) {
         this.setStateValue(this.walletMempoolTxCountKey(walletIndex), mempoolCount);
         this.log("info", "mempool_diagnostic", {
@@ -6925,7 +6935,7 @@ export class NonceDO {
 
         // Pre-check wallet health: skip entries for wallets already known to be unhealthy.
         // This prevents the bounded_broadcast loop from wasting broadcasts (and amplifying
-        // failures) on wallets whose circuit breaker is active or that are ghost-degraded.
+        // failures) on wallets whose circuit breaker is active, ghost-degraded, or chaining-degraded.
         const cbKey = this.walletQuarantineRecentKey(entry.wallet_index);
         const cbCutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
         const cbRecent = (await this.state.storage.get<string[]>(cbKey)) ?? [];
@@ -6938,10 +6948,16 @@ export class NonceDO {
           errors++;
           continue;
         }
-        const isEntryGhostDegraded =
-          (this.getStateValue(this.walletGhostDegradedKey(entry.wallet_index)) ?? 0) === 1;
-        if (isEntryGhostDegraded) {
+        if (this.isGhostDegraded(entry.wallet_index)) {
           this.log("warn", "bounded_broadcast_ghost_skip", {
+            walletIndex: entry.wallet_index,
+            sponsorNonce: entry.sponsor_nonce,
+          });
+          errors++;
+          continue;
+        }
+        if (this.isChainingDegraded(entry.wallet_index)) {
+          this.log("warn", "bounded_broadcast_chaining_skip", {
             walletIndex: entry.wallet_index,
             sponsorNonce: entry.sponsor_nonce,
           });
@@ -7272,12 +7288,10 @@ export class NonceDO {
           }
 
           // Chaining-degraded probe: after reconciliation, test if the wallet can accept new txs.
-          // Only fires once per alarm cycle per wallet, after a 5-minute cooldown from first degradation.
-          const isChainingDegradedNow =
-            (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
-          if (isChainingDegradedNow) {
+          // Only fires once per alarm cycle per wallet, after a cooldown from first degradation.
+          if (this.isChainingDegraded(walletIndex)) {
             const degradedAtMs = this.getStateValue(this.walletChainingDegradedAtKey(walletIndex)) ?? 0;
-            const cooldownElapsed = Date.now() - degradedAtMs > 5 * 60 * 1000;
+            const cooldownElapsed = Date.now() - degradedAtMs > CHAINING_PROBE_COOLDOWN_MS;
             if (cooldownElapsed) {
               await this.attemptChainingProbe(walletIndex, address);
             }

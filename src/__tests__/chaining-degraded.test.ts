@@ -148,11 +148,9 @@ describe("chaining probe recovery (attemptChainingProbe)", () => {
         recipient: "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM",
       }),
       broadcastRawTx: vi.fn().mockResolvedValue(opts.broadcastResult),
-      // resetChainingState and walletChainingDegradedAtKey are bound methods — we need them on ctx
+      // resetChainingState is called by attemptChainingProbe on success — bind it from the prototype.
+      // The wallet*Key methods are already provided by makeStateStore via the spread above.
       resetChainingState: (NonceDO as any).prototype.resetChainingState,
-      walletChainingFailuresKey: (NonceDO as any).prototype.walletChainingFailuresKey,
-      walletChainingDegradedKey: (NonceDO as any).prototype.walletChainingDegradedKey,
-      walletChainingDegradedAtKey: (NonceDO as any).prototype.walletChainingDegradedAtKey,
     };
   }
 

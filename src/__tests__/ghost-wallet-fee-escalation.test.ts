@@ -135,6 +135,8 @@ describe("buildSponsorStatusSnapshot ghost-degraded wallets", () => {
         if (match && ghostSet.has(Number(match[1]))) return 1;
         return null;
       },
+      isGhostDegraded: (walletIndex: number) => ghostSet.has(walletIndex),
+      isChainingDegraded: () => false,
       getStoredCount: () => 0,
     };
   }

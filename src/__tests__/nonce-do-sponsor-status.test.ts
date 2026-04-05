@@ -19,6 +19,8 @@ function makeSnapshotBuilderDouble(rawAvailabilities: number[]) {
     walletHeadroom: (walletIndex: number) => rawAvailabilities[walletIndex],
     getStateValue: () => null,
     getStoredCount: () => 0,
+    isGhostDegraded: () => false,
+    isChainingDegraded: () => false,
   };
 }
 
