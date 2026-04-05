@@ -69,6 +69,10 @@ export class NonceState extends BaseEndpoint {
                           available: { type: "number" as const, description: "Effective headroom — how many more nonces this wallet can accept (same calc as assignment)" },
                           reserved: { type: "number" as const, description: "In-flight nonces across all states (assigned + broadcasted + confirmed-pending)" },
                           circuitBreakerOpen: { type: "boolean" as const },
+                          ghostDegraded: { type: "boolean" as const, description: "True when the wallet has accumulated consecutive ghost broadcast failures (invisible mempool entries)" },
+                          ghostFailures: { type: "number" as const, description: "Number of consecutive ghost broadcast failures (ConflictingNonceInMempool with no Hiro-visible occupant)" },
+                          chainingDegraded: { type: "boolean" as const, description: "True when the wallet has hit the Stacks node TooMuchChaining limit" },
+                          chainingFailures: { type: "number" as const, description: "Number of consecutive TooMuchChaining broadcast failures" },
                           mempoolTxCount: {
                             type: "number" as const,
                             nullable: true,
