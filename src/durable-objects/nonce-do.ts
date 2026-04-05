@@ -258,6 +258,8 @@ interface ObservableWalletState {
   ghostDegraded?: boolean;
   /** Number of consecutive ghost broadcast failures (ConflictingNonceInMempool with no Hiro-visible occupant) */
   ghostFailures?: number;
+  /** Last known Hiro mempool tx count for this address (null = never queried or query failed) */
+  mempoolTxCount?: number;
 }
 
 /**
@@ -2851,6 +2853,11 @@ export class NonceDO {
     return `wallet_ghost_degraded:${walletIndex}`;
   }
 
+  /** nonce_state key for the last known Hiro mempool tx count for a wallet (diagnostic only) */
+  private walletMempoolTxCountKey(walletIndex: number): string {
+    return `wallet_mempool_tx_count:${walletIndex}`;
+  }
+
   /**
    * Increment the ghost failure counter for a wallet.
    * When the counter reaches GHOST_FAILURE_THRESHOLD, marks the wallet as ghost_degraded.
@@ -3112,6 +3119,34 @@ export class NonceDO {
         ? data.detected_mempool_nonces
         : [],
     };
+  }
+
+  /**
+   * Fetch the total mempool tx count for a sponsor address from Hiro.
+   * Uses GET /extended/v1/tx/mempool?sender_address={addr}&limit=1 — the `total`
+   * field tells us how many mempool transactions Hiro sees from this address.
+   *
+   * Used ONLY as a diagnostic for stuck wallets (circuit breaker active or zero
+   * headroom with no visible mempool activity). Fail-open: returns null on any error.
+   * Never throws.
+   */
+  private async fetchMempoolTxCount(address: string): Promise<number | null> {
+    try {
+      const base = getHiroBaseUrl(this.env.STACKS_NETWORK);
+      const url = `${base}/extended/v1/tx/mempool?sender_address=${address}&limit=1`;
+      const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+      const response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        return null;
+      }
+      const data = (await response.json()) as { total?: unknown };
+      return typeof data?.total === "number" ? data.total : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -4703,6 +4738,10 @@ export class NonceDO {
         const ghostDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
         const ghostFailures = this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0;
 
+        // Mempool diagnostic: last known Hiro mempool tx count (populated during reconciliation)
+        const mempoolTxCountRaw = this.getStateValue(this.walletMempoolTxCountKey(walletIndex));
+        const mempoolTxCount = mempoolTxCountRaw !== null ? mempoolTxCountRaw : undefined;
+
         return {
           walletIndex,
           sponsorAddress: address,
@@ -4719,6 +4758,7 @@ export class NonceDO {
           settlementTimes,
           ghostDegraded,
           ghostFailures,
+          mempoolTxCount,
         };
       })
     );
@@ -5981,6 +6021,39 @@ export class NonceDO {
       flush_flushed: flushResult.flushed,
       flush_replay_buffer_depth: flushResult.replayBufferDepth,
     });
+
+    // -------------------------------------------------------------------------
+    // Mempool diagnostic: query Hiro's mempool API for wallets that show signs
+    // of being stuck (circuit breaker active OR zero headroom with no mempool
+    // activity visible in the nonces endpoint). Read-only observability only —
+    // no state mutations or behavioral changes.
+    // -------------------------------------------------------------------------
+    const headroom = this.walletHeadroom(walletIndex);
+    const isStuckWallet =
+      walletCircuitOpen || (headroom === 0 && detected_mempool_nonces.length === 0);
+    if (isStuckWallet) {
+      const mempoolCount = await this.fetchMempoolTxCount(sponsorAddress);
+      const ghostDegradedNow =
+        (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+      if (mempoolCount !== null) {
+        this.setStateValue(this.walletMempoolTxCountKey(walletIndex), mempoolCount);
+        this.log("info", "mempool_diagnostic", {
+          walletIndex,
+          address: sponsorAddress,
+          hiroMempoolCount: mempoolCount,
+          hiroPossibleNextNonce: possible_next_nonce,
+          ledgerInFlight: this.ledgerInFlightCount(walletIndex),
+          circuitBreakerActive: walletCircuitOpen,
+          ghostDegraded: ghostDegradedNow,
+        });
+      } else {
+        this.log("warn", "mempool_diagnostic_failed", {
+          walletIndex,
+          address: sponsorAddress,
+          circuitBreakerActive: walletCircuitOpen,
+        });
+      }
+    }
 
     // -------------------------------------------------------------------------
     // Head maintenance: forward bump and stale reset based on Hiro signals.

@@ -69,6 +69,11 @@ export class NonceState extends BaseEndpoint {
                           available: { type: "number" as const, description: "Effective headroom — how many more nonces this wallet can accept (same calc as assignment)" },
                           reserved: { type: "number" as const, description: "In-flight nonces across all states (assigned + broadcasted + confirmed-pending)" },
                           circuitBreakerOpen: { type: "boolean" as const },
+                          mempoolTxCount: {
+                            type: "number" as const,
+                            nullable: true,
+                            description: "Last known Hiro mempool tx count for this sponsor address (populated only for stuck wallets during reconciliation)",
+                          },
                           healthy: { type: "boolean" as const },
                           settlementTimes: {
                             type: "object" as const,
