@@ -322,4 +322,60 @@ describe("queue consumer recovery boundaries", () => {
       repo_version: expect.any(String),
     }));
   });
+
+  it("passes errorReason to releaseNonceDO on TooMuchChaining retry path", async () => {
+    // Regression test: the retry path (attempt < MAX_ATTEMPTS) must pass errorReason to
+    // releaseNonceDO so the circuit breaker fires immediately on the first TooMuchChaining.
+    // Without errorReason the wallet keeps being selected on every retry — amplification loop.
+    const kv = new MemoryKV();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const record = transitionPayment(
+      createPaymentRecord("pay_chaining_cb", "testnet"),
+      "queued"
+    );
+    record.senderNonce = 20;
+    await putPaymentRecord(kv, record);
+
+    mocks.deserializeTransaction.mockReturnValue({
+      auth: { spendingCondition: { signer: "signer_cb" } },
+    });
+    mocks.sponsorTransaction.mockResolvedValue({
+      success: true,
+      sponsoredTxHex: "sponsored_cb_tx",
+      walletIndex: 2,
+      fee: "1000",
+    });
+    // extractSponsorNonce returns 55 per beforeEach default
+    mocks.broadcastOnly.mockResolvedValue({
+      error: "TooMuchChaining",
+      tooMuchChaining: true,
+      retryable: true,
+    });
+
+    const message = createMessage({
+      paymentId: "pay_chaining_cb",
+      txHex: "cb_tx",
+      network: "testnet",
+      attempt: 1,
+    }, 1);
+
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(message.retry).toHaveBeenCalledTimes(1);
+    // Circuit breaker MUST fire on the retry path — errorReason must be "TooMuchChaining"
+    expect(mocks.releaseNonceDO).toHaveBeenCalledWith(
+      expect.anything(), // env
+      expect.anything(), // logger
+      55,                // sponsorNonce (from extractSponsorNonce mock default in beforeEach)
+      undefined,         // txid
+      2,                 // walletIndex (from sponsorTransaction mock)
+      undefined,         // fee
+      "TooMuchChaining"  // errorReason — critical: fires circuit breaker on first failure
+    );
+  });
 });
