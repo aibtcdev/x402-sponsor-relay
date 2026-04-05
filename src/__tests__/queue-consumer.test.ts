@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPaymentRecord, getPaymentRecord, putPaymentRecord, transitionPayment } from "../services/payment-status";
 import { handlePaymentQueue } from "../queue-consumer";
 import { MemoryKV } from "./helpers/memory-kv";
@@ -65,6 +65,10 @@ function createMessage(body: { paymentId: string; txHex: string; network: "mainn
 }
 
 describe("queue consumer recovery boundaries", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.extractSponsorNonce.mockReturnValue(55);

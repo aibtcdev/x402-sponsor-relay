@@ -259,7 +259,7 @@ interface ObservableWalletState {
   /** Number of consecutive ghost broadcast failures (ConflictingNonceInMempool with no Hiro-visible occupant) */
   ghostFailures?: number;
   /** Last known Hiro mempool tx count for this address (null = never queried or query failed) */
-  mempoolTxCount?: number;
+  mempoolTxCount?: number | null;
   /** True when the wallet has accumulated CHAINING_FAILURE_THRESHOLD consecutive TooMuchChaining failures */
   chainingDegraded?: boolean;
   /** Number of consecutive TooMuchChaining broadcast failures */
@@ -3218,7 +3218,7 @@ export class NonceDO {
   private async fetchMempoolTxCount(address: string): Promise<number | null> {
     try {
       const base = getHiroBaseUrl(this.env.STACKS_NETWORK);
-      const url = `${base}/extended/v1/tx/mempool?sender_address=${address}&limit=1`;
+      const url = `${base}/extended/v1/tx/mempool?sender_address=${encodeURIComponent(address)}&limit=1`;
       const headers = getHiroHeaders(this.env.HIRO_API_KEY);
       const response = await fetch(url, {
         headers,
@@ -4842,8 +4842,7 @@ export class NonceDO {
         const chainingFailures = this.getStateValue(this.walletChainingFailuresKey(walletIndex)) ?? 0;
 
         // Mempool diagnostic: last known Hiro mempool tx count (populated during reconciliation)
-        const mempoolTxCountRaw = this.getStateValue(this.walletMempoolTxCountKey(walletIndex));
-        const mempoolTxCount = mempoolTxCountRaw !== null ? mempoolTxCountRaw : undefined;
+        const mempoolTxCount = this.getStateValue(this.walletMempoolTxCountKey(walletIndex));
 
         return {
           walletIndex,
@@ -6911,10 +6910,29 @@ export class NonceDO {
     let broadcasts = 0;
     let errors = 0;
 
+    // Precompute wallet health map to avoid repeated KV/state reads per entry.
+    const walletMap = new Map(initializedWallets.map((w) => [w.walletIndex, w]));
+    const walletHealthy = new Map<number, boolean>();
+    const cbCutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+    const affectedWallets = new Set(queued.map((e) => e.wallet_index));
+    for (const wi of affectedWallets) {
+      if (!walletMap.has(wi)) {
+        walletHealthy.set(wi, false);
+        continue;
+      }
+      const cbKey = this.walletQuarantineRecentKey(wi);
+      const cbRecent = (await this.state.storage.get<string[]>(cbKey)) ?? [];
+      const cbActive = cbRecent.filter((ts) => new Date(ts).getTime() >= cbCutoff);
+      const healthy =
+        cbActive.length < CIRCUIT_BREAKER_QUARANTINE_THRESHOLD &&
+        !this.isGhostDegraded(wi) &&
+        !this.isChainingDegraded(wi);
+      walletHealthy.set(wi, healthy);
+    }
+
     for (const entry of queued) {
       try {
-        const wallet = initializedWallets.find((w) => w.walletIndex === entry.wallet_index);
-        if (!wallet) {
+        if (!walletMap.has(entry.wallet_index)) {
           this.log("warn", "bounded_broadcast_no_wallet", {
             walletIndex: entry.wallet_index,
             sponsorNonce: entry.sponsor_nonce,
@@ -6934,30 +6952,8 @@ export class NonceDO {
         }
 
         // Pre-check wallet health: skip entries for wallets already known to be unhealthy.
-        // This prevents the bounded_broadcast loop from wasting broadcasts (and amplifying
-        // failures) on wallets whose circuit breaker is active, ghost-degraded, or chaining-degraded.
-        const cbKey = this.walletQuarantineRecentKey(entry.wallet_index);
-        const cbCutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
-        const cbRecent = (await this.state.storage.get<string[]>(cbKey)) ?? [];
-        const cbActive = cbRecent.filter((ts) => new Date(ts).getTime() >= cbCutoff);
-        if (cbActive.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD) {
-          this.log("warn", "bounded_broadcast_cb_skip", {
-            walletIndex: entry.wallet_index,
-            sponsorNonce: entry.sponsor_nonce,
-          });
-          errors++;
-          continue;
-        }
-        if (this.isGhostDegraded(entry.wallet_index)) {
-          this.log("warn", "bounded_broadcast_ghost_skip", {
-            walletIndex: entry.wallet_index,
-            sponsorNonce: entry.sponsor_nonce,
-          });
-          errors++;
-          continue;
-        }
-        if (this.isChainingDegraded(entry.wallet_index)) {
-          this.log("warn", "bounded_broadcast_chaining_skip", {
+        if (!walletHealthy.get(entry.wallet_index)) {
+          this.log("warn", "bounded_broadcast_health_skip", {
             walletIndex: entry.wallet_index,
             sponsorNonce: entry.sponsor_nonce,
           });

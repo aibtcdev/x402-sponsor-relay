@@ -76,7 +76,7 @@ export class NonceState extends BaseEndpoint {
                           mempoolTxCount: {
                             type: "number" as const,
                             nullable: true,
-                            description: "Last known Hiro mempool tx count for this sponsor address (populated only for stuck wallets during reconciliation)",
+                            description: "Last known Hiro mempool tx count for this sponsor address (present only for stuck wallets during reconciliation; null when unavailable)",
                           },
                           healthy: { type: "boolean" as const },
                           settlementTimes: {
