@@ -6749,6 +6749,32 @@ export class NonceDO {
           continue;
         }
 
+        // Pre-check wallet health: skip entries for wallets already known to be unhealthy.
+        // This prevents the bounded_broadcast loop from wasting broadcasts (and amplifying
+        // failures) on wallets whose circuit breaker is active or that are ghost-degraded.
+        const cbKey = this.walletQuarantineRecentKey(entry.wallet_index);
+        const cbCutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
+        const cbRecent = (await this.state.storage.get<string[]>(cbKey)) ?? [];
+        const cbActive = cbRecent.filter((ts) => new Date(ts).getTime() >= cbCutoff);
+        if (cbActive.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD) {
+          this.log("warn", "bounded_broadcast_cb_skip", {
+            walletIndex: entry.wallet_index,
+            sponsorNonce: entry.sponsor_nonce,
+          });
+          errors++;
+          continue;
+        }
+        const isEntryGhostDegraded =
+          (this.getStateValue(this.walletGhostDegradedKey(entry.wallet_index)) ?? 0) === 1;
+        if (isEntryGhostDegraded) {
+          this.log("warn", "bounded_broadcast_ghost_skip", {
+            walletIndex: entry.wallet_index,
+            sponsorNonce: entry.sponsor_nonce,
+          });
+          errors++;
+          continue;
+        }
+
         const cleanHex = entry.sender_tx_hex.replace(/^0x/i, "");
         const senderTx = deserializeTransaction(cleanHex);
         const sponsoredTx = await sponsorTransaction({
@@ -6787,8 +6813,27 @@ export class NonceDO {
               httpStatus: result.status,
               reason: result.reason,
             });
+          } else if (
+            result.reason === "TooMuchChaining" ||
+            result.reason === "ConflictingNonceInMempool"
+          ) {
+            // Retire entry and fire circuit breaker — these errors indicate the wallet's mempool
+            // is saturated. Retrying the same nonce each tick is an amplification loop: it keeps
+            // broadcasting into a wall, recording quarantines, and preventing recovery.
+            // Retiring here stops the loop; reconciliation will replenish the wallet when clear.
+            this.transitionQueueEntry(entry.wallet_index, entry.sponsor_nonce, "retired");
+            await this.recordQuarantineEvent(entry.wallet_index);
+            const logEvent =
+              result.reason === "TooMuchChaining"
+                ? "bounded_broadcast_chaining_retired"
+                : "bounded_broadcast_conflict_retired";
+            this.log("warn", logEvent, {
+              walletIndex: entry.wallet_index,
+              sponsorNonce: entry.sponsor_nonce,
+              reason: result.reason,
+            });
           } else {
-            // On failure, leave in 'queued' state — next tick will retry
+            // Other failures (5xx, timeout, etc.) — leave in 'queued' for retry next tick
             this.log("warn", "bounded_broadcast_failed", {
               walletIndex: entry.wallet_index,
               sponsorNonce: entry.sponsor_nonce,
