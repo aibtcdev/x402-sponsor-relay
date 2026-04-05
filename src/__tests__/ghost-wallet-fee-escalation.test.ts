@@ -128,6 +128,7 @@ describe("buildSponsorStatusSnapshot ghost-degraded wallets", () => {
       walletQuarantineRecentKey: (walletIndex: number) => `quarantine:${walletIndex}`,
       walletHeadroom: (walletIndex: number) => opts.rawAvailabilities[walletIndex],
       walletGhostDegradedKey: (walletIndex: number) => `wallet_ghost_degraded:${walletIndex}`,
+      walletChainingDegradedKey: (walletIndex: number) => `wallet_chaining_degraded:${walletIndex}`,
       getStateValue: (key: string) => {
         // Parse wallet index from key like "wallet_ghost_degraded:3"
         const match = key.match(/wallet_ghost_degraded:(\d+)/);

@@ -15,6 +15,7 @@ function makeSnapshotBuilderDouble(rawAvailabilities: number[]) {
     },
     walletQuarantineRecentKey: (walletIndex: number) => `quarantine:${walletIndex}`,
     walletGhostDegradedKey: (walletIndex: number) => `wallet_ghost_degraded:${walletIndex}`,
+    walletChainingDegradedKey: (walletIndex: number) => `wallet_chaining_degraded:${walletIndex}`,
     walletHeadroom: (walletIndex: number) => rawAvailabilities[walletIndex],
     getStateValue: () => null,
     getStoredCount: () => 0,
