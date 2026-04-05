@@ -299,11 +299,13 @@ async function processPaymentMessage(
     const isTooMuchChaining = broadcastResult.tooMuchChaining === true;
 
     if ((isNonceConflict || isTooMuchChaining) && attempt < MAX_ATTEMPTS) {
-      // Release the sponsor nonce back to pool — no errorReason here so the nonce
-      // expires cleanly without feeding the circuit breaker on every retry attempt.
-      // Quarantine only happens on the terminal path when retries are exhausted.
+      // Release the sponsor nonce back to pool WITH errorReason so the circuit breaker
+      // fires immediately on the first TooMuchChaining/nonce_conflict failure.
+      // Without errorReason the wallet keeps being selected every 15 seconds — the exact
+      // amplification loop this fix is designed to stop.
       if (sponsorNonce !== null) {
-        await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
+        const retryReason = isTooMuchChaining ? "TooMuchChaining" : "nonce_conflict";
+        await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex, undefined, retryReason);
       }
 
       emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
