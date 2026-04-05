@@ -260,6 +260,10 @@ interface ObservableWalletState {
   ghostFailures?: number;
   /** Last known Hiro mempool tx count for this address (null = never queried or query failed) */
   mempoolTxCount?: number;
+  /** True when the wallet has accumulated CHAINING_FAILURE_THRESHOLD consecutive TooMuchChaining failures */
+  chainingDegraded?: boolean;
+  /** Number of consecutive TooMuchChaining broadcast failures */
+  chainingFailures?: number;
 }
 
 /**
@@ -501,6 +505,13 @@ const CIRCUIT_BREAKER_QUARANTINE_THRESHOLD = 1;
  * Ghost-degraded wallets are skipped during nonce assignment until they self-clear.
  */
 const GHOST_FAILURE_THRESHOLD = 5;
+/**
+ * Number of consecutive TooMuchChaining broadcast failures before a wallet is marked chaining_degraded.
+ * Lower threshold than ghost (3 vs 5) because TooMuchChaining is deterministic — the node
+ * has already rejected us and will keep rejecting until pending txs drain.
+ * Chaining-degraded wallets are skipped during nonce assignment until a probe confirms recovery.
+ */
+const CHAINING_FAILURE_THRESHOLD = 3;
 /** Maximum fee cap for gap-fill escalation and RBF broadcasts (90,000 uSTX) */
 const MAX_BROADCAST_FEE = 90_000n;
 
@@ -2853,6 +2864,24 @@ export class NonceDO {
     return `wallet_ghost_degraded:${walletIndex}`;
   }
 
+  /** nonce_state key for per-wallet chaining failure counter */
+  private walletChainingFailuresKey(walletIndex: number): string {
+    return `wallet_chaining_failures:${walletIndex}`;
+  }
+
+  /** nonce_state key for per-wallet chaining-degraded flag (0 = healthy, 1 = degraded) */
+  private walletChainingDegradedKey(walletIndex: number): string {
+    return `wallet_chaining_degraded:${walletIndex}`;
+  }
+
+  /**
+   * nonce_state key for the timestamp (ms) when a wallet first became chaining_degraded.
+   * Used to enforce the 5-minute cooldown before a probe attempt.
+   */
+  private walletChainingDegradedAtKey(walletIndex: number): string {
+    return `wallet_chaining_degraded_at:${walletIndex}`;
+  }
+
   /** nonce_state key for the last known Hiro mempool tx count for a wallet (diagnostic only) */
   private walletMempoolTxCountKey(walletIndex: number): string {
     return `wallet_mempool_tx_count:${walletIndex}`;
@@ -2893,6 +2922,47 @@ export class NonceDO {
     this.setStateValue(this.walletGhostDegradedKey(walletIndex), 0);
     if (wasDegraded) {
       this.log("info", "ghost_wallet_recovered", { walletIndex });
+    }
+  }
+
+  /**
+   * Increment the chaining failure counter for a wallet.
+   * When the counter reaches CHAINING_FAILURE_THRESHOLD, marks the wallet as chaining_degraded
+   * and records the degraded timestamp for cooldown tracking.
+   * Chaining-degraded wallets are skipped during nonce assignment.
+   * Returns true if the wallet just became chaining_degraded.
+   */
+  private incrementChainingFailures(walletIndex: number): boolean {
+    const count = (this.getStateValue(this.walletChainingFailuresKey(walletIndex)) ?? 0) + 1;
+    this.setStateValue(this.walletChainingFailuresKey(walletIndex), count);
+    if (count >= CHAINING_FAILURE_THRESHOLD) {
+      const alreadyDegraded = (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
+      this.setStateValue(this.walletChainingDegradedKey(walletIndex), 1);
+      if (!alreadyDegraded) {
+        // Record the first degraded timestamp for probe cooldown
+        this.setStateValue(this.walletChainingDegradedAtKey(walletIndex), Date.now());
+        this.log("warn", "chaining_wallet_degraded", {
+          walletIndex,
+          chainingFailures: count,
+          threshold: CHAINING_FAILURE_THRESHOLD,
+        });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Reset chaining failure state for a wallet on recovery.
+   * Called after a chaining probe succeeds (broadcast accepted by node).
+   */
+  private resetChainingState(walletIndex: number): void {
+    const wasDegraded = (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
+    this.setStateValue(this.walletChainingFailuresKey(walletIndex), 0);
+    this.setStateValue(this.walletChainingDegradedKey(walletIndex), 0);
+    this.setStateValue(this.walletChainingDegradedAtKey(walletIndex), 0);
+    if (wasDegraded) {
+      this.log("info", "chaining_wallet_recovered", { walletIndex });
     }
   }
 
@@ -4061,6 +4131,21 @@ export class NonceDO {
           continue;
         }
 
+        // Check chaining-degraded state: skip wallets stuck in TooMuchChaining loops.
+        // These wallets have hit the Stacks node's 25-tx chaining limit and can't accept new txs.
+        // The alarm reconciliation loop will probe recovery after a 5-minute cooldown.
+        const isChainingDegraded = (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
+        if (isChainingDegraded) {
+          this.log("warn", "chaining_degraded_skip", {
+            walletIndex,
+            chainingFailures: this.getStateValue(this.walletChainingFailuresKey(walletIndex)) ?? 0,
+          });
+          degradedWallets.push({ walletIndex, cycleCount: 0 });
+          walletIndex = (walletIndex + 1) % effectiveWalletCount;
+          attempts++;
+          continue;
+        }
+
         const headroom = this.walletHeadroom(walletIndex);
         if (headroom > 0) {
           // Collect all eligible wallets; select by headroom after full scan
@@ -4398,14 +4483,17 @@ export class NonceDO {
         );
         const ghostDegraded =
           (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
+        const chainingDegraded =
+          (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
         const rawAvailable = this.walletHeadroom(walletIndex);
-        // Ghost-degraded wallets are skipped by assignNonce, so report 0 available
-        const available = ghostDegraded ? 0 : Math.max(0, Math.min(CHAINING_LIMIT, rawAvailable));
+        // Ghost-degraded or chaining-degraded wallets are skipped by assignNonce, so report 0 available
+        const available = (ghostDegraded || chainingDegraded) ? 0 : Math.max(0, Math.min(CHAINING_LIMIT, rawAvailable));
         const reserved = CHAINING_LIMIT - available;
         return {
           circuitBreakerOpen:
             activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
           ghostDegraded,
+          chainingDegraded,
           available,
           reserved,
         };
@@ -4417,7 +4505,7 @@ export class NonceDO {
     const totalCapacity = walletCount * CHAINING_LIMIT;
     const allWalletsDegraded =
       walletCount > 0 &&
-      walletSnapshots.every((wallet) => wallet.circuitBreakerOpen || wallet.ghostDegraded);
+      walletSnapshots.every((wallet) => wallet.circuitBreakerOpen || wallet.ghostDegraded || wallet.chainingDegraded);
     const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
     const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
     const healInProgress =
@@ -4738,6 +4826,10 @@ export class NonceDO {
         const ghostDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
         const ghostFailures = this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0;
 
+        // Chaining degraded state
+        const chainingDegraded = (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
+        const chainingFailures = this.getStateValue(this.walletChainingFailuresKey(walletIndex)) ?? 0;
+
         // Mempool diagnostic: last known Hiro mempool tx count (populated during reconciliation)
         const mempoolTxCountRaw = this.getStateValue(this.walletMempoolTxCountKey(walletIndex));
         const mempoolTxCount = mempoolTxCountRaw !== null ? mempoolTxCountRaw : undefined;
@@ -4752,12 +4844,14 @@ export class NonceDO {
           available,
           reserved,
           circuitBreakerOpen,
-          healthy: gaps.length === 0 && !circuitBreakerOpen && !ghostDegraded && available > 0,
+          healthy: gaps.length === 0 && !circuitBreakerOpen && !ghostDegraded && !chainingDegraded && available > 0,
           queueDepth: queueState.total,
           replayBufferDepth: replayDepth,
           settlementTimes,
           ghostDegraded,
           ghostFailures,
+          chainingDegraded,
+          chainingFailures,
           mempoolTxCount,
         };
       })
@@ -5144,6 +5238,86 @@ export class NonceDO {
     }
 
     return { processed, replaced, conflict, rejected };
+  }
+
+  /**
+   * Attempt a forward self-transfer probe for a chaining-degraded wallet.
+   * Broadcasts a single STX self-transfer at possible_next_nonce to test whether the
+   * node's chaining limit has cleared. Uses cached Hiro nonce info to avoid extra API calls.
+   *
+   * - Success → resetChainingState(): wallet is healthy again.
+   * - TooMuchChaining → update degradedAt cooldown timestamp; probe again next alarm cycle.
+   * - Other failure → log diagnostic; do NOT update cooldown (may be transient).
+   */
+  private async attemptChainingProbe(walletIndex: number, address: string): Promise<void> {
+    // Use cached Hiro nonce info from this alarm cycle — avoids extra API calls.
+    // If no cache entry exists (reconciliation was skipped), don't probe this cycle.
+    const cached = this.hiroNonceCache.get(walletIndex);
+    if (!cached) {
+      this.log("warn", "chaining_probe_no_nonce_info", {
+        walletIndex,
+        address,
+      });
+      return;
+    }
+    const possible_next_nonce = cached.value;
+
+    const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+    if (!privateKey) {
+      this.log("warn", "chaining_probe_key_derivation_failed", { walletIndex });
+      return;
+    }
+
+    try {
+      const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
+      const tx = await makeSTXTokenTransfer({
+        recipient,
+        amount: GAP_FILL_AMOUNT,
+        senderKey: privateKey,
+        network,
+        nonce: BigInt(possible_next_nonce),
+        fee: RBF_FEE,
+        memo: `chaining-probe-${possible_next_nonce}`,
+      });
+
+      const result = await this.broadcastRawTx(tx, "chaining_probe");
+
+      if (result.ok) {
+        this.log("info", "chaining_probe_success", {
+          walletIndex,
+          address,
+          possibleNextNonce: possible_next_nonce,
+          txid: result.txid,
+        });
+        this.resetChainingState(walletIndex);
+      } else if (result.reason === "TooMuchChaining") {
+        // Node still at chaining limit — update the degradedAt timestamp to reset
+        // the 5-minute cooldown. Probe again after the next cooldown elapses.
+        this.setStateValue(this.walletChainingDegradedAtKey(walletIndex), Date.now());
+        this.log("warn", "chaining_probe_still_full", {
+          walletIndex,
+          address,
+          possibleNextNonce: possible_next_nonce,
+          reason: result.reason,
+        });
+      } else {
+        // Other failure (BadNonce, network error, etc.) — leave cooldown unchanged.
+        // This may be a transient error; let the existing degradedAt cooldown stand.
+        this.log("warn", "chaining_probe_failed", {
+          walletIndex,
+          address,
+          possibleNextNonce: possible_next_nonce,
+          reason: result.reason,
+          httpStatus: result.status,
+        });
+      }
+    } catch (e) {
+      this.log("warn", "chaining_probe_error", {
+        walletIndex,
+        address,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
   }
 
   private async processReplayBuffer(
@@ -6823,6 +6997,11 @@ export class NonceDO {
             // Retiring here stops the loop; reconciliation will replenish the wallet when clear.
             this.transitionQueueEntry(entry.wallet_index, entry.sponsor_nonce, "retired");
             await this.recordQuarantineEvent(entry.wallet_index);
+            // TooMuchChaining: increment chaining failure counter — may mark wallet chaining_degraded.
+            // This is distinct from ghost_degraded and triggers probe-based recovery.
+            if (result.reason === "TooMuchChaining") {
+              this.incrementChainingFailures(entry.wallet_index);
+            }
             const logEvent =
               result.reason === "TooMuchChaining"
                 ? "bounded_broadcast_chaining_retired"
@@ -7089,6 +7268,18 @@ export class NonceDO {
               if (stuckState) {
                 await this.state.storage.delete(stuckKey);
               }
+            }
+          }
+
+          // Chaining-degraded probe: after reconciliation, test if the wallet can accept new txs.
+          // Only fires once per alarm cycle per wallet, after a 5-minute cooldown from first degradation.
+          const isChainingDegradedNow =
+            (this.getStateValue(this.walletChainingDegradedKey(walletIndex)) ?? 0) === 1;
+          if (isChainingDegradedNow) {
+            const degradedAtMs = this.getStateValue(this.walletChainingDegradedAtKey(walletIndex)) ?? 0;
+            const cooldownElapsed = Date.now() - degradedAtMs > 5 * 60 * 1000;
+            if (cooldownElapsed) {
+              await this.attemptChainingProbe(walletIndex, address);
             }
           }
         }
