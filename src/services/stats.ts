@@ -7,6 +7,7 @@ import type {
   ErrorCategory,
   RelayEndpointName,
   TransactionLogEntry,
+  WalletHourlyPoint,
 } from "../types";
 import type { TerminalReason } from "@aibtc/tx-schemas/core/terminal-reasons";
 
@@ -264,6 +265,16 @@ export class StatsService {
     return (await this.doGet<
       Array<{ hour: string; transactions: number; success: number; fees?: string }>
     >("/hourly")) ?? [];
+  }
+
+  /**
+   * Get per-wallet hourly stats for a given wallet index and window.
+   * Useful for per-wallet throughput spark charts.
+   */
+  async getWalletHourlyStats(walletIndex: number, hours: number = 24): Promise<WalletHourlyPoint[]> {
+    return (await this.doGet<WalletHourlyPoint[]>(
+      `/wallet-hourly?walletIndex=${walletIndex}&hours=${hours}`
+    )) ?? [];
   }
 
   /**

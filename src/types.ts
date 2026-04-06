@@ -927,6 +927,25 @@ export interface EndpointBreakdown {
   verify: { total: number };
 }
 
+/** Hourly data point for per-wallet throughput spark chart */
+export interface WalletHourlyPoint {
+  hour: string;
+  total: number;
+  success: number;
+  failed: number;
+  feeTotal: string;
+}
+
+/** Per-wallet 24h throughput summary with hourly spark data */
+export interface WalletThroughputEntry {
+  walletIndex: number;
+  total24h: number;
+  success24h: number;
+  failed24h: number;
+  feeTotal24h: string;
+  hourly: WalletHourlyPoint[];
+}
+
 export interface DashboardOverview {
   period: "24h" | "7d";
   transactions: {
@@ -937,6 +956,10 @@ export interface DashboardOverview {
     previousTotal: number;
     /** Number of failures caused by client errors in the rolling 24h window */
     clientErrors?: number;
+    /** Raw success rate = success / total (includes client errors in denominator). 0-1 range. */
+    rawSuccessRate?: number;
+    /** Effective success rate = success / (success + relayErrors) — excludes client errors from denominator. 0-1 range. */
+    effectiveSuccessRate?: number;
   };
   tokens: {
     STX: TokenStats;
@@ -980,6 +1003,20 @@ export interface DashboardOverview {
     settlement: number;
     replacement: number;
     identity: number;
+  };
+  /**
+   * Per-wallet 24h throughput totals with hourly spark data.
+   * Only includes wallets that had at least one transaction in the last 24h.
+   */
+  walletThroughput?: WalletThroughputEntry[];
+  /**
+   * Rolling 24-48h window totals for trend comparison (previous 24h period).
+   * Used for rolling-vs-rolling trend calculation instead of calendar day comparison.
+   */
+  previous24h?: {
+    total: number;
+    success: number;
+    failed: number;
   };
 }
 
