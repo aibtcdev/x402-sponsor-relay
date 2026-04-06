@@ -224,7 +224,8 @@ export const dashboardCss = `
   .bg-gray-600 { background-color: #4b5563; }
   .bg-gray-800 { background-color: #1f2937; }
   .bg-gray-900 { background-color: #111827; }
-  .bg-gray-900.bg-opacity-50 { background-color: rgba(17, 24, 39, 0.5); }
+  .bg-opacity-50 { --bg-opacity: 0.5; }
+  .bg-gray-900.bg-opacity-50 { background-color: rgba(17, 24, 39, var(--bg-opacity, 1)); }
   .bg-green-600 { background-color: #16a34a; }
   .bg-green-900 { background-color: #14532d; }
   .bg-yellow-900 { background-color: #713f12; }
@@ -268,6 +269,7 @@ export const dashboardCss = `
     .md\\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   }
   @media (min-width: 1024px) {
+    .lg\\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .lg\\:px-8 { padding-left: 2rem; padding-right: 2rem; }
   }
 
