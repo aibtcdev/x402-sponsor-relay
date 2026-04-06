@@ -341,7 +341,7 @@ export class Sponsor extends BaseEndpoint {
 
       // Extract token type and transfer amount from the sponsored transaction for accurate
       // stats attribution. Falls back to { tokenType: "STX", amount: "0" } on any error.
-      const { tokenType: txTokenType, amount: txAmount } = extractTransferDetails(sponsoredTx);
+      const { tokenType: txTokenType, amount: txAmount } = extractTransferDetails(sponsoredTx, c.env.STACKS_NETWORK);
 
       // Extract nonce before broadcast so it's available in all failure and success paths
       const sponsorNonce = extractSponsorNonce(sponsoredTx);

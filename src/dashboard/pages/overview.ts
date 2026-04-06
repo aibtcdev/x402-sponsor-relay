@@ -491,14 +491,23 @@ ${footer(utcTimestamp())}
   // Module-scoped reference for auto-refresh interval
   var _txChartInstance = null;
 
-  // Convert UTC hour label ("HH:00") to visitor's local timezone.
+  // Convert UTC hour label to visitor's local timezone.
+  // Accepts ISO timestamps ("2026-04-06T14:00:00Z") or legacy "HH:00" format.
   // For non-hour labels (e.g. "Feb 12" from 7d view), return as-is.
   function toLocalHour(utcLabel) {
+    // ISO timestamp format (YYYY-MM-DDTHH:00:00Z)
+    if (utcLabel.length > 5 && utcLabel.indexOf('T') !== -1) {
+      var d = new Date(utcLabel);
+      if (!isNaN(d.getTime())) {
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+      }
+    }
+    // Legacy "HH:00" format
     var m = utcLabel.match(/^(\\d{2}):00$/);
     if (!m) return utcLabel;
     var now = new Date();
-    var d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), parseInt(m[1], 10)));
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    var d2 = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), parseInt(m[1], 10)));
+    return d2.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
   }
 
   // Convert all labels in a chart config to local timezone

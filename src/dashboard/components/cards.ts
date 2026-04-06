@@ -144,8 +144,9 @@ export function healthCard(
 /**
  * Success rate card with visual indicator showing both effective and raw rates.
  *
- * When precomputed rates are provided (effectiveRateOverride / rawRateOverride, 0-100),
- * they are used directly. Otherwise rates are computed from success/total/clientErrors.
+ * When precomputed rates are provided (effectiveRateOverride / rawRateOverride, as 0-1 fractions),
+ * they are used directly and converted to percentages for display. Otherwise rates are computed
+ * from success/total/clientErrors.
  *
  * Effective rate formula: success / (success + relayErrors)
  *   where relayErrors = (total - success) - clientErrors
@@ -367,9 +368,13 @@ export function walletThroughputCard(wallets: WalletThroughputEntry[] | undefine
     // Build sparkline: 24 hourly bars
     const maxHourly = Math.max(1, ...w.hourly.map((h) => h.total));
     const sparkBars = w.hourly.map((h) => {
-      const heightPct = Math.round((h.total / maxHourly) * 100);
-      const barColor = h.failed > 0 ? colors.status.degraded : colors.status.healthy;
-      return `<div class="sparkline-bar" style="height: ${Math.max(4, heightPct)}%; background-color: ${barColor}"></div>`;
+      const hasActivity = h.total > 0;
+      const heightPct = hasActivity ? Math.round((h.total / maxHourly) * 100) : 0;
+      const barHeight = hasActivity ? Math.max(4, heightPct) : 0;
+      const barColor = !hasActivity
+        ? "transparent"
+        : h.failed > 0 ? colors.status.degraded : colors.status.healthy;
+      return `<div class="sparkline-bar" style="height: ${barHeight}%; background-color: ${barColor}"></div>`;
     }).join("");
 
     return `

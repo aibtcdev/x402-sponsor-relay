@@ -29,6 +29,12 @@ function getHourKey(now: number = Date.now()): string {
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
+/** Convert a DB hour key ("YYYY-MM-DD:HH") to an ISO 8601 timestamp ("YYYY-MM-DDTHH:00:00Z"). */
+function hourKeyToISO(key: string): string {
+  const [date, hh] = key.split(":");
+  return `${date}T${hh}:00:00Z`;
+}
+
 // ===========================================================================
 // StatsDO — SQLite-backed atomic stats for the x402 sponsor relay
 //
@@ -311,6 +317,8 @@ export class StatsDO {
     // Only applies to failed transactions with a known terminal reason.
     if (!entry.success && terminalReason) {
       const category = TERMINAL_REASON_TO_CATEGORY[terminalReason as keyof typeof TERMINAL_REASON_TO_CATEGORY];
+      // categoryColMap must stay in sync with TERMINAL_REASON_TO_CATEGORY categories in @aibtc/tx-schemas.
+      // If tx-schemas adds a new category, add the corresponding column here and in the migrations array.
       const categoryColMap: Record<string, string> = {
         validation: "err_schema_validation",
         sender: "err_sender",
@@ -397,15 +405,11 @@ export class StatsDO {
       clientErrorInt
     );
 
-    // Hourly fee total + min/max (only for successful transactions with fee data)
+    // Hourly fee total + min/max in a single UPDATE (only for successful transactions with fee data)
     if (entry.success && fee) {
       this.sql.exec(
-        `UPDATE hourly_stats SET fee_total = CAST(CAST(fee_total AS INTEGER) + ? AS TEXT) WHERE hour = ?`,
-        fee,
-        hourKey
-      );
-      this.sql.exec(
         `UPDATE hourly_stats SET
+           fee_total = CAST(CAST(fee_total AS INTEGER) + ? AS TEXT),
            fee_min = CASE
              WHEN fee_min IS NULL THEN ?
              WHEN CAST(? AS INTEGER) < CAST(fee_min AS INTEGER) THEN ?
@@ -417,6 +421,7 @@ export class StatsDO {
              ELSE fee_max
            END
          WHERE hour = ?`,
+        fee,
         fee, fee, fee,
         fee, fee, fee,
         hourKey
@@ -619,15 +624,12 @@ export class StatsDO {
   private readHourlyData(): Array<{ hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number }> {
     const now = Date.now();
 
-    // Generate the 24 hour keys and their display labels
+    // Generate the 24 hour keys and ISO timestamp labels
     const hourEntries: Array<{ key: string; label: string }> = [];
     for (let i = 23; i >= 0; i--) {
       const ts = now - i * HOUR_MS;
-      const d = new Date(ts);
-      hourEntries.push({
-        key: getHourKey(ts),
-        label: d.getUTCHours().toString().padStart(2, "0") + ":00",
-      });
+      const key = getHourKey(ts);
+      hourEntries.push({ key, label: hourKeyToISO(key) });
     }
 
     const startKey = hourEntries[0].key;
@@ -690,15 +692,12 @@ export class StatsDO {
   ): Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> {
     const now = Date.now();
 
-    // Generate the hour keys and their display labels
+    // Generate the hour keys and ISO timestamp labels
     const hourEntries: Array<{ key: string; label: string }> = [];
     for (let i = hours - 1; i >= 0; i--) {
       const ts = now - i * HOUR_MS;
-      const d = new Date(ts);
-      hourEntries.push({
-        key: getHourKey(ts),
-        label: d.getUTCHours().toString().padStart(2, "0") + ":00",
-      });
+      const key = getHourKey(ts);
+      hourEntries.push({ key, label: hourKeyToISO(key) });
     }
 
     const startKey = hourEntries[0].key;
@@ -843,15 +842,12 @@ export class StatsDO {
   private readWalletThroughput(): WalletThroughputEntry[] {
     const now = Date.now();
 
-    // Generate the 24 hour keys and labels (same logic as readWalletHourlyStats)
+    // Generate the 24 hour keys and ISO timestamp labels (same logic as readWalletHourlyStats)
     const hourEntries: Array<{ key: string; label: string }> = [];
     for (let i = 23; i >= 0; i--) {
       const ts = now - i * HOUR_MS;
-      const d = new Date(ts);
-      hourEntries.push({
-        key: getHourKey(ts),
-        label: d.getUTCHours().toString().padStart(2, "0") + ":00",
-      });
+      const key = getHourKey(ts);
+      hourEntries.push({ key, label: hourKeyToISO(key) });
     }
 
     const startKey = hourEntries[0].key;
@@ -944,7 +940,6 @@ export class StatsDO {
     const hourlyData = this.readHourlyData();
     const rolling = hourlyData.reduce(
       (acc, h) => {
-        const hasHourFee = h.fees && h.fees !== "0";
         // Rolling fee min: track the lowest fee_min across all hours in the window
         let newFeeMin = acc.feeMin;
         if (h.feeMin) {
@@ -968,12 +963,11 @@ export class StatsDO {
           success: acc.success + h.success,
           clientErrors: acc.clientErrors + (h.clientErrors ?? 0),
           fees: acc.fees + BigInt(h.fees || "0"),
-          feeCount: hasHourFee ? acc.feeCount + 1 : acc.feeCount,
           feeMin: newFeeMin,
           feeMax: newFeeMax,
         };
       },
-      { total: 0, success: 0, clientErrors: 0, fees: 0n, feeCount: 0, feeMin: null as string | null, feeMax: null as string | null }
+      { total: 0, success: 0, clientErrors: 0, fees: 0n, feeMin: null as string | null, feeMax: null as string | null }
     );
     const rollingFailed = rolling.total - rolling.success;
 
@@ -981,16 +975,20 @@ export class StatsDO {
     // Fall back to today's calendar-day fee total for backward compatibility
     // (e.g., when hourly data is absent on a fresh deployment).
     const rollingFeeTotal = rolling.fees > 0n ? rolling.fees.toString() : currentFees.total;
+    // Per-transaction fee average: use rolling.success as denominator since fees are
+    // recorded only for successful transactions. More accurate than counting hours-with-fees.
     const rollingFeeAvg =
-      rolling.feeCount > 0
-        ? (rolling.fees / BigInt(rolling.feeCount)).toString()
+      rolling.success > 0
+        ? (rolling.fees / BigInt(rolling.success)).toString()
         : avgFee;
 
     // Rolling previous 24h (24-48h ago) for rolling-vs-rolling comparison (Bug #7 fix).
     const prev24h = this.readPrevious24hTotals();
 
-    // TODO: implement previous-window fee comparison
-    const feeTrend: "up" | "down" | "stable" = rolling.fees > 0n ? "up" : "stable";
+    // Until we can compare against a real previous rolling-window fee total,
+    // return a neutral trend instead of incorrectly reporting "up" whenever
+    // any fees exist in the current window.
+    const feeTrend: "up" | "down" | "stable" = "stable";
 
     // Per-endpoint breakdown from today's daily_stats
     const endpointBreakdown = this.readEndpointBreakdown(current.date);
@@ -1046,7 +1044,7 @@ export class StatsDO {
         min: rolling.feeMin ?? currentFees.min ?? "0",
         max: rolling.feeMax ?? currentFees.max ?? "0",
         trend: feeTrend,
-        previousTotal: currentFees.total,
+        previousTotal: "0",  // placeholder until previous rolling-window fee tracking is implemented
       },
       hourlyData,
       endpointBreakdown,

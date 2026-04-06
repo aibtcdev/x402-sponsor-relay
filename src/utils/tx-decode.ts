@@ -16,6 +16,7 @@ import {
 } from "@stacks/transactions";
 import type { TokenType } from "../types";
 import {
+  SBTC_CONTRACT_MAINNET,
   SBTC_CONTRACT_NAME,
   USDCX_CIRCLE_CONTRACT_MAINNET,
   USDCX_CIRCLE_CONTRACT_NAME,
@@ -38,22 +39,25 @@ const FALLBACK: TransferDetails = { tokenType: "STX", amount: "0" };
 /**
  * Detect whether a contract is a known sBTC contract.
  *
- * On mainnet, sBTC has a fixed deployer address. On testnet, any deployer can
- * deploy sbtc-token, so we match by contract name only (same approach as
- * settlement.ts matchTokenContract in testnet mode).
+ * On mainnet, sBTC has a fixed deployer address — require address+name match.
+ * On testnet, any deployer can deploy sbtc-token, so match by name only
+ * (mirrors settlement.ts matchTokenContract behavior).
  */
-function isKnownSbtc(contractName: string): boolean {
-  return contractName === SBTC_CONTRACT_NAME;
+function isKnownSbtc(address: string, contractName: string, network: "mainnet" | "testnet"): boolean {
+  if (contractName !== SBTC_CONTRACT_NAME) return false;
+  if (network === "mainnet") return address.toUpperCase() === SBTC_CONTRACT_MAINNET;
+  return true;
 }
 
 /**
  * Detect whether a contract is a known USDCx contract.
  *
- * Accepts both mainnet deployer+name pairs and testnet lookalikes by name.
+ * On mainnet, require exact deployer+name pair match.
+ * On testnet, allow name-only matching for any deployer.
  */
-function isKnownUsdcx(address: string, contractName: string): boolean {
+function isKnownUsdcx(address: string, contractName: string, network: "mainnet" | "testnet"): boolean {
   const upper = address.toUpperCase();
-  // Exact mainnet match
+  // Exact mainnet deployer+name match
   if (
     (upper === USDCX_CIRCLE_CONTRACT_MAINNET && contractName === USDCX_CIRCLE_CONTRACT_NAME) ||
     (upper === USDCX_AEUSDC_CONTRACT_MAINNET && contractName === USDCX_AEUSDC_CONTRACT_NAME)
@@ -61,7 +65,10 @@ function isKnownUsdcx(address: string, contractName: string): boolean {
     return true;
   }
   // Testnet fallback: match by contract name only
-  return contractName === USDCX_CIRCLE_CONTRACT_NAME || contractName === USDCX_AEUSDC_CONTRACT_NAME;
+  if (network === "testnet") {
+    return contractName === USDCX_CIRCLE_CONTRACT_NAME || contractName === USDCX_AEUSDC_CONTRACT_NAME;
+  }
+  return false;
 }
 
 /**
@@ -73,8 +80,11 @@ function isKnownUsdcx(address: string, contractName: string): boolean {
  * - Fallback for unrecognized payloads: returns { tokenType: "STX", amount: "0" }
  *
  * Never throws — all extraction is wrapped in try/catch.
+ *
+ * @param tx - Deserialized Stacks transaction
+ * @param network - Network context for token contract matching (mainnet requires deployer address)
  */
-export function extractTransferDetails(tx: StacksTransactionWire): TransferDetails {
+export function extractTransferDetails(tx: StacksTransactionWire, network: "mainnet" | "testnet" = "testnet"): TransferDetails {
   try {
     const payloadType = tx.payload.payloadType;
 
@@ -103,9 +113,9 @@ export function extractTransferDetails(tx: StacksTransactionWire): TransferDetai
 
       // Determine token type
       let tokenType: TokenType;
-      if (isKnownSbtc(contractName)) {
+      if (isKnownSbtc(contractAddress, contractName, network)) {
         tokenType = "sBTC";
-      } else if (isKnownUsdcx(contractAddress, contractName)) {
+      } else if (isKnownUsdcx(contractAddress, contractName, network)) {
         tokenType = "USDCx";
       } else {
         // Unrecognized token contract — fall back
