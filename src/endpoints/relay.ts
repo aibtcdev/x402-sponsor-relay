@@ -213,6 +213,9 @@ export class Relay extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("Relay request received");
 
+    // Capture HTTP request arrival time for user-perceived settlement latency measurement.
+    const submittedAt = new Date().toISOString();
+
     const statsService = new StatsService(c.env, logger);
 
     try {
@@ -563,6 +566,7 @@ export class Relay extends BaseEndpoint {
                       senderTxHex: body.transaction,
                       senderAddress: validation.senderAddress,
                       senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
+                      submittedAt,
                     })
                   );
                 }
@@ -752,6 +756,7 @@ export class Relay extends BaseEndpoint {
             senderTxHex: body.transaction,
             senderAddress: validation.senderAddress,
             senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
+            submittedAt,
           })
         );
       }

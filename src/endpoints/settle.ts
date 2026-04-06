@@ -42,6 +42,8 @@ interface BroadcastSuccessParams {
   paymentIdService: PaymentIdService;
   paymentIdentifier: string | undefined;
   paymentIdPayloadHash: string | undefined;
+  /** ISO timestamp of when the client HTTP request arrived at the relay endpoint. */
+  submittedAt: string;
 }
 
 /**
@@ -151,6 +153,7 @@ export class Settle extends BaseEndpoint {
       verifiedTx, recipient, amount,
       settleOptions, settlementService, statsService,
       paymentIdService, paymentIdentifier, paymentIdPayloadHash,
+      submittedAt,
     } = params;
 
     const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
@@ -166,6 +169,7 @@ export class Settle extends BaseEndpoint {
           senderTxHex: txHex,
           senderAddress: payer,
           senderNonce: Number(verifiedTx.auth.spendingCondition.nonce),
+          submittedAt,
         })
       );
     }
@@ -270,6 +274,9 @@ export class Settle extends BaseEndpoint {
   async handle(c: AppContext) {
     const logger = this.getLogger(c);
     logger.info("x402 V2 settle request received");
+
+    // Capture HTTP request arrival time for user-perceived settlement latency measurement.
+    const submittedAt = new Date().toISOString();
 
     const statsService = new StatsService(c.env, logger);
     const paymentIdService = new PaymentIdService(c.env.RELAY_KV, logger);
@@ -589,6 +596,7 @@ export class Settle extends BaseEndpoint {
                     amount: retryVerifyResult.data.amount,
                     settleOptions, settlementService, statsService,
                     paymentIdService, paymentIdentifier, paymentIdPayloadHash,
+                    submittedAt,
                   });
                 } else {
                   // Retry broadcast also failed — release retry nonce, fall through to error
@@ -670,6 +678,7 @@ export class Settle extends BaseEndpoint {
         amount: verifyResult.data.amount,
         settleOptions, settlementService, statsService,
         paymentIdService, paymentIdentifier, paymentIdPayloadHash,
+        submittedAt,
       });
     } catch (e) {
       logger.error("Unexpected settle error", {

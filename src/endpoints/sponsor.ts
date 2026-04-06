@@ -158,6 +158,9 @@ export class Sponsor extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("Sponsor request received");
 
+    // Capture HTTP request arrival time for user-perceived settlement latency measurement.
+    const submittedAt = new Date().toISOString();
+
     const statsService = new StatsService(c.env, logger);
 
     try {
@@ -433,6 +436,7 @@ export class Sponsor extends BaseEndpoint {
             senderTxHex: body.transaction,
             senderAddress: validation.senderAddress,
             senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
+            submittedAt,
           })
         );
       }
