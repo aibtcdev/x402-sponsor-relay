@@ -25,20 +25,17 @@ import type {
 } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, CLIENT_REJECTION_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
+import {
+  SBTC_CONTRACT_MAINNET,
+  SBTC_CONTRACT_NAME,
+  USDCX_CIRCLE_CONTRACT_MAINNET,
+  USDCX_CIRCLE_CONTRACT_NAME,
+  USDCX_AEUSDC_CONTRACT_MAINNET,
+  USDCX_AEUSDC_CONTRACT_NAME,
+  SIP010_TRANSFER_FUNCTION,
+} from "../utils/token-contracts";
 import { extractSponsorNonce } from "./sponsor";
 import { waitForHiroTxConfirmationViaStream } from "./hiro-tx-stream";
-
-// Known SIP-010 token contract addresses
-const SBTC_CONTRACT_MAINNET = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4";
-const SBTC_CONTRACT_NAME = "sbtc-token";
-
-// USDCx — two known mainnet contracts that both represent USDC on Stacks
-const USDCX_CIRCLE_CONTRACT_MAINNET = "SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE";
-const USDCX_CIRCLE_CONTRACT_NAME = "usdcx";
-const USDCX_AEUSDC_CONTRACT_MAINNET = "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9";
-const USDCX_AEUSDC_CONTRACT_NAME = "token-aeusdc";
-
-const SIP010_TRANSFER_FUNCTION = "transfer";
 
 // Polling configuration
 /** Default max poll time for confirmation polling.

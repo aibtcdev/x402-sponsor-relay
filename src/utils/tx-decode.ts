@@ -15,16 +15,14 @@ import {
   type ClarityValue,
 } from "@stacks/transactions";
 import type { TokenType } from "../types";
-
-// Known SIP-010 token contract addresses (mirrors settlement.ts)
-const SBTC_CONTRACT_NAME = "sbtc-token";
-
-const USDCX_CIRCLE_CONTRACT_MAINNET = "SP120SBRBQJ00MCWS7TM5R8WJNTTKD5K0HFRC2CNE";
-const USDCX_CIRCLE_CONTRACT_NAME = "usdcx";
-const USDCX_AEUSDC_CONTRACT_MAINNET = "SP3K8BC0PPEVCV7NZ6QSRWPQ2JE9E5B6N3PA0KBR9";
-const USDCX_AEUSDC_CONTRACT_NAME = "token-aeusdc";
-
-const SIP010_TRANSFER_FUNCTION = "transfer";
+import {
+  SBTC_CONTRACT_NAME,
+  USDCX_CIRCLE_CONTRACT_MAINNET,
+  USDCX_CIRCLE_CONTRACT_NAME,
+  USDCX_AEUSDC_CONTRACT_MAINNET,
+  USDCX_AEUSDC_CONTRACT_NAME,
+  SIP010_TRANSFER_FUNCTION,
+} from "./token-contracts";
 
 /**
  * Result of extracting transfer details from a deserialized transaction.

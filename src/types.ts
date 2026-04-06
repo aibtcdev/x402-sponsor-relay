@@ -1,4 +1,5 @@
 import type { Context } from "hono";
+import type { TerminalReason } from "@aibtc/tx-schemas/core/terminal-reasons";
 
 /**
  * LogsRPC interface (from worker-logs service)
@@ -1103,7 +1104,7 @@ export interface TransactionLogEntry {
    * Present only on failed transactions where the reason is known.
    * Examples: "invalid_transaction", "sponsor_failure", "broadcast_failure", "chain_abort"
    */
-  terminalReason?: string;
+  terminalReason?: TerminalReason;
 }
 
 // =============================================================================
