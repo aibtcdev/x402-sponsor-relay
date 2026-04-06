@@ -22,7 +22,7 @@ import {
 import { checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import type { AppContext, Env, Logger, SponsorRequest } from "../types";
 import { buildQueueInfo } from "../types";
-import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix, extractTransferDetails } from "../utils";
 import type { BroadcastTarget } from "../utils";
 
 const BROADCAST_MAX_ATTEMPTS = 3;
@@ -336,6 +336,10 @@ export class Sponsor extends BaseEndpoint {
       const cleanHex = stripHexPrefix(sponsorResult.sponsoredTxHex);
       const sponsoredTx = deserializeTransaction(cleanHex);
 
+      // Extract token type and transfer amount from the sponsored transaction for accurate
+      // stats attribution. Falls back to { tokenType: "STX", amount: "0" } on any error.
+      const { tokenType: txTokenType, amount: txAmount } = extractTransferDetails(sponsoredTx);
+
       // Extract nonce before broadcast so it's available in all failure and success paths
       const sponsorNonce = extractSponsorNonce(sponsoredTx);
       // walletIndex from NonceDO assignment — routes release to the correct per-wallet pool
@@ -450,8 +454,8 @@ export class Sponsor extends BaseEndpoint {
           timestamp: new Date().toISOString(),
           endpoint: "sponsor",
           success: true,
-          tokenType: "STX",
-          amount: "0",
+          tokenType: txTokenType,
+          amount: txAmount,
           fee: sponsorResult.fee,
           txid,
           sender: validation.senderAddress,
@@ -462,8 +466,8 @@ export class Sponsor extends BaseEndpoint {
       // Also record usage for the API key (for volume tracking)
       await authService.recordUsage(metadata.keyId, {
         success: true,
-        tokenType: "STX",
-        amount: "0",
+        tokenType: txTokenType,
+        amount: txAmount,
         fee: sponsorResult.fee,
       });
 

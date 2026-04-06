@@ -141,6 +141,8 @@ export class StatsDO {
       ["daily_stats", "settle_client_errors INTEGER DEFAULT 0"],
       ["daily_stats", "verify_total INTEGER DEFAULT 0"],
       ["hourly_stats", "client_errors INTEGER DEFAULT 0"],
+      ["hourly_stats", "fee_min TEXT"],
+      ["hourly_stats", "fee_max TEXT"],
     ];
     for (const [table, columnDef] of migrations) {
       try {
@@ -345,11 +347,28 @@ export class StatsDO {
       clientErrorInt
     );
 
-    // Hourly fee total
+    // Hourly fee total + min/max (only for successful transactions with fee data)
     if (entry.success && fee) {
       this.sql.exec(
         `UPDATE hourly_stats SET fee_total = CAST(CAST(fee_total AS INTEGER) + ? AS TEXT) WHERE hour = ?`,
         fee,
+        hourKey
+      );
+      this.sql.exec(
+        `UPDATE hourly_stats SET
+           fee_min = CASE
+             WHEN fee_min IS NULL THEN ?
+             WHEN CAST(? AS INTEGER) < CAST(fee_min AS INTEGER) THEN ?
+             ELSE fee_min
+           END,
+           fee_max = CASE
+             WHEN fee_max IS NULL THEN ?
+             WHEN CAST(? AS INTEGER) > CAST(fee_max AS INTEGER) THEN ?
+             ELSE fee_max
+           END
+         WHERE hour = ?`,
+        fee, fee, fee,
+        fee, fee, fee,
         hourKey
       );
     }
@@ -482,9 +501,9 @@ export class StatsDO {
     return result;
   }
 
-  private readHourlyData(): Array<{ hour: string; transactions: number; success: number; fees?: string; clientErrors?: number }> {
+  private readHourlyData(): Array<{ hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number }> {
     const now = Date.now();
-    const result: Array<{ hour: string; transactions: number; success: number; fees?: string; clientErrors?: number }> = [];
+    const result: Array<{ hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number }> = [];
 
     for (let i = 23; i >= 0; i--) {
       const ts = now - i * HOUR_MS;
@@ -493,8 +512,8 @@ export class StatsDO {
       const key = getHourKey(ts);
 
       const rows = this.sql
-        .exec<{ total: number; success: number; fee_total: string; client_errors: number }>(
-          `SELECT total, success, fee_total, client_errors FROM hourly_stats WHERE hour = ? LIMIT 1`,
+        .exec<{ total: number; success: number; fee_total: string; fee_min: string | null; fee_max: string | null; client_errors: number }>(
+          `SELECT total, success, fee_total, fee_min, fee_max, client_errors FROM hourly_stats WHERE hour = ? LIMIT 1`,
           key
         )
         .toArray();
@@ -503,13 +522,19 @@ export class StatsDO {
         result.push({ hour: hourLabel, transactions: 0, success: 0 });
       } else {
         const r = rows[0];
-        const entry: { hour: string; transactions: number; success: number; fees?: string; clientErrors?: number } = {
+        const entry: { hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number } = {
           hour: hourLabel,
           transactions: r.total,
           success: r.success,
         };
         if (r.fee_total && r.fee_total !== "0") {
           entry.fees = r.fee_total;
+        }
+        if (r.fee_min) {
+          entry.feeMin = r.fee_min;
+        }
+        if (r.fee_max) {
+          entry.feeMax = r.fee_max;
         }
         if (r.client_errors > 0) {
           entry.clientErrors = r.client_errors;
@@ -617,14 +642,37 @@ export class StatsDO {
     // (when daily_stats has reset but the rolling window still has fee data from yesterday).
     const hourlyData = this.readHourlyData();
     const rolling = hourlyData.reduce(
-      (acc, h) => ({
-        total: acc.total + h.transactions,
-        success: acc.success + h.success,
-        clientErrors: acc.clientErrors + (h.clientErrors ?? 0),
-        fees: acc.fees + BigInt(h.fees || "0"),
-        feeCount: h.fees && h.fees !== "0" ? acc.feeCount + 1 : acc.feeCount,
-      }),
-      { total: 0, success: 0, clientErrors: 0, fees: 0n, feeCount: 0 }
+      (acc, h) => {
+        const hasHourFee = h.fees && h.fees !== "0";
+        // Rolling fee min: track the lowest fee_min across all hours in the window
+        let newFeeMin = acc.feeMin;
+        if (h.feeMin) {
+          if (newFeeMin === null) {
+            newFeeMin = h.feeMin;
+          } else if (BigInt(h.feeMin) < BigInt(newFeeMin)) {
+            newFeeMin = h.feeMin;
+          }
+        }
+        // Rolling fee max: track the highest fee_max across all hours in the window
+        let newFeeMax = acc.feeMax;
+        if (h.feeMax) {
+          if (newFeeMax === null) {
+            newFeeMax = h.feeMax;
+          } else if (BigInt(h.feeMax) > BigInt(newFeeMax)) {
+            newFeeMax = h.feeMax;
+          }
+        }
+        return {
+          total: acc.total + h.transactions,
+          success: acc.success + h.success,
+          clientErrors: acc.clientErrors + (h.clientErrors ?? 0),
+          fees: acc.fees + BigInt(h.fees || "0"),
+          feeCount: hasHourFee ? acc.feeCount + 1 : acc.feeCount,
+          feeMin: newFeeMin,
+          feeMax: newFeeMax,
+        };
+      },
+      { total: 0, success: 0, clientErrors: 0, fees: 0n, feeCount: 0, feeMin: null as string | null, feeMax: null as string | null }
     );
     const rollingFailed = rolling.total - rolling.success;
 
@@ -673,8 +721,8 @@ export class StatsDO {
       fees: {
         total: rollingFeeTotal,
         average: rollingFeeAvg,
-        min: currentFees.min || "0",
-        max: currentFees.max || "0",
+        min: rolling.feeMin ?? currentFees.min ?? "0",
+        max: rolling.feeMax ?? currentFees.max ?? "0",
         trend: feeTrend,
         previousTotal: previousFees.total,
       },
