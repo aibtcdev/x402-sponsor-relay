@@ -1244,6 +1244,10 @@ export type BroadcastAndConfirmResult =
       nonceConflict?: boolean;
       /** Sponsor wallet hit TooMuchChaining — relay-side congestion, retryable after backoff */
       tooMuchChaining?: boolean;
+      /** True when TooMuchChaining was triggered by the origin (sender) address, not the sponsor.
+       *  Parsed from the node's `reason_data.is_origin` field. When true, the relay should NOT
+       *  penalize the sponsor wallet — the agent's address has too many pending transactions. */
+      isOriginChaining?: boolean;
       /** Matched Stacks node rejection reason (e.g. "NotEnoughFunds") when the 4xx
        *  rejection was caused by the client submitting an invalid transaction. */
       clientRejection?: string;
@@ -1263,6 +1267,7 @@ export type BroadcastOnlyResult =
       retryable: boolean;
       nonceConflict?: boolean;
       tooMuchChaining?: boolean;
+      isOriginChaining?: boolean;
       clientRejection?: string;
       nodeUrl?: string;
       httpStatus?: number;
