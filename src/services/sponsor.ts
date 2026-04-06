@@ -1551,6 +1551,9 @@ export async function nonceLifecycleOnBroadcastSuccess(
     senderTxHex: string;
     senderAddress: string;
     senderNonce: number;
+    /** ISO timestamp of when the client HTTP request arrived at the relay endpoint.
+     *  Used as the start time for settlement latency measurement. */
+    submittedAt?: string;
   }
 ): Promise<void> {
   // Record broadcast outcome FIRST so ledgerBroadcastOutcome() runs while state is
@@ -1573,7 +1576,8 @@ export async function nonceLifecycleOnBroadcastSuccess(
       env, logger, opts.walletIndex,
       opts.senderTxHex, opts.senderAddress,
       opts.senderNonce, opts.sponsorNonce,
-      opts.fee ?? null
+      opts.fee ?? null,
+      opts.submittedAt ?? null
     ),
   ]).catch((e) => {
     logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
@@ -1588,7 +1592,8 @@ export async function queueDispatchDO(
   senderAddress: string,
   senderNonce: number,
   sponsorNonce: number,
-  fee?: string | null
+  fee?: string | null,
+  submittedAt?: string | null
 ): Promise<void> {
   if (!env.NONCE_DO) {
     return;
@@ -1605,6 +1610,7 @@ export async function queueDispatchDO(
         senderNonce,
         sponsorNonce,
         fee: fee ?? null,
+        submittedAt: submittedAt ?? null,
       }),
     });
     if (!response.ok) {

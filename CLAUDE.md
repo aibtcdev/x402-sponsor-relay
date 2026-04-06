@@ -87,7 +87,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /fees` - Get clamped fee estimates (no auth required)
 - `POST /fees/config` - Update fee clamps (admin, requires API key)
 - `GET /nonce/state` - Observable nonce state for client diagnostics (pending txs, gaps, health)
-- `GET /stats` - Relay statistics (JSON API)
+- `GET /stats` - Relay statistics (JSON API): transactions (total/success/failed/clientErrors, rawSuccessRate, effectiveSuccessRate, previousTotal, trend), tokens (STX/sBTC/USDCx volume), settlement health, settlementTimes (p50/p95 excluding gap-fills), terminalReasons (6-category breakdown), walletThroughput, previous24h comparison window
 - `GET /dashboard` - Public dashboard (HTML)
 - `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast; auto-sponsors transactions with empty sponsor slot)
 - `POST /verify` - x402 V2 facilitator verify (local validation only, no broadcast)
@@ -98,6 +98,12 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - Held sender-hand entries live for 15 minutes.
 - The alarm may conservatively repair stale-low sender frontiers after 5 minutes, with a 10 minute per-sender Hiro refresh cooldown.
 - Repair only bumps to the lowest held nonce when Hiro reports `possible_next_nonce >= lowestHeldNonce`; it must never speculate past locally held work.
+
+**Transaction timestamp semantics (NonceDO):**
+- `submitted_at` — when the relay first received and queued the transaction (set in NonceDO on nonce reservation). Used as the start time for settlement duration measurement.
+- `dispatched_at` — when the relay broadcast the transaction to Hiro. May be set multiple times for gap-fill retries; not used for latency measurement.
+- `queued_at` — legacy field retained for backward compatibility; equivalent to `submitted_at` in practice.
+- Gap-fill transactions carry `is_gap_fill: true` and are excluded from `settlementTimes` percentiles in `/stats` to prevent artificial inflation of reported settlement latency.
 
 **Agent Discovery (AX) — `src/routes/discovery.ts`:**
 - `GET /llms.txt` - Quick-start guide: what the relay does, key provisioning, /relay and /sponsor examples
@@ -378,6 +384,63 @@ Response: {
   extensions: ["payment-identifier"],  // client-controlled idempotency key extension
   signers: { "stacks:*": [] }  // empty = any signer accepted
 }
+
+// GET /stats (relay statistics — public, cached 15s)
+Response: {
+  success: true,
+  requestId: "uuid",
+  period: "24h",
+  transactions: {
+    total: 1240,
+    success: 1185,
+    failed: 55,
+    clientErrors: 12,          // client-caused failures (excluded from effectiveSuccessRate)
+    trend: "up",               // "up" | "down" | "stable" (rolling-vs-rolling comparison)
+    previousTotal: 1100,       // total in the previous 24h window (24-48h ago)
+    rawSuccessRate: 0.956,     // success / total (includes client errors in denominator)
+    effectiveSuccessRate: 0.978 // success / (success + relayErrors) (excludes client errors)
+  },
+  tokens: {
+    STX:  { count: 980, volume: "9800000000", percentage: 79 },
+    sBTC: { count: 200, volume: "500000",      percentage: 16 },
+    USDCx:{ count:  60, volume: "60000000",    percentage:  5 }
+  },
+  settlement: {
+    status: "healthy",    // "healthy" | "degraded" | "down" | "unknown"
+    avgLatencyMs: 8200,
+    uptime24h: 0.998,
+    lastCheck: "2026-04-06T12:00:00.000Z"
+  },
+  settlementTimes: {      // p50/p95 exclude gap-fill txs (is_gap_fill=true)
+    p50: 7800,
+    p95: 22000,
+    avg: 9100,
+    count: 1185
+  },
+  terminalReasons: {      // tx-schemas 6-category breakdown (today's calendar day)
+    validation:  3,       // invalid_transaction, not_sponsored
+    sender:     18,       // sender_nonce_* errors, origin_chaining_limit, sender_hand_expired
+    relay:       7,       // sponsor_failure, queue_unavailable, internal_error, sponsor_exhausted, sponsor_nonce_conflict
+    settlement: 12,       // broadcast_failure, chain_abort, broadcast_rate_limited
+    replacement: 5,       // nonce_replacement, superseded
+    identity:    2        // expired, unknown_payment_identity
+  },
+  walletThroughput: [     // per-wallet 24h totals + hourly sparklines (wallets with >0 txs only)
+    {
+      walletIndex: 0,
+      total24h: 310,
+      success24h: 298,
+      failed24h: 12,
+      feeTotal24h: "3100000",
+      hourly: [{ hour: "2026-04-06T11:00:00Z", total: 14, success: 13, failed: 1, feeTotal: "140000" }]
+    }
+  ],
+  previous24h: {          // rolling window 24-48h ago (for trend comparison)
+    total: 1100,
+    success: 1050,
+    failed: 50
+  }
+}
 ```
 
 **SIP-018 Authentication:**
@@ -434,6 +497,7 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
 - `src/endpoints/provision-stx.ts` - API key provisioning via Stacks signature
 - `src/endpoints/fees.ts` - Fee estimation endpoint (public, no auth)
 - `src/endpoints/fees-config.ts` - Fee clamp configuration endpoint (admin, API key auth)
+- `src/utils/tx-decode.ts` - `extractTransferDetails()` — decode token type and transfer amount from a deserialized Stacks tx without full payment verification. Used by `/sponsor` for accurate token attribution in stats.
 - `src/services/receipt.ts` - ReceiptService (store/retrieve/consume receipts in KV)
 - `src/services/btc-verify.ts` - BtcVerifyService (BIP-137/BIP-322 signature verification)
 - `src/services/stx-verify.ts` - StxVerifyService (plain message + SIP-018 signature verification)
@@ -595,6 +659,8 @@ Agent                    Relay                              Stacks
 - `confirmed`: tx confirmed on-chain within 60s — includes `blockHeight`
 - `pending`: broadcast succeeded but confirmation timed out — safe state, poll `/verify/:receiptId`
 - `failed`: tx broadcast OK but definitively aborted on-chain (`abort_*` status) — returns `SETTLEMENT_FAILED` (422, not retryable)
+
+Note: `/stats` `settlementTimes` percentiles (p50/p95) exclude gap-fill transactions (`is_gap_fill: true` in NonceDO). Gap-fills are relay-internal nonce repair transactions, not agent-submitted payments; including them would inflate reported settlement latency by 3-5x.
 
 **Drop vs abort semantics:**
 - `dropped_*` from Hiro is TRANSIENT — 93% of `dropped_replace_by_fee` reports actually confirm on-chain.

@@ -13,3 +13,5 @@ export type {
   PaymentLifecycleLogContext,
 } from "./payment-events";
 export { NONCE_CONFLICT_REASONS, CLIENT_REJECTION_REASONS, stripHexPrefix, decodeClarityUint } from "./stacks";
+export { extractTransferDetails } from "./tx-decode";
+export type { TransferDetails } from "./tx-decode";

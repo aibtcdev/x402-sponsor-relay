@@ -52,7 +52,18 @@ export class DashboardStats extends BaseEndpoint {
                       type: "string" as const,
                       enum: ["up", "down", "stable"],
                     },
-                    previousTotal: { type: "number" as const },
+                    previousTotal: {
+                      type: "number" as const,
+                      description: "Total transactions in the previous rolling 24h window (24-48h ago) for trend comparison.",
+                    },
+                    rawSuccessRate: {
+                      type: "number" as const,
+                      description: "Raw success rate = success / total. Includes client errors in denominator. Range 0-1.",
+                    },
+                    effectiveSuccessRate: {
+                      type: "number" as const,
+                      description: "Effective success rate = success / (success + relayErrors). Excludes client errors from denominator. Range 0-1.",
+                    },
                   },
                 },
                 tokens: {
@@ -152,6 +163,59 @@ export class DashboardStats extends BaseEndpoint {
                         },
                       },
                     },
+                  },
+                },
+                terminalReasons: {
+                  type: "object" as const,
+                  nullable: true,
+                  description:
+                    "Error counts grouped by tx-schemas terminal reason category (today's calendar-day). Additive alongside legacy errors object. Categories: validation, sender, relay, settlement, replacement, identity.",
+                  properties: {
+                    validation: { type: "number" as const, description: "invalid_transaction, not_sponsored" },
+                    sender: { type: "number" as const, description: "sender_nonce_* errors, origin_chaining_limit, sender_hand_expired" },
+                    relay: { type: "number" as const, description: "sponsor_failure, queue_unavailable, internal_error, sponsor_exhausted, sponsor_nonce_conflict" },
+                    settlement: { type: "number" as const, description: "broadcast_failure, chain_abort, broadcast_rate_limited" },
+                    replacement: { type: "number" as const, description: "nonce_replacement, superseded" },
+                    identity: { type: "number" as const, description: "expired, unknown_payment_identity" },
+                  },
+                },
+                walletThroughput: {
+                  type: "array" as const,
+                  nullable: true,
+                  description: "Per-wallet 24h throughput totals with hourly spark data. Only includes wallets with at least one transaction in the last 24h.",
+                  items: {
+                    type: "object" as const,
+                    properties: {
+                      walletIndex: { type: "number" as const, description: "Sponsor wallet index (0-based)" },
+                      total24h: { type: "number" as const, description: "Total transactions in rolling 24h" },
+                      success24h: { type: "number" as const, description: "Successful transactions in rolling 24h" },
+                      failed24h: { type: "number" as const, description: "Failed transactions in rolling 24h" },
+                      feeTotal24h: { type: "string" as const, description: "Total fees paid by this wallet in microSTX (rolling 24h)" },
+                      hourly: {
+                        type: "array" as const,
+                        description: "Hourly spark data for the last 24h",
+                        items: {
+                          type: "object" as const,
+                          properties: {
+                            hour: { type: "string" as const },
+                            total: { type: "number" as const },
+                            success: { type: "number" as const },
+                            failed: { type: "number" as const },
+                            feeTotal: { type: "string" as const },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+                previous24h: {
+                  type: "object" as const,
+                  nullable: true,
+                  description: "Rolling 24h totals from the previous window (24-48h ago). Used for rolling-vs-rolling trend comparison.",
+                  properties: {
+                    total: { type: "number" as const },
+                    success: { type: "number" as const },
+                    failed: { type: "number" as const },
                   },
                 },
                 endpointBreakdown: {

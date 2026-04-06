@@ -22,7 +22,7 @@ import {
 import { checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import type { AppContext, Env, Logger, SponsorRequest } from "../types";
 import { buildQueueInfo } from "../types";
-import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix } from "../utils";
+import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix, extractTransferDetails } from "../utils";
 import type { BroadcastTarget } from "../utils";
 
 const BROADCAST_MAX_ATTEMPTS = 3;
@@ -158,6 +158,9 @@ export class Sponsor extends BaseEndpoint {
     const logger = this.getLogger(c);
     logger.info("Sponsor request received");
 
+    // Capture HTTP request arrival time for user-perceived settlement latency measurement.
+    const submittedAt = new Date().toISOString();
+
     const statsService = new StatsService(c.env, logger);
 
     try {
@@ -166,7 +169,7 @@ export class Sponsor extends BaseEndpoint {
 
       if (!body.transaction) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "invalid_transaction").catch(() => {}));
         return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
@@ -180,7 +183,7 @@ export class Sponsor extends BaseEndpoint {
         const authError = stxVerifyService.verifySip018Auth(body.auth, "sponsor");
         if (authError) {
           c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "invalid_transaction").catch(() => {}));
           return this.err(c, {
             error: authError.error,
             code: authError.code,
@@ -196,7 +199,9 @@ export class Sponsor extends BaseEndpoint {
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined,
+          validation.error === "Transaction must be sponsored" ? "not_sponsored" : "invalid_transaction"
+        ).catch(() => {}));
         if (validation.error === "Malformed transaction payload") {
           const blocked = clientIp ? checkAndRecordMalformed(clientIp) : false;
           if (blocked) {
@@ -242,7 +247,7 @@ export class Sponsor extends BaseEndpoint {
           tier: metadata.tier,
           code: rateLimitResult.code,
         });
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "broadcast_rate_limited").catch(() => {}));
         const isDaily = rateLimitResult.code === "DAILY_LIMIT_EXCEEDED";
         return this.err(c, {
           error: isDaily ? "Daily request limit exceeded" : "Rate limit exceeded",
@@ -280,7 +285,7 @@ export class Sponsor extends BaseEndpoint {
           tier: metadata.tier,
           estimatedFee: estimatedFee.toString(),
         });
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "broadcast_rate_limited").catch(() => {}));
         return this.err(c, {
           error: "Daily spending cap exceeded",
           code: "SPENDING_CAP_EXCEEDED",
@@ -304,7 +309,7 @@ export class Sponsor extends BaseEndpoint {
         // The tx was NOT added to sender_hand (mode:"immediate" prevents insertion on gap).
         if ("held" in sponsorResult && sponsorResult.held) {
           c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "sender_nonce_gap").catch(() => {}));
           const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
           const queue = buildQueueInfo(sponsorResult, senderNonce);
           logger.warn("Sender nonce gap — rejecting /sponsor request", {
@@ -323,6 +328,7 @@ export class Sponsor extends BaseEndpoint {
             queue,
           }, 400);
         }
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", false, undefined, "sponsor_failure").catch(() => {}));
         return this.sponsorFailureResponse(
           c,
           sponsorResult as { error: string; details: string; code?: string; retryAfter?: number },
@@ -332,6 +338,10 @@ export class Sponsor extends BaseEndpoint {
 
       const cleanHex = stripHexPrefix(sponsorResult.sponsoredTxHex);
       const sponsoredTx = deserializeTransaction(cleanHex);
+
+      // Extract token type and transfer amount from the sponsored transaction for accurate
+      // stats attribution. Falls back to { tokenType: "STX", amount: "0" } on any error.
+      const { tokenType: txTokenType, amount: txAmount } = extractTransferDetails(sponsoredTx, c.env.STACKS_NETWORK);
 
       // Extract nonce before broadcast so it's available in all failure and success paths
       const sponsorNonce = extractSponsorNonce(sponsoredTx);
@@ -352,7 +362,7 @@ export class Sponsor extends BaseEndpoint {
         const isClientError = clientRejection !== undefined;
 
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError, undefined, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {}));
 
         // Record broadcast outcome in the intent ledger.
         // httpStatus 0 = network/timeout exception (no HTTP response received).
@@ -433,6 +443,7 @@ export class Sponsor extends BaseEndpoint {
             senderTxHex: body.transaction,
             senderAddress: validation.senderAddress,
             senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
+            submittedAt,
           })
         );
       }
@@ -446,20 +457,21 @@ export class Sponsor extends BaseEndpoint {
           timestamp: new Date().toISOString(),
           endpoint: "sponsor",
           success: true,
-          tokenType: "STX",
-          amount: "0",
+          tokenType: txTokenType,
+          amount: txAmount,
           fee: sponsorResult.fee,
           txid,
           sender: validation.senderAddress,
           status: "pending",
+          walletIndex: sponsorWalletIndex,
         }).catch(() => {})
       );
 
       // Also record usage for the API key (for volume tracking)
       await authService.recordUsage(metadata.keyId, {
         success: true,
-        tokenType: "STX",
-        amount: "0",
+        tokenType: txTokenType,
+        amount: txAmount,
         fee: sponsorResult.fee,
       });
 
@@ -480,7 +492,7 @@ export class Sponsor extends BaseEndpoint {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
-      c.executionCtx.waitUntil(statsService.logFailure("sponsor", false).catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logFailure("sponsor", false, undefined, "internal_error").catch(() => {}));
       return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",

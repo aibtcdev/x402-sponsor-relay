@@ -776,6 +776,40 @@ export class NonceDO {
       );
     }
 
+    // Migration: add submitted_at column to dispatch_queue.
+    // ISO timestamp of when the client HTTP request first arrived at the relay endpoint.
+    // NULL for gap-fill entries, replay re-dispatches, and pre-migration rows.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('dispatch_queue') WHERE name = 'submitted_at'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE dispatch_queue ADD COLUMN submitted_at TEXT");
+      }
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to ensure dispatch_queue.submitted_at column exists; continuing without migration:",
+        err
+      );
+    }
+
+    // Migration: add is_gap_fill column to dispatch_queue.
+    // 1 for gap-fill/flush/replay-respon system txs, 0 for user-submitted txs.
+    // These entries are excluded from settlement time percentiles.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('dispatch_queue') WHERE name = 'is_gap_fill'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE dispatch_queue ADD COLUMN is_gap_fill INTEGER DEFAULT 0");
+      }
+    } catch (err) {
+      console.warn(
+        "[nonce-do] Failed to ensure dispatch_queue.is_gap_fill column exists; continuing without migration:",
+        err
+      );
+    }
+
     // Migration: add gap_fill_attempts column to nonce_intents (nullable INTEGER, default 0).
     // Tracks how many gap-fill broadcasts have been attempted for a conflict nonce,
     // used to escalate the fee by +1 uSTX per attempt (30000, 30001, 30002, ...).
@@ -945,7 +979,9 @@ export class NonceDO {
     senderAddress: string,
     senderNonce: number,
     sponsorNonce: number,
-    fee: string | null = null
+    fee: string | null = null,
+    submittedAt: string | null = null,
+    isGapFill: boolean = false
   ): void {
     const now = new Date().toISOString();
     // Compute position as next slot (max position + 1) for ordering within the wallet queue
@@ -960,8 +996,9 @@ export class NonceDO {
     this.sql.exec(
       `INSERT OR REPLACE INTO dispatch_queue
          (wallet_index, position, sender_tx_hex, sender_address, sender_nonce,
-          sponsor_nonce, original_fee, state, queued_at, dispatched_at, confirmed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, NULL)`,
+          sponsor_nonce, original_fee, state, queued_at, dispatched_at, confirmed_at,
+          submitted_at, is_gap_fill)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, NULL, ?, ?)`,
       walletIndex,
       position,
       senderTxHex,
@@ -970,7 +1007,9 @@ export class NonceDO {
       sponsorNonce,
       fee,
       now,
-      now
+      now,
+      submittedAt,
+      isGapFill ? 1 : 0
     );
   }
 
@@ -1049,6 +1088,7 @@ export class NonceDO {
         .exec<{ settlement_ms: number }>(
           `SELECT settlement_ms FROM dispatch_queue
            WHERE state = 'confirmed' AND settlement_ms IS NOT NULL
+             AND (is_gap_fill IS NULL OR is_gap_fill = 0)
              AND wallet_index = ? AND confirmed_at >= ?
            ORDER BY settlement_ms ASC`,
           walletIndex,
@@ -1060,6 +1100,7 @@ export class NonceDO {
         .exec<{ settlement_ms: number }>(
           `SELECT settlement_ms FROM dispatch_queue
            WHERE state = 'confirmed' AND settlement_ms IS NOT NULL
+             AND (is_gap_fill IS NULL OR is_gap_fill = 0)
              AND confirmed_at >= ?
            ORDER BY settlement_ms ASC`,
           cutoff
@@ -1092,19 +1133,22 @@ export class NonceDO {
     const now = new Date().toISOString();
 
     if (newState === "confirmed") {
-      // On confirmation: set confirmed_at and compute settlement_ms from dispatched_at.
-      // Also read original_fee and sender_address for the settlement_confirmed log event.
+      // On confirmation: set confirmed_at and compute settlement_ms.
+      // Use submitted_at (client HTTP request arrival) as the start time when available,
+      // falling back to dispatched_at for pre-migration entries. This ensures settlement
+      // percentiles reflect actual user-perceived latency rather than internal queue timing.
       const preRow = this.sql
-        .exec<{ dispatched_at: string | null; original_fee: string | null; sender_address: string | null }>(
-          "SELECT dispatched_at, original_fee, sender_address FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
+        .exec<{ dispatched_at: string | null; submitted_at: string | null; original_fee: string | null; sender_address: string | null }>(
+          "SELECT dispatched_at, submitted_at, original_fee, sender_address FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
           walletIndex,
           sponsorNonce
         )
         .toArray()[0];
 
       let settlementMs: number | null = null;
-      if (preRow?.dispatched_at) {
-        settlementMs = Math.max(0, Date.now() - new Date(preRow.dispatched_at).getTime());
+      const startTime = preRow?.submitted_at ?? preRow?.dispatched_at;
+      if (startTime) {
+        settlementMs = Math.max(0, Date.now() - new Date(startTime).getTime());
       }
 
       this.sql.exec(
@@ -4858,14 +4902,19 @@ export class NonceDO {
           // Broadcast the re-sponsored tx
           const result = await this.broadcastRawTx(reSponsoredTx, "replay_respon");
           if (result.ok) {
-            // Record in dispatch queue (fee=GAP_FILL_FEE used for replayed txs)
+            // Record in dispatch queue (fee=GAP_FILL_FEE used for replayed txs).
+            // Replay re-dispatches are tagged as is_gap_fill=1 so they are excluded from
+            // settlement time percentiles — the original submitted_at is in the retired entry
+            // and cannot be accurately carried forward here.
             this.queueDispatch(
               targetWallet.walletIndex,
               entry.sender_tx_hex,
               entry.sender_address,
               entry.sender_nonce,
               freshNonce,
-              GAP_FILL_FEE.toString()
+              GAP_FILL_FEE.toString(),
+              null,  // submitted_at: not available after replay
+              true   // is_gap_fill: exclude from settlement percentiles
             );
             // Transition to dispatched
             this.transitionQueueEntry(targetWallet.walletIndex, freshNonce, "dispatched");
@@ -7427,6 +7476,7 @@ export class NonceDO {
           senderNonce: number;
           sponsorNonce: number;
           fee?: string | null;
+          submittedAt?: string | null;
         }>(request);
       if (errorResponse) return errorResponse;
       if (
@@ -7444,7 +7494,8 @@ export class NonceDO {
           body.senderAddress,
           body.senderNonce ?? 0,
           body.sponsorNonce,
-          typeof body.fee === "string" ? body.fee : null
+          typeof body.fee === "string" ? body.fee : null,
+          typeof body.submittedAt === "string" ? body.submittedAt : null
         );
         return this.jsonResponse({ success: true });
       } catch (error) {

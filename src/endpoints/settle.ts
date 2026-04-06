@@ -42,6 +42,8 @@ interface BroadcastSuccessParams {
   paymentIdService: PaymentIdService;
   paymentIdentifier: string | undefined;
   paymentIdPayloadHash: string | undefined;
+  /** ISO timestamp of when the client HTTP request arrived at the relay endpoint. */
+  submittedAt: string;
 }
 
 /**
@@ -151,6 +153,7 @@ export class Settle extends BaseEndpoint {
       verifiedTx, recipient, amount,
       settleOptions, settlementService, statsService,
       paymentIdService, paymentIdentifier, paymentIdPayloadHash,
+      submittedAt,
     } = params;
 
     const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
@@ -166,6 +169,7 @@ export class Settle extends BaseEndpoint {
           senderTxHex: txHex,
           senderAddress: payer,
           senderNonce: Number(verifiedTx.auth.spendingCondition.nonce),
+          submittedAt,
         })
       );
     }
@@ -205,6 +209,7 @@ export class Settle extends BaseEndpoint {
         recipient,
         status: "pending",
         fee: sponsorFee,
+        walletIndex: sponsorWalletIndex,
       }).catch(() => {})
     );
 
@@ -270,6 +275,9 @@ export class Settle extends BaseEndpoint {
   async handle(c: AppContext) {
     const logger = this.getLogger(c);
     logger.info("x402 V2 settle request received");
+
+    // Capture HTTP request arrival time for user-perceived settlement latency measurement.
+    const submittedAt = new Date().toISOString();
 
     const statsService = new StatsService(c.env, logger);
     const paymentIdService = new PaymentIdService(c.env.RELAY_KV, logger);
@@ -360,7 +368,7 @@ export class Settle extends BaseEndpoint {
         c.executionCtx.waitUntil(
           Promise.all([
             statsService.recordError("validation"),
-            statsService.logFailure("settle", true),
+            statsService.logFailure("settle", true, undefined, "invalid_transaction"),
           ]).catch(() => {})
         );
         return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
@@ -381,7 +389,7 @@ export class Settle extends BaseEndpoint {
         c.executionCtx.waitUntil(
           Promise.all([
             statsService.recordError("validation"),
-            statsService.logFailure("settle", true),
+            statsService.logFailure("settle", true, undefined, "invalid_transaction"),
           ]).catch(() => {})
         );
         return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
@@ -418,7 +426,7 @@ export class Settle extends BaseEndpoint {
           c.executionCtx.waitUntil(
             Promise.all([
               statsService.recordError("validation"),
-              statsService.logFailure("settle", true, failureCtx),
+              statsService.logFailure("settle", true, failureCtx, "invalid_transaction"),
             ]).catch(() => {})
           );
           return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
@@ -444,7 +452,7 @@ export class Settle extends BaseEndpoint {
             c.executionCtx.waitUntil(
               Promise.all([
                 statsService.recordError("sponsoring"),
-                statsService.logFailure("settle", false, failureCtx),
+                statsService.logFailure("settle", false, failureCtx, "sender_nonce_gap"),
               ]).catch(() => {})
             );
             return c.json({
@@ -460,7 +468,7 @@ export class Settle extends BaseEndpoint {
           c.executionCtx.waitUntil(
             Promise.all([
               statsService.recordError("sponsoring"),
-              statsService.logFailure("settle", false, failureCtx),
+              statsService.logFailure("settle", false, failureCtx, "sponsor_failure"),
             ]).catch(() => {})
           );
           // Transient sponsor failures — signal retryable via BROADCAST_FAILED
@@ -506,7 +514,7 @@ export class Settle extends BaseEndpoint {
         c.executionCtx.waitUntil(
           Promise.all([
             statsService.recordError("validation"),
-            statsService.logFailure("settle", true, failureCtx),
+            statsService.logFailure("settle", true, failureCtx, "invalid_transaction"),
           ]).catch(() => {})
         );
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
@@ -541,7 +549,7 @@ export class Settle extends BaseEndpoint {
 
         // Record stats once for all error branches
         c.executionCtx.waitUntil(
-          statsService.logFailure("settle", isClientError, failureCtx).catch(() => {})
+          statsService.logFailure("settle", isClientError, failureCtx, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {})
         );
 
         // Sponsor-side issues (nonce conflict or TooMuchChaining) → inline resync + single retry
@@ -589,6 +597,7 @@ export class Settle extends BaseEndpoint {
                     amount: retryVerifyResult.data.amount,
                     settleOptions, settlementService, statsService,
                     paymentIdService, paymentIdentifier, paymentIdPayloadHash,
+                    submittedAt,
                   });
                 } else {
                   // Retry broadcast also failed — release retry nonce, fall through to error
@@ -670,6 +679,7 @@ export class Settle extends BaseEndpoint {
         amount: verifyResult.data.amount,
         settleOptions, settlementService, statsService,
         paymentIdService, paymentIdentifier, paymentIdPayloadHash,
+        submittedAt,
       });
     } catch (e) {
       logger.error("Unexpected settle error", {

@@ -8,6 +8,7 @@ import type {
   RelayEndpointName,
   TransactionLogEntry,
 } from "../types";
+import type { TerminalReason } from "@aibtc/tx-schemas/core/terminal-reasons";
 
 /**
  * Calculate trend based on current vs previous values
@@ -142,11 +143,15 @@ export class StatsService {
   /**
    * Log a failed transaction with common defaults (timestamp, success:false, status:"failed").
    * Reduces boilerplate at each error-path call site.
+   *
+   * @param terminalReason - Optional terminal reason from @aibtc/tx-schemas TERMINAL_REASONS.
+   *   When provided, StatsDO increments the matching category column in daily_stats.
    */
   async logFailure(
     endpoint: RelayEndpointName,
     clientError: boolean,
-    opts?: { tokenType?: TokenType; amount?: string; fee?: string; sender?: string; recipient?: string }
+    opts?: { tokenType?: TokenType; amount?: string; fee?: string; sender?: string; recipient?: string },
+    terminalReason?: TerminalReason
   ): Promise<void> {
     await this.logTransaction({
       timestamp: new Date().toISOString(),
@@ -159,6 +164,7 @@ export class StatsService {
       fee: opts?.fee,
       sender: opts?.sender,
       recipient: opts?.recipient,
+      terminalReason,
     });
   }
 

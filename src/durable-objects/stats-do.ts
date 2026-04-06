@@ -6,8 +6,10 @@ import type {
   DashboardOverview,
   EndpointBreakdown,
   TransactionLogEntry,
+  WalletThroughputEntry,
 } from "../types";
 import { calculateTrend } from "../services/stats";
+import { TERMINAL_REASON_TO_CATEGORY } from "@aibtc/tx-schemas/core/terminal-reasons";
 
 // ===========================================================================
 // Time helpers
@@ -26,6 +28,12 @@ function getHourKey(now: number = Date.now()): string {
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
+
+/** Convert a DB hour key ("YYYY-MM-DD:HH") to an ISO 8601 timestamp ("YYYY-MM-DDTHH:00:00Z"). */
+function hourKeyToISO(key: string): string {
+  const [date, hh] = key.split(":");
+  return `${date}T${hh}:00:00Z`;
+}
 
 // ===========================================================================
 // StatsDO — SQLite-backed atomic stats for the x402 sponsor relay
@@ -124,6 +132,19 @@ export class StatsDO {
       );
     `);
 
+    // Per-wallet hourly aggregate (rolling 48h) — tracks throughput per sponsor wallet
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS wallet_hourly (
+        wallet_index INTEGER NOT NULL,
+        hour TEXT NOT NULL,
+        total INTEGER DEFAULT 0,
+        success INTEGER DEFAULT 0,
+        failed INTEGER DEFAULT 0,
+        fee_total TEXT DEFAULT '0',
+        PRIMARY KEY(wallet_index, hour)
+      );
+    `);
+
     // Schema migrations — ALTER TABLE ADD COLUMN is idempotent (catch ignores
     // "duplicate column name" errors on repeated DO restarts).
     const migrations: Array<[table: string, column: string]> = [
@@ -141,6 +162,17 @@ export class StatsDO {
       ["daily_stats", "settle_client_errors INTEGER DEFAULT 0"],
       ["daily_stats", "verify_total INTEGER DEFAULT 0"],
       ["hourly_stats", "client_errors INTEGER DEFAULT 0"],
+      ["hourly_stats", "fee_min TEXT"],
+      ["hourly_stats", "fee_max TEXT"],
+      // Terminal reason category columns (tx-schemas v0.4.0 alignment)
+      // Named with _schema suffix to avoid collision with legacy err_validation / err_settlement columns.
+      ["tx_log", "terminal_reason TEXT"],
+      ["daily_stats", "err_schema_validation INTEGER DEFAULT 0"],
+      ["daily_stats", "err_sender INTEGER DEFAULT 0"],
+      ["daily_stats", "err_relay INTEGER DEFAULT 0"],
+      ["daily_stats", "err_settlement_schema INTEGER DEFAULT 0"],
+      ["daily_stats", "err_replacement INTEGER DEFAULT 0"],
+      ["daily_stats", "err_identity INTEGER DEFAULT 0"],
     ];
     for (const [table, columnDef] of migrations) {
       try {
@@ -189,13 +221,14 @@ export class StatsDO {
     const amount = entry.amount || "0";
     const fee = entry.fee || null;
 
-    // Insert into tx_log (includes new client_error column)
+    // Insert into tx_log (includes client_error and terminal_reason columns)
     const id = crypto.randomUUID();
     const timestamp = new Date(entry.timestamp).getTime() || now;
+    const terminalReason = entry.terminalReason || null;
     this.sql.exec(
       `INSERT OR IGNORE INTO tx_log
-         (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height, client_error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height, client_error, terminal_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       entry.endpoint,
       timestamp,
@@ -208,7 +241,8 @@ export class StatsDO {
       entry.recipient || null,
       entry.status || null,
       entry.blockHeight || null,
-      clientErrorInt
+      clientErrorInt,
+      terminalReason
     );
 
     // Prune tx_log older than 7 days
@@ -279,6 +313,32 @@ export class StatsDO {
       );
     }
 
+    // Atomic daily upsert — terminal reason category increment (tx-schemas alignment)
+    // Only applies to failed transactions with a known terminal reason.
+    if (!entry.success && terminalReason) {
+      const category = TERMINAL_REASON_TO_CATEGORY[terminalReason as keyof typeof TERMINAL_REASON_TO_CATEGORY];
+      // categoryColMap must stay in sync with TERMINAL_REASON_TO_CATEGORY categories in @aibtc/tx-schemas.
+      // If tx-schemas adds a new category, add the corresponding column here and in the migrations array.
+      const categoryColMap: Record<string, string> = {
+        validation: "err_schema_validation",
+        sender: "err_sender",
+        relay: "err_relay",
+        settlement: "err_settlement_schema",
+        replacement: "err_replacement",
+        identity: "err_identity",
+      };
+      const categoryCol = category ? categoryColMap[category] : null;
+      if (categoryCol) {
+        this.sql.exec(
+          `INSERT INTO daily_stats (date, ${categoryCol})
+           VALUES (?, 1)
+           ON CONFLICT(date) DO UPDATE SET
+             ${categoryCol} = ${categoryCol} + 1`,
+          today
+        );
+      }
+    }
+
     // Atomic daily upsert — volumes (must be separate to use BigInt arithmetic safely)
     if (stxInt) {
       this.sql.exec(
@@ -345,11 +405,25 @@ export class StatsDO {
       clientErrorInt
     );
 
-    // Hourly fee total
+    // Hourly fee total + min/max in a single UPDATE (only for successful transactions with fee data)
     if (entry.success && fee) {
       this.sql.exec(
-        `UPDATE hourly_stats SET fee_total = CAST(CAST(fee_total AS INTEGER) + ? AS TEXT) WHERE hour = ?`,
+        `UPDATE hourly_stats SET
+           fee_total = CAST(CAST(fee_total AS INTEGER) + ? AS TEXT),
+           fee_min = CASE
+             WHEN fee_min IS NULL THEN ?
+             WHEN CAST(? AS INTEGER) < CAST(fee_min AS INTEGER) THEN ?
+             ELSE fee_min
+           END,
+           fee_max = CASE
+             WHEN fee_max IS NULL THEN ?
+             WHEN CAST(? AS INTEGER) > CAST(fee_max AS INTEGER) THEN ?
+             ELSE fee_max
+           END
+         WHERE hour = ?`,
         fee,
+        fee, fee, fee,
+        fee, fee, fee,
         hourKey
       );
     }
@@ -358,6 +432,27 @@ export class StatsDO {
     const hourCutoff = new Date(now - 48 * HOUR_MS);
     const hourCutoffStr = `${hourCutoff.toISOString().split("T")[0]}:${hourCutoff.getUTCHours().toString().padStart(2, "0")}`;
     this.sql.exec("DELETE FROM hourly_stats WHERE hour < ?", hourCutoffStr);
+
+    // Atomic per-wallet hourly upsert (only when walletIndex is provided)
+    if (entry.walletIndex !== undefined) {
+      const walletFee = fee || "0";
+      this.sql.exec(
+        `INSERT INTO wallet_hourly (wallet_index, hour, total, success, failed, fee_total)
+         VALUES (?, ?, 1, ?, ?, ?)
+         ON CONFLICT(wallet_index, hour) DO UPDATE SET
+           total = total + 1,
+           success = success + excluded.success,
+           failed = failed + excluded.failed,
+           fee_total = CAST(CAST(fee_total AS INTEGER) + CAST(excluded.fee_total AS INTEGER) AS TEXT)`,
+        entry.walletIndex,
+        hourKey,
+        successInt,
+        failedInt,
+        walletFee
+      );
+      // Prune wallet_hourly older than 48h (same cutoff as hourly_stats)
+      this.sql.exec("DELETE FROM wallet_hourly WHERE hour < ?", hourCutoffStr);
+    }
   }
 
   private recordErrorCategory(category: ErrorCategory): void {
@@ -390,131 +485,258 @@ export class StatsDO {
 
   private readDailyStats(days: number): DailyStats[] {
     const now = Date.now();
-    const result: DailyStats[] = [];
 
+    // Generate the ordered list of date keys we need
+    const dateKeys: string[] = [];
     for (let i = days - 1; i >= 0; i--) {
-      const date = getDateKey(now - i * DAY_MS);
-      const rows = this.sql
-        .exec<{
-          total: number;
-          success: number;
-          failed: number;
-          client_errors: number;
-          stx_count: number;
-          stx_volume: string;
-          sbtc_count: number;
-          sbtc_volume: string;
-          usdcx_count: number;
-          usdcx_volume: string;
-          fee_total: string;
-          fee_count: number;
-          fee_min: string | null;
-          fee_max: string | null;
-          err_validation: number;
-          err_rate_limit: number;
-          err_sponsoring: number;
-          err_settlement: number;
-          err_internal: number;
-        }>(
-          `SELECT total, success, failed, client_errors,
-                  stx_count, stx_volume,
-                  sbtc_count, sbtc_volume,
-                  usdcx_count, usdcx_volume,
-                  fee_total, fee_count, fee_min, fee_max,
-                  err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal
-           FROM daily_stats WHERE date = ? LIMIT 1`,
-          date
-        )
-        .toArray();
+      dateKeys.push(getDateKey(now - i * DAY_MS));
+    }
 
-      if (rows.length === 0) {
-        result.push({
-          date,
-          transactions: { total: 0, success: 0, failed: 0, clientErrors: 0 },
-          tokens: {
-            STX: { count: 0, volume: "0" },
-            sBTC: { count: 0, volume: "0" },
-            USDCx: { count: 0, volume: "0" },
-          },
-          errors: {
-            validation: 0,
-            rateLimit: 0,
-            sponsoring: 0,
-            settlement: 0,
-            internal: 0,
-          },
-        });
-      } else {
-        const r = rows[0];
-        const ds: DailyStats = {
-          date,
-          transactions: {
-            total: r.total,
-            success: r.success,
-            failed: r.failed,
-            clientErrors: r.client_errors ?? 0,
-          },
-          tokens: {
-            STX: { count: r.stx_count, volume: r.stx_volume || "0" },
-            sBTC: { count: r.sbtc_count, volume: r.sbtc_volume || "0" },
-            USDCx: { count: r.usdcx_count, volume: r.usdcx_volume || "0" },
-          },
-          errors: {
-            validation: r.err_validation,
-            rateLimit: r.err_rate_limit,
-            sponsoring: r.err_sponsoring,
-            settlement: r.err_settlement,
-            internal: r.err_internal,
-          },
-        };
-        if (r.fee_count > 0) {
-          ds.fees = {
-            total: r.fee_total || "0",
-            count: r.fee_count,
-            min: r.fee_min || "0",
-            max: r.fee_max || "0",
-          };
-        }
-        result.push(ds);
+    const startDate = dateKeys[0];
+
+    // Single range query instead of N individual queries
+    type DailyRow = {
+      date: string;
+      total: number;
+      success: number;
+      failed: number;
+      client_errors: number;
+      stx_count: number;
+      stx_volume: string;
+      sbtc_count: number;
+      sbtc_volume: string;
+      usdcx_count: number;
+      usdcx_volume: string;
+      fee_total: string;
+      fee_count: number;
+      fee_min: string | null;
+      fee_max: string | null;
+      err_validation: number;
+      err_rate_limit: number;
+      err_sponsoring: number;
+      err_settlement: number;
+      err_internal: number;
+      err_schema_validation: number;
+      err_sender: number;
+      err_relay: number;
+      err_settlement_schema: number;
+      err_replacement: number;
+      err_identity: number;
+    };
+
+    const rows = this.sql
+      .exec<DailyRow>(
+        `SELECT date, total, success, failed, client_errors,
+                stx_count, stx_volume,
+                sbtc_count, sbtc_volume,
+                usdcx_count, usdcx_volume,
+                fee_total, fee_count, fee_min, fee_max,
+                err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal,
+                err_schema_validation, err_sender, err_relay, err_settlement_schema, err_replacement, err_identity
+         FROM daily_stats WHERE date >= ? ORDER BY date ASC`,
+        startDate
+      )
+      .toArray();
+
+    // Index results by date for O(1) lookup
+    const rowMap = new Map<string, DailyRow>();
+    for (const r of rows) {
+      rowMap.set(r.date, r);
+    }
+
+    const zeroDailyStats = (date: string): DailyStats => ({
+      date,
+      transactions: { total: 0, success: 0, failed: 0, clientErrors: 0 },
+      tokens: {
+        STX: { count: 0, volume: "0" },
+        sBTC: { count: 0, volume: "0" },
+        USDCx: { count: 0, volume: "0" },
+      },
+      errors: {
+        validation: 0,
+        rateLimit: 0,
+        sponsoring: 0,
+        settlement: 0,
+        internal: 0,
+      },
+      terminalReasons: {
+        validation: 0,
+        sender: 0,
+        relay: 0,
+        settlement: 0,
+        replacement: 0,
+        identity: 0,
+      },
+    });
+
+    // Build result array, filling missing dates with zeros
+    const result: DailyStats[] = [];
+    for (const date of dateKeys) {
+      const r = rowMap.get(date);
+      if (!r) {
+        result.push(zeroDailyStats(date));
+        continue;
       }
+
+      const ds: DailyStats = {
+        date,
+        transactions: {
+          total: r.total,
+          success: r.success,
+          failed: r.failed,
+          clientErrors: r.client_errors ?? 0,
+        },
+        tokens: {
+          STX: { count: r.stx_count, volume: r.stx_volume || "0" },
+          sBTC: { count: r.sbtc_count, volume: r.sbtc_volume || "0" },
+          USDCx: { count: r.usdcx_count, volume: r.usdcx_volume || "0" },
+        },
+        errors: {
+          validation: r.err_validation,
+          rateLimit: r.err_rate_limit,
+          sponsoring: r.err_sponsoring,
+          settlement: r.err_settlement,
+          internal: r.err_internal,
+        },
+        terminalReasons: {
+          validation: r.err_schema_validation ?? 0,
+          sender: r.err_sender ?? 0,
+          relay: r.err_relay ?? 0,
+          settlement: r.err_settlement_schema ?? 0,
+          replacement: r.err_replacement ?? 0,
+          identity: r.err_identity ?? 0,
+        },
+      };
+      if (r.fee_count > 0) {
+        ds.fees = {
+          total: r.fee_total || "0",
+          count: r.fee_count,
+          min: r.fee_min || "0",
+          max: r.fee_max || "0",
+        };
+      }
+      result.push(ds);
     }
 
     return result;
   }
 
-  private readHourlyData(): Array<{ hour: string; transactions: number; success: number; fees?: string; clientErrors?: number }> {
+  private readHourlyData(): Array<{ hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number }> {
     const now = Date.now();
-    const result: Array<{ hour: string; transactions: number; success: number; fees?: string; clientErrors?: number }> = [];
 
+    // Generate the 24 hour keys and ISO timestamp labels
+    const hourEntries: Array<{ key: string; label: string }> = [];
     for (let i = 23; i >= 0; i--) {
       const ts = now - i * HOUR_MS;
-      const d = new Date(ts);
-      const hourLabel = d.getUTCHours().toString().padStart(2, "0") + ":00";
       const key = getHourKey(ts);
+      hourEntries.push({ key, label: hourKeyToISO(key) });
+    }
 
-      const rows = this.sql
-        .exec<{ total: number; success: number; fee_total: string; client_errors: number }>(
-          `SELECT total, success, fee_total, client_errors FROM hourly_stats WHERE hour = ? LIMIT 1`,
-          key
-        )
-        .toArray();
+    const startKey = hourEntries[0].key;
+    const endKey = hourEntries[hourEntries.length - 1].key;
 
-      if (rows.length === 0) {
-        result.push({ hour: hourLabel, transactions: 0, success: 0 });
+    // Single range query instead of 24 individual queries
+    type HourlyRow = { hour: string; total: number; success: number; fee_total: string; fee_min: string | null; fee_max: string | null; client_errors: number };
+    const rows = this.sql
+      .exec<HourlyRow>(
+        `SELECT hour, total, success, fee_total, fee_min, fee_max, client_errors
+         FROM hourly_stats
+         WHERE hour >= ? AND hour <= ?
+         ORDER BY hour ASC`,
+        startKey,
+        endKey
+      )
+      .toArray();
+
+    // Index results by hour key for O(1) lookup
+    const rowMap = new Map<string, HourlyRow>();
+    for (const r of rows) {
+      rowMap.set(r.hour, r);
+    }
+
+    // Build result array, filling missing hours with zeros
+    const result: Array<{ hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number }> = [];
+    for (const { key, label } of hourEntries) {
+      const r = rowMap.get(key);
+      if (!r) {
+        result.push({ hour: label, transactions: 0, success: 0 });
+        continue;
+      }
+
+      const entry: { hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number } = {
+        hour: label,
+        transactions: r.total,
+        success: r.success,
+      };
+      if (r.fee_total && r.fee_total !== "0") {
+        entry.fees = r.fee_total;
+      }
+      if (r.fee_min) {
+        entry.feeMin = r.fee_min;
+      }
+      if (r.fee_max) {
+        entry.feeMax = r.fee_max;
+      }
+      if (r.client_errors > 0) {
+        entry.clientErrors = r.client_errors;
+      }
+      result.push(entry);
+    }
+
+    return result;
+  }
+
+  private readWalletHourlyStats(
+    walletIndex: number,
+    hours: number
+  ): Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> {
+    const now = Date.now();
+
+    // Generate the hour keys and ISO timestamp labels
+    const hourEntries: Array<{ key: string; label: string }> = [];
+    for (let i = hours - 1; i >= 0; i--) {
+      const ts = now - i * HOUR_MS;
+      const key = getHourKey(ts);
+      hourEntries.push({ key, label: hourKeyToISO(key) });
+    }
+
+    const startKey = hourEntries[0].key;
+    const endKey = hourEntries[hourEntries.length - 1].key;
+
+    // Single range query instead of N individual queries per wallet
+    type WalletHourlyRow = { hour: string; total: number; success: number; failed: number; fee_total: string };
+    const rows = this.sql
+      .exec<WalletHourlyRow>(
+        `SELECT hour, total, success, failed, fee_total
+         FROM wallet_hourly
+         WHERE wallet_index = ? AND hour >= ? AND hour <= ?
+         ORDER BY hour ASC`,
+        walletIndex,
+        startKey,
+        endKey
+      )
+      .toArray();
+
+    // Index results by hour key for O(1) lookup
+    const rowMap = new Map<string, WalletHourlyRow>();
+    for (const r of rows) {
+      rowMap.set(r.hour, r);
+    }
+
+    // Build result array, filling missing hours with zeros
+    const result: Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> = [];
+    for (const { key, label } of hourEntries) {
+      const r = rowMap.get(key);
+      if (!r) {
+        result.push({ hour: label, total: 0, success: 0, failed: 0, feeTotal: "0" });
       } else {
-        const r = rows[0];
-        const entry: { hour: string; transactions: number; success: number; fees?: string; clientErrors?: number } = {
-          hour: hourLabel,
-          transactions: r.total,
+        result.push({
+          hour: label,
+          total: r.total,
           success: r.success,
-        };
-        if (r.fee_total && r.fee_total !== "0") {
-          entry.fees = r.fee_total;
-        }
-        if (r.client_errors > 0) {
-          entry.clientErrors = r.client_errors;
-        }
-        result.push(entry);
+          failed: r.failed,
+          feeTotal: r.fee_total || "0",
+        });
       }
     }
 
@@ -575,12 +797,125 @@ export class StatsDO {
     });
   }
 
+  /**
+   * Compute rolling totals for the previous 24h window (24-48h ago).
+   * Used for rolling-vs-rolling trend comparison instead of calendar day.
+   *
+   * Single aggregate query instead of 24 individual queries.
+   */
+  private readPrevious24hTotals(): { total: number; success: number; clientErrors: number } {
+    const now = Date.now();
+    const startKey = getHourKey(now - 47 * HOUR_MS);
+    const endKey = getHourKey(now - 24 * HOUR_MS);
+
+    const rows = this.sql
+      .exec<{ total: number; success: number; client_errors: number }>(
+        `SELECT COALESCE(SUM(total), 0) as total,
+                COALESCE(SUM(success), 0) as success,
+                COALESCE(SUM(client_errors), 0) as client_errors
+         FROM hourly_stats
+         WHERE hour >= ? AND hour <= ?`,
+        startKey,
+        endKey
+      )
+      .toArray();
+
+    if (rows.length === 0) {
+      return { total: 0, success: 0, clientErrors: 0 };
+    }
+
+    const r = rows[0];
+    return {
+      total: r.total,
+      success: r.success,
+      clientErrors: r.client_errors ?? 0,
+    };
+  }
+
+  /**
+   * Build per-wallet 24h throughput entries from wallet_hourly data.
+   * Only includes wallets with at least one transaction in the last 24h.
+   *
+   * Uses a single query to fetch all wallet+hour rows in the 24h window,
+   * then groups by wallet and fills missing hours in code.
+   */
+  private readWalletThroughput(): WalletThroughputEntry[] {
+    const now = Date.now();
+
+    // Generate the 24 hour keys and ISO timestamp labels (same logic as readWalletHourlyStats)
+    const hourEntries: Array<{ key: string; label: string }> = [];
+    for (let i = 23; i >= 0; i--) {
+      const ts = now - i * HOUR_MS;
+      const key = getHourKey(ts);
+      hourEntries.push({ key, label: hourKeyToISO(key) });
+    }
+
+    const startKey = hourEntries[0].key;
+    const endKey = hourEntries[hourEntries.length - 1].key;
+
+    // Single query for ALL wallets across the 24h window
+    type BulkRow = { wallet_index: number; hour: string; total: number; success: number; failed: number; fee_total: string };
+    const rows = this.sql
+      .exec<BulkRow>(
+        `SELECT wallet_index, hour, total, success, failed, fee_total
+         FROM wallet_hourly
+         WHERE hour >= ? AND hour <= ?
+         ORDER BY wallet_index ASC, hour ASC`,
+        startKey,
+        endKey
+      )
+      .toArray();
+
+    // Group rows by wallet_index
+    const walletMap = new Map<number, Map<string, BulkRow>>();
+    for (const r of rows) {
+      let hourMap = walletMap.get(r.wallet_index);
+      if (!hourMap) {
+        hourMap = new Map();
+        walletMap.set(r.wallet_index, hourMap);
+      }
+      hourMap.set(r.hour, r);
+    }
+
+    // Build result for each wallet, filling missing hours with zeros
+    const result: WalletThroughputEntry[] = [];
+    for (const [walletIndex, hourMap] of walletMap) {
+      const hourly: Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> = [];
+      let total24h = 0;
+      let success24h = 0;
+      let failed24h = 0;
+      let feeTotal24h = 0n;
+
+      for (const { key, label } of hourEntries) {
+        const r = hourMap.get(key);
+        if (!r) {
+          hourly.push({ hour: label, total: 0, success: 0, failed: 0, feeTotal: "0" });
+        } else {
+          const feeStr = r.fee_total || "0";
+          hourly.push({
+            hour: label,
+            total: r.total,
+            success: r.success,
+            failed: r.failed,
+            feeTotal: feeStr,
+          });
+          total24h += r.total;
+          success24h += r.success;
+          failed24h += r.failed;
+          feeTotal24h += BigInt(feeStr);
+        }
+      }
+
+      result.push({ walletIndex, total24h, success24h, failed24h, feeTotal24h: feeTotal24h.toString(), hourly });
+    }
+
+    return result;
+  }
+
   private buildOverview(): DashboardOverview {
-    // readDailyStats(2) returns [yesterday, today] — reuse instead of
-    // duplicating the raw SQL query for yesterday's row.
-    const twoDays = this.readDailyStats(2);
-    const previous = twoDays[0] ?? null;
-    const current = twoDays[1];
+    // readDailyStats(1) returns [today] — used for calendar-day token and fee breakdown.
+    const todayArr = this.readDailyStats(1);
+    const current = todayArr[0];
 
     // Token percentages (from today's daily_stats — calendar-day token breakdown)
     const totalTokenTx =
@@ -592,24 +927,11 @@ export class StatsDO {
 
     // Fee aggregates (from today's daily_stats)
     const currentFees = current.fees ?? { total: "0", count: 0, min: "0", max: "0" };
-    const previousFees = previous?.fees ?? { total: "0", count: 0, min: "0", max: "0" };
 
     const avgFee =
       currentFees.count > 0
         ? (BigInt(currentFees.total) / BigInt(currentFees.count)).toString()
         : "0";
-
-    const currentFeeTotal = BigInt(currentFees.total);
-    const previousFeeTotal = BigInt(previousFees.total);
-    let feeTrend: "up" | "down" | "stable" = "stable";
-    if (previousFeeTotal === 0n) {
-      feeTrend = currentFeeTotal > 0n ? "up" : "stable";
-    } else {
-      const diff = currentFeeTotal - previousFeeTotal;
-      const pctChange = (diff * 100n) / previousFeeTotal;
-      if (pctChange > 5n) feeTrend = "up";
-      else if (pctChange < -5n) feeTrend = "down";
-    }
 
     // Hourly data covers the rolling 24h window (crossing midnight).
     // Sum it to produce headline totals that match the hourly chart exactly.
@@ -617,14 +939,35 @@ export class StatsDO {
     // (when daily_stats has reset but the rolling window still has fee data from yesterday).
     const hourlyData = this.readHourlyData();
     const rolling = hourlyData.reduce(
-      (acc, h) => ({
-        total: acc.total + h.transactions,
-        success: acc.success + h.success,
-        clientErrors: acc.clientErrors + (h.clientErrors ?? 0),
-        fees: acc.fees + BigInt(h.fees || "0"),
-        feeCount: h.fees && h.fees !== "0" ? acc.feeCount + 1 : acc.feeCount,
-      }),
-      { total: 0, success: 0, clientErrors: 0, fees: 0n, feeCount: 0 }
+      (acc, h) => {
+        // Rolling fee min: track the lowest fee_min across all hours in the window
+        let newFeeMin = acc.feeMin;
+        if (h.feeMin) {
+          if (newFeeMin === null) {
+            newFeeMin = h.feeMin;
+          } else if (BigInt(h.feeMin) < BigInt(newFeeMin)) {
+            newFeeMin = h.feeMin;
+          }
+        }
+        // Rolling fee max: track the highest fee_max across all hours in the window
+        let newFeeMax = acc.feeMax;
+        if (h.feeMax) {
+          if (newFeeMax === null) {
+            newFeeMax = h.feeMax;
+          } else if (BigInt(h.feeMax) > BigInt(newFeeMax)) {
+            newFeeMax = h.feeMax;
+          }
+        }
+        return {
+          total: acc.total + h.transactions,
+          success: acc.success + h.success,
+          clientErrors: acc.clientErrors + (h.clientErrors ?? 0),
+          fees: acc.fees + BigInt(h.fees || "0"),
+          feeMin: newFeeMin,
+          feeMax: newFeeMax,
+        };
+      },
+      { total: 0, success: 0, clientErrors: 0, fees: 0n, feeMin: null as string | null, feeMax: null as string | null }
     );
     const rollingFailed = rolling.total - rolling.success;
 
@@ -632,13 +975,38 @@ export class StatsDO {
     // Fall back to today's calendar-day fee total for backward compatibility
     // (e.g., when hourly data is absent on a fresh deployment).
     const rollingFeeTotal = rolling.fees > 0n ? rolling.fees.toString() : currentFees.total;
+    // Per-transaction fee average: use rolling.success as denominator since fees are
+    // recorded only for successful transactions. More accurate than counting hours-with-fees.
     const rollingFeeAvg =
-      rolling.feeCount > 0
-        ? (rolling.fees / BigInt(rolling.feeCount)).toString()
+      rolling.success > 0
+        ? (rolling.fees / BigInt(rolling.success)).toString()
         : avgFee;
+
+    // Rolling previous 24h (24-48h ago) for rolling-vs-rolling comparison (Bug #7 fix).
+    const prev24h = this.readPrevious24hTotals();
+
+    // Until we can compare against a real previous rolling-window fee total,
+    // return a neutral trend instead of incorrectly reporting "up" whenever
+    // any fees exist in the current window.
+    const feeTrend: "up" | "down" | "stable" = "stable";
 
     // Per-endpoint breakdown from today's daily_stats
     const endpointBreakdown = this.readEndpointBreakdown(current.date);
+
+    // Dual success rates (Bug #4)
+    // rawSuccessRate: success / total (includes all failures in denominator)
+    const rawSuccessRate = rolling.total > 0
+      ? Math.round((rolling.success / rolling.total) * 10000) / 10000
+      : 0;
+    // effectiveSuccessRate: success / (success + relayErrors) — excludes client errors
+    const relayErrors = rollingFailed - rolling.clientErrors;
+    const effectiveDenominator = rolling.success + Math.max(0, relayErrors);
+    const effectiveSuccessRate = effectiveDenominator > 0
+      ? Math.round((rolling.success / effectiveDenominator) * 10000) / 10000
+      : 0;
+
+    // Per-wallet throughput (Bug #6)
+    const walletThroughput = this.readWalletThroughput();
 
     return {
       period: "24h",
@@ -647,11 +1015,11 @@ export class StatsDO {
         success: rolling.success,
         failed: rollingFailed,
         clientErrors: rolling.clientErrors,
-        trend: calculateTrend(
-          rolling.total,
-          previous?.transactions.total ?? 0
-        ),
-        previousTotal: previous?.transactions.total ?? 0,
+        // Rolling-vs-rolling trend comparison (Bug #7 fix)
+        trend: calculateTrend(rolling.total, prev24h.total),
+        previousTotal: prev24h.total,
+        rawSuccessRate,
+        effectiveSuccessRate,
       },
       tokens: {
         STX: {
@@ -673,13 +1041,28 @@ export class StatsDO {
       fees: {
         total: rollingFeeTotal,
         average: rollingFeeAvg,
-        min: currentFees.min || "0",
-        max: currentFees.max || "0",
+        min: rolling.feeMin ?? currentFees.min ?? "0",
+        max: rolling.feeMax ?? currentFees.max ?? "0",
         trend: feeTrend,
-        previousTotal: previousFees.total,
+        previousTotal: "0",  // placeholder until previous rolling-window fee tracking is implemented
       },
       hourlyData,
       endpointBreakdown,
+      // Terminal reason category counts from today's daily_stats row
+      terminalReasons: {
+        validation: current.terminalReasons?.validation ?? 0,
+        sender: current.terminalReasons?.sender ?? 0,
+        relay: current.terminalReasons?.relay ?? 0,
+        settlement: current.terminalReasons?.settlement ?? 0,
+        replacement: current.terminalReasons?.replacement ?? 0,
+        identity: current.terminalReasons?.identity ?? 0,
+      },
+      walletThroughput,
+      previous24h: {
+        total: prev24h.total,
+        success: prev24h.success,
+        failed: prev24h.total - prev24h.success,
+      },
     };
   }
 
@@ -911,6 +1294,21 @@ export class StatsDO {
       // GET /hourly — return 24h hourly data
       if (method === "GET" && url.pathname === "/hourly") {
         const data = this.readHourlyData();
+        return this.jsonResponse(data);
+      }
+
+      // GET /wallet-hourly?walletIndex=N&hours=N — per-wallet hourly data
+      if (method === "GET" && url.pathname === "/wallet-hourly") {
+        const walletIndexParam = url.searchParams.get("walletIndex");
+        if (!walletIndexParam) {
+          return this.badRequest("Missing walletIndex");
+        }
+        const walletIndex = parseInt(walletIndexParam, 10);
+        if (isNaN(walletIndex)) {
+          return this.badRequest("Invalid walletIndex");
+        }
+        const hours = Math.min(Math.max(parseInt(url.searchParams.get("hours") || "24", 10), 1), 48);
+        const data = this.readWalletHourlyStats(walletIndex, hours);
         return this.jsonResponse(data);
       }
 
