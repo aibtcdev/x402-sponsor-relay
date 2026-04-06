@@ -1,4 +1,5 @@
 import { colors, formatNumber, formatTokenAmount, escapeHtml } from "../styles";
+import type { DashboardOverview, WalletThroughputEntry } from "../../types";
 
 /**
  * Stats card component
@@ -141,27 +142,40 @@ export function healthCard(
 }
 
 /**
- * Success rate card with visual indicator.
+ * Success rate card with visual indicator showing both effective and raw rates.
  *
- * When clientErrors is provided and > 0, shows the effective success rate
- * (excluding client errors from the denominator) as the primary metric,
- * with the raw success rate as secondary subtext. This surfaces the relay's
- * actual reliability independent of client-caused failures.
+ * When precomputed rates are provided (effectiveRateOverride / rawRateOverride, 0-100),
+ * they are used directly. Otherwise rates are computed from success/total/clientErrors.
  *
  * Effective rate formula: success / (success + relayErrors)
  *   where relayErrors = (total - success) - clientErrors
+ *
+ * Displays effective rate as primary metric and raw rate as a secondary metric below.
+ * When both rates are equal (no client errors), only the effective rate is shown.
  */
-export function successRateCard(success: number, total: number, clientErrors?: number): string {
-  const failed = total - success;
-  const relayErrors = Math.max(0, failed - (clientErrors ?? 0));
-  const effectiveDenominator = success + relayErrors;
+export function successRateCard(
+  success: number,
+  total: number,
+  clientErrors?: number,
+  options?: { effectiveRateOverride?: number; rawRateOverride?: number }
+): string {
+  let effectiveRate: number;
+  let rawRate: number;
 
-  // Effective rate excludes client errors from denominator
-  const effectiveRate = effectiveDenominator > 0 ? Math.round((success / effectiveDenominator) * 100) : 0;
-  // Raw rate includes all requests
-  const rawRate = total > 0 ? Math.round((success / total) * 100) : 0;
+  if (options?.effectiveRateOverride !== undefined) {
+    effectiveRate = Math.round(options.effectiveRateOverride * 100);
+    rawRate = options?.rawRateOverride !== undefined
+      ? Math.round(options.rawRateOverride * 100)
+      : effectiveRate;
+  } else {
+    const failed = total - success;
+    const relayErrors = Math.max(0, failed - (clientErrors ?? 0));
+    const effectiveDenominator = success + relayErrors;
+    effectiveRate = effectiveDenominator > 0 ? Math.round((success / effectiveDenominator) * 100) : 0;
+    rawRate = total > 0 ? Math.round((success / total) * 100) : 0;
+  }
 
-  const hasClientErrors = (clientErrors ?? 0) > 0;
+  const hasClientErrors = (clientErrors ?? 0) > 0 || rawRate !== effectiveRate;
 
   let color: string;
   if (effectiveRate >= 95) {
@@ -172,6 +186,10 @@ export function successRateCard(success: number, total: number, clientErrors?: n
     color = colors.status.down;
   }
 
+  const rawColor = rawRate >= 95 ? colors.status.healthy
+    : rawRate >= 80 ? colors.status.degraded
+    : colors.status.down;
+
   return `
 <div class="brand-card p-4">
   <p class="text-sm text-gray-400">Success Rate</p>
@@ -179,8 +197,12 @@ export function successRateCard(success: number, total: number, clientErrors?: n
   <div class="mt-2 h-2 rounded-full overflow-hidden" style="background-color: ${colors.bg.border}">
     <div class="h-full rounded-full" style="width: ${effectiveRate}%; background-color: ${color}"></div>
   </div>
-  <p class="text-xs text-gray-500 mt-1">${formatNumber(success)} / ${formatNumber(effectiveDenominator)} (relay)</p>
-  ${hasClientErrors ? `<p class="text-xs text-gray-600 mt-0.5">raw: ${rawRate}% (${formatNumber(total)} total)</p>` : ""}
+  <p class="text-xs text-gray-500 mt-1">effective (relay errors only)</p>
+  ${hasClientErrors ? `
+  <div class="mt-2 pt-2" style="border-top: 1px solid ${colors.bg.border}">
+    <p class="text-xs text-gray-400">raw: <span style="color: ${rawColor}">${rawRate}%</span></p>
+    <p class="text-xs text-gray-600">includes client errors</p>
+  </div>` : ""}
 </div>`;
 }
 
@@ -260,5 +282,153 @@ export function feesSpentCard(totalFees: string, avgFee: string): string {
   </div>
   <p class="text-2xl font-bold mt-2" style="color: ${colors.brand.orange}">${escapeHtml(formattedTotal)}</p>
   <p class="text-xs text-gray-500 mt-1">avg: ${formatNumber(avgFeeNum)} uSTX / tx</p>
+</div>`;
+}
+
+/**
+ * Fees detail card — server-rendered card showing total, avg, min, and max STX fees.
+ * Uses rolling 24h data from DashboardOverview.fees (Phases 1-2 data sources).
+ *
+ * @param fees - Fee stats object with total, average, min, max in microSTX strings
+ */
+export function feesDetailCard(fees: { total: string; average: string; min: string; max: string }): string {
+  const formattedTotal = formatTokenAmount(fees.total, "STX");
+  const avgFeeNum = parseInt(fees.average || "0", 10);
+  const minFeeNum = parseInt(fees.min || "0", 10);
+  const maxFeeNum = parseInt(fees.max || "0", 10);
+
+  return `
+<div class="brand-card p-4">
+  <div class="flex items-center justify-between">
+    <p class="text-sm text-gray-400">Fees Sponsored (24h)</p>
+    <svg class="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+        d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+    </svg>
+  </div>
+  <p class="text-2xl font-bold mt-2" style="color: ${colors.brand.orange}">${escapeHtml(formattedTotal)}</p>
+  <div class="grid grid-cols-3 gap-2 mt-2 pt-2" style="border-top: 1px solid ${colors.bg.border}">
+    <div>
+      <p class="text-xs text-gray-500">avg</p>
+      <p class="text-sm font-medium text-white">${formatNumber(avgFeeNum)}</p>
+    </div>
+    <div>
+      <p class="text-xs text-gray-500">min</p>
+      <p class="text-sm font-medium text-white">${formatNumber(minFeeNum)}</p>
+    </div>
+    <div>
+      <p class="text-xs text-gray-500">max</p>
+      <p class="text-sm font-medium text-white">${formatNumber(maxFeeNum)}</p>
+    </div>
+  </div>
+  <p class="text-xs text-gray-600 mt-1">uSTX per tx</p>
+</div>`;
+}
+
+/**
+ * Terminal reason breakdown card — server-rendered breakdown of error counts
+ * grouped by tx-schemas terminal reason category (rolling 24h).
+ *
+ * Categories: validation, sender, relay, settlement, replacement, identity
+ * Returns null-safe HTML: shows "No errors" when all counts are zero or data is missing.
+ */
+export function terminalReasonsCard(reasons: DashboardOverview["terminalReasons"]): string {
+  const categories: Array<{ key: keyof NonNullable<typeof reasons>; label: string }> = [
+    { key: "validation", label: "Validation" },
+    { key: "sender", label: "Sender" },
+    { key: "relay", label: "Relay" },
+    { key: "settlement", label: "Settlement" },
+    { key: "replacement", label: "Replacement" },
+    { key: "identity", label: "Identity" },
+  ];
+
+  const hasErrors = reasons && Object.values(reasons).some((v) => v > 0);
+
+  const rows = hasErrors
+    ? categories.map(({ key, label }) => {
+        const count = reasons![key];
+        const dotColor = colors.terminalReasons[key];
+        return `
+  <div class="flex items-center justify-between py-1" style="border-bottom: 1px solid ${colors.bg.border}">
+    <div class="flex items-center gap-2">
+      <div class="w-3 h-3 rounded-full flex-shrink-0" style="background-color: ${dotColor}"></div>
+      <span class="text-sm text-gray-400">${escapeHtml(label)}</span>
+    </div>
+    <span class="text-sm font-medium ${count > 0 ? "text-white" : "text-gray-600"}">${formatNumber(count)}</span>
+  </div>`;
+      }).join("")
+    : `<p class="text-sm text-gray-500 py-2">No errors in rolling 24h window</p>`;
+
+  return `
+<div class="brand-card p-4">
+  <p class="text-sm text-gray-400 mb-3">Error Breakdown (24h)</p>
+  ${rows}
+</div>`;
+}
+
+/**
+ * Wallet throughput card — server-rendered per-wallet 24h throughput with sparklines.
+ *
+ * Shows a row per active wallet with: index, 24h total, success rate bar, sparkline.
+ * Sparkline: 24 hourly bars scaled to the wallet's own max hourly total.
+ * Empty state shown when wallets array is empty or undefined.
+ */
+export function walletThroughputCard(wallets: WalletThroughputEntry[] | undefined): string {
+  if (!wallets || wallets.length === 0) {
+    return `
+<div class="brand-card p-4">
+  <p class="text-sm text-gray-400 mb-2">Wallet Throughput (24h)</p>
+  <p class="text-sm text-gray-500">No wallet activity in last 24h</p>
+</div>`;
+  }
+
+  const walletRows = wallets.map((w) => {
+    const successRate = w.total24h > 0 ? Math.round((w.success24h / w.total24h) * 100) : 0;
+    const rateColor = successRate >= 95 ? colors.status.healthy
+      : successRate >= 80 ? colors.status.degraded
+      : colors.status.down;
+
+    // Build sparkline: 24 hourly bars
+    const maxHourly = Math.max(1, ...w.hourly.map((h) => h.total));
+    const sparkBars = w.hourly.map((h) => {
+      const heightPct = Math.round((h.total / maxHourly) * 100);
+      const barColor = h.failed > 0 ? colors.status.degraded : colors.status.healthy;
+      return `<div class="sparkline-bar" style="height: ${Math.max(4, heightPct)}%; background-color: ${barColor}"></div>`;
+    }).join("");
+
+    return `
+<div class="flex items-center gap-3 py-2" style="border-bottom: 1px solid ${colors.bg.border}">
+  <span class="text-xs font-mono text-gray-500" style="min-width: 1.5rem; text-align: right">#${w.walletIndex}</span>
+  <span class="text-sm font-bold text-white" style="min-width: 2.5rem">${formatNumber(w.total24h)}</span>
+  <div class="flex-1" style="max-width: 80px">
+    <div class="h-2 rounded-full overflow-hidden" style="background-color: ${colors.bg.border}">
+      <div class="h-full rounded-full" style="width: ${successRate}%; background-color: ${rateColor}"></div>
+    </div>
+    <p class="text-xs mt-0.5" style="color: ${rateColor}">${successRate}%</p>
+  </div>
+  <div class="sparkline flex-1">${sparkBars}</div>
+</div>`;
+  }).join("");
+
+  return `
+<div class="brand-card p-4">
+  <div class="flex items-center justify-between mb-3">
+    <p class="text-sm text-gray-400">Wallet Throughput (24h)</p>
+    <div class="flex items-center gap-3 text-xs text-gray-500">
+      <span class="flex items-center gap-1">
+        <span class="sparkline-bar" style="display: inline-block; width: 8px; height: 10px; background-color: ${colors.status.healthy}"></span> success
+      </span>
+      <span class="flex items-center gap-1">
+        <span class="sparkline-bar" style="display: inline-block; width: 8px; height: 10px; background-color: ${colors.status.degraded}"></span> w/ errors
+      </span>
+    </div>
+  </div>
+  <div class="flex items-center gap-3 mb-1" style="padding-left: 0.25rem">
+    <span class="text-xs text-gray-600" style="min-width: 1.5rem"></span>
+    <span class="text-xs text-gray-600" style="min-width: 2.5rem">txs</span>
+    <span class="text-xs text-gray-600" style="max-width: 80px; flex: 1">rate</span>
+    <span class="text-xs text-gray-600 flex-1">24h (hourly)</span>
+  </div>
+  ${walletRows}
 </div>`;
 }

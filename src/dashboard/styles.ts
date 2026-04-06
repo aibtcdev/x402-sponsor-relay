@@ -41,6 +41,16 @@ export const colors = {
     stable: "#6B7280", // Gray
   },
 
+  // Terminal reason category colors (tx-schemas error categories)
+  terminalReasons: {
+    validation: "#5546FF",   // Stacks purple — invalid_transaction, not_sponsored
+    sender: "#FBBF24",       // Yellow — sender_nonce_*, origin_chaining_limit
+    relay: "#F87171",        // Red — sponsor_failure, queue_unavailable, internal_error
+    settlement: "#FB923C",   // Orange — broadcast_failure, chain_abort
+    replacement: "#A855F7",  // Purple — nonce_replacement, superseded
+    identity: "#6B7280",     // Gray — expired, unknown_payment_identity
+  },
+
   // UI colors
   bg: {
     primary: "#000000", // brand black
@@ -317,11 +327,28 @@ export const dashboardCss = `
 
   /* ── Utility additions for redesign ───────────────────────── */
   .h-64 { height: 16rem; }
+  .h-20 { height: 5rem; }
   .gap-2 { gap: 0.5rem; }
   .text-green-400 { color: #4ade80; }
   .text-red-400 { color: #f87171; }
   .flex-1 { flex: 1; }
   .max-w-\\[200px\\] { max-width: 200px; }
+  .grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+  /* ── Sparkline bar chart ───────────────────────────────────── */
+  .sparkline {
+    display: flex;
+    align-items: flex-end;
+    gap: 1px;
+    height: 24px;
+    overflow: hidden;
+  }
+  .sparkline-bar {
+    flex: 1;
+    min-width: 2px;
+    border-radius: 1px 1px 0 0;
+    transition: height 0.2s ease;
+  }
 
   /* ── Nonce tile classes ────────────────────────────────────── */
   .nonce-lane {
