@@ -847,8 +847,37 @@ This is the canonical sponsor status surface. Reads do not trigger live Hiro fan
 
 ## GET /stats — Relay Statistics
 
-Returns aggregate relay statistics for the last 24h and 7 days.
-Includes transaction counts, token breakdown, fee stats, and settlement health.
+Returns aggregate relay statistics. Public endpoint, cached 15s.
+
+### Response (abridged)
+
+{
+  "success": true,
+  "period": "24h",
+  "transactions": {
+    "total": 1240,
+    "success": 1185,
+    "failed": 55,
+    "clientErrors": 12,           // client-caused (excluded from effectiveSuccessRate)
+    "trend": "up",                // rolling-vs-rolling comparison
+    "rawSuccessRate": 0.956,      // success / total
+    "effectiveSuccessRate": 0.978 // success / (success + relayErrors)
+  },
+  "settlementTimes": {            // gap-fill txs excluded from percentiles
+    "p50": 7800, "p95": 22000, "avg": 9100, "count": 1185
+  },
+  "terminalReasons": {            // tx-schemas 6-category breakdown (today)
+    "validation": 3, "sender": 18, "relay": 7,
+    "settlement": 12, "replacement": 5, "identity": 2
+  },
+  "walletThroughput": [           // per-wallet 24h totals + hourly spark data
+    { "walletIndex": 0, "total24h": 310, "success24h": 298, "feeTotal24h": "3100000",
+      "hourly": [{ "hour": "2026-04-06T11:00:00Z", "total": 14, "success": 13 }] }
+  ],
+  "previous24h": {                // 24-48h window for rolling comparison
+    "total": 1100, "success": 1050, "failed": 50
+  }
+}
 
 ---
 
