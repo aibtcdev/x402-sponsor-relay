@@ -480,116 +480,137 @@ export class StatsDO {
 
   private readDailyStats(days: number): DailyStats[] {
     const now = Date.now();
-    const result: DailyStats[] = [];
 
+    // Generate the ordered list of date keys we need
+    const dateKeys: string[] = [];
     for (let i = days - 1; i >= 0; i--) {
-      const date = getDateKey(now - i * DAY_MS);
-      const rows = this.sql
-        .exec<{
-          total: number;
-          success: number;
-          failed: number;
-          client_errors: number;
-          stx_count: number;
-          stx_volume: string;
-          sbtc_count: number;
-          sbtc_volume: string;
-          usdcx_count: number;
-          usdcx_volume: string;
-          fee_total: string;
-          fee_count: number;
-          fee_min: string | null;
-          fee_max: string | null;
-          err_validation: number;
-          err_rate_limit: number;
-          err_sponsoring: number;
-          err_settlement: number;
-          err_internal: number;
-          err_schema_validation: number;
-          err_sender: number;
-          err_relay: number;
-          err_settlement_schema: number;
-          err_replacement: number;
-          err_identity: number;
-        }>(
-          `SELECT total, success, failed, client_errors,
-                  stx_count, stx_volume,
-                  sbtc_count, sbtc_volume,
-                  usdcx_count, usdcx_volume,
-                  fee_total, fee_count, fee_min, fee_max,
-                  err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal,
-                  err_schema_validation, err_sender, err_relay, err_settlement_schema, err_replacement, err_identity
-           FROM daily_stats WHERE date = ? LIMIT 1`,
-          date
-        )
-        .toArray();
+      dateKeys.push(getDateKey(now - i * DAY_MS));
+    }
 
-      if (rows.length === 0) {
-        result.push({
-          date,
-          transactions: { total: 0, success: 0, failed: 0, clientErrors: 0 },
-          tokens: {
-            STX: { count: 0, volume: "0" },
-            sBTC: { count: 0, volume: "0" },
-            USDCx: { count: 0, volume: "0" },
-          },
-          errors: {
-            validation: 0,
-            rateLimit: 0,
-            sponsoring: 0,
-            settlement: 0,
-            internal: 0,
-          },
-          terminalReasons: {
-            validation: 0,
-            sender: 0,
-            relay: 0,
-            settlement: 0,
-            replacement: 0,
-            identity: 0,
-          },
-        });
-      } else {
-        const r = rows[0];
-        const ds: DailyStats = {
-          date,
-          transactions: {
-            total: r.total,
-            success: r.success,
-            failed: r.failed,
-            clientErrors: r.client_errors ?? 0,
-          },
-          tokens: {
-            STX: { count: r.stx_count, volume: r.stx_volume || "0" },
-            sBTC: { count: r.sbtc_count, volume: r.sbtc_volume || "0" },
-            USDCx: { count: r.usdcx_count, volume: r.usdcx_volume || "0" },
-          },
-          errors: {
-            validation: r.err_validation,
-            rateLimit: r.err_rate_limit,
-            sponsoring: r.err_sponsoring,
-            settlement: r.err_settlement,
-            internal: r.err_internal,
-          },
-          terminalReasons: {
-            validation: r.err_schema_validation ?? 0,
-            sender: r.err_sender ?? 0,
-            relay: r.err_relay ?? 0,
-            settlement: r.err_settlement_schema ?? 0,
-            replacement: r.err_replacement ?? 0,
-            identity: r.err_identity ?? 0,
-          },
-        };
-        if (r.fee_count > 0) {
-          ds.fees = {
-            total: r.fee_total || "0",
-            count: r.fee_count,
-            min: r.fee_min || "0",
-            max: r.fee_max || "0",
-          };
-        }
-        result.push(ds);
+    const startDate = dateKeys[0];
+
+    // Single range query instead of N individual queries
+    type DailyRow = {
+      date: string;
+      total: number;
+      success: number;
+      failed: number;
+      client_errors: number;
+      stx_count: number;
+      stx_volume: string;
+      sbtc_count: number;
+      sbtc_volume: string;
+      usdcx_count: number;
+      usdcx_volume: string;
+      fee_total: string;
+      fee_count: number;
+      fee_min: string | null;
+      fee_max: string | null;
+      err_validation: number;
+      err_rate_limit: number;
+      err_sponsoring: number;
+      err_settlement: number;
+      err_internal: number;
+      err_schema_validation: number;
+      err_sender: number;
+      err_relay: number;
+      err_settlement_schema: number;
+      err_replacement: number;
+      err_identity: number;
+    };
+
+    const rows = this.sql
+      .exec<DailyRow>(
+        `SELECT date, total, success, failed, client_errors,
+                stx_count, stx_volume,
+                sbtc_count, sbtc_volume,
+                usdcx_count, usdcx_volume,
+                fee_total, fee_count, fee_min, fee_max,
+                err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal,
+                err_schema_validation, err_sender, err_relay, err_settlement_schema, err_replacement, err_identity
+         FROM daily_stats WHERE date >= ? ORDER BY date ASC`,
+        startDate
+      )
+      .toArray();
+
+    // Index results by date for O(1) lookup
+    const rowMap = new Map<string, DailyRow>();
+    for (const r of rows) {
+      rowMap.set(r.date, r);
+    }
+
+    const zeroDailyStats = (date: string): DailyStats => ({
+      date,
+      transactions: { total: 0, success: 0, failed: 0, clientErrors: 0 },
+      tokens: {
+        STX: { count: 0, volume: "0" },
+        sBTC: { count: 0, volume: "0" },
+        USDCx: { count: 0, volume: "0" },
+      },
+      errors: {
+        validation: 0,
+        rateLimit: 0,
+        sponsoring: 0,
+        settlement: 0,
+        internal: 0,
+      },
+      terminalReasons: {
+        validation: 0,
+        sender: 0,
+        relay: 0,
+        settlement: 0,
+        replacement: 0,
+        identity: 0,
+      },
+    });
+
+    // Build result array, filling missing dates with zeros
+    const result: DailyStats[] = [];
+    for (const date of dateKeys) {
+      const r = rowMap.get(date);
+      if (!r) {
+        result.push(zeroDailyStats(date));
+        continue;
       }
+
+      const ds: DailyStats = {
+        date,
+        transactions: {
+          total: r.total,
+          success: r.success,
+          failed: r.failed,
+          clientErrors: r.client_errors ?? 0,
+        },
+        tokens: {
+          STX: { count: r.stx_count, volume: r.stx_volume || "0" },
+          sBTC: { count: r.sbtc_count, volume: r.sbtc_volume || "0" },
+          USDCx: { count: r.usdcx_count, volume: r.usdcx_volume || "0" },
+        },
+        errors: {
+          validation: r.err_validation,
+          rateLimit: r.err_rate_limit,
+          sponsoring: r.err_sponsoring,
+          settlement: r.err_settlement,
+          internal: r.err_internal,
+        },
+        terminalReasons: {
+          validation: r.err_schema_validation ?? 0,
+          sender: r.err_sender ?? 0,
+          relay: r.err_relay ?? 0,
+          settlement: r.err_settlement_schema ?? 0,
+          replacement: r.err_replacement ?? 0,
+          identity: r.err_identity ?? 0,
+        },
+      };
+      if (r.fee_count > 0) {
+        ds.fees = {
+          total: r.fee_total || "0",
+          count: r.fee_count,
+          min: r.fee_min || "0",
+          max: r.fee_max || "0",
+        };
+      }
+      result.push(ds);
     }
 
     return result;
@@ -597,44 +618,67 @@ export class StatsDO {
 
   private readHourlyData(): Array<{ hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number }> {
     const now = Date.now();
-    const result: Array<{ hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number }> = [];
 
+    // Generate the 24 hour keys and their display labels
+    const hourEntries: Array<{ key: string; label: string }> = [];
     for (let i = 23; i >= 0; i--) {
       const ts = now - i * HOUR_MS;
       const d = new Date(ts);
-      const hourLabel = d.getUTCHours().toString().padStart(2, "0") + ":00";
-      const key = getHourKey(ts);
+      hourEntries.push({
+        key: getHourKey(ts),
+        label: d.getUTCHours().toString().padStart(2, "0") + ":00",
+      });
+    }
 
-      const rows = this.sql
-        .exec<{ total: number; success: number; fee_total: string; fee_min: string | null; fee_max: string | null; client_errors: number }>(
-          `SELECT total, success, fee_total, fee_min, fee_max, client_errors FROM hourly_stats WHERE hour = ? LIMIT 1`,
-          key
-        )
-        .toArray();
+    const startKey = hourEntries[0].key;
+    const endKey = hourEntries[hourEntries.length - 1].key;
 
-      if (rows.length === 0) {
-        result.push({ hour: hourLabel, transactions: 0, success: 0 });
-      } else {
-        const r = rows[0];
-        const entry: { hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number } = {
-          hour: hourLabel,
-          transactions: r.total,
-          success: r.success,
-        };
-        if (r.fee_total && r.fee_total !== "0") {
-          entry.fees = r.fee_total;
-        }
-        if (r.fee_min) {
-          entry.feeMin = r.fee_min;
-        }
-        if (r.fee_max) {
-          entry.feeMax = r.fee_max;
-        }
-        if (r.client_errors > 0) {
-          entry.clientErrors = r.client_errors;
-        }
-        result.push(entry);
+    // Single range query instead of 24 individual queries
+    type HourlyRow = { hour: string; total: number; success: number; fee_total: string; fee_min: string | null; fee_max: string | null; client_errors: number };
+    const rows = this.sql
+      .exec<HourlyRow>(
+        `SELECT hour, total, success, fee_total, fee_min, fee_max, client_errors
+         FROM hourly_stats
+         WHERE hour >= ? AND hour <= ?
+         ORDER BY hour ASC`,
+        startKey,
+        endKey
+      )
+      .toArray();
+
+    // Index results by hour key for O(1) lookup
+    const rowMap = new Map<string, HourlyRow>();
+    for (const r of rows) {
+      rowMap.set(r.hour, r);
+    }
+
+    // Build result array, filling missing hours with zeros
+    const result: Array<{ hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number }> = [];
+    for (const { key, label } of hourEntries) {
+      const r = rowMap.get(key);
+      if (!r) {
+        result.push({ hour: label, transactions: 0, success: 0 });
+        continue;
       }
+
+      const entry: { hour: string; transactions: number; success: number; fees?: string; feeMin?: string; feeMax?: string; clientErrors?: number } = {
+        hour: label,
+        transactions: r.total,
+        success: r.success,
+      };
+      if (r.fee_total && r.fee_total !== "0") {
+        entry.fees = r.fee_total;
+      }
+      if (r.fee_min) {
+        entry.feeMin = r.fee_min;
+      }
+      if (r.fee_max) {
+        entry.feeMax = r.fee_max;
+      }
+      if (r.client_errors > 0) {
+        entry.clientErrors = r.client_errors;
+      }
+      result.push(entry);
     }
 
     return result;
@@ -645,29 +689,50 @@ export class StatsDO {
     hours: number
   ): Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> {
     const now = Date.now();
-    const result: Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> = [];
 
+    // Generate the hour keys and their display labels
+    const hourEntries: Array<{ key: string; label: string }> = [];
     for (let i = hours - 1; i >= 0; i--) {
       const ts = now - i * HOUR_MS;
       const d = new Date(ts);
-      const hourLabel = d.getUTCHours().toString().padStart(2, "0") + ":00";
-      const key = getHourKey(ts);
+      hourEntries.push({
+        key: getHourKey(ts),
+        label: d.getUTCHours().toString().padStart(2, "0") + ":00",
+      });
+    }
 
-      const rows = this.sql
-        .exec<{ total: number; success: number; failed: number; fee_total: string }>(
-          `SELECT total, success, failed, fee_total FROM wallet_hourly
-           WHERE wallet_index = ? AND hour = ? LIMIT 1`,
-          walletIndex,
-          key
-        )
-        .toArray();
+    const startKey = hourEntries[0].key;
+    const endKey = hourEntries[hourEntries.length - 1].key;
 
-      if (rows.length === 0) {
-        result.push({ hour: hourLabel, total: 0, success: 0, failed: 0, feeTotal: "0" });
+    // Single range query instead of N individual queries per wallet
+    type WalletHourlyRow = { hour: string; total: number; success: number; failed: number; fee_total: string };
+    const rows = this.sql
+      .exec<WalletHourlyRow>(
+        `SELECT hour, total, success, failed, fee_total
+         FROM wallet_hourly
+         WHERE wallet_index = ? AND hour >= ? AND hour <= ?
+         ORDER BY hour ASC`,
+        walletIndex,
+        startKey,
+        endKey
+      )
+      .toArray();
+
+    // Index results by hour key for O(1) lookup
+    const rowMap = new Map<string, WalletHourlyRow>();
+    for (const r of rows) {
+      rowMap.set(r.hour, r);
+    }
+
+    // Build result array, filling missing hours with zeros
+    const result: Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> = [];
+    for (const { key, label } of hourEntries) {
+      const r = rowMap.get(key);
+      if (!r) {
+        result.push({ hour: label, total: 0, success: 0, failed: 0, feeTotal: "0" });
       } else {
-        const r = rows[0];
         result.push({
-          hour: hourLabel,
+          hour: label,
           total: r.total,
           success: r.success,
           failed: r.failed,
@@ -736,61 +801,118 @@ export class StatsDO {
   /**
    * Compute rolling totals for the previous 24h window (24-48h ago).
    * Used for rolling-vs-rolling trend comparison instead of calendar day.
+   *
+   * Single aggregate query instead of 24 individual queries.
    */
   private readPrevious24hTotals(): { total: number; success: number; clientErrors: number } {
     const now = Date.now();
-    let total = 0;
-    let success = 0;
-    let clientErrors = 0;
+    const startKey = getHourKey(now - 47 * HOUR_MS);
+    const endKey = getHourKey(now - 24 * HOUR_MS);
 
-    // Iterate hourly buckets from 48h ago to 25h ago (inclusive) — that's 24 buckets
-    for (let i = 47; i >= 24; i--) {
-      const ts = now - i * HOUR_MS;
-      const key = getHourKey(ts);
-      const rows = this.sql
-        .exec<{ total: number; success: number; client_errors: number }>(
-          `SELECT total, success, client_errors FROM hourly_stats WHERE hour = ? LIMIT 1`,
-          key
-        )
-        .toArray();
-      if (rows.length > 0) {
-        total += rows[0].total;
-        success += rows[0].success;
-        clientErrors += rows[0].client_errors ?? 0;
-      }
+    const rows = this.sql
+      .exec<{ total: number; success: number; client_errors: number }>(
+        `SELECT COALESCE(SUM(total), 0) as total,
+                COALESCE(SUM(success), 0) as success,
+                COALESCE(SUM(client_errors), 0) as client_errors
+         FROM hourly_stats
+         WHERE hour >= ? AND hour <= ?`,
+        startKey,
+        endKey
+      )
+      .toArray();
+
+    if (rows.length === 0) {
+      return { total: 0, success: 0, clientErrors: 0 };
     }
 
-    return { total, success, clientErrors };
+    const r = rows[0];
+    return {
+      total: r.total,
+      success: r.success,
+      clientErrors: r.client_errors ?? 0,
+    };
   }
 
   /**
    * Build per-wallet 24h throughput entries from wallet_hourly data.
    * Only includes wallets with at least one transaction in the last 24h.
+   *
+   * Uses a single query to fetch all wallet+hour rows in the 24h window,
+   * then groups by wallet and fills missing hours in code.
    */
   private readWalletThroughput(): WalletThroughputEntry[] {
     const now = Date.now();
-    const cutoffTs = now - 24 * HOUR_MS;
-    const cutoffKey = getHourKey(cutoffTs);
 
-    // Find all distinct wallet indices with activity in the last 24h
-    const walletRows = this.sql
-      .exec<{ wallet_index: number }>(
-        `SELECT DISTINCT wallet_index FROM wallet_hourly WHERE hour >= ? ORDER BY wallet_index ASC`,
-        cutoffKey
+    // Generate the 24 hour keys and labels (same logic as readWalletHourlyStats)
+    const hourEntries: Array<{ key: string; label: string }> = [];
+    for (let i = 23; i >= 0; i--) {
+      const ts = now - i * HOUR_MS;
+      const d = new Date(ts);
+      hourEntries.push({
+        key: getHourKey(ts),
+        label: d.getUTCHours().toString().padStart(2, "0") + ":00",
+      });
+    }
+
+    const startKey = hourEntries[0].key;
+    const endKey = hourEntries[hourEntries.length - 1].key;
+
+    // Single query for ALL wallets across the 24h window
+    type BulkRow = { wallet_index: number; hour: string; total: number; success: number; failed: number; fee_total: string };
+    const rows = this.sql
+      .exec<BulkRow>(
+        `SELECT wallet_index, hour, total, success, failed, fee_total
+         FROM wallet_hourly
+         WHERE hour >= ? AND hour <= ?
+         ORDER BY wallet_index ASC, hour ASC`,
+        startKey,
+        endKey
       )
       .toArray();
 
-    const result: WalletThroughputEntry[] = [];
-    for (const { wallet_index } of walletRows) {
-      const hourly = this.readWalletHourlyStats(wallet_index, 24);
-      const total24h = hourly.reduce((s, h) => s + h.total, 0);
-      const success24h = hourly.reduce((s, h) => s + h.success, 0);
-      const failed24h = hourly.reduce((s, h) => s + h.failed, 0);
-      const feeTotal24h = hourly
-        .reduce((s, h) => s + BigInt(h.feeTotal || "0"), 0n)
-        .toString();
-      result.push({ walletIndex: wallet_index, total24h, success24h, failed24h, feeTotal24h, hourly });
+    // Group rows by wallet_index
+    const walletMap = new Map<number, Map<string, BulkRow>>();
+    for (const r of rows) {
+      let hourMap = walletMap.get(r.wallet_index);
+      if (!hourMap) {
+        hourMap = new Map();
+        walletMap.set(r.wallet_index, hourMap);
+      }
+      hourMap.set(r.hour, r);
     }
+
+    // Build result for each wallet, filling missing hours with zeros
+    const result: WalletThroughputEntry[] = [];
+    for (const [walletIndex, hourMap] of walletMap) {
+      const hourly: Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> = [];
+      let total24h = 0;
+      let success24h = 0;
+      let failed24h = 0;
+      let feeTotal24h = 0n;
+
+      for (const { key, label } of hourEntries) {
+        const r = hourMap.get(key);
+        if (!r) {
+          hourly.push({ hour: label, total: 0, success: 0, failed: 0, feeTotal: "0" });
+        } else {
+          const feeStr = r.fee_total || "0";
+          hourly.push({
+            hour: label,
+            total: r.total,
+            success: r.success,
+            failed: r.failed,
+            feeTotal: feeStr,
+          });
+          total24h += r.total;
+          success24h += r.success;
+          failed24h += r.failed;
+          feeTotal24h += BigInt(feeStr);
+        }
+      }
+
+      result.push({ walletIndex, total24h, success24h, failed24h, feeTotal24h: feeTotal24h.toString(), hourly });
+    }
+
     return result;
   }
 
