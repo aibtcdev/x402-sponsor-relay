@@ -367,7 +367,7 @@ export class Settle extends BaseEndpoint {
         c.executionCtx.waitUntil(
           Promise.all([
             statsService.recordError("validation"),
-            statsService.logFailure("settle", true),
+            statsService.logFailure("settle", true, undefined, "invalid_transaction"),
           ]).catch(() => {})
         );
         return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
@@ -388,7 +388,7 @@ export class Settle extends BaseEndpoint {
         c.executionCtx.waitUntil(
           Promise.all([
             statsService.recordError("validation"),
-            statsService.logFailure("settle", true),
+            statsService.logFailure("settle", true, undefined, "invalid_transaction"),
           ]).catch(() => {})
         );
         return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
@@ -425,7 +425,7 @@ export class Settle extends BaseEndpoint {
           c.executionCtx.waitUntil(
             Promise.all([
               statsService.recordError("validation"),
-              statsService.logFailure("settle", true, failureCtx),
+              statsService.logFailure("settle", true, failureCtx, "invalid_transaction"),
             ]).catch(() => {})
           );
           return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
@@ -451,7 +451,7 @@ export class Settle extends BaseEndpoint {
             c.executionCtx.waitUntil(
               Promise.all([
                 statsService.recordError("sponsoring"),
-                statsService.logFailure("settle", false, failureCtx),
+                statsService.logFailure("settle", false, failureCtx, "sender_nonce_gap"),
               ]).catch(() => {})
             );
             return c.json({
@@ -467,7 +467,7 @@ export class Settle extends BaseEndpoint {
           c.executionCtx.waitUntil(
             Promise.all([
               statsService.recordError("sponsoring"),
-              statsService.logFailure("settle", false, failureCtx),
+              statsService.logFailure("settle", false, failureCtx, "sponsor_failure"),
             ]).catch(() => {})
           );
           // Transient sponsor failures — signal retryable via BROADCAST_FAILED
@@ -513,7 +513,7 @@ export class Settle extends BaseEndpoint {
         c.executionCtx.waitUntil(
           Promise.all([
             statsService.recordError("validation"),
-            statsService.logFailure("settle", true, failureCtx),
+            statsService.logFailure("settle", true, failureCtx, "invalid_transaction"),
           ]).catch(() => {})
         );
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
@@ -548,7 +548,7 @@ export class Settle extends BaseEndpoint {
 
         // Record stats once for all error branches
         c.executionCtx.waitUntil(
-          statsService.logFailure("settle", isClientError, failureCtx).catch(() => {})
+          statsService.logFailure("settle", isClientError, failureCtx, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {})
         );
 
         // Sponsor-side issues (nonce conflict or TooMuchChaining) → inline resync + single retry

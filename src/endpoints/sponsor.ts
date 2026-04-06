@@ -169,7 +169,7 @@ export class Sponsor extends BaseEndpoint {
 
       if (!body.transaction) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "invalid_transaction").catch(() => {}));
         return this.err(c, {
           error: "Missing transaction field",
           code: "MISSING_TRANSACTION",
@@ -183,7 +183,7 @@ export class Sponsor extends BaseEndpoint {
         const authError = stxVerifyService.verifySip018Auth(body.auth, "sponsor");
         if (authError) {
           c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "invalid_transaction").catch(() => {}));
           return this.err(c, {
             error: authError.error,
             code: authError.code,
@@ -199,7 +199,9 @@ export class Sponsor extends BaseEndpoint {
       const validation = sponsorService.validateTransaction(body.transaction);
       if (validation.valid === false) {
         c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined,
+          validation.error === "Transaction must be sponsored" ? "not_sponsored" : "invalid_transaction"
+        ).catch(() => {}));
         if (validation.error === "Malformed transaction payload") {
           const blocked = clientIp ? checkAndRecordMalformed(clientIp) : false;
           if (blocked) {
@@ -245,7 +247,7 @@ export class Sponsor extends BaseEndpoint {
           tier: metadata.tier,
           code: rateLimitResult.code,
         });
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "broadcast_rate_limited").catch(() => {}));
         const isDaily = rateLimitResult.code === "DAILY_LIMIT_EXCEEDED";
         return this.err(c, {
           error: isDaily ? "Daily request limit exceeded" : "Rate limit exceeded",
@@ -283,7 +285,7 @@ export class Sponsor extends BaseEndpoint {
           tier: metadata.tier,
           estimatedFee: estimatedFee.toString(),
         });
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "broadcast_rate_limited").catch(() => {}));
         return this.err(c, {
           error: "Daily spending cap exceeded",
           code: "SPENDING_CAP_EXCEEDED",
@@ -307,7 +309,7 @@ export class Sponsor extends BaseEndpoint {
         // The tx was NOT added to sender_hand (mode:"immediate" prevents insertion on gap).
         if ("held" in sponsorResult && sponsorResult.held) {
           c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true).catch(() => {}));
+          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "sender_nonce_gap").catch(() => {}));
           const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
           const queue = buildQueueInfo(sponsorResult, senderNonce);
           logger.warn("Sender nonce gap — rejecting /sponsor request", {
@@ -326,6 +328,7 @@ export class Sponsor extends BaseEndpoint {
             queue,
           }, 400);
         }
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", false, undefined, "sponsor_failure").catch(() => {}));
         return this.sponsorFailureResponse(
           c,
           sponsorResult as { error: string; details: string; code?: string; retryAfter?: number },
@@ -359,7 +362,7 @@ export class Sponsor extends BaseEndpoint {
         const isClientError = clientRejection !== undefined;
 
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError).catch(() => {}));
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError, undefined, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {}));
 
         // Record broadcast outcome in the intent ledger.
         // httpStatus 0 = network/timeout exception (no HTTP response received).
@@ -488,7 +491,7 @@ export class Sponsor extends BaseEndpoint {
         error: e instanceof Error ? e.message : "Unknown error",
       });
       c.executionCtx.waitUntil(statsService.recordError("internal").catch(() => {}));
-      c.executionCtx.waitUntil(statsService.logFailure("sponsor", false).catch(() => {}));
+      c.executionCtx.waitUntil(statsService.logFailure("sponsor", false, undefined, "internal_error").catch(() => {}));
       return this.err(c, {
         error: "Internal server error",
         code: "INTERNAL_ERROR",
