@@ -154,6 +154,20 @@ export class DashboardStats extends BaseEndpoint {
                     },
                   },
                 },
+                terminalReasons: {
+                  type: "object" as const,
+                  nullable: true,
+                  description:
+                    "Error counts grouped by tx-schemas terminal reason category (today's calendar-day). Additive alongside legacy errors object. Categories: validation, sender, relay, settlement, replacement, identity.",
+                  properties: {
+                    validation: { type: "number" as const, description: "invalid_transaction, not_sponsored" },
+                    sender: { type: "number" as const, description: "sender_nonce_* errors, origin_chaining_limit, sender_hand_expired" },
+                    relay: { type: "number" as const, description: "sponsor_failure, queue_unavailable, internal_error, sponsor_exhausted, sponsor_nonce_conflict" },
+                    settlement: { type: "number" as const, description: "broadcast_failure, chain_abort, broadcast_rate_limited" },
+                    replacement: { type: "number" as const, description: "nonce_replacement, superseded" },
+                    identity: { type: "number" as const, description: "expired, unknown_payment_identity" },
+                  },
+                },
                 endpointBreakdown: {
                   type: "object" as const,
                   nullable: true,
