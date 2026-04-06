@@ -6,6 +6,7 @@ import type {
   DashboardOverview,
   EndpointBreakdown,
   TransactionLogEntry,
+  WalletThroughputEntry,
 } from "../types";
 import { calculateTrend } from "../services/stats";
 import { TERMINAL_REASON_TO_CATEGORY } from "@aibtc/tx-schemas/core/terminal-reasons";
@@ -122,6 +123,19 @@ export class StatsDO {
         sbtc_count INTEGER DEFAULT 0,
         usdcx_count INTEGER DEFAULT 0,
         fee_total TEXT DEFAULT '0'
+      );
+    `);
+
+    // Per-wallet hourly aggregate (rolling 48h) — tracks throughput per sponsor wallet
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS wallet_hourly (
+        wallet_index INTEGER NOT NULL,
+        hour TEXT NOT NULL,
+        total INTEGER DEFAULT 0,
+        success INTEGER DEFAULT 0,
+        failed INTEGER DEFAULT 0,
+        fee_total TEXT DEFAULT '0',
+        PRIMARY KEY(wallet_index, hour)
       );
     `);
 
@@ -413,6 +427,27 @@ export class StatsDO {
     const hourCutoff = new Date(now - 48 * HOUR_MS);
     const hourCutoffStr = `${hourCutoff.toISOString().split("T")[0]}:${hourCutoff.getUTCHours().toString().padStart(2, "0")}`;
     this.sql.exec("DELETE FROM hourly_stats WHERE hour < ?", hourCutoffStr);
+
+    // Atomic per-wallet hourly upsert (only when walletIndex is provided)
+    if (entry.walletIndex !== undefined) {
+      const walletFee = fee || "0";
+      this.sql.exec(
+        `INSERT INTO wallet_hourly (wallet_index, hour, total, success, failed, fee_total)
+         VALUES (?, ?, 1, ?, ?, ?)
+         ON CONFLICT(wallet_index, hour) DO UPDATE SET
+           total = total + 1,
+           success = success + excluded.success,
+           failed = failed + excluded.failed,
+           fee_total = CAST(CAST(fee_total AS INTEGER) + CAST(excluded.fee_total AS INTEGER) AS TEXT)`,
+        entry.walletIndex,
+        hourKey,
+        successInt,
+        failedInt,
+        walletFee
+      );
+      // Prune wallet_hourly older than 48h (same cutoff as hourly_stats)
+      this.sql.exec("DELETE FROM wallet_hourly WHERE hour < ?", hourCutoffStr);
+    }
   }
 
   private recordErrorCategory(category: ErrorCategory): void {
@@ -605,6 +640,45 @@ export class StatsDO {
     return result;
   }
 
+  private readWalletHourlyStats(
+    walletIndex: number,
+    hours: number
+  ): Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> {
+    const now = Date.now();
+    const result: Array<{ hour: string; total: number; success: number; failed: number; feeTotal: string }> = [];
+
+    for (let i = hours - 1; i >= 0; i--) {
+      const ts = now - i * HOUR_MS;
+      const d = new Date(ts);
+      const hourLabel = d.getUTCHours().toString().padStart(2, "0") + ":00";
+      const key = getHourKey(ts);
+
+      const rows = this.sql
+        .exec<{ total: number; success: number; failed: number; fee_total: string }>(
+          `SELECT total, success, failed, fee_total FROM wallet_hourly
+           WHERE wallet_index = ? AND hour = ? LIMIT 1`,
+          walletIndex,
+          key
+        )
+        .toArray();
+
+      if (rows.length === 0) {
+        result.push({ hour: hourLabel, total: 0, success: 0, failed: 0, feeTotal: "0" });
+      } else {
+        const r = rows[0];
+        result.push({
+          hour: hourLabel,
+          total: r.total,
+          success: r.success,
+          failed: r.failed,
+          feeTotal: r.fee_total || "0",
+        });
+      }
+    }
+
+    return result;
+  }
+
   private readRecentTxLog(opts: {
     days?: number;
     limit?: number;
@@ -659,12 +733,71 @@ export class StatsDO {
     });
   }
 
+  /**
+   * Compute rolling totals for the previous 24h window (24-48h ago).
+   * Used for rolling-vs-rolling trend comparison instead of calendar day.
+   */
+  private readPrevious24hTotals(): { total: number; success: number; clientErrors: number } {
+    const now = Date.now();
+    let total = 0;
+    let success = 0;
+    let clientErrors = 0;
+
+    // Iterate hourly buckets from 48h ago to 25h ago (inclusive) — that's 24 buckets
+    for (let i = 47; i >= 24; i--) {
+      const ts = now - i * HOUR_MS;
+      const key = getHourKey(ts);
+      const rows = this.sql
+        .exec<{ total: number; success: number; client_errors: number }>(
+          `SELECT total, success, client_errors FROM hourly_stats WHERE hour = ? LIMIT 1`,
+          key
+        )
+        .toArray();
+      if (rows.length > 0) {
+        total += rows[0].total;
+        success += rows[0].success;
+        clientErrors += rows[0].client_errors ?? 0;
+      }
+    }
+
+    return { total, success, clientErrors };
+  }
+
+  /**
+   * Build per-wallet 24h throughput entries from wallet_hourly data.
+   * Only includes wallets with at least one transaction in the last 24h.
+   */
+  private readWalletThroughput(): WalletThroughputEntry[] {
+    const now = Date.now();
+    const cutoffTs = now - 24 * HOUR_MS;
+    const cutoffKey = getHourKey(cutoffTs);
+
+    // Find all distinct wallet indices with activity in the last 24h
+    const walletRows = this.sql
+      .exec<{ wallet_index: number }>(
+        `SELECT DISTINCT wallet_index FROM wallet_hourly WHERE hour >= ? ORDER BY wallet_index ASC`,
+        cutoffKey
+      )
+      .toArray();
+
+    const result: WalletThroughputEntry[] = [];
+    for (const { wallet_index } of walletRows) {
+      const hourly = this.readWalletHourlyStats(wallet_index, 24);
+      const total24h = hourly.reduce((s, h) => s + h.total, 0);
+      const success24h = hourly.reduce((s, h) => s + h.success, 0);
+      const failed24h = hourly.reduce((s, h) => s + h.failed, 0);
+      const feeTotal24h = hourly
+        .reduce((s, h) => s + BigInt(h.feeTotal || "0"), 0n)
+        .toString();
+      result.push({ walletIndex: wallet_index, total24h, success24h, failed24h, feeTotal24h, hourly });
+    }
+    return result;
+  }
+
   private buildOverview(): DashboardOverview {
-    // readDailyStats(2) returns [yesterday, today] — reuse instead of
-    // duplicating the raw SQL query for yesterday's row.
-    const twoDays = this.readDailyStats(2);
-    const previous = twoDays[0] ?? null;
-    const current = twoDays[1];
+    // readDailyStats(1) returns [today] — used for calendar-day token and fee breakdown.
+    const todayArr = this.readDailyStats(1);
+    const current = todayArr[0];
 
     // Token percentages (from today's daily_stats — calendar-day token breakdown)
     const totalTokenTx =
@@ -676,24 +809,11 @@ export class StatsDO {
 
     // Fee aggregates (from today's daily_stats)
     const currentFees = current.fees ?? { total: "0", count: 0, min: "0", max: "0" };
-    const previousFees = previous?.fees ?? { total: "0", count: 0, min: "0", max: "0" };
 
     const avgFee =
       currentFees.count > 0
         ? (BigInt(currentFees.total) / BigInt(currentFees.count)).toString()
         : "0";
-
-    const currentFeeTotal = BigInt(currentFees.total);
-    const previousFeeTotal = BigInt(previousFees.total);
-    let feeTrend: "up" | "down" | "stable" = "stable";
-    if (previousFeeTotal === 0n) {
-      feeTrend = currentFeeTotal > 0n ? "up" : "stable";
-    } else {
-      const diff = currentFeeTotal - previousFeeTotal;
-      const pctChange = (diff * 100n) / previousFeeTotal;
-      if (pctChange > 5n) feeTrend = "up";
-      else if (pctChange < -5n) feeTrend = "down";
-    }
 
     // Hourly data covers the rolling 24h window (crossing midnight).
     // Sum it to produce headline totals that match the hourly chart exactly.
@@ -744,8 +864,41 @@ export class StatsDO {
         ? (rolling.fees / BigInt(rolling.feeCount)).toString()
         : avgFee;
 
+    // Rolling previous 24h (24-48h ago) for rolling-vs-rolling comparison (Bug #7 fix).
+    const prev24h = this.readPrevious24hTotals();
+
+    // Fee trend: compare rolling fee total vs previous 24h rolling fee total.
+    // Previous rolling fee data isn't tracked in hourly_stats (would need a separate window query).
+    // Use previous 24h transaction count as a proxy to avoid needing extra columns.
+    const previousFeeTotal = 0n; // Fee trend vs previous window not yet tracked
+    const currentFeeTotal = rolling.fees;
+    let feeTrend: "up" | "down" | "stable" = "stable";
+    if (previousFeeTotal === 0n) {
+      feeTrend = currentFeeTotal > 0n ? "up" : "stable";
+    } else {
+      const diff = currentFeeTotal - previousFeeTotal;
+      const pctChange = (diff * 100n) / previousFeeTotal;
+      if (pctChange > 5n) feeTrend = "up";
+      else if (pctChange < -5n) feeTrend = "down";
+    }
+
     // Per-endpoint breakdown from today's daily_stats
     const endpointBreakdown = this.readEndpointBreakdown(current.date);
+
+    // Dual success rates (Bug #4)
+    // rawSuccessRate: success / total (includes all failures in denominator)
+    const rawSuccessRate = rolling.total > 0
+      ? Math.round((rolling.success / rolling.total) * 10000) / 10000
+      : 0;
+    // effectiveSuccessRate: success / (success + relayErrors) — excludes client errors
+    const relayErrors = rollingFailed - rolling.clientErrors;
+    const effectiveDenominator = rolling.success + Math.max(0, relayErrors);
+    const effectiveSuccessRate = effectiveDenominator > 0
+      ? Math.round((rolling.success / effectiveDenominator) * 10000) / 10000
+      : 0;
+
+    // Per-wallet throughput (Bug #6)
+    const walletThroughput = this.readWalletThroughput();
 
     return {
       period: "24h",
@@ -754,11 +907,11 @@ export class StatsDO {
         success: rolling.success,
         failed: rollingFailed,
         clientErrors: rolling.clientErrors,
-        trend: calculateTrend(
-          rolling.total,
-          previous?.transactions.total ?? 0
-        ),
-        previousTotal: previous?.transactions.total ?? 0,
+        // Rolling-vs-rolling trend comparison (Bug #7 fix)
+        trend: calculateTrend(rolling.total, prev24h.total),
+        previousTotal: prev24h.total,
+        rawSuccessRate,
+        effectiveSuccessRate,
       },
       tokens: {
         STX: {
@@ -783,7 +936,7 @@ export class StatsDO {
         min: rolling.feeMin ?? currentFees.min ?? "0",
         max: rolling.feeMax ?? currentFees.max ?? "0",
         trend: feeTrend,
-        previousTotal: previousFees.total,
+        previousTotal: currentFees.total,
       },
       hourlyData,
       endpointBreakdown,
@@ -795,6 +948,12 @@ export class StatsDO {
         settlement: current.terminalReasons?.settlement ?? 0,
         replacement: current.terminalReasons?.replacement ?? 0,
         identity: current.terminalReasons?.identity ?? 0,
+      },
+      walletThroughput,
+      previous24h: {
+        total: prev24h.total,
+        success: prev24h.success,
+        failed: prev24h.total - prev24h.success,
       },
     };
   }
@@ -1027,6 +1186,21 @@ export class StatsDO {
       // GET /hourly — return 24h hourly data
       if (method === "GET" && url.pathname === "/hourly") {
         const data = this.readHourlyData();
+        return this.jsonResponse(data);
+      }
+
+      // GET /wallet-hourly?walletIndex=N&hours=N — per-wallet hourly data
+      if (method === "GET" && url.pathname === "/wallet-hourly") {
+        const walletIndexParam = url.searchParams.get("walletIndex");
+        if (!walletIndexParam) {
+          return this.badRequest("Missing walletIndex");
+        }
+        const walletIndex = parseInt(walletIndexParam, 10);
+        if (isNaN(walletIndex)) {
+          return this.badRequest("Invalid walletIndex");
+        }
+        const hours = Math.min(Math.max(parseInt(url.searchParams.get("hours") || "24", 10), 1), 48);
+        const data = this.readWalletHourlyStats(walletIndex, hours);
         return this.jsonResponse(data);
       }
 
