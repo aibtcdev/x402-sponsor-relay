@@ -8,6 +8,7 @@ import type {
   TransactionLogEntry,
 } from "../types";
 import { calculateTrend } from "../services/stats";
+import { TERMINAL_REASON_TO_CATEGORY } from "@aibtc/tx-schemas/core/terminal-reasons";
 
 // ===========================================================================
 // Time helpers
@@ -143,6 +144,15 @@ export class StatsDO {
       ["hourly_stats", "client_errors INTEGER DEFAULT 0"],
       ["hourly_stats", "fee_min TEXT"],
       ["hourly_stats", "fee_max TEXT"],
+      // Terminal reason category columns (tx-schemas v0.4.0 alignment)
+      // Named with _schema suffix to avoid collision with legacy err_validation / err_settlement columns.
+      ["tx_log", "terminal_reason TEXT"],
+      ["daily_stats", "err_schema_validation INTEGER DEFAULT 0"],
+      ["daily_stats", "err_sender INTEGER DEFAULT 0"],
+      ["daily_stats", "err_relay INTEGER DEFAULT 0"],
+      ["daily_stats", "err_settlement_schema INTEGER DEFAULT 0"],
+      ["daily_stats", "err_replacement INTEGER DEFAULT 0"],
+      ["daily_stats", "err_identity INTEGER DEFAULT 0"],
     ];
     for (const [table, columnDef] of migrations) {
       try {
@@ -191,13 +201,14 @@ export class StatsDO {
     const amount = entry.amount || "0";
     const fee = entry.fee || null;
 
-    // Insert into tx_log (includes new client_error column)
+    // Insert into tx_log (includes client_error and terminal_reason columns)
     const id = crypto.randomUUID();
     const timestamp = new Date(entry.timestamp).getTime() || now;
+    const terminalReason = entry.terminalReason || null;
     this.sql.exec(
       `INSERT OR IGNORE INTO tx_log
-         (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height, client_error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, endpoint, timestamp, success, token, amount, fee, txid, sender, recipient, status, block_height, client_error, terminal_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id,
       entry.endpoint,
       timestamp,
@@ -210,7 +221,8 @@ export class StatsDO {
       entry.recipient || null,
       entry.status || null,
       entry.blockHeight || null,
-      clientErrorInt
+      clientErrorInt,
+      terminalReason
     );
 
     // Prune tx_log older than 7 days
@@ -279,6 +291,30 @@ export class StatsDO {
         `UPDATE daily_stats SET verify_total = verify_total + 1 WHERE date = ?`,
         today
       );
+    }
+
+    // Atomic daily upsert — terminal reason category increment (tx-schemas alignment)
+    // Only applies to failed transactions with a known terminal reason.
+    if (!entry.success && terminalReason) {
+      const category = TERMINAL_REASON_TO_CATEGORY[terminalReason as keyof typeof TERMINAL_REASON_TO_CATEGORY];
+      const categoryColMap: Record<string, string> = {
+        validation: "err_schema_validation",
+        sender: "err_sender",
+        relay: "err_relay",
+        settlement: "err_settlement_schema",
+        replacement: "err_replacement",
+        identity: "err_identity",
+      };
+      const categoryCol = category ? categoryColMap[category] : null;
+      if (categoryCol) {
+        this.sql.exec(
+          `INSERT INTO daily_stats (date, ${categoryCol})
+           VALUES (?, 1)
+           ON CONFLICT(date) DO UPDATE SET
+             ${categoryCol} = ${categoryCol} + 1`,
+          today
+        );
+      }
     }
 
     // Atomic daily upsert — volumes (must be separate to use BigInt arithmetic safely)
@@ -434,13 +470,20 @@ export class StatsDO {
           err_sponsoring: number;
           err_settlement: number;
           err_internal: number;
+          err_schema_validation: number;
+          err_sender: number;
+          err_relay: number;
+          err_settlement_schema: number;
+          err_replacement: number;
+          err_identity: number;
         }>(
           `SELECT total, success, failed, client_errors,
                   stx_count, stx_volume,
                   sbtc_count, sbtc_volume,
                   usdcx_count, usdcx_volume,
                   fee_total, fee_count, fee_min, fee_max,
-                  err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal
+                  err_validation, err_rate_limit, err_sponsoring, err_settlement, err_internal,
+                  err_schema_validation, err_sender, err_relay, err_settlement_schema, err_replacement, err_identity
            FROM daily_stats WHERE date = ? LIMIT 1`,
           date
         )
@@ -461,6 +504,14 @@ export class StatsDO {
             sponsoring: 0,
             settlement: 0,
             internal: 0,
+          },
+          terminalReasons: {
+            validation: 0,
+            sender: 0,
+            relay: 0,
+            settlement: 0,
+            replacement: 0,
+            identity: 0,
           },
         });
       } else {
@@ -484,6 +535,14 @@ export class StatsDO {
             sponsoring: r.err_sponsoring,
             settlement: r.err_settlement,
             internal: r.err_internal,
+          },
+          terminalReasons: {
+            validation: r.err_schema_validation ?? 0,
+            sender: r.err_sender ?? 0,
+            relay: r.err_relay ?? 0,
+            settlement: r.err_settlement_schema ?? 0,
+            replacement: r.err_replacement ?? 0,
+            identity: r.err_identity ?? 0,
           },
         };
         if (r.fee_count > 0) {
@@ -728,6 +787,15 @@ export class StatsDO {
       },
       hourlyData,
       endpointBreakdown,
+      // Terminal reason category counts from today's daily_stats row
+      terminalReasons: {
+        validation: current.terminalReasons?.validation ?? 0,
+        sender: current.terminalReasons?.sender ?? 0,
+        relay: current.terminalReasons?.relay ?? 0,
+        settlement: current.terminalReasons?.settlement ?? 0,
+        replacement: current.terminalReasons?.replacement ?? 0,
+        identity: current.terminalReasons?.identity ?? 0,
+      },
     };
   }
 
