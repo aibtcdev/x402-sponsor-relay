@@ -13,7 +13,7 @@ Phase 6: Update documentation
 | 3. Align errors with tx-schemas terminal reasons | completed | 19-reason error recording + /stats API |
 | 4. Add wallet throughput and dual rates | completed | wallet_hourly table + comparison fix |
 | 5. Rebuild dashboard UI | completed | Schema-aligned cards and visualizations |
-| 6. Update documentation | active | CLAUDE.md + discovery docs |
+| 6. Update documentation | completed | CLAUDE.md + discovery docs |
 
 ## Decisions
 
@@ -34,4 +34,4 @@ Phase 6: Update documentation
 - 2026-04-06: Phase 3 completed — 19 terminal reasons, 6 category columns, wired all error paths in endpoints, /stats returns terminalReasons (106d937..2c0bc58)
 - 2026-04-06: Phase 4 completed — wallet_hourly table, dual success rates, rolling-vs-rolling comparison periods (95e5c9f..f1ac88a)
 - 2026-04-06: Phase 5 completed — terminal reason colors, new card components (fees, terminal reasons, wallet throughput), dual success rates in UI, CSS utilities (8b63594..1c0486c)
-- 2026-04-06: Phase 6 active — CLAUDE.md updated with /stats response shape, tx-decode Key File entry, gap-fill settlement note, timestamp semantics; discovery.ts /llms-full.txt GET /stats expanded with response example
+- 2026-04-06: Phase 6 completed — CLAUDE.md updated with /stats response shape, tx-decode Key File entry, gap-fill settlement note, timestamp semantics; discovery.ts /llms-full.txt GET /stats expanded with response example (490c6c5)
