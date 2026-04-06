@@ -158,8 +158,10 @@ export const dashboardCss = `
   .mt-3 { margin-top: 0.75rem; }
   .mt-4 { margin-top: 1rem; }
   .mt-6 { margin-top: 1.5rem; }
+  .mb-1 { margin-bottom: 0.25rem; }
   .mb-2 { margin-bottom: 0.5rem; }
   .mb-3 { margin-bottom: 0.75rem; }
+  .space-y-1 > :not(:first-child) { margin-top: 0.25rem; }
   .mb-4 { margin-bottom: 1rem; }
   .mb-6 { margin-bottom: 1.5rem; }
   .mb-8 { margin-bottom: 2rem; }
@@ -261,6 +263,7 @@ export const dashboardCss = `
     .sm\\:py-8 { padding-top: 2rem; padding-bottom: 2rem; }
   }
   @media (min-width: 768px) {
+    .md\\:grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .md\\:grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .md\\:grid-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   }
