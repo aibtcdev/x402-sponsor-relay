@@ -821,15 +821,22 @@ export class SettlementService {
           let errorMessage = `HTTP ${broadcastResponse.status}`;
           let errorDetails = responseText.slice(0, 500);
 
+          // reason_data from stacks-core: includes is_origin for TooMuchChaining/BadNonce
+          type StacksReasonData = { is_origin?: boolean; principal?: string; expected?: number; actual?: number; message?: string };
+          let reasonData: StacksReasonData | undefined;
           try {
             const errorJson = JSON.parse(responseText) as {
               error?: string;
               reason?: string;
               message?: string;
+              reason_data?: StacksReasonData;
             };
             if (errorJson.error || errorJson.reason || errorJson.message) {
               errorMessage = errorJson.error ?? errorJson.message ?? errorMessage;
               errorDetails = errorJson.reason ?? errorDetails;
+            }
+            if (errorJson.reason_data) {
+              reasonData = errorJson.reason_data;
             }
           } catch {
             // Body is not JSON — use raw text as details
@@ -892,21 +899,34 @@ export class SettlementService {
             }
 
             // TooMuchChaining: the sender (sponsor or client) has too many pending txs.
+            // The node's reason_data.is_origin distinguishes origin (sender) vs sponsor triggers.
             // On sponsor-side this is relay congestion — retryable after backoff.
-            // clientRejection is intentionally omitted so stats don't attribute this to the client.
-            // On self-pay this falls through to clientRejection handling below.
+            // On origin-side this is the agent's problem — report back, don't penalize sponsor.
             if (matchedReason === "TooMuchChaining" && sponsorNonceForLog !== null) {
-              this.logger.warn("Sponsor wallet chaining limit hit (TooMuchChaining)", {
-                status: broadcastResponse.status,
-                details: errorDetails,
-                sponsorNonce: sponsorNonceForLog,
-                nodeUrl: target.baseUrl,
-              });
+              const isOrigin = reasonData?.is_origin === true;
+              this.logger.warn(
+                isOrigin
+                  ? "Origin (sender) chaining limit hit (TooMuchChaining)"
+                  : "Sponsor wallet chaining limit hit (TooMuchChaining)",
+                {
+                  status: broadcastResponse.status,
+                  details: errorDetails,
+                  sponsorNonce: sponsorNonceForLog,
+                  isOrigin,
+                  principal: reasonData?.principal,
+                  expected: reasonData?.expected,
+                  actual: reasonData?.actual,
+                  nodeUrl: target.baseUrl,
+                }
+              );
               return {
-                error: "Sponsor wallet congested — too many pending transactions",
+                error: isOrigin
+                  ? "Origin address has too many pending transactions"
+                  : "Sponsor wallet congested — too many pending transactions",
                 details: errorDetails,
-                retryable: true,
+                retryable: !isOrigin,
                 tooMuchChaining: true,
+                isOriginChaining: isOrigin,
                 nodeUrl: target.baseUrl,
                 httpStatus: broadcastResponse.status,
               };

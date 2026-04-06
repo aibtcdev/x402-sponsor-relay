@@ -297,11 +297,11 @@ async function processPaymentMessage(
     // Check for retryable broadcast errors
     const isNonceConflict = broadcastResult.nonceConflict === true;
     const isTooMuchChaining = broadcastResult.tooMuchChaining === true;
+    const isOriginChaining = broadcastResult.isOriginChaining === true;
 
     if ((isNonceConflict || isTooMuchChaining) && attempt < MAX_ATTEMPTS) {
       // Release the sponsor nonce back to pool — no errorReason here so the nonce
-      // expires cleanly without feeding the circuit breaker on every retry attempt.
-      // Quarantine only happens on the terminal path when retries are exhausted.
+      // expires cleanly without penalizing sponsor wallets on every retry attempt.
       if (sponsorNonce !== null) {
         await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
       }
@@ -310,9 +310,11 @@ async function processPaymentMessage(
         route: "PAYMENT_QUEUE",
         paymentId,
         status: "queued",
-        action: isTooMuchChaining
-          ? "queue_retry_too_much_chaining"
-          : "queue_retry_nonce_conflict",
+        action: isOriginChaining
+          ? "queue_retry_origin_chaining"
+          : isTooMuchChaining
+            ? "queue_retry_too_much_chaining"
+            : "queue_retry_nonce_conflict",
         checkStatusUrlPresent: false,
         compatShimUsed: false,
         attempt,
@@ -321,6 +323,7 @@ async function processPaymentMessage(
         paymentId,
         nonceConflict: isNonceConflict,
         tooMuchChaining: isTooMuchChaining,
+        isOriginChaining,
         attempt,
       });
 
@@ -334,10 +337,13 @@ async function processPaymentMessage(
       return;
     }
 
-    // Terminal broadcast failure — only quarantine for contention-specific conditions.
-    // Generic failures (node 500, timeout) release cleanly to avoid penalizing healthy wallets.
+    // Terminal broadcast failure.
+    // Origin-side TooMuchChaining: release cleanly — the agent's address is congested, not the sponsor.
+    // Sponsor-side TooMuchChaining or nonce conflict: release with error reason for tracking.
+    // Generic failures (node 500, timeout): release cleanly to avoid penalizing healthy wallets.
     if (sponsorNonce !== null) {
-      const reason = isTooMuchChaining ? "TooMuchChaining"
+      const reason = isOriginChaining ? undefined
+        : isTooMuchChaining ? "TooMuchChaining"
         : isNonceConflict ? "nonce_conflict"
         : undefined;
       await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex, undefined, reason);
@@ -354,8 +360,9 @@ async function processPaymentMessage(
       errorCode: broadcastResult.clientRejection
         ? `CLIENT_${broadcastResult.clientRejection.toUpperCase()}`
         : "BROADCAST_FAILED",
-      terminalReason:
-        isTooMuchChaining || isNonceConflict
+      terminalReason: isOriginChaining
+        ? "origin_chaining_limit"
+        : (isTooMuchChaining || isNonceConflict)
           ? "sponsor_failure"
           : "broadcast_failure",
       retryable: broadcastResult.retryable,

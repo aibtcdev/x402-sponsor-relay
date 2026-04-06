@@ -246,6 +246,7 @@ interface ObservableWalletState {
   gaps: number[];
   available: number;
   reserved: number;
+  /** @deprecated Always false — circuit breaker removed in favor of per-nonce tracking */
   circuitBreakerOpen: boolean;
   healthy: boolean;
   /** Total non-confirmed dispatch_queue rows (queued + dispatched + replaying) */
@@ -254,10 +255,6 @@ interface ObservableWalletState {
   replayBufferDepth?: number;
   /** Settlement time percentiles for this wallet (last 24h, null if no data) */
   settlementTimes?: SettlementTimeStats;
-  /** True when the wallet has accumulated GHOST_FAILURE_THRESHOLD consecutive ghost failures */
-  ghostDegraded?: boolean;
-  /** Number of consecutive ghost broadcast failures (ConflictingNonceInMempool with no Hiro-visible occupant) */
-  ghostFailures?: number;
 }
 
 /**
@@ -399,12 +396,6 @@ const ALARM_INTERVAL_MS = 5 * 60 * 1000;
 const ALARM_INTERVAL_ACTIVE_MS = 60 * 1000;
 /** Alias for readability: idle wallets revert to the standard 5-minute cadence. */
 const ALARM_INTERVAL_IDLE_MS = ALARM_INTERVAL_MS;
-/**
- * Alarm interval used when a cross-wallet cascade is active AND there are in-flight nonces.
- * 20s fires much more often than the normal 60s active cadence, accelerating RBF and gap-fill
- * cycles during nonce storms so the DO self-heals without waiting for agent retries.
- */
-const ALARM_INTERVAL_CASCADE_MS = 20 * 1000;
 /** Reset to possible_next_nonce if no assignment in this window and we are ahead */
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 /** Maximum number of sponsor wallets supported */
@@ -444,10 +435,6 @@ const SENDER_REFRESH_FAILURE_BACKOFF_MS = 2 * 60 * 1000;
  * probability and are candidates for RBF replacement.
  */
 const STUCK_TX_AGE_MS = 15 * 60 * 1000;
-/** Reduced stuck-tx age when a cross-wallet cascade is active (5 min) */
-const STUCK_TX_AGE_CASCADE_MS = 5 * 60 * 1000;
-/** Most aggressive stuck-tx age when a wallet's circuit breaker is open (3 min) */
-const STUCK_TX_AGE_CIRCUIT_OPEN_MS = 3 * 60 * 1000;
 /**
  * Compute the RBF fee for replacing a stuck tx.
  * Stacks only requires original_fee + 1 uSTX to replace. When original_fee is known
@@ -483,22 +470,6 @@ const MAX_RBF_ATTEMPTS = 3;
  * replacement + resubmission window exceeds the call's deadline.
  */
 const HEAD_BUMP_FEE = MIN_FLUSH_FEE * 2n;
-/**
- * Per-wallet circuit breaker: if a wallet accumulates this many quarantines
- * within CIRCUIT_BREAKER_WINDOW_MS, it is skipped during nonce assignment
- * and an eager resync is triggered for that wallet only.
- */
-// Single failure = immediate skip. Wallet recovers naturally when the 10-minute
-// CIRCUIT_BREAKER_WINDOW_MS expires. For a payment relay, every failed broadcast
-// is a user-facing SETTLEMENT_TIMEOUT — aggressive quarantine is correct.
-const CIRCUIT_BREAKER_QUARANTINE_THRESHOLD = 1;
-/**
- * Number of consecutive ghost broadcast failures before a wallet is marked ghost_degraded.
- * A "ghost" failure is a ConflictingNonceInMempool where fetchOccupantFee returns null —
- * the node holds a transaction that Hiro cannot see (invisible mempool entry).
- * Ghost-degraded wallets are skipped during nonce assignment until they self-clear.
- */
-const GHOST_FAILURE_THRESHOLD = 5;
 /** Maximum fee cap for gap-fill escalation and RBF broadcasts (90,000 uSTX) */
 const MAX_BROADCAST_FEE = 90_000n;
 
@@ -544,13 +515,6 @@ const ALARM_WALLET_CURSOR_KEY = "alarm_wallet_cursor";
 
 /** nonce_state key for the round-robin sender sweep cursor */
 const ALARM_SENDER_CURSOR_KEY = "alarm_sender_cursor";
-/** Time window for circuit breaker quarantine counting (10 minutes) */
-const CIRCUIT_BREAKER_WINDOW_MS = 10 * 60 * 1000;
-/**
- * Cross-wallet cascade detection: log a cascade_detected event when quarantine
- * count across all wallets exceeds this threshold within CIRCUIT_BREAKER_WINDOW_MS.
- */
-const CASCADE_DETECTION_THRESHOLD = 3;
 
 /**
  * Pool pressure threshold (0.80 = 80%) above which a surge event is recorded.
@@ -619,26 +583,6 @@ class LowHeadroomError extends Error {
     // Estimate: each confirmed tx frees one nonce slot. ~2 txs/s drain rate.
     // Backoff scales with pool pressure: more reserved nonces → longer wait.
     this.retryAfterSeconds = Math.ceil((CHAINING_LIMIT - maxHeadroom) / 2) + 5;
-  }
-}
-
-/**
- * Thrown when ALL wallets are circuit-broken (degraded) but at least one has
- * headroom. Previously the code fell back to the "least degraded" wallet,
- * which fed transactions into a broken pool and amplified contention.
- * Now we reject immediately with a retry hint.
- */
-class AllWalletsDegradedError extends Error {
-  readonly degradedCount: number;
-  readonly totalReserved: number;
-  readonly totalCapacity: number;
-
-  constructor(degradedCount: number, totalReserved: number, totalCapacity: number) {
-    super("ALL_WALLETS_DEGRADED");
-    this.name = "AllWalletsDegradedError";
-    this.degradedCount = degradedCount;
-    this.totalReserved = totalReserved;
-    this.totalCapacity = totalCapacity;
   }
 }
 
@@ -2432,7 +2376,6 @@ export class NonceDO {
         state.lastRbfTxid = result.txid;
         await this.state.storage.put(key, state);
         this.incrementCounter(STATE_KEYS.stuckTxRbfBroadcast);
-        this.resetGhostState(walletIndex);
         // Update the ledger txid so reconciliation tracks the replacement
         try {
           this.sql.exec(
@@ -2464,7 +2407,6 @@ export class NonceDO {
         // Terminal — delete stuck-tx state entirely to avoid orphaned entries
         state.rbfAttempts = attemptNum;
         await this.state.storage.delete(key);
-        this.resetGhostState(walletIndex);
         this.log("info", "rbf_nonce_consumed", {
           walletIndex,
           nonce,
@@ -2476,28 +2418,21 @@ export class NonceDO {
       }
 
       if (result.reason === "ConflictingNonceInMempool") {
-        // Classify the conflict based on why occupant fee lookup failed:
-        //   no_txid/not_found = true ghost (node holds tx invisible to Hiro)
-        //   hiro_error = transient Hiro failure — don't penalize the wallet
-        //   fee discovered = our fee was too low
+        // Classify the conflict for logging — no per-wallet degradation flags.
         const occupantReason = occupantResult.reason;
         const isGhost = occupantReason === "no_txid" || occupantReason === "not_found";
         const isHiroError = occupantReason === "hiro_error";
 
         if (isGhost) {
-          // True ghost — node holds something invisible to Hiro: increment ghost counter.
-          // Do NOT increment rbfAttempts — this is a guaranteed failure, not a real attempt.
-          this.incrementGhostFailures(walletIndex);
+          // Ghost — node holds tx invisible to Hiro. Log but don't penalize wallet.
           this.log("warn", "rbf_ghost_conflict", {
             walletIndex,
             nonce,
-            ghostFailures: this.getStateValue(this.walletGhostFailuresKey(walletIndex)),
             rbfFee: rbfFee.toString(),
             occupantReason,
           });
         } else if (isHiroError) {
-          // Hiro was unavailable — we can't determine occupant fee, don't blame the wallet.
-          // Do NOT increment rbfAttempts or ghost counter.
+          // Hiro unavailable — can't determine occupant fee, don't blame the wallet.
           this.log("warn", "rbf_conflict_hiro_unavailable", {
             walletIndex,
             nonce,
@@ -2505,10 +2440,8 @@ export class NonceDO {
             attemptNum,
           });
         } else {
-          // Fee too low (occupant fee discovered but our fee wasn't enough) — increment counter.
-          // This is a non-ghost outcome: reset ghost state if accumulated.
+          // Fee too low — occupant fee discovered but ours wasn't enough.
           state.rbfAttempts = attemptNum;
-          this.resetGhostState(walletIndex);
           this.log("warn", "rbf_fee_too_low", {
             walletIndex,
             nonce,
@@ -2836,59 +2769,6 @@ export class NonceDO {
     return `stuck_tx:${walletIndex}:${nonce}`;
   }
 
-  /** KV key for per-wallet recent quarantine timestamps (circuit breaker window) */
-  private walletQuarantineRecentKey(walletIndex: number): string {
-    return `wallet_quarantine_recent:${walletIndex}`;
-  }
-
-  /** nonce_state key for per-wallet ghost failure counter */
-  private walletGhostFailuresKey(walletIndex: number): string {
-    return `wallet_ghost_failures:${walletIndex}`;
-  }
-
-  /** nonce_state key for per-wallet ghost-degraded flag (0 = healthy, 1 = degraded) */
-  private walletGhostDegradedKey(walletIndex: number): string {
-    return `wallet_ghost_degraded:${walletIndex}`;
-  }
-
-  /**
-   * Increment the ghost failure counter for a wallet.
-   * When the counter reaches GHOST_FAILURE_THRESHOLD, marks the wallet as ghost_degraded.
-   * Ghost-degraded wallets are skipped during nonce assignment.
-   * Returns true if the wallet just became ghost_degraded.
-   */
-  private incrementGhostFailures(walletIndex: number): boolean {
-    const count = (this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0) + 1;
-    this.setStateValue(this.walletGhostFailuresKey(walletIndex), count);
-    if (count >= GHOST_FAILURE_THRESHOLD) {
-      const alreadyDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
-      this.setStateValue(this.walletGhostDegradedKey(walletIndex), 1);
-      if (!alreadyDegraded) {
-        this.log("warn", "ghost_wallet_degraded", {
-          walletIndex,
-          ghostFailures: count,
-          threshold: GHOST_FAILURE_THRESHOLD,
-        });
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Reset ghost failure state for a wallet on any non-ghost broadcast outcome.
-   * Called after: successful RBF, successful gap-fill, BadNonce (consumed),
-   * or fee-too-low (occupant fee was discovered, so not a ghost).
-   */
-  private resetGhostState(walletIndex: number): void {
-    const wasDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
-    this.setStateValue(this.walletGhostFailuresKey(walletIndex), 0);
-    this.setStateValue(this.walletGhostDegradedKey(walletIndex), 0);
-    if (wasDegraded) {
-      this.log("info", "ghost_wallet_recovered", { walletIndex });
-    }
-  }
-
   /**
    * Compute the escalated gap-fill fee for a nonce based on prior attempts.
    * Returns baseFee + priorAttempts (capped at MAX_BROADCAST_FEE), or baseFee if no prior attempts.
@@ -2910,100 +2790,6 @@ export class NonceDO {
       }
     } catch { /* fail-open — use base fee */ }
     return baseFee;
-  }
-
-  /** KV key for cross-wallet cascade quarantine tracking */
-  private readonly cascadeQuarantineKey = "cascade_quarantine_window";
-
-  /**
-   * Record a quarantine event for a specific wallet.
-   * Maintains a rolling window of recent quarantine timestamps for the circuit breaker.
-   * Also contributes to cross-wallet cascade detection.
-   * Called from releaseNonce() only for failure quarantines (not normal consumption).
-   */
-  private async recordQuarantineEvent(walletIndex: number): Promise<void> {
-    const now = new Date().toISOString();
-    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
-
-    // Update per-wallet recent quarantine list
-    const recentKey = this.walletQuarantineRecentKey(walletIndex);
-    const existing = (await this.state.storage.get<string[]>(recentKey)) ?? [];
-    const pruned = existing.filter((ts) => new Date(ts).getTime() >= cutoff);
-    pruned.push(now);
-    await this.state.storage.put(recentKey, pruned);
-
-    if (pruned.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD) {
-      this.log("warn", "circuit_breaker_triggered", {
-        walletIndex,
-        quarantineCount: pruned.length,
-        windowMs: CIRCUIT_BREAKER_WINDOW_MS,
-        threshold: CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
-      });
-    }
-
-    // Update cross-wallet cascade window
-    await this.checkCascadeThreshold(walletIndex, now);
-  }
-
-  /**
-   * Check if cross-wallet quarantines have crossed the cascade detection threshold.
-   * Logs a cascade_detected event when >= CASCADE_DETECTION_THRESHOLD quarantines
-   * have occurred across any wallets within the circuit breaker time window.
-   */
-  private async checkCascadeThreshold(walletIndex: number, ts: string): Promise<void> {
-    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
-    const existing = (await this.state.storage.get<Array<{ walletIndex: number; ts: string }>>(
-      this.cascadeQuarantineKey
-    )) ?? [];
-
-    const pruned = existing.filter((e) => new Date(e.ts).getTime() >= cutoff);
-    pruned.push({ walletIndex, ts });
-    await this.state.storage.put(this.cascadeQuarantineKey, pruned);
-
-    if (pruned.length >= CASCADE_DETECTION_THRESHOLD) {
-      const uniqueWallets = [...new Set(pruned.map((e) => e.walletIndex))];
-      this.log("warn", "cascade_detected", {
-        totalQuarantinesInWindow: pruned.length,
-        affectedWallets: uniqueWallets,
-        windowMs: CIRCUIT_BREAKER_WINDOW_MS,
-        threshold: CASCADE_DETECTION_THRESHOLD,
-        detectedAt: ts,
-      });
-    }
-  }
-
-  /**
-   * Return true when a cross-wallet cascade is currently active.
-   * A cascade is active when >= CASCADE_DETECTION_THRESHOLD quarantine events have
-   * been recorded across any wallets within the CIRCUIT_BREAKER_WINDOW_MS window.
-   * Reads the same KV key that checkCascadeThreshold() writes so the signal is
-   * consistent without adding a separate flag.
-   */
-  private async isCascadeActive(): Promise<boolean> {
-    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
-    const existing = (await this.state.storage.get<Array<{ walletIndex: number; ts: string }>>(
-      this.cascadeQuarantineKey
-    )) ?? [];
-    const pruned = existing.filter((e) => new Date(e.ts).getTime() >= cutoff);
-    if (pruned.length !== existing.length) {
-      await this.state.storage.put(this.cascadeQuarantineKey, pruned);
-    }
-    return pruned.length >= CASCADE_DETECTION_THRESHOLD;
-  }
-
-  /**
-   * Return the effective "stuck tx" age threshold for RBF eligibility.
-   * During a cascade the relay needs to RBF stuck transactions sooner so the
-   * nonce pipeline can drain before the situation worsens.
-   *
-   * - circuitOpen (any wallet): 3 min — most aggressive, wallet already skipped
-   * - cascadeActive:            5 min — multiple wallets affected, speed up RBF
-   * - normal:                  15 min (STUCK_TX_AGE_MS)
-   */
-  private getEffectiveStuckTxAge(cascadeActive: boolean, circuitOpen: boolean): number {
-    if (circuitOpen) return STUCK_TX_AGE_CIRCUIT_OPEN_MS;
-    if (cascadeActive) return STUCK_TX_AGE_CASCADE_MS;
-    return STUCK_TX_AGE_MS;
   }
 
   /**
@@ -3970,76 +3756,28 @@ export class NonceDO {
         )
       );
 
-      // Round-robin: start from stored nextWalletIndex, find a wallet under chaining limit
-      let walletIndex = (await this.getNextWalletIndex()) % effectiveWalletCount;
-
       // Resolve the correct sponsor address for a given wallet index.
       // In multi-wallet mode, each wallet has its own Stacks address for nonce seeding.
       const resolveAddress = (wi: number): string =>
         addresses?.[String(wi)] ?? sponsorAddress;
 
-      // Try each wallet in round-robin order; skip any at chaining limit or degraded (stuck nonce)
-      let attempts = 0;
+      // Scan all wallets and select the one with the most available headroom.
+      // No degradation flags — per-nonce occupied tracking handles conflicts.
       let totalMempoolDepth = 0;
-      // Track degraded wallets for fallback (walletIndex only — no pool state needed)
-      const degradedWallets: Array<{ walletIndex: number; cycleCount: number }> = [];
-      /** Eligible (under chaining limit) wallets with their available headroom */
       const eligibleWallets: Array<{ walletIndex: number; headroom: number }> = [];
-      let selectedWalletIndex: number | null = null;
 
-      while (attempts < effectiveWalletCount) {
-        // Ensure wallet head is initialized before circuit breaker check
-        await this.initWalletHeadFromHiro(walletIndex, resolveAddress(walletIndex));
-
-        // Check per-wallet circuit breaker: skip if too many recent quarantines
-        const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
-        const recentQuarantines = (
-          await this.state.storage.get<string[]>(this.walletQuarantineRecentKey(walletIndex))
-        ) ?? [];
-        const activeQuarantines = recentQuarantines.filter(
-          (ts) => new Date(ts).getTime() >= cutoff
-        );
-        if (activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD) {
-          this.log("warn", "circuit_breaker_skip", {
-            walletIndex,
-            quarantineCount: activeQuarantines.length,
-            windowMs: CIRCUIT_BREAKER_WINDOW_MS,
-            threshold: CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
-          });
-          degradedWallets.push({ walletIndex, cycleCount: 0 });
-          walletIndex = (walletIndex + 1) % effectiveWalletCount;
-          attempts++;
-          continue;
-        }
-
-        // Check ghost-degraded state: skip wallets where broadcast failures indicate
-        // the node holds transactions invisible to Hiro (ghost mempool entries).
-        const isGhostDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
-        if (isGhostDegraded) {
-          this.log("warn", "ghost_degraded_skip", {
-            walletIndex,
-            ghostFailures: this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0,
-          });
-          degradedWallets.push({ walletIndex, cycleCount: 0 });
-          walletIndex = (walletIndex + 1) % effectiveWalletCount;
-          attempts++;
-          continue;
-        }
-
-        const headroom = this.walletHeadroom(walletIndex);
+      for (let i = 0; i < effectiveWalletCount; i++) {
+        await this.initWalletHeadFromHiro(i, resolveAddress(i));
+        const headroom = this.walletHeadroom(i);
         if (headroom > 0) {
-          // Collect all eligible wallets; select by headroom after full scan
-          eligibleWallets.push({ walletIndex, headroom });
+          eligibleWallets.push({ walletIndex: i, headroom });
         } else {
-          // This wallet is at its chaining limit; accumulate depth for error reporting
-          totalMempoolDepth += CHAINING_LIMIT - headroom; // headroom is 0 (or negative on fallback path)
+          totalMempoolDepth += CHAINING_LIMIT - headroom;
         }
-        walletIndex = (walletIndex + 1) % effectiveWalletCount;
-        attempts++;
       }
 
-      // Select wallet with most chain headroom (fewest in-flight nonces).
-      // Prefer a wallet that has more room to absorb additional burst traffic.
+      // Select wallet with most available headroom (fewest in-flight nonces).
+      let selectedWalletIndex: number | null = null;
       if (eligibleWallets.length > 0) {
         eligibleWallets.sort((a, b) => b.headroom - a.headroom);
         const best = eligibleWallets[0];
@@ -4057,35 +3795,10 @@ export class NonceDO {
       }
 
       if (selectedWalletIndex === null) {
-        // No healthy wallet with capacity was found. Remaining wallets are either:
-        // - At chaining limit (healthy but full)
-        // - Circuit-broken (degraded, may have capacity)
-        // Reject instead of falling back to a degraded wallet — feeding transactions
-        // into a broken pool amplifies contention (see #226).
-        const degradedNotFull = degradedWallets.filter(
-          (d) => this.walletHeadroom(d.walletIndex) > 0
-        );
-        if (degradedNotFull.length > 0) {
-          // The only wallets with capacity are circuit-broken — reject so callers
-          // can distinguish this from pure chaining limit exhaustion.
-          const totalReservedAll = this.poolTotalReserved(effectiveWalletCount);
-          this.log("warn", "all_wallets_degraded_rejecting", {
-            degradedCount: degradedWallets.length,
-            degradedNotFullCount: degradedNotFull.length,
-            totalReserved: totalReservedAll,
-            totalCapacity: effectiveWalletCount * CHAINING_LIMIT,
-          });
-          throw new AllWalletsDegradedError(
-            degradedWallets.length,
-            totalReservedAll,
-            effectiveWalletCount * CHAINING_LIMIT,
-          );
-        } else {
-          throw new ChainingLimitError(totalMempoolDepth);
-        }
+        throw new ChainingLimitError(totalMempoolDepth);
       }
 
-      walletIndex = selectedWalletIndex;
+      const walletIndex = selectedWalletIndex;
 
       // Store the per-wallet sponsor address (used by alarm reconciliation)
       await this.setStoredSponsorAddressForWallet(walletIndex, resolveAddress(walletIndex));
@@ -4165,13 +3878,12 @@ export class NonceDO {
    *
    * txid present   → nonce was broadcast successfully; mark as 'confirmed' in ledger.
    * txid absent    → nonce was NOT broadcast (e.g. broadcast failure). Priority order:
-   *   1. errorReason provided → immediate quarantine ('failed' state) + recordQuarantineEvent.
-   *      Use for contention-specific terminal failures (TooMuchChaining, nonce_conflict).
-   *   2. Prior txid in nonce_txids → quarantine (broadcast happened but release has no txid).
+   *   1. errorReason provided → mark as 'failed' with reason recorded.
+   *   2. Prior txid in nonce_txids → mark as 'failed' (broadcast happened but release has no txid).
    *   3. Neither → mark as 'expired' (truly unused nonce, available for gap-fill).
    * walletIndex    → which wallet the nonce belongs to (default: 0)
    * fee            → when provided with txid (broadcast succeeded), recorded in cumulative wallet stats
-   * errorReason    → triggers quarantine when txid is absent (feeds circuit breaker)
+   * errorReason    → recorded in ledger for diagnostics
    */
   async releaseNonce(nonce: number, txid?: string, walletIndex: number = 0, fee?: string, errorReason?: string): Promise<void> {
     return this.state.blockConcurrencyWhile(async () => {
@@ -4190,14 +3902,8 @@ export class NonceDO {
         return;
       }
 
-      // Track whether this is a failure quarantine (for circuit breaker)
-      let failureQuarantined = false;
-
       if (!txid) {
-        // Caller-supplied error reason (e.g. TooMuchChaining, nonce_conflict from queue-consumer)
-        // takes priority — quarantine immediately so the circuit breaker fires.
         if (errorReason) {
-          failureQuarantined = true;
           this.log("warn", "nonce_quarantined", {
             walletIndex,
             nonce,
@@ -4206,7 +3912,6 @@ export class NonceDO {
           this.ledgerRelease(walletIndex, nonce, undefined, errorReason);
         } else {
           // No explicit error reason: check if a txid was previously recorded in nonce_txids.
-          // If so, the nonce was broadcast at some point — quarantine as failure.
           const txidRows = this.sql
             .exec<{ count: number }>(
               "SELECT COUNT(*) as count FROM nonce_txids WHERE nonce = ?",
@@ -4216,8 +3921,6 @@ export class NonceDO {
           const hasPriorTxid = (txidRows[0]?.count ?? 0) > 0;
 
           if (hasPriorTxid) {
-            // Nonce was broadcast at some point — quarantine permanently
-            failureQuarantined = true;
             this.log("warn", "nonce_quarantined", {
               walletIndex,
               nonce,
@@ -4226,15 +3929,12 @@ export class NonceDO {
             this.ledgerRelease(walletIndex, nonce, undefined, "txid_recorded_on_failed_release");
           } else {
             // Truly unused nonce (never broadcast) — mark expired
-            // The ledger head already advanced past this nonce on assignment,
-            // so this creates a gap that reconciliation will fill if needed.
             this.ledgerRelease(walletIndex, nonce, undefined);
           }
         }
       } else {
         // txid provided: nonce was broadcast successfully — consumed
         if (fee && fee !== "0") {
-          // Broadcast succeeded and fee provided — record in wallet stats
           await this.recordWalletFee(walletIndex, fee);
         }
         this.ledgerRelease(walletIndex, nonce, txid);
@@ -4247,11 +3947,6 @@ export class NonceDO {
         txid: txid ?? null,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
       });
-
-      // Circuit breaker: only record failure quarantines (not normal consumption).
-      if (failureQuarantined) {
-        await this.recordQuarantineEvent(walletIndex);
-      }
 
       await this.refreshSponsorStatusSnapshot();
     });
@@ -4309,80 +4004,42 @@ export class NonceDO {
    */
   async getPoolHealth(): Promise<PoolHealthResponse> {
     const initializedWallets = await this.getInitializedWallets();
-    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
 
-    // Parallelize KV reads across wallets — avoids N serial awaits as the pool grows
-    const wallets: WalletHealthSnapshot[] = await Promise.all(
-      initializedWallets.map(async ({ walletIndex }) => {
-        const recentQuarantines =
-          (await this.state.storage.get<string[]>(
-            this.walletQuarantineRecentKey(walletIndex)
-          )) ?? [];
-        const activeQuarantines = recentQuarantines.filter(
-          (ts) => new Date(ts).getTime() >= cutoff
-        );
-        const cbOpen = activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
-        const reserved = this.ledgerReservedCount(walletIndex);
-        const available = Math.max(0, CHAINING_LIMIT - reserved);
-        // Queue state for observability (dispatch_queue + replay_buffer)
-        const queueState = this.getDispatchQueueDepth(walletIndex);
-        const replayDepth = this.getReplayBufferDepth(walletIndex);
-        return {
-          walletIndex,
-          circuitBreakerOpen: cbOpen,
-          reserved,
-          available,
-          quarantineCount: activeQuarantines.length,
-          queueDepth: queueState.total,
-          replayBufferDepth: replayDepth,
-          dispatchedCount: queueState.dispatched,
-        };
-      })
-    );
+    const wallets: WalletHealthSnapshot[] = initializedWallets.map(({ walletIndex }) => {
+      const reserved = this.ledgerReservedCount(walletIndex);
+      const available = Math.max(0, CHAINING_LIMIT - reserved);
+      const queueState = this.getDispatchQueueDepth(walletIndex);
+      const replayDepth = this.getReplayBufferDepth(walletIndex);
+      return {
+        walletIndex,
+        circuitBreakerOpen: false,
+        reserved,
+        available,
+        quarantineCount: 0,
+        queueDepth: queueState.total,
+        replayBufferDepth: replayDepth,
+        dispatchedCount: queueState.dispatched,
+      };
+    });
 
     const totalReserved = wallets.reduce((s, w) => s + w.reserved, 0);
-    const degradedCount = wallets.filter((w) => w.circuitBreakerOpen).length;
     const totalCapacity = initializedWallets.length * CHAINING_LIMIT;
-    const allWalletsDegraded =
-      initializedWallets.length > 0 && degradedCount === initializedWallets.length;
 
-    return { allWalletsDegraded, totalReserved, totalCapacity, wallets };
+    return { allWalletsDegraded: false, totalReserved, totalCapacity, wallets };
   }
 
   private async buildSponsorStatusSnapshot(): Promise<StoredSponsorStatusSnapshot> {
     const initializedWallets = await this.getInitializedWallets();
-    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
-    const walletSnapshots = await Promise.all(
-      initializedWallets.map(async ({ walletIndex }) => {
-        const recentQuarantines =
-          (await this.state.storage.get<string[]>(
-            this.walletQuarantineRecentKey(walletIndex)
-          )) ?? [];
-        const activeQuarantines = recentQuarantines.filter(
-          (ts) => new Date(ts).getTime() >= cutoff
-        );
-        const ghostDegraded =
-          (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
-        const rawAvailable = this.walletHeadroom(walletIndex);
-        // Ghost-degraded wallets are skipped by assignNonce, so report 0 available
-        const available = ghostDegraded ? 0 : Math.max(0, Math.min(CHAINING_LIMIT, rawAvailable));
-        const reserved = CHAINING_LIMIT - available;
-        return {
-          circuitBreakerOpen:
-            activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD,
-          ghostDegraded,
-          available,
-          reserved,
-        };
-      })
-    );
+    const walletSnapshots = initializedWallets.map(({ walletIndex }) => {
+      const available = Math.max(0, Math.min(CHAINING_LIMIT, this.walletHeadroom(walletIndex)));
+      const reserved = CHAINING_LIMIT - available;
+      return { available, reserved };
+    });
     const walletCount = walletSnapshots.length;
     const totalAvailable = walletSnapshots.reduce((sum, wallet) => sum + wallet.available, 0);
     const totalReserved = walletSnapshots.reduce((sum, wallet) => sum + wallet.reserved, 0);
     const totalCapacity = walletCount * CHAINING_LIMIT;
-    const allWalletsDegraded =
-      walletCount > 0 &&
-      walletSnapshots.every((wallet) => wallet.circuitBreakerOpen || wallet.ghostDegraded);
+    const allWalletsDegraded = walletCount > 0 && totalAvailable === 0;
     const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
     const lastHiroSyncMs = this.getStateValue(STATE_KEYS.lastHiroSync);
     const healInProgress =
@@ -4576,7 +4233,6 @@ export class NonceDO {
    */
   async getObservableNonceState(): Promise<ObservableNonceState> {
     const initializedWallets = await this.getInitializedWallets();
-    const cutoff = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
     const lastGapDetectedMs = this.getStateValue(STATE_KEYS.lastGapDetected);
     const gapsFilled = this.getStoredCount(STATE_KEYS.gapsFilled);
 
@@ -4675,20 +4331,7 @@ export class NonceDO {
           }
         }
 
-        // Circuit breaker state
-        const recentQuarantines =
-          (await this.state.storage.get<string[]>(
-            this.walletQuarantineRecentKey(walletIndex)
-          )) ?? [];
-        const activeQuarantines = recentQuarantines.filter(
-          (ts) => new Date(ts).getTime() >= cutoff
-        );
-        const circuitBreakerOpen =
-          activeQuarantines.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
-
         // Use walletHeadroom() — same calculation as the assignment path.
-        // Counts assigned + broadcasted + confirmed (all in-flight states),
-        // not just 'assigned' like ledgerReservedCount().
         const available = this.walletHeadroom(walletIndex);
         const reserved = CHAINING_LIMIT - available;
 
@@ -4699,10 +4342,6 @@ export class NonceDO {
         // Settlement time percentiles for this wallet (last 24h)
         const settlementTimes = this.computeSettlementPercentiles(walletIndex);
 
-        // Ghost degraded state
-        const ghostDegraded = (this.getStateValue(this.walletGhostDegradedKey(walletIndex)) ?? 0) === 1;
-        const ghostFailures = this.getStateValue(this.walletGhostFailuresKey(walletIndex)) ?? 0;
-
         return {
           walletIndex,
           sponsorAddress: address,
@@ -4712,19 +4351,16 @@ export class NonceDO {
           gaps,
           available,
           reserved,
-          circuitBreakerOpen,
-          healthy: gaps.length === 0 && !circuitBreakerOpen && !ghostDegraded && available > 0,
+          circuitBreakerOpen: false,
+          healthy: gaps.length === 0 && available > 0,
           queueDepth: queueState.total,
           replayBufferDepth: replayDepth,
           settlementTimes,
-          ghostDegraded,
-          ghostFailures,
         };
       })
     );
 
     const anyGaps = wallets.some((w) => w.gaps.length > 0);
-    const allDegraded = wallets.length > 0 && wallets.every((w) => w.circuitBreakerOpen);
     const totalAvailable = wallets.reduce((s, w) => s + w.available, 0);
     const totalReserved = wallets.reduce((s, w) => s + w.reserved, 0);
     const totalCapacity = initializedWallets.length * CHAINING_LIMIT;
@@ -4733,11 +4369,9 @@ export class NonceDO {
     const healInProgress = lastGapDetectedMs !== null &&
       Date.now() - lastGapDetectedMs < ALARM_INTERVAL_ACTIVE_MS * 2;
 
-    const healthy = !anyGaps && !allDegraded && totalAvailable > 0;
-    // recommendation is derived here (single source of truth) so endpoints
-    // don't duplicate the fallback decision logic.
+    const healthy = !anyGaps && totalAvailable > 0;
     const recommendation: "fallback_to_direct" | null =
-      !healthy && (anyGaps || allDegraded) ? "fallback_to_direct" : null;
+      !healthy && anyGaps ? "fallback_to_direct" : null;
 
     // Sender hands: active senders with held transactions waiting for nonce gap fill.
     // Capped at 50 senders to bound the response size.
@@ -5305,7 +4939,6 @@ export class NonceDO {
   private async reconcileNonceForWallet(
     walletIndex: number,
     sponsorAddress: string,
-    cascadeActive = false
   ): Promise<ReconcileResult | null> {
     let nonceInfo: HiroNonceInfo;
     try {
@@ -5386,19 +5019,6 @@ export class NonceDO {
       "conflict_recent_skip",
     ]);
 
-    // -------------------------------------------------------------------------
-    // Cascade-aware RBF threshold: when a cross-wallet cascade is active or this
-    // wallet's circuit breaker is open, reduce the stuck-tx age so RBF fires sooner
-    // and the nonce pipeline drains faster without waiting for agent retries.
-    // -------------------------------------------------------------------------
-    const cutoffForCircuitBreaker = Date.now() - CIRCUIT_BREAKER_WINDOW_MS;
-    const recentQuarantinesForWallet =
-      (await this.state.storage.get<string[]>(this.walletQuarantineRecentKey(walletIndex))) ?? [];
-    const activeQuarantinesForWallet = recentQuarantinesForWallet.filter(
-      (ts) => new Date(ts).getTime() >= cutoffForCircuitBreaker
-    );
-    const walletCircuitOpen = activeQuarantinesForWallet.length >= CIRCUIT_BREAKER_QUARANTINE_THRESHOLD;
-    const effectiveStuckTxAge = this.getEffectiveStuckTxAge(cascadeActive, walletCircuitOpen);
 
     // -------------------------------------------------------------------------
     // Cross-reference: broadcasted nonces (have a txid recorded in ledger)
@@ -5424,7 +5044,7 @@ export class NonceDO {
         verdict = "pending_agree";
         reason = "ledger_and_hiro_both_pending";
         verdictPendingAgree++;
-      } else if (missingNonceSet.has(nonce) && ageMs < effectiveStuckTxAge) {
+      } else if (missingNonceSet.has(nonce) && ageMs < STUCK_TX_AGE_MS) {
         // Hiro lost sight of tx we know we sent — tx is young, wait for Hiro to catch up
         verdict = "pending_diverge";
         reason = "hiro_missing_but_tx_young";
@@ -5436,7 +5056,7 @@ export class NonceDO {
           ageMs,
           reason: "hiro_reports_missing_but_we_broadcasted_recently",
         });
-      } else if (missingNonceSet.has(nonce) && ageMs >= effectiveStuckTxAge) {
+      } else if (missingNonceSet.has(nonce) && ageMs >= STUCK_TX_AGE_MS) {
         // Hiro and time both say trouble — RBF candidate (tx status check in RBF section)
         verdict = "rbf_candidate";
         reason = "hiro_missing_and_tx_old";
@@ -5445,7 +5065,7 @@ export class NonceDO {
       } else if (
         !mempoolNonceSet.has(nonce) &&
         (last_executed_tx_nonce === null || nonce > last_executed_tx_nonce) &&
-        ageMs >= effectiveStuckTxAge
+        ageMs >= STUCK_TX_AGE_MS
       ) {
         // Not in mempool AND not confirmed AND old — likely evicted from all mempools
         verdict = "rbf_candidate";
@@ -5830,13 +5450,10 @@ export class NonceDO {
         });
       }
       const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
-      // During a cascade, allow more gap-fills per cycle (15 vs 5) to drain stuck nonces faster.
-      // Gap-fills are cheap (1 uSTX + 30k fee) so the cost increase is negligible.
-      const effectiveMaxGapFills = cascadeActive ? 15 : MAX_GAP_FILLS_PER_ALARM;
       const gapsToFill = gapFillNonces
         .slice()
         .sort((a, b) => a - b)
-        .slice(0, Math.min(effectiveMaxGapFills, gapFillBudget));
+        .slice(0, Math.min(MAX_GAP_FILLS_PER_ALARM, gapFillBudget));
       if (privateKey) {
         for (const gapNonce of gapsToFill) {
           // Fee escalation: conflict retries use GAP_FILL_FEE + prior attempts (+1 uSTX each)
@@ -5855,7 +5472,7 @@ export class NonceDO {
             gapFillFilled.push(gapNonce);
             this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
             await this.recordGapFillFee(walletIndex, actualFee.toString());
-            this.resetGhostState(walletIndex);
+
           }
         }
       }
@@ -5949,14 +5566,7 @@ export class NonceDO {
     // dispatch_queue, flush their sponsor nonce slots with self-transfers,
     // and move sender txs to the replay buffer for re-sponsoring.
     // -------------------------------------------------------------------------
-    const flushResult = await this.runFlushAndReplayCycle(walletIndex, effectiveStuckTxAge);
-
-    // -------------------------------------------------------------------------
-    // Auto-clear ghost_degraded when wallet shows confirmed transactions this cycle.
-    // If nonces are confirming, the wallet is broadcasting successfully — ghost state is stale.
-    if (verdictConfirmed > 0) {
-      this.resetGhostState(walletIndex);
-    }
+    const flushResult = await this.runFlushAndReplayCycle(walletIndex, STUCK_TX_AGE_MS);
 
     // Log reconciliation_summary for this wallet
     // -------------------------------------------------------------------------
@@ -6919,10 +6529,6 @@ export class NonceDO {
 
         const initializedWallets = await this.getInitializedWallets();
 
-        // Read cascade state once per alarm cycle so we don't repeat the KV read
-        // inside every wallet's reconcileNonceForWallet call.
-        const cascadeActive = await this.isCascadeActive();
-
         // ---------------------------------------------------------------------------
         // Bounded reconciliation: process MAX_RECONCILE_WALLETS wallets per tick.
         // Round-robin cursor advances each tick so all wallets reconcile over time.
@@ -6941,7 +6547,7 @@ export class NonceDO {
 
         for (const { walletIndex, address } of reconcileWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
-          await this.reconcileNonceForWallet(walletIndex, address, cascadeActive);
+          await this.reconcileNonceForWallet(walletIndex, address);
 
           // Clean up StuckTxState entries for nonces that have been confirmed on-chain.
           const cached = this.hiroNonceCache.get(walletIndex);
@@ -7046,22 +6652,19 @@ export class NonceDO {
 
         await this.refreshSponsorStatusSnapshot();
 
-        // Dynamic alarm interval: use cascade (20s) when cascade is active + in-flight nonces,
-        // active (60s) when in-flight nonces present, idle (5min) when all wallets are drained.
+        // Dynamic alarm interval: active (60s) when in-flight nonces present,
+        // idle (5min) when all wallets are drained.
         const totalReservedAfterCycle = this.ledgerTotalAssigned();
         const probeQueuePending = this.sql
           .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM probe_queue WHERE state = 'pending'")
           .toArray()[0]?.cnt ?? 0;
         const isActive = totalReservedAfterCycle > 0 || probeQueuePending > 0;
-        const intervalMs = cascadeActive && isActive
-          ? ALARM_INTERVAL_CASCADE_MS
-          : isActive ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
+        const intervalMs = isActive ? ALARM_INTERVAL_ACTIVE_MS : ALARM_INTERVAL_IDLE_MS;
         this.log("info", "nonce_alarm_scheduled", {
           intervalMs,
           activeWallets: initializedWallets.length,
           totalReserved: totalReservedAfterCycle,
           isActive,
-          cascadeActive,
           walletCursor,
           nextWalletCursor,
           reconcileCount: reconcileWallets.length,
@@ -7305,7 +6908,6 @@ export class NonceDO {
           this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
           this.incrementCounter(STATE_KEYS.gapsFilled);
           await this.recordGapFillFee(walletIndex, escalatedFee.toString());
-          this.resetGhostState(walletIndex);
         } else {
           failed.push({ nonce: gapNonce, reason: "broadcast rejected or already occupied" });
         }
@@ -7505,7 +7107,6 @@ export class NonceDO {
                 this.ledgerInsertGapFill(walletIndex, nonce, gapTxid);
                 this.incrementCounter(STATE_KEYS.gapsFilled);
                 await this.recordGapFillFee(walletIndex, flushFee.toString());
-                this.resetGhostState(walletIndex);
                 filled.push({ nonce, txid: gapTxid, method: "gap_fill" });
               } else {
                 failedNonces.push({ nonce, reason: "rbf and gap-fill both failed or already occupied" });
@@ -7542,7 +7143,6 @@ export class NonceDO {
               this.ledgerInsertGapFill(walletIndex, nonce, txid);
               this.incrementCounter(STATE_KEYS.gapsFilled);
               await this.recordGapFillFee(walletIndex, gapFlushFee.toString());
-              this.resetGhostState(walletIndex);
               filled.push({ nonce, txid, method: "gap_fill" });
             } else {
               // ConflictingNonceInMempool means already occupied — not a hard failure
@@ -7640,18 +7240,6 @@ export class NonceDO {
                 "Retry-After": String(error.retryAfterSeconds),
               },
             }
-          );
-        }
-        if (error instanceof AllWalletsDegradedError) {
-          return this.jsonResponse(
-            {
-              error: "All sponsor wallets are circuit-broken; retry after recovery",
-              code: "ALL_WALLETS_DEGRADED",
-              degradedCount: error.degradedCount,
-              totalReserved: error.totalReserved,
-              totalCapacity: error.totalCapacity,
-            },
-            503
           );
         }
         if (error instanceof ChainingLimitError) {

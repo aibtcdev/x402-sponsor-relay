@@ -31,7 +31,7 @@
     "wrangler": "^4.75.0"
   },
   "dependencies": {
-    "@aibtc/tx-schemas": "^0.3.0",
+    "@aibtc/tx-schemas": "^0.4.0",
     "@noble/curves": "^2.0.1",
     "@scure/btc-signer": "^2.0.1",
     "@stacks/common": "^7.3.1",
