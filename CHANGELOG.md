@@ -7,6 +7,14 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.27.3](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.2...x402-sponsor-relay-v1.27.3) (2026-04-06)
+
+
+### Bug Fixes
+
+* **nonce-do:** stop zombie gap-fill loop and add ghost wallet detection ([#304](https://github.com/aibtcdev/x402-sponsor-relay/issues/304)) ([#305](https://github.com/aibtcdev/x402-sponsor-relay/issues/305)) ([f88d6bb](https://github.com/aibtcdev/x402-sponsor-relay/commit/f88d6bb5cf4fee33e05a10ae7fc58948778bda7e))
+* wire fee escalation into all gap-fill callers and add ghost wallet tests ([#309](https://github.com/aibtcdev/x402-sponsor-relay/issues/309)) ([5915001](https://github.com/aibtcdev/x402-sponsor-relay/commit/591500178287802533514ca82ea4dbf5d3b214d8))
+
 ## [1.27.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.1...x402-sponsor-relay-v1.27.2) (2026-04-03)
 
 
