@@ -993,7 +993,7 @@ export interface DashboardOverview {
   /** Per-endpoint transaction breakdown (today's calendar-day counters) */
   endpointBreakdown?: EndpointBreakdown;
   /**
-   * Error counts grouped by tx-schemas terminal reason category (rolling 24h).
+   * Error counts grouped by tx-schemas terminal reason category (today, calendar day UTC).
    * Additive alongside legacy `errors` object — both are present for backward compat.
    * Categories: validation, sender, relay, settlement, replacement, identity
    */

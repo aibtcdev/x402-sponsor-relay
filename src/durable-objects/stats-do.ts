@@ -989,20 +989,8 @@ export class StatsDO {
     // Rolling previous 24h (24-48h ago) for rolling-vs-rolling comparison (Bug #7 fix).
     const prev24h = this.readPrevious24hTotals();
 
-    // Fee trend: compare rolling fee total vs previous 24h rolling fee total.
-    // Previous rolling fee data isn't tracked in hourly_stats (would need a separate window query).
-    // Use previous 24h transaction count as a proxy to avoid needing extra columns.
-    const previousFeeTotal = 0n; // Fee trend vs previous window not yet tracked
-    const currentFeeTotal = rolling.fees;
-    let feeTrend: "up" | "down" | "stable" = "stable";
-    if (previousFeeTotal === 0n) {
-      feeTrend = currentFeeTotal > 0n ? "up" : "stable";
-    } else {
-      const diff = currentFeeTotal - previousFeeTotal;
-      const pctChange = (diff * 100n) / previousFeeTotal;
-      if (pctChange > 5n) feeTrend = "up";
-      else if (pctChange < -5n) feeTrend = "down";
-    }
+    // TODO: implement previous-window fee comparison
+    const feeTrend: "up" | "down" | "stable" = rolling.fees > 0n ? "up" : "stable";
 
     // Per-endpoint breakdown from today's daily_stats
     const endpointBreakdown = this.readEndpointBreakdown(current.date);

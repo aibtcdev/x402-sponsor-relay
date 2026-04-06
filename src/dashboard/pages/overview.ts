@@ -316,7 +316,7 @@ ${header(network)}
     <!-- Error Breakdown by Terminal Reason Category -->
     <div class="detail-section" x-data="{ open: false }">
       <button class="detail-section__header" @click="open = !open" type="button">
-        <span class="text-sm font-semibold text-white">Error Breakdown (24h)</span>
+        <span class="text-sm font-semibold text-white">Error Breakdown (Today)</span>
         <svg class="detail-section__chevron" :class="{ 'detail-section__chevron--open': open }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
         </svg>

@@ -303,7 +303,7 @@ export function feesDetailCard(fees: { total: string; average: string; min: stri
 
 /**
  * Terminal reason breakdown card — server-rendered breakdown of error counts
- * grouped by tx-schemas terminal reason category (rolling 24h).
+ * grouped by tx-schemas terminal reason category (today, calendar day UTC).
  *
  * Categories: validation, sender, relay, settlement, replacement, identity
  * Returns null-safe HTML: shows "No errors" when all counts are zero or data is missing.
@@ -333,11 +333,11 @@ export function terminalReasonsCard(reasons: DashboardOverview["terminalReasons"
     <span class="text-sm font-medium ${count > 0 ? "text-white" : "text-gray-600"}">${formatNumber(count)}</span>
   </div>`;
       }).join("")
-    : `<p class="text-sm text-gray-500 py-2">No errors in rolling 24h window</p>`;
+    : `<p class="text-sm text-gray-500 py-2">No errors today</p>`;
 
   return `
 <div class="brand-card p-4">
-  <p class="text-sm text-gray-400 mb-3">Error Breakdown (24h)</p>
+  <p class="text-sm text-gray-400 mb-3">Error Breakdown (Today)</p>
   ${rows}
 </div>`;
 }
