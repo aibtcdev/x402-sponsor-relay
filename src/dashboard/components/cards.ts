@@ -262,30 +262,6 @@ export function settlementTimeCard(): string {
 }
 
 /**
- * Fees spent card — server-rendered card showing total STX fees sponsored.
- *
- * @param totalFees - Total fees in microSTX as a string (e.g. "1234567890")
- * @param avgFee - Average fee per transaction in microSTX as a string (e.g. "12345")
- */
-export function feesSpentCard(totalFees: string, avgFee: string): string {
-  const formattedTotal = formatTokenAmount(totalFees, "STX");
-  const avgFeeNum = parseInt(avgFee || "0", 10);
-
-  return `
-<div class="brand-card p-4">
-  <div class="flex items-center justify-between">
-    <p class="text-sm text-gray-400">Fees Sponsored</p>
-    <svg class="w-5 h-5 text-orange-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-        d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-    </svg>
-  </div>
-  <p class="text-2xl font-bold mt-2" style="color: ${colors.brand.orange}">${escapeHtml(formattedTotal)}</p>
-  <p class="text-xs text-gray-500 mt-1">avg: ${formatNumber(avgFeeNum)} uSTX / tx</p>
-</div>`;
-}
-
-/**
  * Fees detail card — server-rendered card showing total, avg, min, and max STX fees.
  * Uses rolling 24h data from DashboardOverview.fees (Phases 1-2 data sources).
  *
