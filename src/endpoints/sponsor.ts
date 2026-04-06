@@ -463,6 +463,7 @@ export class Sponsor extends BaseEndpoint {
           txid,
           sender: validation.senderAddress,
           status: "pending",
+          walletIndex: sponsorWalletIndex,
         }).catch(() => {})
       );
 

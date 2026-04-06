@@ -789,6 +789,7 @@ export class Relay extends BaseEndpoint {
           recipient: verifyResult.data.recipient,
           status: broadcastResult.status,
           blockHeight: confirmedBlockHeight,
+          walletIndex: sponsorWalletIndex,
         }).catch(() => {})
       );
 

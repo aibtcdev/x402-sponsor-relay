@@ -209,6 +209,7 @@ export class Settle extends BaseEndpoint {
         recipient,
         status: "pending",
         fee: sponsorFee,
+        walletIndex: sponsorWalletIndex,
       }).catch(() => {})
     );
 
