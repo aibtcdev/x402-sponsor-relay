@@ -6,8 +6,10 @@ import {
   healthCard,
   successRateCard,
   statusBannerPlaceholder,
-  feesSpentCard,
+  feesDetailCard,
   settlementTimeCard,
+  terminalReasonsCard,
+  walletThroughputCard,
 } from "../components/cards";
 import {
   formatTrend,
@@ -151,9 +153,16 @@ ${header(network)}
         icon: `<svg class="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`,
       })}
 
-      ${successRateCard(data.transactions.success, data.transactions.total, data.transactions.clientErrors)}
+      ${successRateCard(
+        data.transactions.success,
+        data.transactions.total,
+        data.transactions.clientErrors,
+        data.transactions.effectiveSuccessRate !== undefined
+          ? { effectiveRateOverride: data.transactions.effectiveSuccessRate, rawRateOverride: data.transactions.rawSuccessRate }
+          : undefined
+      )}
 
-      ${feesSpentCard(data.fees.total, data.fees.average)}
+      ${feesDetailCard({ total: data.fees.total, average: data.fees.average, min: data.fees.min, max: data.fees.max })}
 
       ${settlementTimeCard()}
     </div>
@@ -299,6 +308,49 @@ ${header(network)}
       </button>
       <div class="detail-section__body" x-show="open" x-cloak>
         ${endpointBreakdownCards(data.endpointBreakdown)}
+      </div>
+    </div>
+    ` : ""}
+
+    ${data.terminalReasons ? `
+    <!-- Error Breakdown by Terminal Reason Category -->
+    <div class="detail-section" x-data="{ open: false }">
+      <button class="detail-section__header" @click="open = !open" type="button">
+        <span class="text-sm font-semibold text-white">Error Breakdown (24h)</span>
+        <svg class="detail-section__chevron" :class="{ 'detail-section__chevron--open': open }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div class="detail-section__body" x-show="open" x-cloak>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          ${terminalReasonsCard(data.terminalReasons)}
+          <div class="brand-card p-4">
+            <p class="text-sm text-gray-400 mb-3">Category Guide</p>
+            <div class="space-y-1">
+              <p class="text-xs text-gray-500"><span style="color: ${colors.terminalReasons.validation}">Validation</span> — invalid_transaction, not_sponsored</p>
+              <p class="text-xs text-gray-500"><span style="color: ${colors.terminalReasons.sender}">Sender</span> — nonce gaps, chaining limit, expired holds</p>
+              <p class="text-xs text-gray-500"><span style="color: ${colors.terminalReasons.relay}">Relay</span> — sponsor_failure, queue_unavailable, internal</p>
+              <p class="text-xs text-gray-500"><span style="color: ${colors.terminalReasons.settlement}">Settlement</span> — broadcast_failure, chain_abort</p>
+              <p class="text-xs text-gray-500"><span style="color: ${colors.terminalReasons.replacement}">Replacement</span> — nonce_replacement, superseded</p>
+              <p class="text-xs text-gray-500"><span style="color: ${colors.terminalReasons.identity}">Identity</span> — expired, unknown_payment_identity</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    ` : ""}
+
+    ${data.walletThroughput && data.walletThroughput.length > 0 ? `
+    <!-- Wallet Throughput (24h) -->
+    <div class="detail-section" x-data="{ open: false }">
+      <button class="detail-section__header" @click="open = !open" type="button">
+        <span class="text-sm font-semibold text-white">Wallet Throughput (24h)</span>
+        <svg class="detail-section__chevron" :class="{ 'detail-section__chevron--open': open }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+        </svg>
+      </button>
+      <div class="detail-section__body" x-show="open" x-cloak>
+        ${walletThroughputCard(data.walletThroughput)}
       </div>
     </div>
     ` : ""}
