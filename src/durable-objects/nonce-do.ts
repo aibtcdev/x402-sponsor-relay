@@ -3993,14 +3993,12 @@ export class NonceDO {
   }
 
   /**
-   * Lightweight pool health check — returns per-wallet circuit breaker state
-   * and aggregate availability so callers can perform pre-flight gating
-   * before attempting nonce assignment and avoid sending traffic into
-   * known-degraded pools. Exposed via GET /pool-health for observability
-   * and the /health endpoint.
+   * Lightweight pool health check — returns per-wallet availability and
+   * aggregate capacity so callers can perform pre-flight gating before
+   * attempting nonce assignment. Exposed via GET /pool-health and /health.
    *
-   * Much cheaper than getStats() — only reads quarantine lists and reserved counts,
-   * no heavy SQL joins or utilization queries.
+   * Much cheaper than getStats() — only reads reserved counts from the
+   * ledger, no heavy SQL joins or utilization queries.
    */
   async getPoolHealth(): Promise<PoolHealthResponse> {
     const initializedWallets = await this.getInitializedWallets();
@@ -4012,6 +4010,7 @@ export class NonceDO {
       const replayDepth = this.getReplayBufferDepth(walletIndex);
       return {
         walletIndex,
+        // circuit breaker removed; always false for API compatibility
         circuitBreakerOpen: false,
         reserved,
         available,
@@ -4024,8 +4023,10 @@ export class NonceDO {
 
     const totalReserved = wallets.reduce((s, w) => s + w.reserved, 0);
     const totalCapacity = initializedWallets.length * CHAINING_LIMIT;
+    const allWalletsDegraded = initializedWallets.length > 0 &&
+      wallets.every((w) => w.available === 0);
 
-    return { allWalletsDegraded: false, totalReserved, totalCapacity, wallets };
+    return { allWalletsDegraded, totalReserved, totalCapacity, wallets };
   }
 
   private async buildSponsorStatusSnapshot(): Promise<StoredSponsorStatusSnapshot> {
@@ -5472,7 +5473,6 @@ export class NonceDO {
             gapFillFilled.push(gapNonce);
             this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
             await this.recordGapFillFee(walletIndex, actualFee.toString());
-
           }
         }
       }
@@ -5865,6 +5865,34 @@ export class NonceDO {
         error: e instanceof Error ? e.message : String(e),
       });
     }
+  }
+
+  /**
+   * One-shot cleanup: delete orphaned KV keys from removed degradation state machines
+   * (circuit breaker, ghost degraded, cascade detection). These keys are no longer
+   * read but accumulate in DO storage. Runs once; sets a flag to skip on subsequent cycles.
+   */
+  private async cleanupLegacyDegradationKeys(): Promise<void> {
+    const flagKey = "legacy_degradation_keys_cleaned";
+    if (await this.state.storage.get<boolean>(flagKey)) return;
+
+    const keysToDelete: string[] = ["cascade_quarantine_window"];
+    for (let i = 0; i < MAX_WALLET_COUNT; i++) {
+      keysToDelete.push(
+        `wallet_quarantine_recent:${i}`,
+      );
+    }
+    // nonce_state SQL keys for ghost counters
+    for (let i = 0; i < MAX_WALLET_COUNT; i++) {
+      this.setStateValue(`wallet_ghost_failures:${i}`, 0);
+      this.setStateValue(`wallet_ghost_degraded:${i}`, 0);
+    }
+    await this.state.storage.delete(keysToDelete);
+    await this.state.storage.put(flagKey, true);
+    this.log("info", "legacy_degradation_keys_cleaned", {
+      deletedKvKeys: keysToDelete.length,
+      clearedNonceStateKeys: MAX_WALLET_COUNT * 2,
+    });
   }
 
   /**
@@ -6502,8 +6530,9 @@ export class NonceDO {
   async alarm(): Promise<void> {
     await this.state.blockConcurrencyWhile(async () => {
       try {
-        // --- Gin rummy preamble: migration, replay recycling, seed upgrades ---
+        // --- Preamble: migration, cleanup, replay recycling, seed upgrades ---
         this.runGinRummyMigration();
+        await this.cleanupLegacyDegradationKeys();
         this.recycleReplayBuffer();
         await this.retrySeedFirstTxSenders();
 

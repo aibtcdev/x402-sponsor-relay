@@ -299,7 +299,7 @@ async function processPaymentMessage(
     const isTooMuchChaining = broadcastResult.tooMuchChaining === true;
     const isOriginChaining = broadcastResult.isOriginChaining === true;
 
-    if ((isNonceConflict || isTooMuchChaining) && attempt < MAX_ATTEMPTS) {
+    if ((isNonceConflict || (isTooMuchChaining && !isOriginChaining)) && attempt < MAX_ATTEMPTS) {
       // Release the sponsor nonce back to pool — no errorReason here so the nonce
       // expires cleanly without penalizing sponsor wallets on every retry attempt.
       if (sponsorNonce !== null) {
