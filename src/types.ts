@@ -890,6 +890,15 @@ export interface DailyStats {
     settlement: number;
     internal: number;
   };
+  /** Terminal reason category counts for the day (tx-schemas alignment) */
+  terminalReasons?: {
+    validation: number;
+    sender: number;
+    relay: number;
+    settlement: number;
+    replacement: number;
+    identity: number;
+  };
   /** Fee statistics for the day */
   fees?: FeeStats;
 }
@@ -959,6 +968,19 @@ export interface DashboardOverview {
   apiKeys?: AggregateKeyStats;
   /** Per-endpoint transaction breakdown (today's calendar-day counters) */
   endpointBreakdown?: EndpointBreakdown;
+  /**
+   * Error counts grouped by tx-schemas terminal reason category (rolling 24h).
+   * Additive alongside legacy `errors` object — both are present for backward compat.
+   * Categories: validation, sender, relay, settlement, replacement, identity
+   */
+  terminalReasons?: {
+    validation: number;
+    sender: number;
+    relay: number;
+    settlement: number;
+    replacement: number;
+    identity: number;
+  };
 }
 
 /**
@@ -1039,6 +1061,12 @@ export interface TransactionLogEntry {
    * allowing the relay success rate to exclude client-caused failures.
    */
   clientError?: boolean;
+  /**
+   * Terminal reason for this failure from @aibtc/tx-schemas TERMINAL_REASONS.
+   * Present only on failed transactions where the reason is known.
+   * Examples: "invalid_transaction", "sponsor_failure", "broadcast_failure", "chain_abort"
+   */
+  terminalReason?: string;
 }
 
 // =============================================================================
@@ -1100,7 +1128,7 @@ export interface WalletsResponse {
 }
 
 /**
- * Error categories for metrics tracking
+ * Error categories for metrics tracking (legacy — kept for backward compatibility)
  */
 export type ErrorCategory =
   | "validation"
@@ -1108,6 +1136,19 @@ export type ErrorCategory =
   | "sponsoring"
   | "settlement"
   | "internal";
+
+/**
+ * Terminal reason categories from @aibtc/tx-schemas.
+ * Six categories that group the 19 terminal reasons.
+ * Matches TERMINAL_REASON_CATEGORIES in "@aibtc/tx-schemas/core/terminal-reasons".
+ */
+export type TerminalReasonCategory =
+  | "validation"
+  | "sender"
+  | "relay"
+  | "settlement"
+  | "replacement"
+  | "identity";
 
 // =============================================================================
 // Fee Estimation Types
