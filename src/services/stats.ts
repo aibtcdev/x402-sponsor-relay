@@ -8,6 +8,22 @@ import type {
   RelayEndpointName,
   TransactionLogEntry,
 } from "../types";
+import type { TerminalReason } from "@aibtc/tx-schemas/core/terminal-reasons";
+
+/**
+ * Maps a legacy 5-bucket ErrorCategory to a representative terminal reason.
+ * Used for backward-compat when the specific reason is unknown at the call site.
+ * Callers that know the specific reason should pass it directly to logFailure().
+ */
+export function legacyErrorCategoryToTerminalReason(category: ErrorCategory): TerminalReason {
+  switch (category) {
+    case "validation": return "invalid_transaction";
+    case "rateLimit": return "broadcast_rate_limited";
+    case "sponsoring": return "sponsor_failure";
+    case "settlement": return "broadcast_failure";
+    case "internal": return "internal_error";
+  }
+}
 
 /**
  * Calculate trend based on current vs previous values
@@ -142,11 +158,15 @@ export class StatsService {
   /**
    * Log a failed transaction with common defaults (timestamp, success:false, status:"failed").
    * Reduces boilerplate at each error-path call site.
+   *
+   * @param terminalReason - Optional terminal reason from @aibtc/tx-schemas TERMINAL_REASONS.
+   *   When provided, StatsDO increments the matching category column in daily_stats.
    */
   async logFailure(
     endpoint: RelayEndpointName,
     clientError: boolean,
-    opts?: { tokenType?: TokenType; amount?: string; fee?: string; sender?: string; recipient?: string }
+    opts?: { tokenType?: TokenType; amount?: string; fee?: string; sender?: string; recipient?: string },
+    terminalReason?: TerminalReason
   ): Promise<void> {
     await this.logTransaction({
       timestamp: new Date().toISOString(),
@@ -159,6 +179,7 @@ export class StatsService {
       fee: opts?.fee,
       sender: opts?.sender,
       recipient: opts?.recipient,
+      terminalReason,
     });
   }
 
