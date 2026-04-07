@@ -2115,7 +2115,12 @@ export class NonceDO {
 
   /**
    * Broadcast a gap-fill STX transfer for a specific nonce.
-   * Returns the txid on success, null if the nonce is already occupied or on error.
+   * Returns { ok: true, txid } on success.
+   * Returns { ok: false, reason } on failure, where `reason` is the broadcast
+   * error code (e.g. "ConflictingNonceInMempool") or a synthetic code
+   * ("gap_fill_error" for transport failures, "gap_fill_rejected" for other 4xx).
+   * Callers that need to distinguish slot occupancy from transient failures should
+   * check whether reason === "ConflictingNonceInMempool".
    * Amount: 1 uSTX. Fee: 30,000 uSTX (RBF-capable). Memo: gap-fill-{nonce}.
    */
   private async fillGapNonce(
@@ -2123,7 +2128,7 @@ export class NonceDO {
     gapNonce: number,
     privateKey: string,
     feeOverride?: bigint
-  ): Promise<string | null> {
+  ): Promise<{ ok: true; txid: string } | { ok: false; reason: string }> {
     const fee = feeOverride ?? GAP_FILL_FEE;
     // Track gap-fill attempts for this nonce (used for fee escalation).
     // Uses INSERT ON CONFLICT so the counter is created even when no nonce_intents
@@ -2151,7 +2156,7 @@ export class NonceDO {
       });
       const result = await this.broadcastRawTx(tx, "gap_fill");
       if (result.ok) {
-        return result.txid;
+        return { ok: true, txid: result.txid };
       }
       if (result.reason === "ConflictingNonceInMempool") {
         // Nonce already occupied — update ledger to prevent re-queuing on next alarm cycle.
@@ -2212,7 +2217,7 @@ export class NonceDO {
             );
           }
         } catch { /* fail-open */ }
-        return null;
+        return { ok: false, reason: "ConflictingNonceInMempool" };
       }
       this.log("warn", "gap_fill_rejected", {
         walletIndex,
@@ -2221,14 +2226,14 @@ export class NonceDO {
         reason: result.reason,
         body: result.body,
       });
-      return null;
+      return { ok: false, reason: result.reason ?? "gap_fill_rejected" };
     } catch (e) {
       this.log("warn", "gap_fill_error", {
         walletIndex,
         nonce: gapNonce,
         error: e instanceof Error ? e.message : String(e),
       });
-      return null;
+      return { ok: false, reason: "gap_fill_error" };
     }
   }
 
@@ -5513,18 +5518,18 @@ export class NonceDO {
           // Fee escalation: conflict retries use GAP_FILL_FEE + prior attempts (+1 uSTX each)
           const escalatedFee = this.computeEscalatedFee(walletIndex, gapNonce);
           const feeOverride = escalatedFee > GAP_FILL_FEE ? escalatedFee : undefined;
-          const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey, feeOverride);
-          if (txid) {
+          const gapResult = await this.fillGapNonce(walletIndex, gapNonce, privateKey, feeOverride);
+          if (gapResult.ok) {
             const actualFee = escalatedFee;
             this.log("info", "gap_filled", {
               walletIndex,
               nonce: gapNonce,
-              txid,
+              txid: gapResult.txid,
               fee: actualFee.toString(),
             });
             this.incrementCounter(STATE_KEYS.gapsFilled);
             gapFillFilled.push(gapNonce);
-            this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
+            this.ledgerInsertGapFill(walletIndex, gapNonce, gapResult.txid);
             await this.recordGapFillFee(walletIndex, actualFee.toString());
           }
         }
@@ -7033,14 +7038,14 @@ export class NonceDO {
       for (const gapNonce of gaps) {
         const escalatedFee = this.computeEscalatedFee(walletIndex, gapNonce);
         const feeOverride = escalatedFee > GAP_FILL_FEE ? escalatedFee : undefined;
-        const txid = await this.fillGapNonce(walletIndex, gapNonce, privateKey, feeOverride);
-        if (txid) {
-          filled.push({ nonce: gapNonce, txid });
-          this.ledgerInsertGapFill(walletIndex, gapNonce, txid);
+        const gapResult = await this.fillGapNonce(walletIndex, gapNonce, privateKey, feeOverride);
+        if (gapResult.ok) {
+          filled.push({ nonce: gapNonce, txid: gapResult.txid });
+          this.ledgerInsertGapFill(walletIndex, gapNonce, gapResult.txid);
           this.incrementCounter(STATE_KEYS.gapsFilled);
           await this.recordGapFillFee(walletIndex, escalatedFee.toString());
         } else {
-          failed.push({ nonce: gapNonce, reason: "broadcast rejected or already occupied" });
+          failed.push({ nonce: gapNonce, reason: gapResult.reason });
         }
       }
 
@@ -7208,7 +7213,10 @@ export class NonceDO {
       // On successful flush of a sponsored nonce, retract to replay_buffer.
       // -------------------------------------------------------------------------
       const filled: Array<{ nonce: number; txid: string; method: "rbf" | "gap_fill" }> = [];
-      const failedNonces: Array<{ nonce: number; reason: string }> = [];
+      // probeEligible=true means the failure was ConflictingNonceInMempool (slot occupied /
+      // ghost-mempool pattern). These nonces are candidates for alarm-driven RBF probe.
+      // probeEligible=false means a transport error or generic rejection the probe cannot resolve.
+      const failedNonces: Array<{ nonce: number; reason: string; probeEligible: boolean }> = [];
       let retracted = 0;
 
       // Build set of nonces that hold real sponsored txs (non-gap-fill dispatch_queue entries)
@@ -7232,15 +7240,21 @@ export class NonceDO {
             } else {
               // RBF failed (max attempts or network error) — fall back to gap-fill
               const flushFee = this.computeEscalatedFee(walletIndex, nonce, MIN_FLUSH_FEE);
-              const gapTxid = await this.fillGapNonce(walletIndex, nonce, privateKey, flushFee);
-              if (gapTxid) {
-                txid = gapTxid;
-                this.ledgerInsertGapFill(walletIndex, nonce, gapTxid);
+              const gapResult = await this.fillGapNonce(walletIndex, nonce, privateKey, flushFee);
+              if (gapResult.ok) {
+                txid = gapResult.txid;
+                this.ledgerInsertGapFill(walletIndex, nonce, gapResult.txid);
                 this.incrementCounter(STATE_KEYS.gapsFilled);
                 await this.recordGapFillFee(walletIndex, flushFee.toString());
-                filled.push({ nonce, txid: gapTxid, method: "gap_fill" });
+                filled.push({ nonce, txid: gapResult.txid, method: "gap_fill" });
               } else {
-                failedNonces.push({ nonce, reason: "rbf and gap-fill both failed or already occupied" });
+                // Probe-eligible only when the slot is occupied (ConflictingNonceInMempool).
+                // Generic transport errors are not candidates for RBF probe.
+                failedNonces.push({
+                  nonce,
+                  reason: gapResult.reason,
+                  probeEligible: gapResult.reason === "ConflictingNonceInMempool",
+                });
               }
             }
             // Only retract to replay_buffer after successful flush for this nonce
@@ -7269,15 +7283,20 @@ export class NonceDO {
           } else {
             // Gap or unknown slot — use gap-fill self-transfer
             const gapFlushFee = this.computeEscalatedFee(walletIndex, nonce, MIN_FLUSH_FEE);
-            const txid = await this.fillGapNonce(walletIndex, nonce, privateKey, gapFlushFee);
-            if (txid) {
-              this.ledgerInsertGapFill(walletIndex, nonce, txid);
+            const gapResult = await this.fillGapNonce(walletIndex, nonce, privateKey, gapFlushFee);
+            if (gapResult.ok) {
+              this.ledgerInsertGapFill(walletIndex, nonce, gapResult.txid);
               this.incrementCounter(STATE_KEYS.gapsFilled);
               await this.recordGapFillFee(walletIndex, gapFlushFee.toString());
-              filled.push({ nonce, txid, method: "gap_fill" });
+              filled.push({ nonce, txid: gapResult.txid, method: "gap_fill" });
             } else {
-              // ConflictingNonceInMempool means already occupied — not a hard failure
-              failedNonces.push({ nonce, reason: "broadcast rejected or already occupied" });
+              // Probe-eligible only for ConflictingNonceInMempool (slot occupied / ghost pattern).
+              // Other rejections or transport errors are not candidates for RBF probe.
+              failedNonces.push({
+                nonce,
+                reason: gapResult.reason,
+                probeEligible: gapResult.reason === "ConflictingNonceInMempool",
+              });
             }
           }
         } catch (e) {
@@ -7286,7 +7305,12 @@ export class NonceDO {
             nonce,
             error: e instanceof Error ? e.message : String(e),
           });
-          failedNonces.push({ nonce, reason: e instanceof Error ? e.message : String(e) });
+          // Exceptions are transport/internal failures — never probe-eligible.
+          failedNonces.push({
+            nonce,
+            reason: e instanceof Error ? e.message : String(e),
+            probeEligible: false,
+          });
         }
       }
 
@@ -7298,6 +7322,45 @@ export class NonceDO {
       this.ledgerAdvanceWalletHead(walletIndex, flushEnd);
       const replayBufferDepth = this.getReplayBufferDepth(walletIndex);
 
+      // -------------------------------------------------------------------------
+      // Step 4: Backward probe for failed nonces (ghost eviction).
+      // Only enqueue nonces whose failure reason indicates slot occupancy or ghost
+      // mempool patterns (probeEligible=true, i.e. ConflictingNonceInMempool).
+      // Generic transport errors and non-occupancy rejections are skipped — the
+      // probe issues RBF self-transfers to evict ghosts and would have no effect
+      // on transient network failures; enqueueing them wastes probe capacity.
+      //
+      // Why INSERT OR IGNORE (not DELETE + INSERT): the empty-range path wipes
+      // the queue before bulk-inserting a range. Here we only add the specific
+      // nonces that just failed, preserving any pending entries that may already
+      // be queued from a previous probe cycle.
+      //
+      // probeEnqueued counts only rows actually written: INSERT OR IGNORE silently
+      // skips duplicates, so we use cursor.rowsWritten (0 for ignored, 1 for new)
+      // instead of incrementing unconditionally.
+      // -------------------------------------------------------------------------
+      let probeEnqueued = 0;
+      const probeEligibleNonces = failedNonces.filter((f) => f.probeEligible);
+      if (probeDepth && probeDepth > 0 && probeEligibleNonces.length > 0) {
+        const now = new Date().toISOString();
+        for (const { nonce } of probeEligibleNonces) {
+          const cursor = this.sql.exec(
+            `INSERT OR IGNORE INTO probe_queue (wallet_index, nonce, state, created_at)
+             VALUES (?, ?, 'pending', ?)`,
+            walletIndex,
+            nonce,
+            now
+          );
+          probeEnqueued += cursor.rowsWritten;
+        }
+        this.log("info", "flush_wallet_failed_enqueued_for_probe", {
+          walletIndex,
+          probeEnqueued,
+          eligibleCount: probeEligibleNonces.length,
+          nonces: probeEligibleNonces.map((f) => f.nonce),
+        });
+      }
+
       this.log("info", "flush_wallet_complete", {
         walletIndex,
         flushStart,
@@ -7305,6 +7368,7 @@ export class NonceDO {
         retracted,
         filledCount: filled.length,
         failedCount: failedNonces.length,
+        probeEnqueued,
         newHead: flushEnd,
         replayBufferDepth,
       });
@@ -7317,6 +7381,10 @@ export class NonceDO {
         retracted,
         filled,
         failed: failedNonces,
+        ...(probeEnqueued > 0 && {
+          probeEnqueued,
+          probeNote: "Failed nonces enqueued for alarm-driven RBF (backward probe). Check GET /nonce/state for progress.",
+        }),
         newHead: flushEnd,
         replayBufferDepth,
         ...(rawFlushEnd > flushStart + MAX_ADMIN_GAP_FILLS && {
