@@ -6351,7 +6351,7 @@ export class NonceDO {
     const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
     let broadcasts = 0;
     let errors = 0;
-    let skippedHeadroom = 0;
+    let skippedThrottled = 0;
 
     // Pre-flight: check headroom per wallet. Wallets at capacity will fail with
     // TooMuchChaining — skip them to avoid burning API calls and generating log spam.
@@ -6361,22 +6361,15 @@ export class NonceDO {
     for (const entry of queued) {
       // Skip wallets throttled during this tick (hit chaining_limit on a prior entry)
       if (throttledWallets.has(entry.wallet_index)) {
-        skippedHeadroom++;
+        skippedThrottled++;
         continue;
       }
 
-      // Pre-flight headroom check — skip wallets with no capacity
-      const headroom = this.walletHeadroom(entry.wallet_index);
-      if (headroom <= 0) {
-        throttledWallets.add(entry.wallet_index);
-        skippedHeadroom++;
-        this.log("debug", "bounded_broadcast_skip_no_headroom", {
-          walletIndex: entry.wallet_index,
-          sponsorNonce: entry.sponsor_nonce,
-          headroom,
-        });
-        continue;
-      }
+      // Note: no pre-flight headroom gate here. Queued entries already have assigned nonces
+      // within the wallet's head-frontier gap — broadcasting them fills the gap rather than
+      // expanding it. Headroom measures local gap, not mempool depth, so gating on it would
+      // prevent the queue from draining when the gap consists entirely of queued entries.
+      // Dynamic throttling via TooMuchChaining outcomes (throttledWallets) is sufficient.
 
       try {
         const wallet = initializedWallets.find((w) => w.walletIndex === entry.wallet_index);
@@ -6435,6 +6428,9 @@ export class NonceDO {
             walletIndex: entry.wallet_index,
             sponsorNonce: entry.sponsor_nonce,
             outcome: outcome.outcome,
+            httpStatus: result.status,
+            reason: result.reason,
+            body: result.body?.slice(0, 512),
           };
 
           if (action.responsible === "sender") {
@@ -6457,7 +6453,8 @@ export class NonceDO {
           } else {
             this.log("info", "bounded_broadcast_network_retry", {
               ...logCtx,
-              retryAfterMs: action.retryAfterMs,
+              retryOnNextAlarmTick: true,
+              requestedRetryAfterMs: action.retryAfterMs,
             });
           }
           errors++;
@@ -6472,12 +6469,12 @@ export class NonceDO {
       }
     }
 
-    if (broadcasts > 0 || errors > 0 || skippedHeadroom > 0) {
+    if (broadcasts > 0 || errors > 0 || skippedThrottled > 0) {
       this.log("info", "bounded_broadcast_tick", {
         broadcasts,
         errors,
         queued: queued.length,
-        skippedHeadroom,
+        skippedThrottled,
         throttledWallets: throttledWallets.size,
       });
     }

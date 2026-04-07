@@ -68,6 +68,9 @@ export function parseBroadcastOutcome(raw: RawBroadcastError): NodeBroadcastOutc
     case "TransferAmountMustBePositive":
       return { outcome: "invalid_transaction", reason };
 
+    case "TemporarilyBlacklisted":
+      return { outcome: "temporarily_blacklisted" };
+
     default:
       if (status >= 500) {
         return { outcome: "server_error", reason: `${reason}: ${raw.body}`.slice(0, 200) };
