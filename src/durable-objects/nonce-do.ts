@@ -29,6 +29,7 @@ import {
   toSponsorStatusResult,
   type StoredSponsorStatusSnapshot,
 } from "../services/sponsor-status";
+import { parseBroadcastOutcome, decideBroadcastAction } from "../utils/broadcast-outcome";
 
 const APP_ID = "x402-relay";
 
@@ -1197,11 +1198,10 @@ export class NonceDO {
   }
 
   /**
-   * Retire a queued dispatch entry when the node reports BadNonce, which means
-   * the sponsor nonce slot was already consumed elsewhere and will never succeed
-   * on future bounded-broadcast retries.
+   * Retire a queued dispatch entry that will never succeed on future broadcast retries.
+   * Transitions both dispatch_queue and wallet_hand to 'retired' and releases the ledger slot.
    */
-  private retireQueuedBadNonce(walletIndex: number, sponsorNonce: number): void {
+  private retireQueuedEntry(walletIndex: number, sponsorNonce: number, reason: string): void {
     this.transitionQueueEntry(walletIndex, sponsorNonce, "retired");
     this.sql.exec(
       `UPDATE wallet_hand
@@ -1210,7 +1210,7 @@ export class NonceDO {
       walletIndex,
       sponsorNonce
     );
-    this.ledgerRelease(walletIndex, sponsorNonce, undefined, "BadNonce");
+    this.ledgerRelease(walletIndex, sponsorNonce, undefined, reason);
   }
 
   /**
@@ -2048,7 +2048,7 @@ export class NonceDO {
     context: string
   ): Promise<
     | { ok: true; txid: string }
-    | { ok: false; status: number; reason: string; body: string }
+    | { ok: false; status: number; reason: string; body: string; reasonData?: Record<string, unknown> }
   > {
     const network: "mainnet" | "testnet" = this.env.STACKS_NETWORK ?? "testnet";
     const baseUrl = getHiroBaseUrl(network);
@@ -2083,15 +2083,19 @@ export class NonceDO {
     let reason = `http_${response.status}`;
     let body = responseText.slice(0, 500);
     let parsedJson = false;
+    let reasonData: Record<string, unknown> | undefined;
     try {
       const errorJson = JSON.parse(responseText) as {
         error?: string;
         reason?: string;
-        reason_data?: unknown;
+        reason_data?: Record<string, unknown>;
       };
       parsedJson = true;
       if (errorJson.reason) reason = errorJson.reason;
       if (errorJson.error) body = errorJson.error;
+      if (errorJson.reason_data && typeof errorJson.reason_data === "object") {
+        reasonData = errorJson.reason_data;
+      }
     } catch {
       // Non-JSON response — keep raw text (could be HTML error page)
     }
@@ -2106,7 +2110,7 @@ export class NonceDO {
       });
     }
 
-    return { ok: false, status: response.status, reason, body };
+    return { ok: false, status: response.status, reason, body, reasonData };
   }
 
   /**
@@ -6313,6 +6317,13 @@ export class NonceDO {
    * For each queued entry: deserializes the sender tx, re-sponsors with the queued sponsor nonce,
    * broadcasts, and transitions the entry to 'dispatched'.
    *
+   * Pre-flight: skips wallets with zero headroom to avoid wasting API calls on broadcasts
+   * that will fail with TooMuchChaining.
+   *
+   * On failure: parses the raw Hiro response into a NodeBroadcastOutcome, maps it to a
+   * BroadcastResponsibility, and acts accordingly — retiring terminal entries instead of
+   * retrying them forever.
+   *
    * This is the bounded broadcast step in the gin rummy alarm tick.
    */
   private async broadcastBoundedQueueEntries(
@@ -6340,8 +6351,26 @@ export class NonceDO {
     const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
     let broadcasts = 0;
     let errors = 0;
+    let skippedThrottled = 0;
+
+    // Pre-flight: check headroom per wallet. Wallets at capacity will fail with
+    // TooMuchChaining — skip them to avoid burning API calls and generating log spam.
+    // Also tracks wallets that hit chaining_limit during this tick so we stop trying.
+    const throttledWallets = new Set<number>();
 
     for (const entry of queued) {
+      // Skip wallets throttled during this tick (hit chaining_limit on a prior entry)
+      if (throttledWallets.has(entry.wallet_index)) {
+        skippedThrottled++;
+        continue;
+      }
+
+      // Note: no pre-flight headroom gate here. Queued entries already have assigned nonces
+      // within the wallet's head-frontier gap — broadcasting them fills the gap rather than
+      // expanding it. Headroom measures local gap, not mempool depth, so gating on it would
+      // prevent the queue from draining when the gap consists entirely of queued entries.
+      // Dynamic throttling via TooMuchChaining outcomes (throttledWallets) is sufficient.
+
       try {
         const wallet = initializedWallets.find((w) => w.walletIndex === entry.wallet_index);
         if (!wallet) {
@@ -6393,21 +6422,39 @@ export class NonceDO {
             txid: result.txid,
           });
         } else {
-          if (result.reason === "BadNonce") {
-            this.retireQueuedBadNonce(entry.wallet_index, entry.sponsor_nonce);
-            this.log("info", "bounded_broadcast_retired_bad_nonce", {
-              walletIndex: entry.wallet_index,
-              sponsorNonce: entry.sponsor_nonce,
-              httpStatus: result.status,
-              reason: result.reason,
+          const outcome = parseBroadcastOutcome(result);
+          const action = decideBroadcastAction(outcome);
+          const logCtx = {
+            walletIndex: entry.wallet_index,
+            sponsorNonce: entry.sponsor_nonce,
+            outcome: outcome.outcome,
+            httpStatus: result.status,
+            reason: result.reason,
+            body: result.body?.slice(0, 512),
+          };
+
+          if (action.responsible === "sender") {
+            this.retireQueuedEntry(entry.wallet_index, entry.sponsor_nonce, outcome.outcome);
+            this.log("info", "bounded_broadcast_retired_sender", {
+              ...logCtx,
+              isOrigin: "isOrigin" in outcome ? outcome.isOrigin : undefined,
+              agentErrorCode: action.agentErrorCode,
             });
+          } else if (action.responsible === "sponsor") {
+            if (action.action === "wait_for_confirmations") {
+              throttledWallets.add(entry.wallet_index);
+              this.log("info", "bounded_broadcast_wallet_throttled", logCtx);
+            } else if (action.action === "skip_nonce") {
+              this.retireQueuedEntry(entry.wallet_index, entry.sponsor_nonce, outcome.outcome);
+              this.log("info", "bounded_broadcast_retired_skip", logCtx);
+            } else {
+              this.log("warn", "bounded_broadcast_needs_fee_bump", logCtx);
+            }
           } else {
-            // On failure, leave in 'queued' state — next tick will retry
-            this.log("warn", "bounded_broadcast_failed", {
-              walletIndex: entry.wallet_index,
-              sponsorNonce: entry.sponsor_nonce,
-              httpStatus: result.status,
-              reason: result.reason,
+            this.log("info", "bounded_broadcast_network_retry", {
+              ...logCtx,
+              retryOnNextAlarmTick: true,
+              requestedRetryAfterMs: action.retryAfterMs,
             });
           }
           errors++;
@@ -6422,8 +6469,14 @@ export class NonceDO {
       }
     }
 
-    if (broadcasts > 0 || errors > 0) {
-      this.log("info", "bounded_broadcast_tick", { broadcasts, errors, queued: queued.length });
+    if (broadcasts > 0 || errors > 0 || skippedThrottled > 0) {
+      this.log("info", "bounded_broadcast_tick", {
+        broadcasts,
+        errors,
+        queued: queued.length,
+        skippedThrottled,
+        throttledWallets: throttledWallets.size,
+      });
     }
   }
 
