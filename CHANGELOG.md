@@ -7,6 +7,13 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.27.4](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.3...x402-sponsor-relay-v1.27.4) (2026-04-07)
+
+
+### Bug Fixes
+
+* **dispatch:** adopt tx-schemas broadcast outcome types in bounded broadcast queue ([#320](https://github.com/aibtcdev/x402-sponsor-relay/issues/320)) ([2caed00](https://github.com/aibtcdev/x402-sponsor-relay/commit/2caed00c8ae3592891c0075a5b90c16fe26427ff))
+
 ## [1.27.3](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.2...x402-sponsor-relay-v1.27.3) (2026-04-06)
 
 
