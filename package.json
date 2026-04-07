@@ -41,5 +41,8 @@
     "chanfana": "^3.0.0",
     "hono": "^4.12.7",
     "x402-stacks": "github:whoabuddy/x402Stacks#feat/sponsored-transactions"
+  },
+  "overrides": {
+    "vite": "7.3.2"
   }
 }
