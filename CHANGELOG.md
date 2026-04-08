@@ -7,6 +7,13 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.27.5](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.4...x402-sponsor-relay-v1.27.5) (2026-04-07)
+
+
+### Bug Fixes
+
+* **security:** upgrade vite to 7.3.2 to address CVE-2026-39363 ([#318](https://github.com/aibtcdev/x402-sponsor-relay/issues/318)) ([c89629d](https://github.com/aibtcdev/x402-sponsor-relay/commit/c89629d9c8bb46c842d73638375a540accb88f1b))
+
 ## [1.27.4](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.3...x402-sponsor-relay-v1.27.4) (2026-04-07)
 
 
