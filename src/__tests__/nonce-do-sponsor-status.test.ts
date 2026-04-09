@@ -1,5 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { NonceDO } from "../durable-objects/nonce-do";
+import { createPaymentRecord, getPaymentRecord, putPaymentRecord, transitionPayment } from "../services/payment-status";
+import { MemoryKV } from "./helpers/memory-kv";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -429,5 +431,43 @@ describe("NonceDO stale sender repair helpers", () => {
         error: "hiro unavailable",
       })
     );
+  });
+
+  it("clears held metadata when a repaired run is re-queued under the same canonical payment", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_repaired", "testnet"),
+      "queued",
+      {
+        holdReason: "gap",
+        nextExpectedNonce: 4,
+        missingNonces: [4, 5],
+        holdExpiresAt: "2026-04-09T12:30:00.000Z",
+      }
+    );
+    record.relayState = "held";
+    await putPaymentRecord(kv, record);
+
+    const sync = (NonceDO as any).prototype.syncPaymentsAfterQueueAssignment;
+    await sync.call(
+      { env: { RELAY_KV: kv } },
+      [{ senderNonce: 6, paymentId: "pay_repaired" }],
+      [{ senderNonce: 6, walletIndex: 2, sponsorNonce: 55 }]
+    );
+
+    const updated = await getPaymentRecord(kv, "pay_repaired");
+    expect(updated).toEqual(
+      expect.objectContaining({
+        status: "queued",
+        relayState: "queued",
+        sponsorWalletIndex: 2,
+        sponsorNonce: 55,
+      })
+    );
+    expect(updated).not.toHaveProperty("holdReason");
+    expect(updated).not.toHaveProperty("nextExpectedNonce");
+    expect(updated).not.toHaveProperty("missingNonces");
+    expect(updated).not.toHaveProperty("holdExpiresAt");
+    expect(updated).not.toHaveProperty("error");
   });
 });

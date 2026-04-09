@@ -118,6 +118,16 @@ export interface PaymentRecord {
   network: "mainnet" | "testnet";
   /** Number of queue processing attempts */
   attempts?: number;
+  /** Internal relay ownership step for queued sender-hand / dispatch tracking */
+  relayState?: "held" | "queued" | "broadcasting" | "mempool";
+  /** Why the payment is currently held before dispatch ownership can advance */
+  holdReason?: "gap" | "capacity";
+  /** The next sender nonce needed before dispatch can advance */
+  nextExpectedNonce?: number;
+  /** Missing sender nonces currently blocking dispatch */
+  missingNonces?: number[];
+  /** ISO timestamp when the current held sender-hand entry expires */
+  holdExpiresAt?: string;
 }
 
 export interface PublicPaymentRecord
@@ -338,22 +348,34 @@ export function transitionPayment(
   switch (status) {
     case "queued":
       updated.queuedAt = now;
+      updated.relayState = extra?.holdReason ? "held" : "queued";
+      if (!extra?.holdReason) {
+        updated.holdReason = undefined;
+        updated.nextExpectedNonce = undefined;
+        updated.missingNonces = undefined;
+        updated.holdExpiresAt = undefined;
+      }
       break;
     case "broadcasting":
       updated.broadcastingAt = now;
       updated.attempts = (record.attempts ?? 0) + 1;
+      updated.relayState = "broadcasting";
       break;
     case "mempool":
       updated.mempoolAt = now;
+      updated.relayState = "mempool";
       break;
     case "confirmed":
       updated.confirmedAt = now;
+      updated.relayState = undefined;
       break;
     case "failed":
       updated.failedAt = now;
+      updated.relayState = undefined;
       break;
     case "replaced":
       updated.replacedAt = now;
+      updated.relayState = undefined;
       break;
   }
 

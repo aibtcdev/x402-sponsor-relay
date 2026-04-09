@@ -417,6 +417,81 @@ describe("payment polling runtime alignment", () => {
     expect(rpcResult.terminalReason).toBe("unknown_payment_identity");
     expect(httpResult.terminalReason).toBe("unknown_payment_identity");
   });
+
+  it("surfaces held sender-wedge diagnostics consistently from RPC and HTTP polling", async () => {
+    const kv = new MemoryKV();
+    const heldRecord = transitionPayment(
+      createPaymentRecord("pay_held", "testnet"),
+      "queued",
+      {
+        holdReason: "gap",
+        nextExpectedNonce: 4,
+        missingNonces: [4, 5],
+        holdExpiresAt: "2026-04-09T12:30:00.000Z",
+      }
+    );
+    heldRecord.senderAddress = "STHOLD000000000000000000000000000000000";
+    heldRecord.relayState = "held";
+    await putPaymentRecord(kv, heldRecord);
+
+    const env = {
+      RELAY_KV: kv,
+      STACKS_NETWORK: "testnet",
+      RELAY_BASE_URL: "https://x402-relay.aibtc.dev",
+      NONCE_DO: {
+        idFromName: () => "sponsor",
+        get: () => ({
+          fetch: vi.fn(async () => new Response(JSON.stringify({
+            senderAddress: "STHOLD000000000000000000000000000000000",
+            blocked: true,
+            blockedOnFrontierMismatch: true,
+            adminRecoveryLikely: false,
+            nextExpectedNonce: 4,
+            lowestHeldNonce: 6,
+            missingNonces: [4, 5],
+            heldCount: 1,
+            oldestHeldAgeMs: 120000,
+            lastRepairAttemptAt: null,
+            lastRepairFailureAt: null,
+            repairEligible: false,
+            repairTriggered: true,
+            repairAdvanced: false,
+            activePaymentIds: ["pay_held"],
+          }))),
+        }),
+      },
+    } as unknown as Env;
+
+    const rpc = new RelayRPC(executionContext, env);
+    const rpcResult = await rpc.checkPayment("pay_held");
+
+    const response = await worker.fetch(
+      new Request("https://x402-relay.aibtc.dev/payment/pay_held"),
+      env,
+      executionContext
+    );
+    const httpBody = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(rpcResult.status).toBe("queued");
+    expect(httpBody.status).toBe("queued");
+    expect((rpcResult as Record<string, unknown>).relayState).toBe("held");
+    expect((rpcResult as Record<string, unknown>).holdReason).toBe("gap");
+    expect((rpcResult as Record<string, unknown>).nextExpectedNonce).toBe(4);
+    expect((rpcResult as Record<string, unknown>).missingNonces).toEqual([4, 5]);
+    expect((rpcResult as Record<string, unknown>).senderWedge).toEqual(
+      expect.objectContaining({
+        blockedOnFrontierMismatch: true,
+        repairTriggered: true,
+      })
+    );
+    expect(httpBody.senderWedge).toEqual(
+      expect.objectContaining({
+        senderAddress: "STHOLD000000000000000000000000000000000",
+        missingNonces: [4, 5],
+      })
+    );
+  });
 });
 
 describe("PaymentStatus endpoint schema", () => {

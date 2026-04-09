@@ -1399,6 +1399,28 @@ export interface RecentExpiryInfo {
 }
 
 /**
+ * Sender-side wedge diagnostics for held transactions that are blocked
+ * behind a sender frontier mismatch inside NonceDO.
+ */
+export interface SenderWedgeStatus {
+  senderAddress: string;
+  blocked: boolean;
+  blockedOnFrontierMismatch: boolean;
+  adminRecoveryLikely: boolean;
+  nextExpectedNonce: number | null;
+  lowestHeldNonce: number | null;
+  missingNonces: number[];
+  heldCount: number;
+  oldestHeldAgeMs: number | null;
+  lastRepairAttemptAt: string | null;
+  lastRepairFailureAt: string | null;
+  repairEligible: boolean;
+  repairTriggered?: boolean;
+  repairAdvanced?: boolean;
+  activePaymentIds?: string[];
+}
+
+/**
  * A single entry in a sender's hand queue (sender_hand table row).
  * Each entry represents an agent-submitted or replay transaction waiting
  * to be dispatched.
