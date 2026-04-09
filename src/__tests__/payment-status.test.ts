@@ -172,6 +172,31 @@ describe("payment status projection", () => {
     expect(queuedProjection.status).toBe("queued");
     expect(queuedProjection.terminalReason).toBeUndefined();
   });
+
+  it("clears held diagnostics when a held payment transitions to a non-held status", () => {
+    const heldRecord = transitionPayment(
+      createPaymentRecord("pay_hold_clear", "testnet"),
+      "queued",
+      {
+        holdReason: "capacity",
+        nextExpectedNonce: 7,
+        missingNonces: [7],
+        holdExpiresAt: "2026-04-09T12:30:00.000Z",
+      }
+    );
+
+    const failedRecord = transitionPayment(heldRecord, "failed", {
+      error: "relay failed",
+      terminalReason: "sponsor_failure",
+      retryable: false,
+    });
+
+    expect(failedRecord.relayState).toBeUndefined();
+    expect(failedRecord.holdReason).toBeUndefined();
+    expect(failedRecord.nextExpectedNonce).toBeUndefined();
+    expect(failedRecord.missingNonces).toBeUndefined();
+    expect(failedRecord.holdExpiresAt).toBeUndefined();
+  });
 });
 
 describe("submitPayment duplicate reuse", () => {

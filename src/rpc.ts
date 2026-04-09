@@ -58,6 +58,15 @@ import { repairSenderWedgeDO } from "./services";
 
 export type { SubmitPaymentResult, CheckPaymentResult };
 
+type RelayCheckPaymentResult = CheckPaymentResult & {
+  relayState?: "held" | "queued" | "broadcasting" | "mempool";
+  holdReason?: "gap" | "capacity";
+  nextExpectedNonce?: number;
+  missingNonces?: number[];
+  holdExpiresAt?: string;
+  senderWedge?: import("./types").SenderWedgeStatus;
+};
+
 type PublicRpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
 function projectRpcErrorCode(errorCode?: string): PublicRpcErrorCode | undefined {
@@ -390,7 +399,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
   /**
    * Check the status of a previously submitted payment.
    */
-  async checkPayment(paymentId: string): Promise<CheckPaymentResult> {
+  async checkPayment(paymentId: string): Promise<RelayCheckPaymentResult> {
     const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
       component: "rpc",
       route: "rpc.checkPayment",
@@ -440,7 +449,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     }
 
     const projected = projectPaymentRecord(refreshedRecord);
-    const compatShimUsed = record.status === "submitted";
+    const compatShimUsed = refreshedRecord.status === "submitted";
 
     emitProjectedPaymentPollEvents(
       logger,
@@ -470,7 +479,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       ...(projected.holdExpiresAt && { holdExpiresAt: projected.holdExpiresAt }),
       ...(senderWedge && { senderWedge }),
       checkStatusUrl,
-    } as CheckPaymentResult;
+    };
   }
 
   /**

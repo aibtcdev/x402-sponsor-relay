@@ -387,4 +387,54 @@ describe("queue consumer recovery boundaries", () => {
       })
     );
   });
+
+  it("does not fabricate an empty sender identity when correlating broadcast success", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_legacy", "testnet"),
+      "queued"
+    );
+    await putPaymentRecord(kv, record);
+
+    const originalTx = {
+      auth: { spendingCondition: { signer: "signer_legacy", nonce: 3n } },
+    };
+    const sponsoredTx = { id: "sponsored_legacy_tx" };
+
+    mocks.deserializeTransaction.mockImplementation((txHex: string) => {
+      if (txHex === "legacy_tx") return originalTx;
+      if (txHex === "sponsored_legacy") return sponsoredTx;
+      throw new Error(`unexpected tx hex ${txHex}`);
+    });
+    mocks.sponsorTransaction.mockResolvedValue({
+      success: true,
+      sponsoredTxHex: "sponsored_legacy",
+      walletIndex: 0,
+      fee: "1200",
+    });
+    mocks.broadcastOnly.mockResolvedValue({ txid: "0xlegacy" });
+
+    const message = createMessage({
+      paymentId: "pay_legacy",
+      txHex: "legacy_tx",
+      network: "testnet",
+      attempt: 1,
+    });
+
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(mocks.nonceLifecycleOnBroadcastSuccess).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({
+        paymentId: "pay_legacy",
+        senderAddress: undefined,
+        senderNonce: undefined,
+      })
+    );
+  });
 });

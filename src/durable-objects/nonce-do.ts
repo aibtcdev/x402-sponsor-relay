@@ -1894,7 +1894,15 @@ export class NonceDO {
       nextSenderNonce: nextExpected + dispatchResult.assigned.length,
     });
 
-    await this.syncPaymentsAfterQueueAssignment(run, dispatchResult.assigned);
+    try {
+      await this.syncPaymentsAfterQueueAssignment(run, dispatchResult.assigned);
+    } catch (error) {
+      this.log("warn", "payment_sync_after_assign_failed", {
+        senderAddress,
+        assignedCount: dispatchResult.assigned.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     // sponsor_address is in async KV storage — return empty string.
     // SponsorService derives the correct key from walletIndex + mnemonic.

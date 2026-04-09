@@ -1568,8 +1568,8 @@ export async function nonceLifecycleOnBroadcastSuccess(
     fee?: string;
     paymentId?: string;
     senderTxHex: string;
-    senderAddress: string;
-    senderNonce: number;
+    senderAddress?: string;
+    senderNonce?: number;
     /** ISO timestamp of when the client HTTP request arrived at the relay endpoint.
      *  Used as the start time for settlement latency measurement. */
     submittedAt?: string;
@@ -1588,18 +1588,34 @@ export async function nonceLifecycleOnBroadcastSuccess(
   }
 
   // Now release nonce and queue dispatch in parallel (order-independent)
-  await Promise.all([
+  const lifecycleTasks: Promise<void>[] = [
     releaseNonceDO(env, logger, opts.sponsorNonce, opts.txid, opts.walletIndex, opts.fee),
     recordNonceTxid(env, logger, opts.txid, opts.sponsorNonce),
-    queueDispatchDO(
-      env, logger, opts.walletIndex,
-      opts.senderTxHex, opts.senderAddress,
-      opts.senderNonce, opts.sponsorNonce,
-      opts.paymentId,
-      opts.fee ?? null,
-      opts.submittedAt ?? null
-    ),
-  ]).catch((e) => {
+  ];
+
+  if (opts.senderAddress && opts.senderNonce !== undefined) {
+    lifecycleTasks.push(
+      queueDispatchDO(
+        env, logger, opts.walletIndex,
+        opts.senderTxHex, opts.senderAddress,
+        opts.senderNonce, opts.sponsorNonce,
+        opts.paymentId,
+        opts.fee ?? null,
+        opts.submittedAt ?? null
+      )
+    );
+  } else {
+    logger.warn("Skipping queue-dispatch correlation after broadcast success", {
+      paymentId: opts.paymentId,
+      txid: opts.txid,
+      walletIndex: opts.walletIndex,
+      sponsorNonce: opts.sponsorNonce,
+      senderAddressPresent: Boolean(opts.senderAddress),
+      senderNoncePresent: opts.senderNonce !== undefined,
+    });
+  }
+
+  await Promise.all(lifecycleTasks).catch((e) => {
     logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
   });
 }

@@ -136,6 +136,13 @@ export interface PublicPaymentRecord
   terminalReason?: TerminalReason;
 }
 
+function clearHoldMetadata(record: PaymentRecord): void {
+  record.holdReason = undefined;
+  record.nextExpectedNonce = undefined;
+  record.missingNonces = undefined;
+  record.holdExpiresAt = undefined;
+}
+
 /**
  * Queue message body for PAYMENT_QUEUE.
  */
@@ -350,32 +357,34 @@ export function transitionPayment(
       updated.queuedAt = now;
       updated.relayState = extra?.holdReason ? "held" : "queued";
       if (!extra?.holdReason) {
-        updated.holdReason = undefined;
-        updated.nextExpectedNonce = undefined;
-        updated.missingNonces = undefined;
-        updated.holdExpiresAt = undefined;
+        clearHoldMetadata(updated);
       }
       break;
     case "broadcasting":
       updated.broadcastingAt = now;
       updated.attempts = (record.attempts ?? 0) + 1;
       updated.relayState = "broadcasting";
+      clearHoldMetadata(updated);
       break;
     case "mempool":
       updated.mempoolAt = now;
       updated.relayState = "mempool";
+      clearHoldMetadata(updated);
       break;
     case "confirmed":
       updated.confirmedAt = now;
       updated.relayState = undefined;
+      clearHoldMetadata(updated);
       break;
     case "failed":
       updated.failedAt = now;
       updated.relayState = undefined;
+      clearHoldMetadata(updated);
       break;
     case "replaced":
       updated.replacedAt = now;
       updated.relayState = undefined;
+      clearHoldMetadata(updated);
       break;
   }
 

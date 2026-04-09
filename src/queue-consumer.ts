@@ -412,8 +412,8 @@ async function processPaymentMessage(
       fee: sponsorResult.fee,
       paymentId,
       senderTxHex: txHex,
-      senderAddress: record.senderAddress ?? "",
-      senderNonce: record.senderNonce ?? Number(transaction.auth.spendingCondition.nonce),
+      senderAddress: record.senderAddress,
+      senderNonce: record.senderNonce,
       submittedAt: record.submittedAt,
     });
   }

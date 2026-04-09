@@ -470,4 +470,47 @@ describe("NonceDO stale sender repair helpers", () => {
     expect(updated).not.toHaveProperty("holdExpiresAt");
     expect(updated).not.toHaveProperty("error");
   });
+
+  it("does not fail run assignment when post-assignment payment sync throws", async () => {
+    const checkAndAssignRun = (NonceDO as any).prototype.checkAndAssignRun;
+    const log = vi.fn();
+
+    const result = await checkAndAssignRun.call({
+      getHandGapInfo: () => ({
+        hand: [
+          {
+            sender_nonce: 4,
+            tx_hex: "0xabc",
+            payment_id: "pay_sync_fail",
+            expires_at: "2099-01-01T00:00:00.000Z",
+          },
+        ],
+        missingNonces: [],
+        nextExpected: 4,
+        handSize: 1,
+      }),
+      assignRunToWallet: () => ({
+        assigned: [{ senderNonce: 4, walletIndex: 1, sponsorNonce: 44 }],
+        held: [],
+      }),
+      syncPaymentsAfterQueueAssignment: vi.fn().mockRejectedValue(new Error("kv unavailable")),
+      log,
+    }, "STSYNC");
+
+    expect(result).toEqual({
+      dispatched: true,
+      sponsorNonce: 44,
+      walletIndex: 1,
+      sponsorAddress: "",
+    });
+    expect(log).toHaveBeenCalledWith(
+      "warn",
+      "payment_sync_after_assign_failed",
+      expect.objectContaining({
+        senderAddress: "STSYNC",
+        assignedCount: 1,
+        error: "kv unavailable",
+      })
+    );
+  });
 });
