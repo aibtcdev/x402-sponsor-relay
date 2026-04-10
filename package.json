@@ -31,7 +31,8 @@
     "wrangler": "^4.75.0"
   },
   "overrides": {
-    "vite": "7.3.2"
+    "vite": "7.3.2",
+    "axios": ">=1.15.0"
   },
   "dependencies": {
     "@aibtc/tx-schemas": "^0.7.0",
