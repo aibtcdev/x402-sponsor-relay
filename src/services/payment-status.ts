@@ -118,12 +118,29 @@ export interface PaymentRecord {
   network: "mainnet" | "testnet";
   /** Number of queue processing attempts */
   attempts?: number;
+  /** Internal relay ownership step for queued sender-hand / dispatch tracking */
+  relayState?: "held" | "queued" | "broadcasting" | "mempool";
+  /** Why the payment is currently held before dispatch ownership can advance */
+  holdReason?: "gap" | "capacity";
+  /** The next sender nonce needed before dispatch can advance */
+  nextExpectedNonce?: number;
+  /** Missing sender nonces currently blocking dispatch */
+  missingNonces?: number[];
+  /** ISO timestamp when the current held sender-hand entry expires */
+  holdExpiresAt?: string;
 }
 
 export interface PublicPaymentRecord
   extends Omit<PaymentRecord, "status" | "terminalReason"> {
   status: PublicPaymentStatus;
   terminalReason?: TerminalReason;
+}
+
+function clearHoldMetadata(record: PaymentRecord): void {
+  record.holdReason = undefined;
+  record.nextExpectedNonce = undefined;
+  record.missingNonces = undefined;
+  record.holdExpiresAt = undefined;
 }
 
 /**
@@ -338,22 +355,36 @@ export function transitionPayment(
   switch (status) {
     case "queued":
       updated.queuedAt = now;
+      updated.relayState = extra?.holdReason ? "held" : "queued";
+      if (!extra?.holdReason) {
+        clearHoldMetadata(updated);
+      }
       break;
     case "broadcasting":
       updated.broadcastingAt = now;
       updated.attempts = (record.attempts ?? 0) + 1;
+      updated.relayState = "broadcasting";
+      clearHoldMetadata(updated);
       break;
     case "mempool":
       updated.mempoolAt = now;
+      updated.relayState = "mempool";
+      clearHoldMetadata(updated);
       break;
     case "confirmed":
       updated.confirmedAt = now;
+      updated.relayState = undefined;
+      clearHoldMetadata(updated);
       break;
     case "failed":
       updated.failedAt = now;
+      updated.relayState = undefined;
+      clearHoldMetadata(updated);
       break;
     case "replaced":
       updated.replacedAt = now;
+      updated.relayState = undefined;
+      clearHoldMetadata(updated);
       break;
   }
 

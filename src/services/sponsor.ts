@@ -16,7 +16,17 @@ import {
   generateWallet,
 } from "@stacks/wallet-sdk";
 import { SERVICE_DEGRADED_RETRY_AFTER_S } from "../types";
-import type { Env, Logger, FeeTransactionType, FeePriority, WalletStatus, WalletsResponse, HandSubmitResult, SponsorHeld } from "../types";
+import type {
+  Env,
+  Logger,
+  FeeTransactionType,
+  FeePriority,
+  WalletStatus,
+  WalletsResponse,
+  HandSubmitResult,
+  SenderWedgeStatus,
+  SponsorHeld,
+} from "../types";
 import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix, decodeClarityUint } from "../utils";
 import { FeeService } from "./fee";
 
@@ -568,7 +578,8 @@ export class SponsorService {
     senderAddress: string,
     senderNonce: number,
     txHex: string,
-    mode: "hold" | "immediate" = "hold"
+    mode: "hold" | "immediate" = "hold",
+    paymentId?: string
   ): Promise<HandSubmitResult | null> {
     if (!this.env.NONCE_DO) return null;
     try {
@@ -576,7 +587,7 @@ export class SponsorService {
       const response = await stub.fetch("https://nonce-do/hand-submit", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ senderAddress, senderNonce, txHex, mode }),
+        body: JSON.stringify({ senderAddress, senderNonce, txHex, mode, paymentId }),
       });
 
       if (!response.ok) {
@@ -777,7 +788,8 @@ export class SponsorService {
   async sponsorTransaction(
     transaction: StacksTransactionWire,
     originalTxHex?: string,
-    mode: "hold" | "immediate" = "hold"
+    mode: "hold" | "immediate" = "hold",
+    paymentId?: string
   ): Promise<SponsorResult> {
     const network = this.getNetwork();
 
@@ -807,7 +819,13 @@ export class SponsorService {
 
       let handResult: HandSubmitResult | null;
       try {
-        handResult = await this.submitToHand(senderAddress, senderNonce, txHexForHand, mode);
+        handResult = await this.submitToHand(
+          senderAddress,
+          senderNonce,
+          txHexForHand,
+          mode,
+          paymentId
+        );
       } catch (e) {
         if (isHandSubmitValidationError(e)) {
           // DO returned a 4xx validation rejection (e.g., STALE_SENDER_NONCE).
@@ -1548,9 +1566,10 @@ export async function nonceLifecycleOnBroadcastSuccess(
     walletIndex: number;
     txid: string;
     fee?: string;
+    paymentId?: string;
     senderTxHex: string;
-    senderAddress: string;
-    senderNonce: number;
+    senderAddress?: string;
+    senderNonce?: number;
     /** ISO timestamp of when the client HTTP request arrived at the relay endpoint.
      *  Used as the start time for settlement latency measurement. */
     submittedAt?: string;
@@ -1569,17 +1588,34 @@ export async function nonceLifecycleOnBroadcastSuccess(
   }
 
   // Now release nonce and queue dispatch in parallel (order-independent)
-  await Promise.all([
+  const lifecycleTasks: Promise<void>[] = [
     releaseNonceDO(env, logger, opts.sponsorNonce, opts.txid, opts.walletIndex, opts.fee),
     recordNonceTxid(env, logger, opts.txid, opts.sponsorNonce),
-    queueDispatchDO(
-      env, logger, opts.walletIndex,
-      opts.senderTxHex, opts.senderAddress,
-      opts.senderNonce, opts.sponsorNonce,
-      opts.fee ?? null,
-      opts.submittedAt ?? null
-    ),
-  ]).catch((e) => {
+  ];
+
+  if (opts.senderAddress && opts.senderNonce !== undefined) {
+    lifecycleTasks.push(
+      queueDispatchDO(
+        env, logger, opts.walletIndex,
+        opts.senderTxHex, opts.senderAddress,
+        opts.senderNonce, opts.sponsorNonce,
+        opts.paymentId,
+        opts.fee ?? null,
+        opts.submittedAt ?? null
+      )
+    );
+  } else {
+    logger.warn("Skipping queue-dispatch correlation after broadcast success", {
+      paymentId: opts.paymentId,
+      txid: opts.txid,
+      walletIndex: opts.walletIndex,
+      sponsorNonce: opts.sponsorNonce,
+      senderAddressPresent: Boolean(opts.senderAddress),
+      senderNoncePresent: opts.senderNonce !== undefined,
+    });
+  }
+
+  await Promise.all(lifecycleTasks).catch((e) => {
     logger.warn("Failed nonce lifecycle after broadcast success", { error: String(e) });
   });
 }
@@ -1592,6 +1628,7 @@ export async function queueDispatchDO(
   senderAddress: string,
   senderNonce: number,
   sponsorNonce: number,
+  paymentId?: string,
   fee?: string | null,
   submittedAt?: string | null
 ): Promise<void> {
@@ -1609,6 +1646,7 @@ export async function queueDispatchDO(
         senderAddress,
         senderNonce,
         sponsorNonce,
+        paymentId,
         fee: fee ?? null,
         submittedAt: submittedAt ?? null,
       }),
@@ -1628,5 +1666,77 @@ export async function queueDispatchDO(
       walletIndex,
       sponsorNonce,
     });
+  }
+}
+
+export async function getSenderWedgeDO(
+  env: Env,
+  logger: Logger,
+  senderAddress: string
+): Promise<SenderWedgeStatus | null> {
+  if (!env.NONCE_DO) {
+    return null;
+  }
+
+  try {
+    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch(
+      `https://nonce-do/queue-sender/${encodeURIComponent(senderAddress)}`
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      logger.warn("Nonce DO queue-sender wedge read failed", {
+        status: response.status,
+        body,
+        senderAddress,
+      });
+      return null;
+    }
+
+    const body = await response.json() as { senderWedge?: SenderWedgeStatus };
+    return body.senderWedge ?? null;
+  } catch (e) {
+    logger.warn("Failed to fetch sender wedge status", {
+      error: e instanceof Error ? e.message : String(e),
+      senderAddress,
+    });
+    return null;
+  }
+}
+
+export async function repairSenderWedgeDO(
+  env: Env,
+  logger: Logger,
+  senderAddress: string
+): Promise<SenderWedgeStatus | null> {
+  if (!env.NONCE_DO) {
+    return null;
+  }
+
+  try {
+    const stub = env.NONCE_DO.get(env.NONCE_DO.idFromName("sponsor"));
+    const response = await stub.fetch(
+      `https://nonce-do/sender-repair/${encodeURIComponent(senderAddress)}`,
+      { method: "POST" }
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      logger.warn("Nonce DO sender repair failed", {
+        status: response.status,
+        body,
+        senderAddress,
+      });
+      return null;
+    }
+
+    return await response.json() as SenderWedgeStatus;
+  } catch (e) {
+    logger.warn("Failed to trigger sender wedge repair", {
+      error: e instanceof Error ? e.message : String(e),
+      senderAddress,
+    });
+    return null;
   }
 }

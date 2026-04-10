@@ -30,7 +30,14 @@ import {
   type PaymentRecord,
 } from "./services/payment-status";
 import { clearInFlight, updateSenderNonceOnBroadcast } from "./services/sender-nonce";
-import { SponsorService, extractSponsorNonce, recordNonceTxid, releaseNonceDO, recordBroadcastOutcomeDO, SettlementService } from "./services";
+import {
+  SponsorService,
+  extractSponsorNonce,
+  releaseNonceDO,
+  SettlementService,
+  nonceLifecycleOnBroadcastSuccess,
+  repairSenderWedgeDO,
+} from "./services";
 
 /** Max retries before dead-lettering */
 const MAX_ATTEMPTS = 5;
@@ -154,7 +161,12 @@ async function processPaymentMessage(
 
   // Sponsor the transaction (assigns nonce from NonceDO, signs with sponsor key)
   const sponsorService = new SponsorService(env, logger);
-  const sponsorResult = await sponsorService.sponsorTransaction(transaction);
+  const sponsorResult = await sponsorService.sponsorTransaction(
+    transaction,
+    txHex,
+    "hold",
+    paymentId
+  );
 
   if (!sponsorResult.success) {
     if ("held" in sponsorResult && sponsorResult.held) {
@@ -165,27 +177,25 @@ async function processPaymentMessage(
         missingNonces: sponsorResult.missingNonces,
       });
       if (sponsorResult.holdReason === "gap") {
-        if (record.senderNonce !== undefined) {
-          await clearInFlight(kv, signerHash, record.senderNonce).catch((e) =>
-            logger.warn("Failed to clear in-flight marker on sender gap", {
-              error: String(e),
-            })
-          );
-        }
-
-        record = transitionPayment(record, "failed", {
+        record = transitionPayment(record, "queued", {
           error: `Sender nonce gap: waiting for nonce ${sponsorResult.nextExpected}`,
-          errorCode: "SENDER_NONCE_GAP",
-          terminalReason: "sender_nonce_gap",
-          retryable: false,
+          errorCode: undefined,
+          terminalReason: undefined,
+          retryable: undefined,
+          holdReason: "gap",
+          nextExpectedNonce: sponsorResult.nextExpected,
+          missingNonces: sponsorResult.missingNonces,
+          holdExpiresAt: sponsorResult.expiresAt,
         });
         await putPaymentRecord(kv, record);
-        emitPaymentLifecycleEvent(logger, "payment.finalized", {
+        if (record.senderAddress) {
+          await repairSenderWedgeDO(env, logger, record.senderAddress);
+        }
+        emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
           route: "PAYMENT_QUEUE",
           paymentId,
           status: record.status,
-          terminalReason: record.terminalReason,
-          action: "sender_nonce_gap_terminal",
+          action: "sender_nonce_gap_held",
           checkStatusUrlPresent: false,
           compatShimUsed: false,
           attempt,
@@ -196,6 +206,10 @@ async function processPaymentMessage(
 
       record = transitionPayment(record, "queued", {
         error: "Sponsor pool temporarily has no dispatch capacity",
+        holdReason: "capacity",
+        nextExpectedNonce: sponsorResult.nextExpected,
+        missingNonces: sponsorResult.missingNonces,
+        holdExpiresAt: sponsorResult.expiresAt,
       });
       await putPaymentRecord(kv, record);
       emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
@@ -289,6 +303,10 @@ async function processPaymentMessage(
   record.sponsorWalletIndex = walletIndex;
   record.sponsorNonce = sponsorNonce !== null ? sponsorNonce : undefined;
   record.sponsorFee = sponsorResult.fee;
+  record.holdReason = undefined;
+  record.nextExpectedNonce = undefined;
+  record.missingNonces = undefined;
+  record.holdExpiresAt = undefined;
 
   const settlementService = new SettlementService(env, logger);
   const broadcastResult = await settlementService.broadcastOnly(sponsoredTx);
@@ -387,17 +405,17 @@ async function processPaymentMessage(
 
   // Record txid with NonceDO and release the reserved nonce slot
   if (sponsorNonce !== null) {
-    await Promise.all([
-      recordNonceTxid(env, logger, txid, sponsorNonce).catch(
-        (e) => logger.warn("Failed to record nonce txid", { error: String(e) })
-      ),
-      releaseNonceDO(env, logger, sponsorNonce, txid, walletIndex, sponsorResult.fee).catch(
-        (e) => logger.warn("Failed to release nonce", { error: String(e) })
-      ),
-      recordBroadcastOutcomeDO(env, logger, sponsorNonce, walletIndex, txid, 200, undefined, undefined).catch(
-        (e) => logger.warn("Failed to record broadcast outcome", { error: String(e) })
-      ),
-    ]);
+    await nonceLifecycleOnBroadcastSuccess(env, logger, {
+      sponsorNonce,
+      walletIndex,
+      txid,
+      fee: sponsorResult.fee,
+      paymentId,
+      senderTxHex: txHex,
+      senderAddress: record.senderAddress,
+      senderNonce: record.senderNonce,
+      submittedAt: record.submittedAt,
+    });
   }
 
   // Update payment record

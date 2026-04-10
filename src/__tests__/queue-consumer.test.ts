@@ -10,9 +10,9 @@ const mocks = vi.hoisted(() => ({
   clearInFlight: vi.fn(),
   updateSenderNonceOnBroadcast: vi.fn(),
   extractSponsorNonce: vi.fn(),
-  recordNonceTxid: vi.fn(),
   releaseNonceDO: vi.fn(),
-  recordBroadcastOutcomeDO: vi.fn(),
+  nonceLifecycleOnBroadcastSuccess: vi.fn(),
+  repairSenderWedgeDO: vi.fn(),
 }));
 
 vi.mock("@stacks/transactions", () => ({
@@ -39,9 +39,9 @@ vi.mock("../services", async () => {
       }
     },
     extractSponsorNonce: mocks.extractSponsorNonce,
-    recordNonceTxid: mocks.recordNonceTxid,
     releaseNonceDO: mocks.releaseNonceDO,
-    recordBroadcastOutcomeDO: mocks.recordBroadcastOutcomeDO,
+    nonceLifecycleOnBroadcastSuccess: mocks.nonceLifecycleOnBroadcastSuccess,
+    repairSenderWedgeDO: mocks.repairSenderWedgeDO,
   };
 });
 
@@ -70,9 +70,9 @@ describe("queue consumer recovery boundaries", () => {
     mocks.extractSponsorNonce.mockReturnValue(55);
     mocks.clearInFlight.mockResolvedValue(undefined);
     mocks.updateSenderNonceOnBroadcast.mockResolvedValue(undefined);
-    mocks.recordNonceTxid.mockResolvedValue(undefined);
     mocks.releaseNonceDO.mockResolvedValue(undefined);
-    mocks.recordBroadcastOutcomeDO.mockResolvedValue(undefined);
+    mocks.nonceLifecycleOnBroadcastSuccess.mockResolvedValue(undefined);
+    mocks.repairSenderWedgeDO.mockResolvedValue(null);
   });
 
   it("keeps mixed x402 and non-x402 queued traffic moving when one sender hits a nonce gap", async () => {
@@ -155,7 +155,7 @@ describe("queue consumer recovery boundaries", () => {
       executionContext
     );
 
-    const failedGapRecord = await getPaymentRecord(kv, "pay_gap");
+    const heldGapRecord = await getPaymentRecord(kv, "pay_gap");
     const successfulRecord = await getPaymentRecord(kv, "pay_ok");
 
     expect(gapMessage.ack).toHaveBeenCalledTimes(1);
@@ -163,11 +163,13 @@ describe("queue consumer recovery boundaries", () => {
     expect(gapMessage.retry).not.toHaveBeenCalled();
     expect(okMessage.retry).not.toHaveBeenCalled();
 
-    expect(failedGapRecord).toEqual(
+    expect(heldGapRecord).toEqual(
       expect.objectContaining({
-        status: "failed",
-        errorCode: "SENDER_NONCE_GAP",
-        terminalReason: "sender_nonce_gap",
+        status: "queued",
+        relayState: "held",
+        holdReason: "gap",
+        nextExpectedNonce: 5,
+        missingNonces: [5, 6, 7],
       })
     );
     expect(successfulRecord).toEqual(
@@ -176,7 +178,12 @@ describe("queue consumer recovery boundaries", () => {
         txid: "0xabc",
       })
     );
-    expect(mocks.clearInFlight).toHaveBeenCalledWith(kv, "signer_gap", 8);
+    expect(mocks.clearInFlight).not.toHaveBeenCalledWith(kv, "signer_gap", 8);
+    expect(mocks.repairSenderWedgeDO).toHaveBeenCalledWith(
+      expect.objectContaining({ RELAY_KV: kv, STACKS_NETWORK: "testnet" }),
+      expect.anything(),
+      "STGAP000000000000000000000000000000000"
+    );
   });
 
   it("keeps sponsor recovery relay-owned for temporary capacity failures", async () => {
@@ -220,6 +227,8 @@ describe("queue consumer recovery boundaries", () => {
       expect.objectContaining({
         status: "queued",
         error: "Sponsor pool temporarily has no dispatch capacity",
+        relayState: "held",
+        holdReason: "capacity",
       })
     );
     expect(mocks.clearInFlight).not.toHaveBeenCalled();
@@ -321,5 +330,111 @@ describe("queue consumer recovery boundaries", () => {
       compat_shim_used: false,
       repo_version: expect.any(String),
     }));
+  });
+
+  it("writes unified payment correlation on normal broadcast success", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_owner", "testnet"),
+      "queued"
+    );
+    record.senderNonce = 12;
+    record.senderAddress = "STOWNER00000000000000000000000000000000";
+    await putPaymentRecord(kv, record);
+
+    const originalTx = {
+      auth: { spendingCondition: { signer: "signer_owner", nonce: 12n } },
+    };
+    const sponsoredTx = { id: "sponsored_owner_tx" };
+
+    mocks.deserializeTransaction.mockImplementation((txHex: string) => {
+      if (txHex === "owner_tx") return originalTx;
+      if (txHex === "sponsored_owner") return sponsoredTx;
+      throw new Error(`unexpected tx hex ${txHex}`);
+    });
+    mocks.sponsorTransaction.mockResolvedValue({
+      success: true,
+      sponsoredTxHex: "sponsored_owner",
+      walletIndex: 2,
+      fee: "3000",
+    });
+    mocks.broadcastOnly.mockResolvedValue({ txid: "0xowner" });
+
+    const message = createMessage({
+      paymentId: "pay_owner",
+      txHex: "owner_tx",
+      network: "testnet",
+      attempt: 1,
+    });
+
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(mocks.nonceLifecycleOnBroadcastSuccess).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({
+        paymentId: "pay_owner",
+        senderTxHex: "owner_tx",
+        senderAddress: "STOWNER00000000000000000000000000000000",
+        senderNonce: 12,
+        sponsorNonce: 55,
+        walletIndex: 2,
+        txid: "0xowner",
+      })
+    );
+  });
+
+  it("does not fabricate an empty sender identity when correlating broadcast success", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_legacy", "testnet"),
+      "queued"
+    );
+    await putPaymentRecord(kv, record);
+
+    const originalTx = {
+      auth: { spendingCondition: { signer: "signer_legacy", nonce: 3n } },
+    };
+    const sponsoredTx = { id: "sponsored_legacy_tx" };
+
+    mocks.deserializeTransaction.mockImplementation((txHex: string) => {
+      if (txHex === "legacy_tx") return originalTx;
+      if (txHex === "sponsored_legacy") return sponsoredTx;
+      throw new Error(`unexpected tx hex ${txHex}`);
+    });
+    mocks.sponsorTransaction.mockResolvedValue({
+      success: true,
+      sponsoredTxHex: "sponsored_legacy",
+      walletIndex: 0,
+      fee: "1200",
+    });
+    mocks.broadcastOnly.mockResolvedValue({ txid: "0xlegacy" });
+
+    const message = createMessage({
+      paymentId: "pay_legacy",
+      txHex: "legacy_tx",
+      network: "testnet",
+      attempt: 1,
+    });
+
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(mocks.nonceLifecycleOnBroadcastSuccess).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({
+        paymentId: "pay_legacy",
+        senderAddress: undefined,
+        senderNonce: undefined,
+      })
+    );
   });
 });

@@ -10,6 +10,7 @@ import {
   emitPaymentLifecycleEvent,
   emitProjectedPaymentPollEvents,
 } from "../utils";
+import { repairSenderWedgeDO } from "../services";
 
 /**
  * GET /payment/:id — Public payment status endpoint.
@@ -60,6 +61,12 @@ export class PaymentStatus extends BaseEndpoint {
                 replacementTxid: { type: "string" as const },
                 resubmittable: { type: "boolean" as const },
                 senderNonceInfo: { type: "object" as const },
+                relayState: { type: "string" as const },
+                holdReason: { type: "string" as const },
+                nextExpectedNonce: { type: "number" as const },
+                missingNonces: { type: "array" as const, items: { type: "number" as const } },
+                holdExpiresAt: { type: "string" as const },
+                senderWedge: { type: "object" as const },
               },
             },
           },
@@ -157,9 +164,21 @@ export class PaymentStatus extends BaseEndpoint {
       );
     }
 
-    const projected = projectPaymentRecord(record);
+    let refreshedRecord = record;
+    let senderWedge;
+    if (
+      record.status === "queued" &&
+      record.relayState === "held" &&
+      record.holdReason === "gap" &&
+      record.senderAddress
+    ) {
+      senderWedge = await repairSenderWedgeDO(c.env, logger, record.senderAddress);
+      refreshedRecord = (await getPaymentRecord(kv, paymentId)) ?? record;
+    }
+
+    const projected = projectPaymentRecord(refreshedRecord);
     const checkStatusUrl = buildPaymentCheckStatusUrl(c.env, projected.paymentId);
-    const compatShimUsed = record.status === "submitted";
+    const compatShimUsed = refreshedRecord.status === "submitted";
 
     emitProjectedPaymentPollEvents(
       logger,
@@ -190,6 +209,14 @@ export class PaymentStatus extends BaseEndpoint {
       ...(projected.senderNonceInfo && {
         senderNonceInfo: projected.senderNonceInfo,
       }),
+      ...(projected.relayState && { relayState: projected.relayState }),
+      ...(projected.holdReason && { holdReason: projected.holdReason }),
+      ...(projected.nextExpectedNonce !== undefined && {
+        nextExpectedNonce: projected.nextExpectedNonce,
+      }),
+      ...(projected.missingNonces && { missingNonces: projected.missingNonces }),
+      ...(projected.holdExpiresAt && { holdExpiresAt: projected.holdExpiresAt }),
+      ...(senderWedge && { senderWedge }),
       submittedAt: projected.submittedAt,
       ...(projected.queuedAt && { queuedAt: projected.queuedAt }),
       ...(projected.mempoolAt && { mempoolAt: projected.mempoolAt }),

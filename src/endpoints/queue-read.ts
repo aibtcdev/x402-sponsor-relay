@@ -74,6 +74,19 @@ export class QueueRead extends BaseEndpoint {
                         },
                       },
                     },
+                    held: {
+                      type: "array" as const,
+                      items: {
+                        type: "object" as const,
+                        properties: {
+                          paymentId: { type: "string" as const },
+                          senderNonce: { type: "number" as const },
+                          source: { type: "string" as const },
+                          receivedAt: { type: "string" as const },
+                          expiresAt: { type: "string" as const },
+                        },
+                      },
+                    },
                     replayBuffer: {
                       type: "array" as const,
                       items: {
@@ -81,10 +94,31 @@ export class QueueRead extends BaseEndpoint {
                         properties: {
                           id: { type: "number" as const },
                           walletIndex: { type: "number" as const },
+                          paymentId: { type: "string" as const },
                           originalSponsorNonce: { type: "number" as const },
                           senderNonce: { type: "number" as const },
                           queuedAt: { type: "string" as const },
                         },
+                      },
+                    },
+                    senderWedge: {
+                      type: "object" as const,
+                      properties: {
+                        senderAddress: { type: "string" as const },
+                        blocked: { type: "boolean" as const },
+                        blockedOnFrontierMismatch: { type: "boolean" as const },
+                        adminRecoveryLikely: { type: "boolean" as const },
+                        nextExpectedNonce: { type: "number" as const, nullable: true },
+                        lowestHeldNonce: { type: "number" as const, nullable: true },
+                        missingNonces: { type: "array" as const, items: { type: "number" as const } },
+                        heldCount: { type: "number" as const },
+                        oldestHeldAgeMs: { type: "number" as const, nullable: true },
+                        lastRepairAttemptAt: { type: "string" as const, nullable: true },
+                        lastRepairFailureAt: { type: "string" as const, nullable: true },
+                        repairEligible: { type: "boolean" as const },
+                        repairTriggered: { type: "boolean" as const },
+                        repairAdvanced: { type: "boolean" as const },
+                        activePaymentIds: { type: "array" as const, items: { type: "string" as const } },
                       },
                     },
                     total: { type: "number" as const },

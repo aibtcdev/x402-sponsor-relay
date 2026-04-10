@@ -12,6 +12,7 @@ import type {
   Env,
   LogsRPC,
   PoolHealthResponse,
+  SenderWedgeStatus,
   SponsorStatusResult,
   WalletHealthSnapshot,
   HandSubmitResult,
@@ -182,6 +183,7 @@ interface SenderHandRow {
   sender_address: string;
   sender_nonce: number;
   tx_hex: string;
+  payment_id: string | null;
   source: string;
   received_at: string;
   expires_at: string;
@@ -718,6 +720,7 @@ export class NonceDO {
       CREATE TABLE IF NOT EXISTS dispatch_queue (
         wallet_index    INTEGER NOT NULL,
         position        INTEGER NOT NULL DEFAULT 0,
+        payment_id      TEXT,
         sender_tx_hex   TEXT    NOT NULL,
         sender_address  TEXT    NOT NULL,
         sender_nonce    INTEGER NOT NULL,
@@ -752,6 +755,15 @@ export class NonceDO {
 
     // Migration: add original_fee column to dispatch_queue (nullable, text for bigint safety).
     // The standard SQLite ADD COLUMN IF NOT EXISTS is not supported — use try/catch instead.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('dispatch_queue') WHERE name = 'payment_id'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE dispatch_queue ADD COLUMN payment_id TEXT");
+      }
+    } catch { /* already present or error — fail-open */ }
+
     try {
       const cols = this.sql
         .exec<{ name: string }>("SELECT name FROM pragma_table_info('dispatch_queue') WHERE name = 'original_fee'")
@@ -830,6 +842,7 @@ export class NonceDO {
       CREATE TABLE IF NOT EXISTS replay_buffer (
         id                    INTEGER PRIMARY KEY AUTOINCREMENT,
         wallet_index          INTEGER NOT NULL,
+        payment_id            TEXT,
         sender_tx_hex         TEXT    NOT NULL,
         sender_address        TEXT    NOT NULL,
         sender_nonce          INTEGER NOT NULL,
@@ -848,6 +861,15 @@ export class NonceDO {
       CREATE INDEX IF NOT EXISTS idx_replay_buffer_sender
         ON replay_buffer(sender_address);
     `);
+
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('replay_buffer') WHERE name = 'payment_id'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE replay_buffer ADD COLUMN payment_id TEXT");
+      }
+    } catch { /* already present or error — fail-open */ }
 
     // Probe queue: alarm-driven backward probe for ghost mempool eviction.
     // When flush-wallet detects an empty forward range + probeDepth, nonces are
@@ -926,12 +948,22 @@ export class NonceDO {
         sender_address  TEXT    NOT NULL,
         sender_nonce    INTEGER NOT NULL,
         tx_hex          TEXT    NOT NULL,
+        payment_id      TEXT,
         source          TEXT    NOT NULL DEFAULT 'agent',
         received_at     TEXT    NOT NULL,
         expires_at      TEXT    NOT NULL,
         PRIMARY KEY (sender_address, sender_nonce)
       );
     `);
+
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('sender_hand') WHERE name = 'payment_id'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE sender_hand ADD COLUMN payment_id TEXT");
+      }
+    } catch { /* already present or error — fail-open */ }
 
     // sender_expiry_log: records recently expired sender_hand entries for agent feedback
     // TTL: entries older than 30 minutes are pruned each alarm cycle
@@ -980,6 +1012,7 @@ export class NonceDO {
     senderAddress: string,
     senderNonce: number,
     sponsorNonce: number,
+    paymentId: string | null = null,
     fee: string | null = null,
     submittedAt: string | null = null,
     isGapFill: boolean = false
@@ -996,12 +1029,13 @@ export class NonceDO {
 
     this.sql.exec(
       `INSERT OR REPLACE INTO dispatch_queue
-         (wallet_index, position, sender_tx_hex, sender_address, sender_nonce,
+         (wallet_index, position, payment_id, sender_tx_hex, sender_address, sender_nonce,
           sponsor_nonce, original_fee, state, queued_at, dispatched_at, confirmed_at,
           submitted_at, is_gap_fill)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, NULL, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, NULL, ?, ?)`,
       walletIndex,
       position,
+      paymentId,
       senderTxHex,
       senderAddress,
       senderNonce,
@@ -1223,15 +1257,17 @@ export class NonceDO {
     senderTxHex: string,
     senderAddress: string,
     senderNonce: number,
-    originalSponsorNonce: number
+    originalSponsorNonce: number,
+    paymentId: string | null = null
   ): void {
     const now = new Date().toISOString();
     this.sql.exec(
       `INSERT INTO replay_buffer
-         (wallet_index, sender_tx_hex, sender_address, sender_nonce,
+         (wallet_index, payment_id, sender_tx_hex, sender_address, sender_nonce,
           original_sponsor_nonce, queued_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
       walletIndex,
+      paymentId,
       senderTxHex,
       senderAddress,
       senderNonce,
@@ -1246,6 +1282,7 @@ export class NonceDO {
    */
   private getReplayBuffer(walletIndex: number): Array<{
     id: number;
+    payment_id: string | null;
     sender_tx_hex: string;
     sender_address: string;
     sender_nonce: number;
@@ -1255,13 +1292,14 @@ export class NonceDO {
     return this.sql
       .exec<{
         id: number;
+        payment_id: string | null;
         sender_tx_hex: string;
         sender_address: string;
         sender_nonce: number;
         original_sponsor_nonce: number;
         queued_at: string;
       }>(
-        `SELECT id, sender_tx_hex, sender_address, sender_nonce,
+        `SELECT id, payment_id, sender_tx_hex, sender_address, sender_nonce,
                 original_sponsor_nonce, queued_at
          FROM replay_buffer
          WHERE wallet_index = ?
@@ -1338,29 +1376,32 @@ export class NonceDO {
     senderAddress: string,
     senderNonce: number,
     txHex: string,
-    source: "agent" | "replay"
+    source: "agent" | "replay",
+    paymentId: string | null = null
   ): void {
     const now = new Date().toISOString();
     const expiresAt = new Date(Date.now() + HAND_HOLD_TIMEOUT_MS).toISOString();
     if (source === "agent") {
       this.sql.exec(
         `INSERT OR REPLACE INTO sender_hand
-           (sender_address, sender_nonce, tx_hex, source, received_at, expires_at)
-         VALUES (?, ?, ?, 'agent', ?, ?)`,
+           (sender_address, sender_nonce, tx_hex, payment_id, source, received_at, expires_at)
+         VALUES (?, ?, ?, ?, 'agent', ?, ?)`,
         senderAddress,
         senderNonce,
         txHex,
+        paymentId,
         now,
         expiresAt
       );
     } else {
       this.sql.exec(
         `INSERT OR IGNORE INTO sender_hand
-           (sender_address, sender_nonce, tx_hex, source, received_at, expires_at)
-         VALUES (?, ?, ?, 'replay', ?, ?)`,
+           (sender_address, sender_nonce, tx_hex, payment_id, source, received_at, expires_at)
+         VALUES (?, ?, ?, ?, 'replay', ?, ?)`,
         senderAddress,
         senderNonce,
         txHex,
+        paymentId,
         now,
         expiresAt
       );
@@ -1376,11 +1417,12 @@ export class NonceDO {
         sender_address: string;
         sender_nonce: number;
         tx_hex: string;
+        payment_id: string | null;
         source: string;
         received_at: string;
         expires_at: string;
       }>(
-        `SELECT sender_address, sender_nonce, tx_hex, source, received_at, expires_at
+        `SELECT sender_address, sender_nonce, tx_hex, payment_id, source, received_at, expires_at
          FROM sender_hand
          WHERE sender_address = ?
          ORDER BY sender_nonce ASC`,
@@ -1674,12 +1716,84 @@ export class NonceDO {
     }
   }
 
+  private buildSenderWedgeStatus(
+    senderAddress: string,
+    opts?: { repairTriggered?: boolean; repairAdvanced?: boolean }
+  ): SenderWedgeStatus {
+    const nowMs = Date.now();
+    const stateRow = this.getSenderState(senderAddress);
+    const activeHand = this.getHand(senderAddress)
+      .filter((entry) => new Date(entry.expires_at).getTime() > nowMs)
+      .sort((a, b) => a.sender_nonce - b.sender_nonce);
+
+    const lowestHeldNonce = activeHand[0]?.sender_nonce ?? null;
+    const nextExpectedNonce = stateRow?.next_expected_nonce ?? null;
+    const blockedOnFrontierMismatch =
+      lowestHeldNonce !== null &&
+      nextExpectedNonce !== null &&
+      lowestHeldNonce > nextExpectedNonce;
+    const candidate = this.evaluateStaleSenderRepairCandidate(stateRow, activeHand, nowMs);
+    const missingNonces: number[] = [];
+
+    if (blockedOnFrontierMismatch && nextExpectedNonce !== null && lowestHeldNonce !== null) {
+      for (let nonce = nextExpectedNonce; nonce < lowestHeldNonce && missingNonces.length < 10; nonce++) {
+        missingNonces.push(nonce);
+      }
+    }
+
+    const oldestHeldAgeMs = activeHand.length > 0
+      ? activeHand.reduce((min, entry) => {
+          const receivedAtMs = new Date(entry.received_at).getTime();
+          return Number.isFinite(receivedAtMs) ? Math.min(min, receivedAtMs) : min;
+        }, Number.MAX_SAFE_INTEGER)
+      : Number.MAX_SAFE_INTEGER;
+    const resolvedOldestHeldAgeMs =
+      oldestHeldAgeMs === Number.MAX_SAFE_INTEGER ? null : Math.max(0, nowMs - oldestHeldAgeMs);
+    const recentRepairFailure = stateRow?.last_refresh_failure_at != null;
+    const nearExpiry =
+      resolvedOldestHeldAgeMs !== null &&
+      resolvedOldestHeldAgeMs >= Math.floor(HAND_HOLD_TIMEOUT_MS * 0.75);
+
+    return {
+      senderAddress,
+      blocked: activeHand.length > 0,
+      blockedOnFrontierMismatch,
+      adminRecoveryLikely:
+        blockedOnFrontierMismatch && Boolean(recentRepairFailure || nearExpiry),
+      nextExpectedNonce,
+      lowestHeldNonce,
+      missingNonces,
+      heldCount: activeHand.length,
+      oldestHeldAgeMs: resolvedOldestHeldAgeMs,
+      lastRepairAttemptAt: stateRow?.last_refresh_attempt_at ?? null,
+      lastRepairFailureAt: stateRow?.last_refresh_failure_at ?? null,
+      repairEligible: candidate !== null,
+      repairTriggered: opts?.repairTriggered,
+      repairAdvanced: opts?.repairAdvanced,
+      activePaymentIds: activeHand
+        .map((entry) => entry.payment_id)
+        .filter((paymentId): paymentId is string => typeof paymentId === "string"),
+    };
+  }
+
+  private async repairSenderWedge(senderAddress: string): Promise<SenderWedgeStatus> {
+    const repairAdvanced = await this.maybeRepairStaleSenderFrontier(senderAddress);
+    if (repairAdvanced) {
+      await this.checkAndAssignRun(senderAddress);
+    }
+
+    return this.buildSenderWedgeStatus(senderAddress, {
+      repairTriggered: true,
+      repairAdvanced,
+    });
+  }
+
   /**
    * Gather the sender's active hand entries and detect gaps relative to next_expected_nonce.
    * Shared by checkAndAssignRun() and checkWouldDispatch() to avoid duplicating gap detection logic.
    */
   private getHandGapInfo(senderAddress: string): {
-    hand: Array<{ sender_nonce: number; tx_hex: string; expires_at: string }>;
+    hand: Array<{ sender_nonce: number; tx_hex: string; payment_id: string | null; expires_at: string }>;
     missingNonces: number[];
     nextExpected: number;
     handSize: number;
@@ -1717,15 +1831,19 @@ export class NonceDO {
    * - dispatched:true with sponsorNonce/walletIndex/sponsorAddress for the first tx
    * - dispatched:false with missingNonces when a gap exists
    */
-  private checkAndAssignRun(senderAddress: string): HandSubmitResult {
+  private async checkAndAssignRun(senderAddress: string): Promise<HandSubmitResult> {
     const { hand, missingNonces, nextExpected, handSize } = this.getHandGapInfo(senderAddress);
 
     // Build the gapless run starting at nextExpected
-    const run: Array<{ senderNonce: number; txHex: string }> = [];
+    const run: Array<{ senderNonce: number; txHex: string; paymentId: string | null }> = [];
     let expectedNonce = nextExpected;
     for (const entry of hand) {
       if (entry.sender_nonce === expectedNonce) {
-        run.push({ senderNonce: entry.sender_nonce, txHex: entry.tx_hex });
+        run.push({
+          senderNonce: entry.sender_nonce,
+          txHex: entry.tx_hex,
+          paymentId: entry.payment_id,
+        });
         expectedNonce++;
       } else {
         break; // gap detected
@@ -1775,6 +1893,16 @@ export class NonceDO {
       heldCount: dispatchResult.held.length,
       nextSenderNonce: nextExpected + dispatchResult.assigned.length,
     });
+
+    try {
+      await this.syncPaymentsAfterQueueAssignment(run, dispatchResult.assigned);
+    } catch (error) {
+      this.log("warn", "payment_sync_after_assign_failed", {
+        senderAddress,
+        assignedCount: dispatchResult.assigned.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
 
     // sponsor_address is in async KV storage — return empty string.
     // SponsorService derives the correct key from walletIndex + mnemonic.
@@ -3618,7 +3746,7 @@ export class NonceDO {
    */
   private assignRunToWallet(
     senderAddress: string,
-    run: Array<{ senderNonce: number; txHex: string }>
+    run: Array<{ senderNonce: number; txHex: string; paymentId: string | null }>
   ): RunDispatchResult {
     const now = new Date().toISOString();
 
@@ -3689,11 +3817,12 @@ export class NonceDO {
       // Insert into dispatch_queue
       this.sql.exec(
         `INSERT OR REPLACE INTO dispatch_queue
-           (wallet_index, position, sender_tx_hex, sender_address, sender_nonce,
+           (wallet_index, position, payment_id, sender_tx_hex, sender_address, sender_nonce,
             sponsor_nonce, state, queued_at, dispatched_at, confirmed_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, NULL, NULL)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, NULL, NULL)`,
         walletIndex,
         position,
+        entry.paymentId,
         entry.txHex,
         senderAddress,
         entry.senderNonce,
@@ -3734,6 +3863,48 @@ export class NonceDO {
     });
 
     return { assigned, held };
+  }
+
+  private async syncPaymentsAfterQueueAssignment(
+    run: Array<{ senderNonce: number; paymentId: string | null }>,
+    assigned: RunDispatchResult["assigned"]
+  ): Promise<void> {
+    if (!this.env.RELAY_KV || assigned.length === 0) {
+      return;
+    }
+
+    const paymentIdsBySenderNonce = new Map(
+      run
+        .filter((entry) => entry.paymentId)
+        .map((entry) => [entry.senderNonce, entry.paymentId as string])
+    );
+
+    await Promise.all(
+      assigned.map(async (entry) => {
+        const paymentId = paymentIdsBySenderNonce.get(entry.senderNonce);
+        if (!paymentId) {
+          return;
+        }
+
+        const record = await getPaymentRecord(this.env.RELAY_KV!, paymentId);
+        if (!record || new Set(["confirmed", "failed", "replaced"]).has(record.status)) {
+          return;
+        }
+
+        record.sponsorWalletIndex = entry.walletIndex;
+        record.sponsorNonce = entry.sponsorNonce;
+        record.relayState = "queued";
+        record.holdReason = undefined;
+        record.nextExpectedNonce = undefined;
+        record.missingNonces = undefined;
+        record.holdExpiresAt = undefined;
+        record.error = undefined;
+        record.errorCode = undefined;
+        record.retryable = undefined;
+
+        await putPaymentRecord(this.env.RELAY_KV!, record);
+      })
+    );
   }
 
   /**
@@ -4557,12 +4728,13 @@ export class NonceDO {
       const stuckCutoff = new Date(Date.now() - stuckAgeMs).toISOString();
       const stuckEntries = this.sql
         .exec<{
+          payment_id: string | null;
           sender_tx_hex: string;
           sender_address: string;
           sender_nonce: number;
           sponsor_nonce: number;
         }>(
-          `SELECT sender_tx_hex, sender_address, sender_nonce, sponsor_nonce
+          `SELECT payment_id, sender_tx_hex, sender_address, sender_nonce, sponsor_nonce
            FROM dispatch_queue
            WHERE wallet_index = ? AND state = 'dispatched'
              AND COALESCE(dispatched_at, queued_at) <= ?
@@ -4639,7 +4811,8 @@ export class NonceDO {
             entry.sender_tx_hex,
             entry.sender_address,
             entry.sender_nonce,
-            entry.sponsor_nonce
+            entry.sponsor_nonce,
+            (entry as { payment_id?: string | null }).payment_id ?? null
           );
 
           flushed++;
@@ -4801,6 +4974,7 @@ export class NonceDO {
       const entries: Array<{
         id: number;
         wallet_index: number;
+        payment_id: string | null;
         sender_tx_hex: string;
         sender_address: string;
         sender_nonce: number;
@@ -4916,6 +5090,7 @@ export class NonceDO {
               entry.sender_address,
               entry.sender_nonce,
               freshNonce,
+              entry.payment_id ?? null,
               GAP_FILL_FEE.toString(),
               null,  // submitted_at: not available after replay
               true   // is_gap_fill: exclude from settlement percentiles
@@ -4926,6 +5101,13 @@ export class NonceDO {
             this.ledgerBroadcastOutcome(
               targetWallet.walletIndex, freshNonce, result.txid, 200, undefined, undefined
             );
+            await this.syncPaymentAfterBroadcast({
+              paymentId: entry.payment_id ?? null,
+              txid: result.txid,
+              walletIndex: targetWallet.walletIndex,
+              sponsorNonce: freshNonce,
+              fee: GAP_FILL_FEE.toString(),
+            });
             // Remove from replay buffer
             this.removeFromReplayBuffer(entry.id);
 
@@ -6120,12 +6302,13 @@ export class NonceDO {
     const entries = this.sql
       .exec<{
         id: number;
+        payment_id: string | null;
         sender_address: string;
         sender_nonce: number;
         sender_tx_hex: string;
         queued_at: string;
       }>(
-        `SELECT id, sender_address, sender_nonce, sender_tx_hex, queued_at
+        `SELECT id, payment_id, sender_address, sender_nonce, sender_tx_hex, queued_at
          FROM replay_buffer
          ORDER BY queued_at ASC
          LIMIT 5`
@@ -6137,11 +6320,12 @@ export class NonceDO {
       // INSERT OR IGNORE — never overwrite a fresher agent submission for the same nonce
       this.sql.exec(
         `INSERT OR IGNORE INTO sender_hand
-           (sender_address, sender_nonce, tx_hex, source, received_at, expires_at)
-         VALUES (?, ?, ?, 'replay', ?, ?)`,
+           (sender_address, sender_nonce, tx_hex, payment_id, source, received_at, expires_at)
+         VALUES (?, ?, ?, ?, 'replay', ?, ?)`,
         entry.sender_address,
         entry.sender_nonce,
         entry.sender_tx_hex,
+        (entry as { payment_id?: string | null }).payment_id ?? null,
         now,
         expiresAt
       );
@@ -6197,7 +6381,7 @@ export class NonceDO {
     for (const { sender_address } of senders) {
       try {
         await this.maybeRepairStaleSenderFrontier(sender_address);
-        this.checkAndAssignRun(sender_address);
+        await this.checkAndAssignRun(sender_address);
         swept++;
       } catch (e) {
         this.log("warn", "sweep_hand_error", {
@@ -6311,6 +6495,37 @@ export class NonceDO {
     };
   }
 
+  private async syncPaymentAfterBroadcast(params: {
+    paymentId: string | null;
+    txid: string;
+    walletIndex: number;
+    sponsorNonce: number;
+    fee: string;
+  }): Promise<void> {
+    if (!params.paymentId || !this.env.RELAY_KV) {
+      return;
+    }
+
+    const record = await getPaymentRecord(this.env.RELAY_KV, params.paymentId);
+    if (record && !new Set(["confirmed", "failed", "replaced"]).has(record.status)) {
+      const updated = transitionPayment(record, "mempool", {
+        txid: params.txid,
+        sponsorWalletIndex: params.walletIndex,
+        sponsorNonce: params.sponsorNonce,
+        sponsorFee: params.fee,
+        holdReason: undefined,
+        nextExpectedNonce: undefined,
+        missingNonces: undefined,
+        holdExpiresAt: undefined,
+      });
+      await putPaymentRecord(this.env.RELAY_KV, updated);
+    }
+
+    await this.env.RELAY_KV.put(`txid_map:${params.txid}`, params.paymentId, {
+      expirationTtl: 86_400,
+    });
+  }
+
   /**
    * Broadcast up to MAX_BROADCASTS_PER_TICK queued dispatch_queue entries across all wallets.
    * Processes entries ordered by wallet_index ASC, sponsor_nonce ASC to maintain ordering.
@@ -6332,12 +6547,13 @@ export class NonceDO {
     const queued = this.sql
       .exec<{
         wallet_index: number;
+        payment_id: string | null;
         sender_tx_hex: string;
         sender_address: string;
         sender_nonce: number;
         sponsor_nonce: number;
       }>(
-        `SELECT wallet_index, sender_tx_hex, sender_address, sender_nonce, sponsor_nonce
+        `SELECT wallet_index, payment_id, sender_tx_hex, sender_address, sender_nonce, sponsor_nonce
          FROM dispatch_queue
          WHERE state = 'queued'
          ORDER BY wallet_index ASC, sponsor_nonce ASC
@@ -6415,6 +6631,13 @@ export class NonceDO {
           this.ledgerBroadcastOutcome(
             entry.wallet_index, entry.sponsor_nonce, result.txid, 200, undefined, undefined
           );
+          await this.syncPaymentAfterBroadcast({
+            paymentId: entry.payment_id,
+            txid: result.txid,
+            walletIndex: entry.wallet_index,
+            sponsorNonce: entry.sponsor_nonce,
+            fee: GAP_FILL_FEE.toString(),
+          });
           broadcasts++;
           this.log("debug", "bounded_broadcast_ok", {
             walletIndex: entry.wallet_index,
@@ -6502,12 +6725,13 @@ export class NonceDO {
     // Get the failed dispatch_queue entry to identify the sender
     const failedEntry = this.sql
       .exec<{
+        payment_id: string | null;
         sender_address: string;
         sender_nonce: number;
         sender_tx_hex: string;
         original_fee: string | null;
       }>(
-        `SELECT sender_address, sender_nonce, sender_tx_hex, original_fee
+        `SELECT payment_id, sender_address, sender_nonce, sender_tx_hex, original_fee
          FROM dispatch_queue
          WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1`,
         walletIndex,
@@ -6564,12 +6788,13 @@ export class NonceDO {
       // Get ALL higher entries from the same sender's run on this wallet
       const higherEntries = this.sql
         .exec<{
+          payment_id: string | null;
           sponsor_nonce: number;
           sender_nonce: number;
           sender_tx_hex: string;
           original_fee: string | null;
         }>(
-          `SELECT sponsor_nonce, sender_nonce, sender_tx_hex, original_fee
+          `SELECT payment_id, sponsor_nonce, sender_nonce, sender_tx_hex, original_fee
            FROM dispatch_queue
            WHERE wallet_index = ? AND sender_address = ? AND sponsor_nonce >= ?
            ORDER BY sponsor_nonce ASC`,
@@ -6604,11 +6829,12 @@ export class NonceDO {
         if (higher.sender_nonce > failedSenderNonce) {
           this.sql.exec(
             `INSERT OR IGNORE INTO sender_hand
-               (sender_address, sender_nonce, tx_hex, source, received_at, expires_at)
-             VALUES (?, ?, ?, 'replay', ?, ?)`,
+               (sender_address, sender_nonce, tx_hex, payment_id, source, received_at, expires_at)
+             VALUES (?, ?, ?, ?, 'replay', ?, ?)`,
             sender_address,
             higher.sender_nonce,
             higher.sender_tx_hex,
+            (higher as { payment_id?: string | null }).payment_id ?? null,
             now,
             expiresAt
           );
@@ -7185,12 +7411,13 @@ export class NonceDO {
       // -------------------------------------------------------------------------
       const activeEntries = this.sql
         .exec<{
+          payment_id: string | null;
           sender_tx_hex: string;
           sender_address: string;
           sender_nonce: number;
           sponsor_nonce: number;
         }>(
-          `SELECT sender_tx_hex, sender_address, sender_nonce, sponsor_nonce
+          `SELECT payment_id, sender_tx_hex, sender_address, sender_nonce, sponsor_nonce
            FROM dispatch_queue
            WHERE wallet_index = ? AND state IN ('queued', 'dispatched')
            ORDER BY sponsor_nonce ASC`,
@@ -7254,7 +7481,8 @@ export class NonceDO {
                     entry.sender_tx_hex,
                     entry.sender_address,
                     entry.sender_nonce,
-                    entry.sponsor_nonce
+                    entry.sponsor_nonce,
+                    (entry as { payment_id?: string | null }).payment_id ?? null
                   );
                   retracted++;
                 } catch (e) {
@@ -7528,6 +7756,7 @@ export class NonceDO {
           senderAddress: string;
           senderNonce: number;
           sponsorNonce: number;
+          paymentId?: string | null;
           fee?: string | null;
           submittedAt?: string | null;
         }>(request);
@@ -7547,6 +7776,7 @@ export class NonceDO {
           body.senderAddress,
           body.senderNonce ?? 0,
           body.sponsorNonce,
+          typeof body.paymentId === "string" ? body.paymentId : null,
           typeof body.fee === "string" ? body.fee : null,
           typeof body.submittedAt === "string" ? body.submittedAt : null
         );
@@ -7714,16 +7944,18 @@ export class NonceDO {
     if (request.method === "GET" && queueSenderMatch) {
       const senderAddress = decodeURIComponent(queueSenderMatch[1]);
       try {
+        const senderWedge = this.buildSenderWedgeStatus(senderAddress);
         const queueRows = this.sql
           .exec<{
             wallet_index: number;
+            payment_id: string | null;
             sponsor_nonce: number;
             sender_nonce: number;
             state: string;
             queued_at: string;
             dispatched_at: string | null;
           }>(
-            `SELECT wallet_index, sponsor_nonce, sender_nonce, state,
+            `SELECT wallet_index, payment_id, sponsor_nonce, sender_nonce, state,
                     queued_at, dispatched_at
              FROM dispatch_queue
              WHERE sender_address = ? AND state NOT IN ('confirmed', 'retired')
@@ -7733,15 +7965,34 @@ export class NonceDO {
           )
           .toArray();
 
+        const heldRows = this.sql
+          .exec<{
+            payment_id: string | null;
+            sender_nonce: number;
+            source: string;
+            received_at: string;
+            expires_at: string;
+          }>(
+            `SELECT payment_id, sender_nonce, source, received_at, expires_at
+             FROM sender_hand
+             WHERE sender_address = ? AND expires_at > ?
+             ORDER BY sender_nonce ASC
+             LIMIT 100`,
+            senderAddress,
+            new Date().toISOString()
+          )
+          .toArray();
+
         const replayRows = this.sql
           .exec<{
             id: number;
             wallet_index: number;
+            payment_id: string | null;
             sender_nonce: number;
             original_sponsor_nonce: number;
             queued_at: string;
           }>(
-            `SELECT id, wallet_index, sender_nonce, original_sponsor_nonce, queued_at
+            `SELECT id, wallet_index, payment_id, sender_nonce, original_sponsor_nonce, queued_at
              FROM replay_buffer
              WHERE sender_address = ?
              ORDER BY queued_at ASC
@@ -7754,6 +8005,7 @@ export class NonceDO {
           .filter((r) => r.state === "queued")
           .map((r) => ({
             walletIndex: r.wallet_index,
+            ...(r.payment_id && { paymentId: r.payment_id }),
             sponsorNonce: r.sponsor_nonce,
             senderNonce: r.sender_nonce,
             queuedAt: r.queued_at,
@@ -7763,6 +8015,7 @@ export class NonceDO {
           .filter((r) => r.state === "dispatched")
           .map((r) => ({
             walletIndex: r.wallet_index,
+            ...(r.payment_id && { paymentId: r.payment_id }),
             sponsorNonce: r.sponsor_nonce,
             senderNonce: r.sender_nonce,
             queuedAt: r.queued_at,
@@ -7773,29 +8026,54 @@ export class NonceDO {
           .filter((r) => r.state === "replaying")
           .map((r) => ({
             walletIndex: r.wallet_index,
+            ...(r.payment_id && { paymentId: r.payment_id }),
             sponsorNonce: r.sponsor_nonce,
             senderNonce: r.sender_nonce,
             queuedAt: r.queued_at,
           }));
 
+        const held = heldRows.map((r) => ({
+          ...(r.payment_id && { paymentId: r.payment_id }),
+          senderNonce: r.sender_nonce,
+          source: r.source,
+          receivedAt: r.received_at,
+          expiresAt: r.expires_at,
+        }));
+
         const replayBuffer = replayRows.map((r) => ({
           id: r.id,
           walletIndex: r.wallet_index,
+          ...(r.payment_id && { paymentId: r.payment_id }),
           originalSponsorNonce: r.original_sponsor_nonce,
           senderNonce: r.sender_nonce,
           queuedAt: r.queued_at,
         }));
 
         return this.jsonResponse({
+          senderWedge,
           queued,
           dispatched,
           replaying,
+          held,
           replayBuffer,
-          total: queued.length + dispatched.length + replaying.length + replayBuffer.length,
+          total: queued.length + dispatched.length + replaying.length + held.length + replayBuffer.length,
         });
       } catch (error) {
         return this.internalError(error);
       }
+    }
+
+    const senderRepairMatch = url.pathname.match(/^\/sender-repair\/([^/]+)$/);
+    if (request.method === "POST" && senderRepairMatch) {
+      const senderAddress = decodeURIComponent(senderRepairMatch[1]);
+      return this.state.blockConcurrencyWhile(async () => {
+        try {
+          const senderWedge = await this.repairSenderWedge(senderAddress);
+          return this.jsonResponse(senderWedge);
+        } catch (error) {
+          return this.internalError(error);
+        }
+      });
     }
 
     // DELETE /queue-sender/:address/:walletIndex/:sponsorNonce — agent self-service cancellation.
@@ -7929,6 +8207,7 @@ export class NonceDO {
         senderNonce: number;
         txHex: string;
         mode?: "hold" | "immediate";
+        paymentId?: string;
       }>(request);
       if (errorResponse) return errorResponse;
       if (!body?.senderAddress || typeof body.senderNonce !== "number" || !body.txHex) {
@@ -7963,10 +8242,16 @@ export class NonceDO {
           }
 
           // 4. Add to hand (agent submission — INSERT OR REPLACE)
-          this.addToHand(body.senderAddress, body.senderNonce, body.txHex, "agent");
+          this.addToHand(
+            body.senderAddress,
+            body.senderNonce,
+            body.txHex,
+            "agent",
+            body.paymentId ?? null
+          );
 
           // 5. Check for a gapless run and dispatch if found
-          const result = this.checkAndAssignRun(body.senderAddress);
+          const result = await this.checkAndAssignRun(body.senderAddress);
 
           // 6. Attach recentlyExpired info when entries expired before this submission.
           //    Helps agents understand why previously-submitted nonces disappeared.

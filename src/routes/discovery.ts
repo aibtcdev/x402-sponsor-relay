@@ -63,7 +63,7 @@ Terminal outcomes include terminalReason when known:
 - expired
 - unknown_payment_identity
 
-Example terminal response:
+If the relay rejects before canonical acceptance, sender nonce gap can still be terminal:
 {
   "success": true,
   "requestId": "req_123",
@@ -73,6 +73,21 @@ Example terminal response:
   "error": "Sender nonce gap: waiting for nonce 5",
   "retryable": false,
   "checkStatusUrl": "${BASE_URL_PLACEHOLDER}/payment/pay_01J..."
+}
+
+If the payment was already accepted and later wedges in sender hand, it remains canonical
+"queued" work on the same paymentId and polling returns additive hold diagnostics instead
+of terminalizing it:
+{
+  "success": true,
+  "requestId": "req_124",
+  "paymentId": "pay_01J...held",
+  "status": "queued",
+  "relayState": "held",
+  "holdReason": "gap",
+  "nextExpectedNonce": 5,
+  "missingNonces": [5],
+  "checkStatusUrl": "${BASE_URL_PLACEHOLDER}/payment/pay_01J...held"
 }
 
 ${includeArtifactDedupeDetail ? `Duplicate submission of the same payment artifact reuses the same paymentId until

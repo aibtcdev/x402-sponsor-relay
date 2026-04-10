@@ -54,8 +54,18 @@ import {
   markInFlight,
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
+import { repairSenderWedgeDO } from "./services";
 
 export type { SubmitPaymentResult, CheckPaymentResult };
+
+type RelayCheckPaymentResult = CheckPaymentResult & {
+  relayState?: "held" | "queued" | "broadcasting" | "mempool";
+  holdReason?: "gap" | "capacity";
+  nextExpectedNonce?: number;
+  missingNonces?: number[];
+  holdExpiresAt?: string;
+  senderWedge?: import("./types").SenderWedgeStatus;
+};
 
 type PublicRpcErrorCode = (typeof RPC_ERROR_CODES)[number];
 
@@ -389,7 +399,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
   /**
    * Check the status of a previously submitted payment.
    */
-  async checkPayment(paymentId: string): Promise<CheckPaymentResult> {
+  async checkPayment(paymentId: string): Promise<RelayCheckPaymentResult> {
     const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
       component: "rpc",
       route: "rpc.checkPayment",
@@ -426,8 +436,20 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
 
-    const projected = projectPaymentRecord(record);
-    const compatShimUsed = record.status === "submitted";
+    let refreshedRecord = record;
+    let senderWedge;
+    if (
+      record.status === "queued" &&
+      record.relayState === "held" &&
+      record.holdReason === "gap" &&
+      record.senderAddress
+    ) {
+      senderWedge = await repairSenderWedgeDO(this.env, logger, record.senderAddress);
+      refreshedRecord = (await getPaymentRecord(kv, paymentId)) ?? record;
+    }
+
+    const projected = projectPaymentRecord(refreshedRecord);
+    const compatShimUsed = refreshedRecord.status === "submitted";
 
     emitProjectedPaymentPollEvents(
       logger,
@@ -448,6 +470,14 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       errorCode: projectRpcErrorCode(projected.errorCode),
       retryable: projected.retryable,
       senderNonceInfo: projected.senderNonceInfo,
+      ...(projected.relayState && { relayState: projected.relayState }),
+      ...(projected.holdReason && { holdReason: projected.holdReason }),
+      ...(projected.nextExpectedNonce !== undefined && {
+        nextExpectedNonce: projected.nextExpectedNonce,
+      }),
+      ...(projected.missingNonces && { missingNonces: projected.missingNonces }),
+      ...(projected.holdExpiresAt && { holdExpiresAt: projected.holdExpiresAt }),
+      ...(senderWedge && { senderWedge }),
       checkStatusUrl,
     };
   }

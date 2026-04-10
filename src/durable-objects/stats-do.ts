@@ -832,6 +832,44 @@ export class StatsDO {
     };
   }
 
+  private readRolling24hTokenStats(): DashboardOverview["tokens"] {
+    const cutoff = Date.now() - DAY_MS;
+    const rows = this.sql
+      .exec<{ token: string; count: number; volume: string | null }>(
+        `SELECT token,
+                COUNT(*) as count,
+                CAST(COALESCE(SUM(CAST(amount AS INTEGER)), 0) AS TEXT) as volume
+         FROM tx_log
+         WHERE timestamp >= ?
+         GROUP BY token`,
+        cutoff
+      )
+      .toArray();
+
+    const totals = {
+      STX: { count: 0, volume: "0", percentage: 0 },
+      sBTC: { count: 0, volume: "0", percentage: 0 },
+      USDCx: { count: 0, volume: "0", percentage: 0 },
+    } satisfies DashboardOverview["tokens"];
+
+    for (const row of rows) {
+      if (row.token === "STX" || row.token === "sBTC" || row.token === "USDCx") {
+        totals[row.token].count = row.count ?? 0;
+        totals[row.token].volume = row.volume ?? "0";
+      }
+    }
+
+    const totalCount = totals.STX.count + totals.sBTC.count + totals.USDCx.count;
+    const pct = (count: number) =>
+      totalCount > 0 ? Math.round((count / totalCount) * 100) : 0;
+
+    totals.STX.percentage = pct(totals.STX.count);
+    totals.sBTC.percentage = pct(totals.sBTC.count);
+    totals.USDCx.percentage = pct(totals.USDCx.count);
+
+    return totals;
+  }
+
   /**
    * Build per-wallet 24h throughput entries from wallet_hourly data.
    * Only includes wallets with at least one transaction in the last 24h.
@@ -913,17 +951,10 @@ export class StatsDO {
   }
 
   private buildOverview(): DashboardOverview {
-    // readDailyStats(1) returns [today] — used for calendar-day token and fee breakdown.
+    // readDailyStats(1) returns [today] — still used for calendar-day endpoint/error breakdown.
     const todayArr = this.readDailyStats(1);
     const current = todayArr[0];
-
-    // Token percentages (from today's daily_stats — calendar-day token breakdown)
-    const totalTokenTx =
-      current.tokens.STX.count +
-      current.tokens.sBTC.count +
-      current.tokens.USDCx.count;
-    const pct = (count: number) =>
-      totalTokenTx > 0 ? Math.round((count / totalTokenTx) * 100) : 0;
+    const rollingTokens = this.readRolling24hTokenStats();
 
     // Fee aggregates (from today's daily_stats)
     const currentFees = current.fees ?? { total: "0", count: 0, min: "0", max: "0" };
@@ -1021,23 +1052,7 @@ export class StatsDO {
         rawSuccessRate,
         effectiveSuccessRate,
       },
-      tokens: {
-        STX: {
-          count: current.tokens.STX.count,
-          volume: current.tokens.STX.volume,
-          percentage: pct(current.tokens.STX.count),
-        },
-        sBTC: {
-          count: current.tokens.sBTC.count,
-          volume: current.tokens.sBTC.volume,
-          percentage: pct(current.tokens.sBTC.count),
-        },
-        USDCx: {
-          count: current.tokens.USDCx.count,
-          volume: current.tokens.USDCx.volume,
-          percentage: pct(current.tokens.USDCx.count),
-        },
-      },
+      tokens: rollingTokens,
       fees: {
         total: rollingFeeTotal,
         average: rollingFeeAvg,

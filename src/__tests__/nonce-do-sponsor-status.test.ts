@@ -1,5 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { NonceDO } from "../durable-objects/nonce-do";
+import { createPaymentRecord, getPaymentRecord, putPaymentRecord, transitionPayment } from "../services/payment-status";
+import { MemoryKV } from "./helpers/memory-kv";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -427,6 +429,87 @@ describe("NonceDO stale sender repair helpers", () => {
       expect.objectContaining({
         senderAddress: "STERR",
         error: "hiro unavailable",
+      })
+    );
+  });
+
+  it("clears held metadata when a repaired run is re-queued under the same canonical payment", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_repaired", "testnet"),
+      "queued",
+      {
+        holdReason: "gap",
+        nextExpectedNonce: 4,
+        missingNonces: [4, 5],
+        holdExpiresAt: "2026-04-09T12:30:00.000Z",
+      }
+    );
+    record.relayState = "held";
+    await putPaymentRecord(kv, record);
+
+    const sync = (NonceDO as any).prototype.syncPaymentsAfterQueueAssignment;
+    await sync.call(
+      { env: { RELAY_KV: kv } },
+      [{ senderNonce: 6, paymentId: "pay_repaired" }],
+      [{ senderNonce: 6, walletIndex: 2, sponsorNonce: 55 }]
+    );
+
+    const updated = await getPaymentRecord(kv, "pay_repaired");
+    expect(updated).toEqual(
+      expect.objectContaining({
+        status: "queued",
+        relayState: "queued",
+        sponsorWalletIndex: 2,
+        sponsorNonce: 55,
+      })
+    );
+    expect(updated).not.toHaveProperty("holdReason");
+    expect(updated).not.toHaveProperty("nextExpectedNonce");
+    expect(updated).not.toHaveProperty("missingNonces");
+    expect(updated).not.toHaveProperty("holdExpiresAt");
+    expect(updated).not.toHaveProperty("error");
+  });
+
+  it("does not fail run assignment when post-assignment payment sync throws", async () => {
+    const checkAndAssignRun = (NonceDO as any).prototype.checkAndAssignRun;
+    const log = vi.fn();
+
+    const result = await checkAndAssignRun.call({
+      getHandGapInfo: () => ({
+        hand: [
+          {
+            sender_nonce: 4,
+            tx_hex: "0xabc",
+            payment_id: "pay_sync_fail",
+            expires_at: "2099-01-01T00:00:00.000Z",
+          },
+        ],
+        missingNonces: [],
+        nextExpected: 4,
+        handSize: 1,
+      }),
+      assignRunToWallet: () => ({
+        assigned: [{ senderNonce: 4, walletIndex: 1, sponsorNonce: 44 }],
+        held: [],
+      }),
+      syncPaymentsAfterQueueAssignment: vi.fn().mockRejectedValue(new Error("kv unavailable")),
+      log,
+    }, "STSYNC");
+
+    expect(result).toEqual({
+      dispatched: true,
+      sponsorNonce: 44,
+      walletIndex: 1,
+      sponsorAddress: "",
+    });
+    expect(log).toHaveBeenCalledWith(
+      "warn",
+      "payment_sync_after_assign_failed",
+      expect.objectContaining({
+        senderAddress: "STSYNC",
+        assignedCount: 1,
+        error: "kv unavailable",
       })
     );
   });
