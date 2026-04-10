@@ -7,6 +7,18 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.28.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.5...x402-sponsor-relay-v1.28.0) (2026-04-10)
+
+
+### Features
+
+* **relay:** complete canonical payment lifecycle ownership ([#330](https://github.com/aibtcdev/x402-sponsor-relay/issues/330)) ([4ff68f0](https://github.com/aibtcdev/x402-sponsor-relay/commit/4ff68f0041b37e64271ccb7bd034dbd59e6e1ce6))
+
+
+### Bug Fixes
+
+* **deps:** pin lodash transitive dependency to 4.18.1 ([#315](https://github.com/aibtcdev/x402-sponsor-relay/issues/315)) ([7de03a2](https://github.com/aibtcdev/x402-sponsor-relay/commit/7de03a2f74a3d12a5a57f207094745e264e579d2))
+
 ## [1.27.5](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.4...x402-sponsor-relay-v1.27.5) (2026-04-07)
 
 
