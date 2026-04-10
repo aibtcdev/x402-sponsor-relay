@@ -68,7 +68,7 @@ Key facts:
 
 ### Step 1: Build a sponsored transaction
 
-Use `@stacks/transactions` (or `x402-stacks`) to build a transfer or contract call with `sponsored: true`.
+Use `@stacks/transactions` to build a transfer or contract call with `sponsored: true`.
 
 ```typescript
 import { makeSTXTokenTransfer, AnchorMode, PostConditionMode } from "@stacks/transactions";

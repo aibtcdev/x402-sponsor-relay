@@ -1068,7 +1068,7 @@ Two modes are available:
 
 ### Step 1: Build a Sponsored Transaction
 
-Using the x402-stacks library or @stacks/transactions:
+Using @stacks/transactions:
 
 import { makeSTXTokenTransfer, AnchorMode, TransactionVersion } from "@stacks/transactions";
 
@@ -1366,10 +1366,9 @@ The message that gets signed is a Clarity tuple:
 
 ## Creating a SIP-018 Signature
 
-Using @stacks/transactions + x402-stacks:
+Using @stacks/transactions:
 
 import { signStructuredData } from "@stacks/transactions";
-import { SIP018_DOMAIN_MAINNET } from "x402-stacks";
 
 const domain = {
   name: "x402-sponsor-relay",
