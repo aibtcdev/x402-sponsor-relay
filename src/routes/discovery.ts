@@ -76,7 +76,7 @@ If the relay rejects before canonical acceptance, sender nonce gap can still be 
 }
 
 If the payment was already accepted and later wedges in sender hand, it remains canonical
-`queued` work on the same paymentId and polling returns additive hold diagnostics instead
+"queued" work on the same paymentId and polling returns additive hold diagnostics instead
 of terminalizing it:
 {
   "success": true,
