@@ -67,7 +67,6 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - Cloudflare Workers for deployment
 - Hono web framework with Chanfana for OpenAPI documentation
 - @stacks/transactions for Stacks transaction handling
-- x402-stacks (fork) for building sponsored transactions
 - worker-logs service binding for centralized logging
 - x402 V2 spec-compliant facilitator (POST /settle, POST /verify, GET /supported)
   Spec: https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
@@ -594,7 +593,6 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 
 **x402 Stacks Ecosystem:**
 - `~/dev/whoabuddy/stx402/` - x402 implementation (stx402.com)
-- `~/dev/tony1908/x402Stacks/` - x402-stacks npm package (PR #8 adds sponsored tx)
 
 **aibtcdev Resources:**
 - `../erc-8004-stacks/` - Agent identity contracts (future integration)

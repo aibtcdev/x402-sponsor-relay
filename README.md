@@ -404,7 +404,6 @@ const response = await fetch("https://x402-relay.aibtc.dev/sponsor", {
 - **Hono** - Lightweight web framework
 - **Chanfana** - OpenAPI documentation generator
 - **@stacks/transactions** - Stacks transaction handling
-- **x402-stacks** - x402 protocol implementation for Stacks
 
 ## Development
 
@@ -445,7 +444,6 @@ The test scripts support these environment variables (set in `.env`):
 ## Related Projects
 
 - [x402 Protocol](https://www.x402.org/) - HTTP-native payment standard
-- [x402-stacks](https://github.com/tony1908/x402Stacks) - x402 for Stacks
 - [stx402](https://stx402.com) - x402 Stacks implementation
 
 ## License
