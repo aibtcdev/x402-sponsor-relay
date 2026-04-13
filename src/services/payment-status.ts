@@ -12,8 +12,9 @@ import type {
   TerminalReason,
   TrackedPaymentState,
 } from "@aibtc/tx-schemas/core";
-import type { SettleOptions } from "../types";
-import { buildExplorerUrl, stripHexPrefix } from "../utils";
+import type { Env, Logger, SettleOptions } from "../types";
+import { buildExplorerUrl, emitPaymentLifecycleEvent, stripHexPrefix } from "../utils";
+import { SettlementService } from "./settlement";
 
 // KV key prefix and TTL
 const PAYMENT_KEY_PREFIX = "payment:";
@@ -406,4 +407,82 @@ export function transitionPayment(
  */
 export function generatePaymentId(): string {
   return `pay_${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
+/** Minimum age (ms) a record must be in mempool before we check Hiro. */
+const SELF_HEAL_MIN_AGE_MS = 10_000;
+
+/**
+ * Self-healing for payments stuck in mempool.
+ *
+ * When a record has status "mempool" with a txid, queries Hiro for actual
+ * on-chain status and transitions to confirmed or failed if terminal.
+ * Throttled: skips records that entered mempool less than 10s ago.
+ *
+ * Shared by GET /payment/:id and RPC checkPayment to keep both paths aligned.
+ * Returns the (possibly updated) record. Never throws — logs and returns
+ * the original record on any failure.
+ */
+export async function selfHealMempoolRecord(
+  record: PaymentRecord,
+  kv: KVNamespace,
+  env: Env,
+  logger: Logger,
+  route: string
+): Promise<PaymentRecord> {
+  if (record.status !== "mempool" || !record.txid) return record;
+
+  // Throttle: don't hit Hiro for records that just entered the mempool
+  if (record.mempoolAt) {
+    const ageMs = Date.now() - new Date(record.mempoolAt).getTime();
+    if (ageMs < SELF_HEAL_MIN_AGE_MS) return record;
+  }
+
+  try {
+    const settlement = new SettlementService(env, logger);
+    const hiroStatus = await settlement.fetchHiroTxStatus(record.txid);
+    if (!hiroStatus) return record;
+
+    let healed: PaymentRecord | undefined;
+    let action: string | undefined;
+
+    if (hiroStatus.txStatus === "success" && typeof hiroStatus.blockHeight === "number") {
+      healed = transitionPayment(record, "confirmed", {
+        blockHeight: hiroStatus.blockHeight,
+      });
+      action = "mempool_to_confirmed";
+    } else if (hiroStatus.txStatus.startsWith("abort_")) {
+      healed = transitionPayment(record, "failed", {
+        error: "Transaction aborted on-chain",
+        errorCode: "SETTLEMENT_FAILED",
+        terminalReason: "chain_abort",
+        retryable: false,
+      });
+      action = "mempool_to_failed";
+    }
+
+    if (healed) {
+      await putPaymentRecord(kv, healed);
+      emitPaymentLifecycleEvent(logger, "payment.self_healed", {
+        route,
+        paymentId: healed.paymentId,
+        status: healed.status,
+        action,
+        txid: healed.txid,
+        hiroTxStatus: hiroStatus.txStatus,
+        ...(healed.blockHeight && { blockHeight: healed.blockHeight }),
+        ...(healed.terminalReason && { terminalReason: healed.terminalReason }),
+        checkStatusUrlPresent: true,
+        compatShimUsed: false,
+      });
+      return healed;
+    }
+  } catch (e) {
+    logger.warn("Self-healing check failed, returning stale status", {
+      paymentId: record.paymentId,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+
+  return record;
 }

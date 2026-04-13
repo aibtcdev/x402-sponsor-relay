@@ -3,8 +3,7 @@ import type { AppContext } from "../types";
 import {
   buildNotFoundPaymentRecord,
   getPaymentRecord,
-  putPaymentRecord,
-  transitionPayment,
+  selfHealMempoolRecord,
   projectPaymentRecord,
 } from "../services/payment-status";
 import {
@@ -12,7 +11,7 @@ import {
   emitPaymentLifecycleEvent,
   emitProjectedPaymentPollEvents,
 } from "../utils";
-import { repairSenderWedgeDO, SettlementService } from "../services";
+import { repairSenderWedgeDO } from "../services";
 
 /**
  * GET /payment/:id — Public payment status endpoint.
@@ -179,53 +178,9 @@ export class PaymentStatus extends BaseEndpoint {
     }
 
     // Self-healing: check on-chain status for payments stuck in mempool
-    if (refreshedRecord.status === "mempool" && refreshedRecord.txid) {
-      try {
-        const settlement = new SettlementService(c.env, logger);
-        const hiroStatus = await settlement.fetchHiroTxStatus(refreshedRecord.txid);
-
-        let healedStatus: "confirmed" | "failed" | undefined;
-        let healAction: string | undefined;
-        let healEventExtra: Record<string, unknown> = {};
-
-        if (hiroStatus?.txStatus === "success" && typeof hiroStatus.blockHeight === "number") {
-          refreshedRecord = transitionPayment(refreshedRecord, "confirmed", {
-            blockHeight: hiroStatus.blockHeight,
-          });
-          healedStatus = "confirmed";
-          healAction = "mempool_to_confirmed";
-          healEventExtra = { blockHeight: hiroStatus.blockHeight };
-        } else if (hiroStatus?.txStatus.startsWith("abort_")) {
-          refreshedRecord = transitionPayment(refreshedRecord, "failed", {
-            error: "Transaction aborted on-chain",
-            errorCode: "SETTLEMENT_FAILED",
-            terminalReason: "chain_abort",
-            retryable: false,
-          });
-          healedStatus = "failed";
-          healAction = "mempool_to_failed";
-          healEventExtra = { terminalReason: "chain_abort" };
-        }
-
-        if (healedStatus) {
-          await putPaymentRecord(kv, refreshedRecord);
-          emitPaymentLifecycleEvent(logger, "payment.self_healed", {
-            route: "GET /payment/:id",
-            paymentId,
-            status: healedStatus,
-            action: healAction!,
-            checkStatusUrlPresent: true,
-            compatShimUsed: false,
-            ...healEventExtra,
-          });
-        }
-      } catch (e) {
-        logger.warn("Self-healing check failed, returning stale status", {
-          paymentId,
-          error: e instanceof Error ? e.message : String(e),
-        });
-      }
-    }
+    refreshedRecord = await selfHealMempoolRecord(
+      refreshedRecord, kv, c.env, logger, "GET /payment/:id"
+    );
 
     const projected = projectPaymentRecord(refreshedRecord);
     const checkStatusUrl = buildPaymentCheckStatusUrl(c.env, projected.paymentId);
