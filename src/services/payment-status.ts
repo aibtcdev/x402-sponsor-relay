@@ -451,7 +451,7 @@ export async function selfHealMempoolRecord(
         blockHeight: hiroStatus.blockHeight,
       });
       action = "mempool_to_confirmed";
-    } else if (hiroStatus.txStatus.startsWith("abort_")) {
+    } else if (hiroStatus.txStatus?.startsWith("abort_")) {
       healed = transitionPayment(record, "failed", {
         error: "Transaction aborted on-chain",
         errorCode: "SETTLEMENT_FAILED",
