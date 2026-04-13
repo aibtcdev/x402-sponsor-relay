@@ -46,6 +46,7 @@ import {
   type SenderNonceInfo,
   putPaymentArtifact,
   putPaymentRecord,
+  selfHealMempoolRecord,
   transitionPayment,
 } from "./services/payment-status";
 import {
@@ -447,6 +448,11 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       senderWedge = await repairSenderWedgeDO(this.env, logger, record.senderAddress);
       refreshedRecord = (await getPaymentRecord(kv, paymentId)) ?? record;
     }
+
+    // Self-healing: check on-chain status for payments stuck in mempool
+    refreshedRecord = await selfHealMempoolRecord(
+      refreshedRecord, kv, this.env, logger, "rpc.checkPayment"
+    );
 
     const projected = projectPaymentRecord(refreshedRecord);
     const compatShimUsed = refreshedRecord.status === "submitted";

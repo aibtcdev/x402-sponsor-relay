@@ -61,6 +61,7 @@ export {
   projectPaymentRecord,
   putPaymentArtifact,
   putPaymentRecord,
+  selfHealMempoolRecord,
   transitionPayment,
 } from "./payment-status";
 export type {

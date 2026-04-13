@@ -3,6 +3,7 @@ import type { AppContext } from "../types";
 import {
   buildNotFoundPaymentRecord,
   getPaymentRecord,
+  selfHealMempoolRecord,
   projectPaymentRecord,
 } from "../services/payment-status";
 import {
@@ -175,6 +176,11 @@ export class PaymentStatus extends BaseEndpoint {
       senderWedge = await repairSenderWedgeDO(c.env, logger, record.senderAddress);
       refreshedRecord = (await getPaymentRecord(kv, paymentId)) ?? record;
     }
+
+    // Self-healing: check on-chain status for payments stuck in mempool
+    refreshedRecord = await selfHealMempoolRecord(
+      refreshedRecord, kv, c.env, logger, "GET /payment/:id"
+    );
 
     const projected = projectPaymentRecord(refreshedRecord);
     const checkStatusUrl = buildPaymentCheckStatusUrl(c.env, projected.paymentId);
