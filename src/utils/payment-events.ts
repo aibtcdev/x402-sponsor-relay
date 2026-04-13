@@ -7,7 +7,8 @@ export type PaymentLifecycleEvent =
   | "payment.poll"
   | "payment.finalized"
   | "payment.retry_decision"
-  | "payment.fallback_used";
+  | "payment.fallback_used"
+  | "payment.self_healed";
 
 type PaymentLogLevel = "info" | "warn" | "error" | "debug";
 
