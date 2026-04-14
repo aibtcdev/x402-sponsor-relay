@@ -3527,7 +3527,7 @@ export class NonceDO {
   private ledgerMarkConfirmedByReconcile(walletIndex: number, nonce: number, txid: string): void {
     try {
       const now = new Date().toISOString();
-      this.sql.exec(
+      const updateCursor = this.sql.exec(
         `UPDATE nonce_intents
          SET state = 'confirmed', txid = ?, broadcasted_at = COALESCE(broadcasted_at, ?), confirmed_at = ?
          WHERE wallet_index = ? AND nonce = ? AND state != 'confirmed'`,
@@ -3537,14 +3537,18 @@ export class NonceDO {
         walletIndex,
         nonce
       );
-      this.sql.exec(
-        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
-         VALUES (?, ?, 'reconcile_confirmed', ?, ?)`,
-        walletIndex,
-        nonce,
-        JSON.stringify({ txid, reason: "chain_advanced_past_nonce" }),
-        now
-      );
+      // Only emit event if the UPDATE actually transitioned the intent (prevents
+      // duplicate reconcile_confirmed events when the nonce is already confirmed)
+      if (updateCursor.rowsWritten > 0) {
+        this.sql.exec(
+          `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+           VALUES (?, ?, 'reconcile_confirmed', ?, ?)`,
+          walletIndex,
+          nonce,
+          JSON.stringify({ txid, reason: "chain_advanced_past_nonce" }),
+          now
+        );
+      }
       // Also advance any matching dispatch queue entry to 'confirmed'
       this.transitionQueueEntry(walletIndex, nonce, "confirmed");
     } catch (e) {
@@ -6162,6 +6166,7 @@ export class NonceDO {
       let confirmedCount = 0;
       let abortedCount = 0;
       let skippedNoPayment = 0;
+      let skippedMissingRecord = 0;
       let skippedTerminal = 0;
 
       for (const ev of events) {
@@ -6180,7 +6185,11 @@ export class NonceDO {
         }
 
         const record = await getPaymentRecord(this.env.RELAY_KV, paymentId);
-        if (!record || TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+        if (!record) {
+          skippedMissingRecord++;
+          continue;
+        }
+        if (TERMINAL_PAYMENT_STATUSES.has(record.status)) {
           skippedTerminal++;
           continue;
         }
@@ -6200,9 +6209,14 @@ export class NonceDO {
               txStatus = parsed.txStatus;
             } catch { /* detail is optional */ }
           }
+          const error = txStatus
+            ? `Transaction aborted on-chain: ${txStatus}`
+            : "Transaction aborted on-chain";
           const updated = transitionPayment(record, "failed", {
             terminalReason: "chain_abort",
-            ...(txStatus && { error: `Transaction aborted on-chain: ${txStatus}` }),
+            error,
+            errorCode: "SETTLEMENT_FAILED",
+            retryable: false,
           });
           await putPaymentRecord(this.env.RELAY_KV, updated);
           abortedCount++;
@@ -6221,6 +6235,7 @@ export class NonceDO {
         confirmed: confirmedCount,
         aborted: abortedCount,
         skippedNoPayment,
+        skippedMissingRecord,
         skippedTerminal,
       });
     } catch (e) {
