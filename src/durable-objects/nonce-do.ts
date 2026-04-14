@@ -525,6 +525,9 @@ const ALARM_CONFIRMATION_CURSOR_KEY = "alarm_confirmation_cursor";
 /** Maximum reconcile_confirmed/reconcile_aborted events processed per alarm tick */
 const MAX_CONFIRMATION_EVENTS_PER_TICK = 50;
 
+/** Payment statuses that should never be regressed by notification processors */
+const TERMINAL_PAYMENT_STATUSES = new Set(["confirmed", "failed", "replaced"]);
+
 /**
  * Pool pressure threshold (0.80 = 80%) above which a surge event is recorded.
  * A surge is active while overall pressure stays above this threshold.
@@ -6074,8 +6077,7 @@ export class NonceDO {
           if (paymentId) {
             const record = await getPaymentRecord(this.env.RELAY_KV, paymentId);
             // Skip terminal states — don't regress confirmed/failed records
-            const TERMINAL_STATUSES = new Set(["confirmed", "failed", "replaced"]);
-            if (record && !TERMINAL_STATUSES.has(record.status)) {
+            if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
               const updated = transitionPayment(record, "replaced", {
                 terminalReason: inferReplacementTerminalReason(metadata.reason),
               });
@@ -6131,12 +6133,21 @@ export class NonceDO {
     try {
       const cursor = this.getStateValue(ALARM_CONFIRMATION_CURSOR_KEY) ?? 0;
 
-      // Fetch up to MAX_CONFIRMATION_EVENTS_PER_TICK events since the cursor
-      type EventRow = { id: number; wallet_index: number; nonce: number; event: string; detail: string | null };
+      // Fetch events joined with nonce_intents to get txid + block_height in one query
+      // (eliminates N per-event intent lookups)
+      type JoinedEventRow = {
+        id: number;
+        event: string;
+        detail: string | null;
+        txid: string | null;
+        block_height: number | null;
+      };
       const events = this.sql
-        .exec<EventRow>(
-          `SELECT ne.id, ne.wallet_index, ne.nonce, ne.event, ne.detail
+        .exec<JoinedEventRow>(
+          `SELECT ne.id, ne.event, ne.detail, ni.txid, ni.block_height
            FROM nonce_events ne
+           LEFT JOIN nonce_intents ni
+             ON ni.wallet_index = ne.wallet_index AND ni.nonce = ne.nonce
            WHERE ne.id > ?
              AND ne.event IN ('reconcile_confirmed', 'reconcile_aborted')
            ORDER BY ne.id ASC
@@ -6148,35 +6159,20 @@ export class NonceDO {
 
       if (events.length === 0) return;
 
-      const TERMINAL_STATUSES = new Set(["confirmed", "failed", "replaced"]);
       let confirmedCount = 0;
       let abortedCount = 0;
       let skippedNoPayment = 0;
       let skippedTerminal = 0;
-      let maxId = cursor;
 
       for (const ev of events) {
-        if (ev.id > maxId) maxId = ev.id;
-
-        // Look up txid from nonce_intents for this wallet+nonce
-        type IntentRow = { txid: string | null; block_height: number | null };
-        const intent = this.sql
-          .exec<IntentRow>(
-            "SELECT txid, block_height FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
-            ev.wallet_index,
-            ev.nonce
-          )
-          .toArray()[0];
-
-        const txid = intent?.txid ?? null;
-        if (!txid) {
+        if (!ev.txid) {
           // No txid — gap-fill or intent not found; skip silently
           skippedNoPayment++;
           continue;
         }
 
         // Resolve txid → paymentId via KV map
-        const paymentId = await this.env.RELAY_KV.get(`txid_map:${txid}`, "text");
+        const paymentId = await this.env.RELAY_KV.get(`txid_map:${ev.txid}`, "text");
         if (!paymentId) {
           // Gap-fill transactions or untracked txids have no mapping
           skippedNoPayment++;
@@ -6184,15 +6180,14 @@ export class NonceDO {
         }
 
         const record = await getPaymentRecord(this.env.RELAY_KV, paymentId);
-        if (!record || TERMINAL_STATUSES.has(record.status)) {
+        if (!record || TERMINAL_PAYMENT_STATUSES.has(record.status)) {
           skippedTerminal++;
           continue;
         }
 
         if (ev.event === "reconcile_confirmed") {
-          const blockHeight = intent?.block_height ?? undefined;
           const updated = transitionPayment(record, "confirmed", {
-            ...(blockHeight !== undefined && { blockHeight }),
+            ...(ev.block_height != null && { blockHeight: ev.block_height }),
           });
           await putPaymentRecord(this.env.RELAY_KV, updated);
           confirmedCount++;
@@ -6214,21 +6209,20 @@ export class NonceDO {
         }
       }
 
-      // Advance cursor past all events we processed
+      // Advance cursor past all events we processed (events ordered by id ASC)
+      const maxId = events[events.length - 1].id;
       this.setStateValue(ALARM_CONFIRMATION_CURSOR_KEY, maxId);
 
-      const total = confirmedCount + abortedCount;
-      if (total > 0 || events.length > 0) {
-        this.log("info", "confirmation_notifications_processed", {
-          cursor,
-          newCursor: maxId,
-          eventsScanned: events.length,
-          confirmed: confirmedCount,
-          aborted: abortedCount,
-          skippedNoPayment,
-          skippedTerminal,
-        });
-      }
+      // Always log when we scanned events (early return above handles zero-event case)
+      this.log("info", "confirmation_notifications_processed", {
+        cursor,
+        newCursor: maxId,
+        eventsScanned: events.length,
+        confirmed: confirmedCount,
+        aborted: abortedCount,
+        skippedNoPayment,
+        skippedTerminal,
+      });
     } catch (e) {
       this.log("warn", "confirmation_notifications_error", {
         error: e instanceof Error ? e.message : String(e),
