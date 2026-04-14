@@ -519,6 +519,15 @@ const ALARM_WALLET_CURSOR_KEY = "alarm_wallet_cursor";
 /** nonce_state key for the round-robin sender sweep cursor */
 const ALARM_SENDER_CURSOR_KEY = "alarm_sender_cursor";
 
+/** nonce_state key for the confirmation notification cursor (nonce_events id) */
+const ALARM_CONFIRMATION_CURSOR_KEY = "alarm_confirmation_cursor";
+
+/** Maximum reconcile_confirmed/reconcile_aborted events processed per alarm tick */
+const MAX_CONFIRMATION_EVENTS_PER_TICK = 50;
+
+/** Payment statuses that should never be regressed by notification processors */
+const TERMINAL_PAYMENT_STATUSES = new Set(["confirmed", "failed", "replaced"]);
+
 /**
  * Pool pressure threshold (0.80 = 80%) above which a surge event is recorded.
  * A surge is active while overall pressure stays above this threshold.
@@ -3518,7 +3527,7 @@ export class NonceDO {
   private ledgerMarkConfirmedByReconcile(walletIndex: number, nonce: number, txid: string): void {
     try {
       const now = new Date().toISOString();
-      this.sql.exec(
+      const updateCursor = this.sql.exec(
         `UPDATE nonce_intents
          SET state = 'confirmed', txid = ?, broadcasted_at = COALESCE(broadcasted_at, ?), confirmed_at = ?
          WHERE wallet_index = ? AND nonce = ? AND state != 'confirmed'`,
@@ -3528,14 +3537,18 @@ export class NonceDO {
         walletIndex,
         nonce
       );
-      this.sql.exec(
-        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
-         VALUES (?, ?, 'reconcile_confirmed', ?, ?)`,
-        walletIndex,
-        nonce,
-        JSON.stringify({ txid, reason: "chain_advanced_past_nonce" }),
-        now
-      );
+      // Only emit event if the UPDATE actually transitioned the intent (prevents
+      // duplicate reconcile_confirmed events when the nonce is already confirmed)
+      if (updateCursor.rowsWritten > 0) {
+        this.sql.exec(
+          `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+           VALUES (?, ?, 'reconcile_confirmed', ?, ?)`,
+          walletIndex,
+          nonce,
+          JSON.stringify({ txid, reason: "chain_advanced_past_nonce" }),
+          now
+        );
+      }
       // Also advance any matching dispatch queue entry to 'confirmed'
       this.transitionQueueEntry(walletIndex, nonce, "confirmed");
     } catch (e) {
@@ -6068,8 +6081,7 @@ export class NonceDO {
           if (paymentId) {
             const record = await getPaymentRecord(this.env.RELAY_KV, paymentId);
             // Skip terminal states — don't regress confirmed/failed records
-            const TERMINAL_STATUSES = new Set(["confirmed", "failed", "replaced"]);
-            if (record && !TERMINAL_STATUSES.has(record.status)) {
+            if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
               const updated = transitionPayment(record, "replaced", {
                 terminalReason: inferReplacementTerminalReason(metadata.reason),
               });
@@ -6097,6 +6109,137 @@ export class NonceDO {
       }
     } catch (e) {
       this.log("warn", "replacement_notifications_error", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Scan nonce_events for reconcile_confirmed and reconcile_aborted events since
+   * the last cursor position, then proactively transition matching payment records
+   * in RELAY_KV to confirmed or failed status.
+   *
+   * Called from alarm() after processReplacementNotifications() so all reconciliation
+   * results are visible before we push updates to RELAY_KV.
+   *
+   * Cursor: stored in nonce_state as ALARM_CONFIRMATION_CURSOR_KEY (last processed
+   * nonce_events.id). Advances after each tick.
+   *
+   * Fail-open: errors are logged but never rethrown so the alarm cycle continues.
+   */
+  private async processConfirmationNotifications(): Promise<void> {
+    if (!this.env.RELAY_KV) {
+      this.log("warn", "confirmation_notifications_skipped", {
+        reason: "RELAY_KV binding not available",
+      });
+      return;
+    }
+    try {
+      const cursor = this.getStateValue(ALARM_CONFIRMATION_CURSOR_KEY) ?? 0;
+
+      // Fetch events joined with nonce_intents to get txid + block_height in one query
+      // (eliminates N per-event intent lookups)
+      type JoinedEventRow = {
+        id: number;
+        event: string;
+        detail: string | null;
+        txid: string | null;
+        block_height: number | null;
+      };
+      const events = this.sql
+        .exec<JoinedEventRow>(
+          `SELECT ne.id, ne.event, ne.detail, ni.txid, ni.block_height
+           FROM nonce_events ne
+           LEFT JOIN nonce_intents ni
+             ON ni.wallet_index = ne.wallet_index AND ni.nonce = ne.nonce
+           WHERE ne.id > ?
+             AND ne.event IN ('reconcile_confirmed', 'reconcile_aborted')
+           ORDER BY ne.id ASC
+           LIMIT ?`,
+          cursor,
+          MAX_CONFIRMATION_EVENTS_PER_TICK
+        )
+        .toArray();
+
+      if (events.length === 0) return;
+
+      let confirmedCount = 0;
+      let abortedCount = 0;
+      let skippedNoPayment = 0;
+      let skippedMissingRecord = 0;
+      let skippedTerminal = 0;
+
+      for (const ev of events) {
+        if (!ev.txid) {
+          // No txid — gap-fill or intent not found; skip silently
+          skippedNoPayment++;
+          continue;
+        }
+
+        // Resolve txid → paymentId via KV map
+        const paymentId = await this.env.RELAY_KV.get(`txid_map:${ev.txid}`, "text");
+        if (!paymentId) {
+          // Gap-fill transactions or untracked txids have no mapping
+          skippedNoPayment++;
+          continue;
+        }
+
+        const record = await getPaymentRecord(this.env.RELAY_KV, paymentId);
+        if (!record) {
+          skippedMissingRecord++;
+          continue;
+        }
+        if (TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+          skippedTerminal++;
+          continue;
+        }
+
+        if (ev.event === "reconcile_confirmed") {
+          const updated = transitionPayment(record, "confirmed", {
+            ...(ev.block_height != null && { blockHeight: ev.block_height }),
+          });
+          await putPaymentRecord(this.env.RELAY_KV, updated);
+          confirmedCount++;
+        } else if (ev.event === "reconcile_aborted") {
+          // Extract txStatus from event detail JSON for context
+          let txStatus: string | undefined;
+          if (ev.detail) {
+            try {
+              const parsed = JSON.parse(ev.detail) as { txid?: string; txStatus?: string };
+              txStatus = parsed.txStatus;
+            } catch { /* detail is optional */ }
+          }
+          const error = txStatus
+            ? `Transaction aborted on-chain: ${txStatus}`
+            : "Transaction aborted on-chain";
+          const updated = transitionPayment(record, "failed", {
+            terminalReason: "chain_abort",
+            error,
+            errorCode: "SETTLEMENT_FAILED",
+            retryable: false,
+          });
+          await putPaymentRecord(this.env.RELAY_KV, updated);
+          abortedCount++;
+        }
+      }
+
+      // Advance cursor past all events we processed (events ordered by id ASC)
+      const maxId = events[events.length - 1].id;
+      this.setStateValue(ALARM_CONFIRMATION_CURSOR_KEY, maxId);
+
+      // Always log when we scanned events (early return above handles zero-event case)
+      this.log("info", "confirmation_notifications_processed", {
+        cursor,
+        newCursor: maxId,
+        eventsScanned: events.length,
+        confirmed: confirmedCount,
+        aborted: abortedCount,
+        skippedNoPayment,
+        skippedMissingRecord,
+        skippedTerminal,
+      });
+    } catch (e) {
+      this.log("warn", "confirmation_notifications_error", {
         error: e instanceof Error ? e.message : String(e),
       });
     }
@@ -6973,6 +7116,10 @@ export class NonceDO {
         // Replacement notifications: scan replaced_tx:* KV entries and transition payment
         // records to "replaced" status so agents can detect via GET /payment/:id.
         await this.processReplacementNotifications();
+
+        // Confirmation notifications: scan nonce_events for reconcile_confirmed/
+        // reconcile_aborted and proactively transition payment records in RELAY_KV.
+        await this.processConfirmationNotifications();
 
         // Process old-path replay buffer: re-sponsor sender txs with fresh nonces and broadcast.
         // Runs after all wallet reconciliation is complete so flush results are visible.
