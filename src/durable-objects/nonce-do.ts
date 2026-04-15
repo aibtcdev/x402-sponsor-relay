@@ -844,6 +844,104 @@ export class NonceDO {
       }
     } catch { /* already present or error — fail-open */ }
 
+    // ---------------------------------------------------------------------------
+    // Phase 1 (sponsor-ledger-integration): extend nonce_intents with 7 new columns
+    // required by SponsorLedgerSchema so Phase 2 can adopt tx-schemas helpers without
+    // a second migration. All additions use check-then-add (PRAGMA table_info) pattern.
+    // ---------------------------------------------------------------------------
+
+    // sponsored: whether the occupying tx was submitted as a sponsored transaction.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'sponsored'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN sponsored INTEGER DEFAULT NULL");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // sponsor_address: the sponsor address recorded on the occupying tx (Hiro response).
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'sponsor_address'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN sponsor_address TEXT DEFAULT NULL");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // sender_address: the origin address of the tx occupying this nonce slot.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'sender_address'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN sender_address TEXT DEFAULT NULL");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // occupant_visible: 1 if the occupying tx is visible in Hiro mempool/chain; 0 if ghost.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'occupant_visible'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN occupant_visible INTEGER DEFAULT NULL");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // abandon_after: ISO-8601 timestamp after which this nonce slot should be quarantined.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'abandon_after'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN abandon_after TEXT DEFAULT NULL");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // status: SponsorLedgerEntry lifecycle status (pending_broadcast | broadcast_sent | broadcast_failed).
+    // Required in tx-schemas 1.0.0 — must be non-null on every row before Phase 2 schema parses.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'status'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN status TEXT DEFAULT NULL");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // broadcast_at: ISO-8601 timestamp of when the broadcast was initiated (beginPendingBroadcast).
+    // Distinct from broadcasted_at which is the Hiro response timestamp. Used by reconcile() grace math.
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'broadcast_at'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN broadcast_at TEXT DEFAULT NULL");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // Backfill: set status on existing rows that predate this migration.
+    // - Rows with a txid (broadcasted, confirmed) → broadcast_sent
+    // - Rows in terminal states without txid (failed, conflict, expired) → broadcast_failed
+    // - Rows in 'assigned' state (still in-flight, no broadcast yet) → status remains NULL
+    //   (Phase 3 will set pending_broadcast via beginPendingBroadcast before the network call)
+    // Fail-open: if backfill errors, the system continues but Phase 2 will handle stragglers.
+    try {
+      this.sql.exec(`
+        UPDATE nonce_intents
+        SET status = CASE
+          WHEN txid IS NOT NULL THEN 'broadcast_sent'
+          WHEN state IN ('failed', 'conflict', 'expired', 'confirmed') THEN 'broadcast_failed'
+          ELSE NULL
+        END
+        WHERE status IS NULL
+      `);
+    } catch (e) {
+      console.warn("[nonce-do] Phase 1 backfill of nonce_intents.status failed (fail-open):", e);
+    }
+
     // Replay buffer: sender txs waiting for a fresh sponsor nonce assignment.
     // Populated when a dispatched slot is stuck and needs to be flushed.
     // The relay will re-sponsor these txs with new nonces in the next alarm cycle.
@@ -3315,9 +3413,11 @@ export class NonceDO {
         if (currentState !== "assigned") {
           return;
         }
+        // Dual-write: status='broadcast_failed' (Phase 1 SponsorLedgerSchema alignment).
+        // Expired = nonce slot was reserved but never dispatched to the network.
         this.sql.exec(
           `UPDATE nonce_intents
-           SET state = 'expired'
+           SET state = 'expired', status = 'broadcast_failed'
            WHERE wallet_index = ? AND nonce = ? AND state = 'assigned'`,
           walletIndex,
           nonce
@@ -3387,15 +3487,18 @@ export class NonceDO {
       }
 
       if (txid) {
-        // Broadcast accepted — record txid, status, node URL
+        // Broadcast accepted — record txid, status, node URL.
+        // Dual-write: status='broadcast_sent', broadcast_at=now (Phase 1 SponsorLedgerSchema alignment).
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = 'broadcasted', txid = ?, http_status = ?,
-               broadcast_node = ?, broadcasted_at = ?
+               broadcast_node = ?, broadcasted_at = ?,
+               status = 'broadcast_sent', broadcast_at = ?
            WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted')`,
           txid,
           httpStatus ?? 200,
           nodeUrl ?? null,
+          now,
           now,
           walletIndex,
           nonce
@@ -3417,10 +3520,12 @@ export class NonceDO {
           errorReason !== undefined &&
           errorReason.includes("ConflictingNonceInMempool");
         const newState = isConflict ? "conflict" : "failed";
+        // Dual-write: status='broadcast_failed' (Phase 1 SponsorLedgerSchema alignment).
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = ?, http_status = ?, broadcast_node = ?,
-               error_reason = ?, broadcasted_at = ?
+               error_reason = ?, broadcasted_at = ?,
+               status = 'broadcast_failed'
            WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted')`,
           newState,
           httpStatus ?? null,
