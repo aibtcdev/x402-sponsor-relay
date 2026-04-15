@@ -31,13 +31,20 @@ import {
   type StoredSponsorStatusSnapshot,
 } from "../services/sponsor-status";
 import { parseBroadcastOutcome, decideBroadcastAction } from "../utils/broadcast-outcome";
-import type { WalletCapacity, OccupiedNonce, SponsorLedger, OccupantClassification } from "@aibtc/tx-schemas";
+import type {
+  WalletCapacity,
+  OccupiedNonce,
+  SponsorLedger,
+  OccupantClassification,
+  ReconcileResult as TxReconcileResult,
+} from "@aibtc/tx-schemas";
 import {
   classifyOccupant,
   beginPendingBroadcast,
   resolveBroadcast,
   LedgerTransitionError,
   HiroSponsorTxViewSchema,
+  reconcile as txReconcile,
 } from "@aibtc/tx-schemas";
 
 const APP_ID = "x402-relay";
@@ -536,6 +543,14 @@ const ALARM_CONFIRMATION_CURSOR_KEY = "alarm_confirmation_cursor";
 
 /** Maximum reconcile_confirmed/reconcile_aborted events processed per alarm tick */
 const MAX_CONFIRMATION_EVENTS_PER_TICK = 50;
+
+/**
+ * Pending-broadcast sweep timeout (Phase 4).
+ * nonce_intents rows stuck in status='pending_broadcast' past this age are swept
+ * to 'broadcast_failed' by runPendingBroadcastSweep() on each alarm cycle.
+ * 60s is generous — the two-phase write should resolve in milliseconds under normal conditions.
+ */
+const PENDING_BROADCAST_SWEEP_TIMEOUT_MS = 60_000;
 
 /** Payment statuses that should never be regressed by notification processors */
 const TERMINAL_PAYMENT_STATUSES = new Set(["confirmed", "failed", "replaced"]);
@@ -2544,6 +2559,103 @@ export class NonceDO {
       return parsed.data;
     } catch {
       return null; // Network/parse error — fail-open
+    }
+  }
+
+  /**
+   * Fetch all mempool transactions sponsored by the given address in a single Hiro call.
+   * Returns a nonce-indexed map suitable for passing to tx-schemas reconcile().
+   *
+   * Phase 4: used by runSchemaReconcileForWallet() to build the mempoolReadByNonce input.
+   * One call per sponsor address per alarm cycle (not per-txid).
+   *
+   * Throws on HTTP/network error — callers must wrap in try/catch and fail-open.
+   */
+  private async fetchMempoolForSponsor(
+    sponsorAddress: string
+  ): Promise<Record<number, import("@aibtc/tx-schemas").HiroSponsorTxView>> {
+    const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    // Request up to 200 entries — sponsor wallet is unlikely to have more in-flight
+    const url = `${base}/extended/v1/tx/mempool?sender_address=${encodeURIComponent(sponsorAddress)}&limit=200&offset=0`;
+    const response = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      throw new Error(`Hiro mempool fetch failed: ${response.status} ${response.statusText}`);
+    }
+    const data = (await response.json()) as { results?: unknown[] };
+    const results = Array.isArray(data?.results) ? data.results : [];
+    const byNonce: Record<number, import("@aibtc/tx-schemas").HiroSponsorTxView> = {};
+    for (const item of results) {
+      const parsed = HiroSponsorTxViewSchema.safeParse(item);
+      if (!parsed.success) continue;
+      const tx = parsed.data;
+      // Only include transactions where this address is the sponsor (not the origin sender)
+      if (tx.sponsor_address !== sponsorAddress) continue;
+      // sponsor_nonce is the slot we care about for reconciliation
+      if (tx.sponsor_nonce === undefined) continue;
+      byNonce[tx.sponsor_nonce] = tx;
+    }
+    return byNonce;
+  }
+
+  /**
+   * Sweep nonce_intents rows stuck in status='pending_broadcast' past PENDING_BROADCAST_SWEEP_TIMEOUT_MS.
+   * Resolves each stale row to 'broadcast_failed' with reason 'sweep_timeout'.
+   *
+   * Phase 4: called from alarm() after reconcileNonceForWallet() so two-phase write has
+   * had ample time to complete. Catches LedgerTransitionError per-row (concurrent path
+   * may have already resolved the entry). Fail-open — never throws.
+   */
+  private runPendingBroadcastSweep(walletIndex: number): void {
+    try {
+      const thresholdMs = Date.now() - PENDING_BROADCAST_SWEEP_TIMEOUT_MS;
+      const threshold = new Date(thresholdMs).toISOString();
+      type SweepRow = { nonce: number; txid: string | null; broadcast_at: string };
+      let staleRows: SweepRow[] = [];
+      try {
+        staleRows = this.sql
+          .exec<SweepRow>(
+            `SELECT nonce, txid, broadcast_at FROM nonce_intents
+             WHERE wallet_index = ? AND status = 'pending_broadcast'
+               AND broadcast_at IS NOT NULL AND broadcast_at < ?
+             ORDER BY nonce ASC LIMIT 20`,
+            walletIndex,
+            threshold
+          )
+          .toArray();
+      } catch {
+        return; // SQL error — fail-open
+      }
+      for (const row of staleRows) {
+        try {
+          this.writeLedgerResolvedBroadcast(walletIndex, row.nonce, "failed");
+          this.log("info", "ledger_pending_broadcast_swept", {
+            walletIndex,
+            nonce: row.nonce,
+            txid: row.txid ?? null,
+            broadcastAt: row.broadcast_at,
+            reason: "sweep_timeout",
+          });
+        } catch (e) {
+          if (e instanceof LedgerTransitionError) {
+            // Concurrent path already resolved — expected, skip silently
+          } else {
+            this.log("debug", "ledger_pending_broadcast_sweep_error", {
+              walletIndex,
+              nonce: row.nonce,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+      }
+    } catch (e) {
+      this.log("debug", "pending_broadcast_sweep_outer_error", {
+        walletIndex,
+        error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 
@@ -6679,6 +6791,127 @@ export class NonceDO {
   }
 
   /**
+   * Phase 4: Run tx-schemas reconcile() for a single wallet using a pre-fetched mempool snapshot.
+   *
+   * Inputs:
+   * - ledger: built from nonce_intents via buildSponsorLedger()
+   * - wallet: WalletCapacity from buildWalletCapacity()
+   * - mempoolSnapshot: nonce-indexed mempool read from fetchMempoolForSponsor()
+   *
+   * Handles reconcile result:
+   * - inFlightPendingIndex: grace-window entries — leave completely alone (no adopt/quarantine/re-broadcast)
+   * - unpriceableOrphans: quarantine + advance head + retire dispatch entry + operator alert
+   *
+   * Fail-open: catches all errors, never re-throws. Wrapped in try/catch matching alarm semantics.
+   */
+  private async runSchemaReconcileForWallet(
+    walletIndex: number,
+    address: string,
+    mempoolSnapshot: Record<number, import("@aibtc/tx-schemas").HiroSponsorTxView>
+  ): Promise<void> {
+    try {
+      const ledger = this.buildSponsorLedger(walletIndex, address);
+      const wallet = await this.buildWalletCapacity(walletIndex, address);
+
+      const result: TxReconcileResult = txReconcile(
+        wallet,
+        ledger,
+        mempoolSnapshot,
+        address,
+        { justBroadcastGraceSeconds: 30 }
+      );
+
+      this.log("debug", "schema_reconcile_result", {
+        walletIndex,
+        adopted: result.adopted,
+        dropped: result.dropped,
+        inFlightPendingIndex: result.inFlightPendingIndex,
+        unpriceableOrphans: result.unpriceableOrphans,
+      });
+
+      // Grace-window entries: left completely alone this cycle
+      if (result.inFlightPendingIndex.length > 0) {
+        this.log("debug", "schema_reconcile_in_flight_grace", {
+          walletIndex,
+          nonces: result.inFlightPendingIndex,
+          message: "grace-window entries — skipping adopt/quarantine/re-broadcast",
+        });
+      }
+
+      // Handle unpriceable orphans: quarantine + advance head + retire dispatch + operator alert
+      for (const nonce of result.unpriceableOrphans) {
+        try {
+          // Operator-level alert: sponsor address is the sponsor of a mempool tx but fee_rate is missing
+          this.log("warn", "schema_reconcile_unpriceable_orphan", {
+            walletIndex,
+            nonce,
+            operator_alert: true,
+            message: "sponsor-owned orphan tx lacks fee_rate — quarantining slot",
+          });
+
+          // Persist quarantine to nonce_intents: mark as conflict with quarantine reason
+          try {
+            this.sql.exec(
+              `UPDATE nonce_intents
+               SET state = 'conflict', error_reason = 'quarantined:unpriceable_orphan'
+               WHERE wallet_index = ? AND nonce = ?
+                 AND state NOT IN ('confirmed', 'failed')`,
+              walletIndex,
+              nonce
+            );
+            const now = new Date().toISOString();
+            this.sql.exec(
+              `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+               VALUES (?, ?, 'quarantine_unpriceable_orphan', ?, ?)`,
+              walletIndex,
+              nonce,
+              JSON.stringify({ reason: "unpriceable_orphan" }),
+              now
+            );
+          } catch (sqlErr) {
+            this.log("debug", "schema_reconcile_quarantine_sql_error", {
+              walletIndex,
+              nonce,
+              error: sqlErr instanceof Error ? sqlErr.message : String(sqlErr),
+            });
+          }
+
+          // Advance assignment head past quarantined nonce to restore capacity
+          const currentHead = this.ledgerGetWalletHead(walletIndex);
+          if (currentHead !== null && currentHead <= nonce) {
+            this.ledgerAdvanceWalletHead(walletIndex, nonce + 1);
+          }
+
+          // Retire dispatch_queue entry for this (walletIndex, nonce) to release dispatch slot
+          try {
+            this.sql.exec(
+              `UPDATE dispatch_queue SET state = 'retired'
+               WHERE wallet_index = ? AND sponsor_nonce = ? AND state NOT IN ('confirmed', 'retired')`,
+              walletIndex,
+              nonce
+            );
+          } catch {
+            // Fail-open — dispatch entry may not exist
+          }
+        } catch (orphanErr) {
+          this.log("debug", "schema_reconcile_orphan_handling_error", {
+            walletIndex,
+            nonce,
+            error: orphanErr instanceof Error ? orphanErr.message : String(orphanErr),
+          });
+        }
+      }
+    } catch (e) {
+      this.log("warn", "schema_reconcile_error", {
+        walletIndex,
+        address,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      // Never re-throw — fail-open matching alarm semantics
+    }
+  }
+
+  /**
    * Gap-aware nonce reconciliation for all initialized wallets, returning a structured response.
    */
   private async performResync(): Promise<{
@@ -7794,9 +8027,46 @@ export class NonceDO {
           if (wallet) reconcileWallets.push(wallet);
         }
 
+        // ---------------------------------------------------------------------------
+        // Phase 4: Pre-fetch address-filtered mempool snapshots for schema reconcile.
+        // One Hiro call per wallet being reconciled (not per-txid).
+        // Fail-open: API blindness logs reconcile_skipped_api_blind and skips that wallet.
+        // Only runs when USE_WALLET_CAPACITY_STATE flag is enabled.
+        // ---------------------------------------------------------------------------
+        const walletMempoolSnapshots = new Map<
+          number,
+          Record<number, import("@aibtc/tx-schemas").HiroSponsorTxView> | null
+        >();
+        if (this.isWalletCapacityEnabled()) {
+          for (const { walletIndex, address } of reconcileWallets) {
+            try {
+              const snapshot = await this.fetchMempoolForSponsor(address);
+              walletMempoolSnapshots.set(walletIndex, snapshot);
+            } catch (mempoolErr) {
+              walletMempoolSnapshots.set(walletIndex, null);
+              this.log("warn", "reconcile_skipped_api_blind", {
+                walletIndex,
+                address,
+                reason: mempoolErr instanceof Error ? mempoolErr.message : String(mempoolErr),
+              });
+            }
+          }
+        }
+
         for (const { walletIndex, address } of reconcileWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
           await this.reconcileNonceForWallet(walletIndex, address);
+
+          // Phase 4: schema-driven reconcile via tx-schemas reconcile().
+          // Only runs when USE_WALLET_CAPACITY_STATE=true AND mempool fetch succeeded.
+          // Null snapshot = API blind cycle; skip reconcile to avoid misclassifying ledger entries.
+          if (this.isWalletCapacityEnabled()) {
+            const mempoolSnapshot = walletMempoolSnapshots.get(walletIndex);
+            if (mempoolSnapshot !== null && mempoolSnapshot !== undefined) {
+              await this.runSchemaReconcileForWallet(walletIndex, address, mempoolSnapshot);
+            }
+            // If mempoolSnapshot is null, reconcile_skipped_api_blind was already logged above
+          }
 
           // Clean up StuckTxState entries for nonces that have been confirmed on-chain.
           const cached = this.hiroNonceCache.get(walletIndex);
@@ -7835,6 +8105,22 @@ export class NonceDO {
           ? (walletCursor + MAX_RECONCILE_WALLETS) % walletCount
           : 0;
         this.setStateValue(ALARM_WALLET_CURSOR_KEY, nextWalletCursor);
+
+        // ---------------------------------------------------------------------------
+        // Phase 4: Pending-broadcast sweep — resolve nonce_intents rows stuck in
+        // status='pending_broadcast' past PENDING_BROADCAST_SWEEP_TIMEOUT_MS.
+        // Runs after schema reconcile so auto-promotions (pending→sent on mempool confirm)
+        // have already been applied. Behind USE_WALLET_CAPACITY_STATE flag.
+        // ---------------------------------------------------------------------------
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            for (const { walletIndex } of reconcileWallets) {
+              this.runPendingBroadcastSweep(walletIndex);
+            }
+          } catch {
+            // Fail-open — sweep errors must not interrupt the alarm cycle
+          }
+        }
 
         // ---------------------------------------------------------------------------
         // Sweep held sender hands: try to dispatch pending runs (bounded per tick)
