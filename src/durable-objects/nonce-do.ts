@@ -31,7 +31,14 @@ import {
   type StoredSponsorStatusSnapshot,
 } from "../services/sponsor-status";
 import { parseBroadcastOutcome, decideBroadcastAction } from "../utils/broadcast-outcome";
-import type { WalletCapacity, OccupiedNonce } from "@aibtc/tx-schemas";
+import type { WalletCapacity, OccupiedNonce, SponsorLedger, OccupantClassification } from "@aibtc/tx-schemas";
+import {
+  classifyOccupant,
+  beginPendingBroadcast,
+  resolveBroadcast,
+  LedgerTransitionError,
+  HiroSponsorTxViewSchema,
+} from "@aibtc/tx-schemas";
 
 const APP_ID = "x402-relay";
 
@@ -2473,24 +2480,23 @@ export class NonceDO {
   }
 
   /**
-   * Fetch the fee paid by the current occupant of a sponsor nonce slot.
-   * Used by broadcastRbfForNonce to compute the minimum fee needed to replace the occupant.
+   * Fetch the full Hiro TX view for the current occupant of a sponsor nonce slot.
+   * Returns the HiroSponsorTxView (fee_rate, sponsored, sponsor_address, sender_address, etc.)
+   * or null when the occupant is untraceable or Hiro is unavailable.
    *
    * Strategy:
    * - Look up txid from nonce_intents for (walletIndex, sponsorNonce).
-   * - If txid found: GET /extended/v1/tx/{txid} from Hiro → extract fee_rate.
-   *   This works for mempool txs (Hiro returns fee_rate for pending txs).
-   * - If no txid: return null — the occupant is a "ghost" (node holds a tx invisible to Hiro).
+   * - If no txid: return null (no known tx to look up — occupant untraceable).
+   * - GET /extended/v1/tx/{txid} from Hiro → parse and validate as HiroSponsorTxView.
+   * - If not OK or parse fails: return null (fail-open).
    *
-   * Fail-open: returns null on any network/parse error.
+   * Phase 3: replaces fetchOccupantFee(). Downstream callers use the full identity fields
+   * (sponsored, sponsor_address, sender_address) with classifyOccupant().
    */
-  private async fetchOccupantFee(
+  private async fetchOccupant(
     walletIndex: number,
     sponsorNonce: number
-  ): Promise<
-    | { fee: bigint; source: "hiro"; reason?: undefined }
-    | { fee: null; source?: undefined; reason: "no_txid" | "not_found" | "hiro_error" }
-  > {
+  ): Promise<import("@aibtc/tx-schemas").HiroSponsorTxView | null> {
     try {
       const rows = this.sql
         .exec<{ txid: string | null }>(
@@ -2500,7 +2506,7 @@ export class NonceDO {
         )
         .toArray();
       const txid = rows[0]?.txid ?? null;
-      if (!txid) return { fee: null, reason: "no_txid" };
+      if (!txid) return null; // No known txid — occupant untraceable
 
       const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
       const headers = getHiroHeaders(this.env.HIRO_API_KEY);
@@ -2508,19 +2514,199 @@ export class NonceDO {
         headers,
         signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
       });
-      if (!response.ok) {
-        // 404 = tx not in Hiro's index (evicted/unknown). Other errors = transient Hiro failure.
-        return { fee: null, reason: response.status === 404 ? "not_found" : "hiro_error" };
-      }
-      const data = (await response.json()) as Record<string, unknown>;
-      const feeRate = data.fee_rate;
-      if (typeof feeRate === "string" || typeof feeRate === "number") {
+      if (!response.ok) return null; // 404 = evicted, 5xx = transient — both untraceable
+
+      const data = await response.json();
+      const parsed = HiroSponsorTxViewSchema.safeParse(data);
+      if (!parsed.success) return null; // Unexpected shape — treat as untraceable
+      return parsed.data;
+    } catch {
+      return null; // Network/parse error — fail-open
+    }
+  }
+
+  /**
+   * Fetch the fee paid by the current occupant of a sponsor nonce slot.
+   * Delegates to fetchOccupant() and extracts fee_rate for backward compatibility.
+   *
+   * @deprecated Use fetchOccupant() + classifyOccupant() instead (Phase 3+).
+   */
+  private async fetchOccupantFee(
+    walletIndex: number,
+    sponsorNonce: number
+  ): Promise<
+    | { fee: bigint; source: "hiro"; reason?: undefined }
+    | { fee: null; source?: undefined; reason: "no_txid" | "not_found" | "hiro_error" }
+  > {
+    // Check if we have a txid in ledger first (to distinguish no_txid from not_found)
+    const rows = this.sql
+      .exec<{ txid: string | null }>(
+        "SELECT txid FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+        walletIndex,
+        sponsorNonce
+      )
+      .toArray();
+    const txid = rows[0]?.txid ?? null;
+    if (!txid) return { fee: null, reason: "no_txid" };
+
+    const hiroTx = await this.fetchOccupant(walletIndex, sponsorNonce);
+    if (!hiroTx) return { fee: null, reason: "not_found" };
+
+    const feeRate = hiroTx.fee_rate;
+    if (feeRate !== undefined) {
+      try {
         const fee = BigInt(feeRate);
         if (fee > 0n) return { fee, source: "hiro" };
-      }
-      return { fee: null, reason: "not_found" };
+      } catch { /* invalid fee string */ }
+    }
+    return { fee: null, reason: "not_found" };
+  }
+
+  /**
+   * Build a SponsorLedger from nonce_intents rows for a wallet.
+   * Used as input for beginPendingBroadcast, resolveBroadcast, and classifyOccupant.
+   *
+   * Only includes rows with a txid and status set (broadcast lifecycle rows).
+   * Rows missing status default to 'broadcast_sent' for legacy compatibility.
+   * Fail-open: returns empty ledger on error.
+   */
+  private buildSponsorLedger(walletIndex: number, sponsorAddress: string): SponsorLedger {
+    type LedgerRow = {
+      nonce: number;
+      txid: string;
+      status: string | null;
+      broadcast_at: string | null;
+      broadcasted_at: string | null;
+      assigned_at: string;
+      gap_fill_attempts: number | null;
+      original_fee: string | null;
+    };
+
+    let rows: LedgerRow[] = [];
+    try {
+      // Join with dispatch_queue to get original_fee when available
+      rows = (this.sql
+        .exec(
+          `SELECT ni.nonce, ni.txid, ni.status, ni.broadcast_at, ni.broadcasted_at,
+                  ni.assigned_at, ni.gap_fill_attempts,
+                  dq.original_fee
+           FROM nonce_intents ni
+           LEFT JOIN dispatch_queue dq
+             ON dq.wallet_index = ni.wallet_index AND dq.sponsor_nonce = ni.nonce
+           WHERE ni.wallet_index = ? AND ni.txid IS NOT NULL
+           ORDER BY ni.nonce ASC
+           LIMIT 200`,
+          walletIndex
+        )
+        .toArray() as LedgerRow[]);
     } catch {
-      return { fee: null, reason: "hiro_error" };
+      // Fail-open: return empty ledger
+      return { sponsorAddress, entries: {} };
+    }
+
+    const entries: Record<string, import("@aibtc/tx-schemas").SponsorLedgerEntry> = {};
+    for (const row of rows) {
+      // Map SQL status column to SponsorLedgerEntry status
+      let status: "pending_broadcast" | "broadcast_sent" | "broadcast_failed";
+      if (row.status === "pending_broadcast") {
+        status = "pending_broadcast";
+      } else if (row.status === "broadcast_failed") {
+        status = "broadcast_failed";
+      } else {
+        // broadcast_sent or NULL (legacy rows default to sent)
+        status = "broadcast_sent";
+      }
+
+      // broadcastAt: prefer broadcast_at (lifecycle), fall back to broadcasted_at, then assigned_at
+      const broadcastAt = row.broadcast_at ?? row.broadcasted_at ?? row.assigned_at;
+
+      entries[row.nonce.toString()] = {
+        nonce: row.nonce,
+        txId: row.txid,
+        fee: row.original_fee ?? "0",
+        status,
+        broadcastAt,
+        rbfAttempts: row.gap_fill_attempts ?? 0,
+      };
+    }
+
+    return { sponsorAddress, entries };
+  }
+
+  /**
+   * Write pending_broadcast status to the ledger before a network broadcast call.
+   * Part of the two-phase broadcast lifecycle (Phase 3).
+   * Fail-open — never throws; errors logged at debug.
+   */
+  private writeLedgerPendingBroadcast(
+    walletIndex: number,
+    nonce: number,
+    txid: string,
+    broadcastAt: string
+  ): void {
+    try {
+      this.sql.exec(
+        `UPDATE nonce_intents
+         SET status = 'pending_broadcast', broadcast_at = ?
+         WHERE wallet_index = ? AND nonce = ?`,
+        broadcastAt,
+        walletIndex,
+        nonce
+      );
+      this.sql.exec(
+        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+         VALUES (?, ?, 'pending_broadcast', ?, ?)`,
+        walletIndex,
+        nonce,
+        JSON.stringify({ txid, broadcastAt }),
+        broadcastAt
+      );
+    } catch (e) {
+      this.log("debug", "ledger_pending_broadcast_write_error", {
+        walletIndex, nonce, error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Write resolved broadcast status (broadcast_sent | broadcast_failed) after a network call.
+   * Part of the two-phase broadcast lifecycle (Phase 3).
+   * Fail-open — never throws; errors logged at debug.
+   */
+  private writeLedgerResolvedBroadcast(
+    walletIndex: number,
+    nonce: number,
+    outcome: "sent" | "failed",
+    txid?: string
+  ): void {
+    try {
+      const now = new Date().toISOString();
+      const newStatus = outcome === "sent" ? "broadcast_sent" : "broadcast_failed";
+      if (outcome === "sent" && txid) {
+        // Also update state and txid on success (redundant with ledgerBroadcastOutcome but kept
+        // for consistency — ledgerBroadcastOutcome is called separately for state transitions)
+        this.sql.exec(
+          `UPDATE nonce_intents SET status = ? WHERE wallet_index = ? AND nonce = ?`,
+          newStatus, walletIndex, nonce
+        );
+      } else {
+        this.sql.exec(
+          `UPDATE nonce_intents SET status = ? WHERE wallet_index = ? AND nonce = ?`,
+          newStatus, walletIndex, nonce
+        );
+      }
+      this.sql.exec(
+        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+         VALUES (?, ?, 'broadcast_resolved', ?, ?)`,
+        walletIndex,
+        nonce,
+        JSON.stringify({ outcome, txid: txid ?? null }),
+        now
+      );
+    } catch (e) {
+      this.log("debug", "ledger_resolved_broadcast_write_error", {
+        walletIndex, nonce, outcome, error: e instanceof Error ? e.message : String(e),
+      });
     }
   }
 
