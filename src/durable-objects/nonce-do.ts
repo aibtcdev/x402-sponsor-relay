@@ -2816,19 +2816,10 @@ export class NonceDO {
     try {
       const now = new Date().toISOString();
       const newStatus = outcome === "sent" ? "broadcast_sent" : "broadcast_failed";
-      if (outcome === "sent" && txid) {
-        // Also update state and txid on success (redundant with ledgerBroadcastOutcome but kept
-        // for consistency — ledgerBroadcastOutcome is called separately for state transitions)
-        this.sql.exec(
-          `UPDATE nonce_intents SET status = ? WHERE wallet_index = ? AND nonce = ?`,
-          newStatus, walletIndex, nonce
-        );
-      } else {
-        this.sql.exec(
-          `UPDATE nonce_intents SET status = ? WHERE wallet_index = ? AND nonce = ?`,
-          newStatus, walletIndex, nonce
-        );
-      }
+      this.sql.exec(
+        `UPDATE nonce_intents SET status = ? WHERE wallet_index = ? AND nonce = ?`,
+        newStatus, walletIndex, nonce
+      );
       this.sql.exec(
         `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
          VALUES (?, ?, 'broadcast_resolved', ?, ?)`,
@@ -3083,10 +3074,8 @@ export class NonceDO {
       });
 
       // Two-phase write: mark pending_broadcast before network call (Phase 3)
+      // Use a placeholder txid for the pending entry (actual txid not known until after broadcast).
       if (this.isWalletCapacityEnabled()) {
-        const rbfTxHex = tx.serialize();
-        // Use a placeholder txid derived from the fee for the pending entry
-        // (actual txid not known until after broadcast)
         this.writeLedgerPendingBroadcast(walletIndex, nonce, `rbf_attempt_${attemptNum}`, now);
       }
 
