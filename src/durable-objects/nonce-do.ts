@@ -2949,6 +2949,21 @@ export class NonceDO {
         maxAttempts: MAX_RBF_ATTEMPTS,
         originalTxid: state.originalTxid,
       });
+      // Enrich with occupant identity for operator diagnosis (flag-gated, fail-open).
+      if (this.isWalletCapacityEnabled()) {
+        try {
+          const maxReachedOccupant = await this.fetchOccupant(walletIndex, nonce);
+          this.log("warn", "rbf_max_attempts_occupant", {
+            walletIndex,
+            nonce,
+            occupant_txid: maxReachedOccupant?.tx_id ?? null,
+            occupant_sender: maxReachedOccupant?.sender_address ?? null,
+            occupant_sponsor: maxReachedOccupant?.sponsor_address ?? null,
+            occupant_fee: maxReachedOccupant?.fee_rate ?? null,
+            our_ledger_txid: state.originalTxid,
+          });
+        } catch { /* fail-open — enrichment is advisory */ }
+      }
       return null;
     }
 
@@ -3181,21 +3196,41 @@ export class NonceDO {
               this.log("warn", "rbf_occupant_foreign", {
                 walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
                 occupant_txid: classification.txId,
-                occupant_address: classification.occupantAddress,
+                occupant_sender: freshHiroTx?.sender_address ?? null,
+                occupant_sponsor: classification.occupantAddress,
                 occupant_fee: classification.fee ?? null,
-                our_sponsor_address: sponsorAddress,
+                our_ledger_txid: state.originalTxid,
+              });
+              // Operator alert channel — foreign occupant in sponsor slot warrants operator attention.
+              this.log("warn", "operator_alert_foreign_occupant", {
+                walletIndex, nonce,
+                occupant_txid: classification.txId,
+                occupant_sender: freshHiroTx?.sender_address ?? null,
+                occupant_sponsor: classification.occupantAddress,
+                occupant_fee: classification.fee ?? null,
+                our_ledger_txid: state.originalTxid,
+                message: "Unknown party occupying sponsor nonce slot — possible wallet misuse",
               });
             } else if (classification.kind === "sponsor_owned_orphan") {
               this.log("warn", "rbf_occupant_orphan", {
                 walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
+                occupant_txid: classification.txId,
                 orphan_txid: classification.txId,
+                occupant_sender: freshHiroTx?.sender_address ?? null,
+                occupant_sponsor: freshHiroTx?.sponsor_address ?? null,
                 occupant_fee: classification.fee ?? null,
+                our_ledger_txid: state.originalTxid,
               });
             } else if (classification.kind === "untraceable") {
               // Ghost — node holds tx invisible to Hiro. Log but don't penalize wallet.
-              this.log("warn", "rbf_ghost_conflict", {
+              this.log("warn", "rbf_occupant_untraceable", {
                 walletIndex, nonce, rbfFee: rbfFee.toString(),
                 classification_kind: "untraceable",
+                occupant_txid: freshHiroTx?.tx_id ?? null,
+                occupant_sender: freshHiroTx?.sender_address ?? null,
+                occupant_sponsor: freshHiroTx?.sponsor_address ?? null,
+                occupant_fee: freshHiroTx?.fee_rate ?? null,
+                our_ledger_txid: state.originalTxid,
               });
             } else {
               // sponsor_owned_in_ledger: fee too low to replace our own tx
@@ -3222,8 +3257,11 @@ export class NonceDO {
           const isHiroError = occupantReason === "hiro_error";
 
           if (isGhost) {
-            this.log("warn", "rbf_ghost_conflict", {
+            // Legacy path: occupant identity not available (no fetchOccupant in legacy mode).
+            this.log("warn", "rbf_occupant_untraceable", {
               walletIndex, nonce, rbfFee: rbfFee.toString(), occupantReason,
+              occupant_txid: null, occupant_sender: null, occupant_sponsor: null,
+              occupant_fee: null, our_ledger_txid: state.originalTxid,
             });
           } else if (isHiroError) {
             this.log("warn", "rbf_conflict_hiro_unavailable", {
@@ -5786,6 +5824,8 @@ export class NonceDO {
                   classification_kind: probeClassification.kind,
                   occupant_txid: probeHiroTx?.tx_id ?? null,
                   occupant_sender: probeHiroTx?.sender_address ?? null,
+                  occupant_sponsor: probeHiroTx?.sponsor_address ?? null,
+                  occupant_fee: probeHiroTx?.fee_rate ?? null,
                 });
               } catch { /* fail-open */ }
             }
@@ -6693,13 +6733,49 @@ export class NonceDO {
       this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
       this.incrementCounter(STATE_KEYS.conflictsDetected);
 
+      // Attribute the forward bump cause so operators can distinguish routine
+      // confirmation catch-up from cold-start races or external wallet use.
+      //
+      // (a) untracked_broadcast — relay broadcast a tx that confirmed, but head
+      //     was not advanced (e.g. concurrent write, DO restart mid-broadcast).
+      //     Evidence: ledger has broadcasted entries at or above previousNonce.
+      // (b) do_cold_start — DO storage was empty at this reconcile tick (no ledger
+      //     entries at all), so head is being seeded for the first time here.
+      //     Note: the true cold-start (previousNonce === null) returns early above;
+      //     this catches the case where head was set but the ledger is empty.
+      // (c) external_wallet_op — chain advanced but relay has no broadcast evidence
+      //     in the gap. Possible unauthorized external use of the sponsor key.
+      let forwardBumpCause: "untracked_broadcast" | "do_cold_start" | "external_wallet_op";
+      const hasOurBroadcastAbovePrevious =
+        broadcastedByNonce.size > 0 &&
+        [...broadcastedByNonce.keys()].some((n) => n >= previousNonce);
+
+      if (hasOurBroadcastAbovePrevious) {
+        forwardBumpCause = "untracked_broadcast";
+      } else if (broadcastedByNonce.size === 0 && this.ledgerReservedCount(walletIndex) === 0) {
+        forwardBumpCause = "do_cold_start";
+      } else {
+        forwardBumpCause = "external_wallet_op";
+      }
+
       this.log("warn", "nonce_reconcile_forward_bump", {
         walletIndex,
         previousNonce,
         newNonce: possible_next_nonce,
         hiroNextNonce: possible_next_nonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
+        cause: forwardBumpCause,
       });
+
+      // Operator alert for external wallet use — requires investigation.
+      if (forwardBumpCause === "external_wallet_op") {
+        this.log("warn", "operator_alert_external_wallet_op", {
+          walletIndex,
+          previousNonce,
+          newNonce: possible_next_nonce,
+          message: "Sponsor wallet nonce advanced externally — possible unauthorized key use",
+        });
+      }
 
       return {
         previousNonce,
@@ -7794,6 +7870,14 @@ export class NonceDO {
               const bbHiroTx = await this.fetchOccupant(entry.wallet_index, entry.sponsor_nonce);
               const bbLedger = this.buildSponsorLedger(entry.wallet_index, bbSponsorAddr);
               const bbClassification = classifyOccupant(bbHiroTx, bbSponsorAddr, bbLedger, entry.sponsor_nonce);
+              // Fetch our ledger txid for cross-reference in operator tools
+              const bbLedgerTxid = this.sql
+                .exec<{ txid: string | null }>(
+                  "SELECT txid FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+                  entry.wallet_index,
+                  entry.sponsor_nonce
+                )
+                .toArray()[0]?.txid ?? null;
               this.log("info", "bounded_broadcast_conflict_classified", {
                 walletIndex: entry.wallet_index,
                 sponsorNonce: entry.sponsor_nonce,
@@ -7801,6 +7885,8 @@ export class NonceDO {
                 occupant_txid: bbHiroTx?.tx_id ?? null,
                 occupant_sender: bbHiroTx?.sender_address ?? null,
                 occupant_sponsor: bbHiroTx?.sponsor_address ?? null,
+                occupant_fee: bbHiroTx?.fee_rate ?? null,
+                our_ledger_txid: bbLedgerTxid,
               });
             } catch { /* fail-open — classification is advisory */ }
           }
