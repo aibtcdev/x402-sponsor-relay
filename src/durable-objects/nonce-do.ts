@@ -35,7 +35,9 @@ import type {
   WalletCapacity,
   OccupiedNonce,
   SponsorLedger,
+  SponsorLedgerEntry,
   OccupantClassification,
+  HiroSponsorTxView,
   ReconcileResult as TxReconcileResult,
 } from "@aibtc/tx-schemas";
 import {
@@ -2528,7 +2530,7 @@ export class NonceDO {
   private async fetchOccupant(
     walletIndex: number,
     sponsorNonce: number
-  ): Promise<import("@aibtc/tx-schemas").HiroSponsorTxView | null> {
+  ): Promise<HiroSponsorTxView | null> {
     try {
       const rows = this.sql
         .exec<{ txid: string | null }>(
@@ -2568,7 +2570,7 @@ export class NonceDO {
    */
   private async fetchMempoolForSponsor(
     sponsorAddress: string
-  ): Promise<Record<number, import("@aibtc/tx-schemas").HiroSponsorTxView>> {
+  ): Promise<Record<number, HiroSponsorTxView>> {
     const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
     // Request up to 200 entries — sponsor wallet is unlikely to have more in-flight
@@ -2582,7 +2584,7 @@ export class NonceDO {
     }
     const data = (await response.json()) as { results?: unknown[] };
     const results = Array.isArray(data?.results) ? data.results : [];
-    const byNonce: Record<number, import("@aibtc/tx-schemas").HiroSponsorTxView> = {};
+    const byNonce: Record<number, HiroSponsorTxView> = {};
     for (const item of results) {
       const parsed = HiroSponsorTxViewSchema.safeParse(item);
       if (!parsed.success) continue;
@@ -2733,28 +2735,21 @@ export class NonceDO {
       return { sponsorAddress, entries: {} };
     }
 
-    const entries: Record<string, import("@aibtc/tx-schemas").SponsorLedgerEntry> = {};
+    const entries: Record<string, SponsorLedgerEntry> = {};
     for (const row of rows) {
-      // Map SQL status column to SponsorLedgerEntry status
-      let status: "pending_broadcast" | "broadcast_sent" | "broadcast_failed";
-      if (row.status === "pending_broadcast") {
-        status = "pending_broadcast";
-      } else if (row.status === "broadcast_failed") {
-        status = "broadcast_failed";
-      } else {
-        // broadcast_sent or NULL (legacy rows default to sent)
-        status = "broadcast_sent";
-      }
-
-      // broadcastAt: prefer broadcast_at (lifecycle), fall back to broadcasted_at, then assigned_at
-      const broadcastAt = row.broadcast_at ?? row.broadcasted_at ?? row.assigned_at;
+      // Legacy rows with NULL status default to 'broadcast_sent'.
+      const status: "pending_broadcast" | "broadcast_sent" | "broadcast_failed" =
+        row.status === "pending_broadcast" || row.status === "broadcast_failed"
+          ? row.status
+          : "broadcast_sent";
 
       entries[row.nonce.toString()] = {
         nonce: row.nonce,
         txId: row.txid,
         fee: row.original_fee ?? "0",
         status,
-        broadcastAt,
+        // broadcastAt: prefer broadcast_at (lifecycle), fall back to broadcasted_at, then assigned_at
+        broadcastAt: row.broadcast_at ?? row.broadcasted_at ?? row.assigned_at,
         rbfAttempts: row.gap_fill_attempts ?? 0,
       };
     }
@@ -2836,7 +2831,7 @@ export class NonceDO {
    * probe, bounded broadcast, RBF) without branching on event name.
    */
   private occupantLogFields(
-    hiroTx: import("@aibtc/tx-schemas").HiroSponsorTxView | null
+    hiroTx: HiroSponsorTxView | null
   ): {
     occupant_txid: string | null;
     occupant_sender: string | null;
@@ -2867,7 +2862,7 @@ export class NonceDO {
     walletIndex: number,
     nonce: number
   ): Promise<{
-    hiroTx: import("@aibtc/tx-schemas").HiroSponsorTxView | null;
+    hiroTx: HiroSponsorTxView | null;
     classification: OccupantClassification;
     ledger: SponsorLedger;
   } | null> {
@@ -2978,7 +2973,7 @@ export class NonceDO {
       // Phase 3: fetch full occupant identity for classifyOccupant (flag-gated).
       // We fetch hiroTx here (before broadcast) so classifyOccupant has context before
       // the conflict response. On ConflictingNonceInMempool we re-fetch for freshness.
-      let hiroTxPreBroadcast: import("@aibtc/tx-schemas").HiroSponsorTxView | null = null;
+      let hiroTxPreBroadcast: HiroSponsorTxView | null = null;
       if (this.isWalletCapacityEnabled()) {
         hiroTxPreBroadcast = await this.fetchOccupant(walletIndex, nonce);
       }
@@ -6858,7 +6853,7 @@ export class NonceDO {
   private async runSchemaReconcileForWallet(
     walletIndex: number,
     address: string,
-    mempoolSnapshot: Record<number, import("@aibtc/tx-schemas").HiroSponsorTxView>
+    mempoolSnapshot: Record<number, HiroSponsorTxView>
   ): Promise<void> {
     try {
       const ledger = this.buildSponsorLedger(walletIndex, address);
@@ -8090,7 +8085,7 @@ export class NonceDO {
         // ---------------------------------------------------------------------------
         const walletMempoolSnapshots = new Map<
           number,
-          Record<number, import("@aibtc/tx-schemas").HiroSponsorTxView> | null
+          Record<number, HiroSponsorTxView> | null
         >();
         if (this.isWalletCapacityEnabled()) {
           for (const { walletIndex, address } of reconcileWallets) {
