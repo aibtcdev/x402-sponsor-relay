@@ -131,6 +131,16 @@ Queue-based polling follows the shared `@aibtc/tx-schemas` contract.
 - Budget controls (optional)
 - Server-side retry queue (optional)
 
+## Sponsor Wallet Nonce Lifecycle
+
+Since `@aibtc/tx-schemas@^1.0.0` (April 2026), the relay uses schema-driven primitives
+for sponsor-wallet conflict resolution. Every outbound broadcast follows a two-phase
+write (`pending_broadcast` → `broadcast_sent` | `broadcast_failed`). Occupants are
+classified via `classifyOccupant` and routed through `decideBroadcast`, replacing the
+earlier inline logic. Feature flag: `USE_WALLET_CAPACITY_STATE` (default on).
+
+See [Sponsor Ledger Lifecycle](./sponsor-ledger-lifecycle.md) for the full reference.
+
 ## Related Documentation
 
 See [Feature Roadmap](./feature-roadmap.md) for implementation status and future plans.
