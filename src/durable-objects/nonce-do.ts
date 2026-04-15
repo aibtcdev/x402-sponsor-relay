@@ -2435,13 +2435,13 @@ export class NonceDO {
           } else if (existingState === null) {
             // Case (b): no ledger entry — insert a conflict entry so reconciler can handle it
             this.log("info", "gap_fill_conflict_unknown_occupant", { walletIndex, nonce: gapNonce });
-            const now = new Date().toISOString();
+            const nowConflict = new Date().toISOString();
             this.sql.exec(
               `INSERT OR IGNORE INTO nonce_intents (wallet_index, nonce, state, assigned_at)
                VALUES (?, ?, 'conflict', ?)`,
               walletIndex,
               gapNonce,
-              now
+              nowConflict
             );
           } else {
             // Case (c): ledger entry with no txid — mark conflict to stop re-queuing
@@ -2459,6 +2459,28 @@ export class NonceDO {
             );
           }
         } catch { /* fail-open */ }
+
+        // Phase 3: classify the occupant for observability (flag-gated, fail-open).
+        // This tells operators whether the conflict is ours, foreign, or untraceable.
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            const gapSponsorAddr = (await this.getStoredSponsorAddressForWallet(walletIndex)) ?? "";
+            const gapHiroTx = await this.fetchOccupant(walletIndex, gapNonce);
+            const gapLedger = this.buildSponsorLedger(walletIndex, gapSponsorAddr);
+            const gapClassification = classifyOccupant(gapHiroTx, gapSponsorAddr, gapLedger, gapNonce);
+            this.log("info", "gap_fill_conflict_classified", {
+              walletIndex,
+              nonce: gapNonce,
+              classification_kind: gapClassification.kind,
+              occupant_txid: gapHiroTx?.tx_id ?? null,
+              occupant_sender: gapHiroTx?.sender_address ?? null,
+              occupant_sponsor: gapHiroTx?.sponsor_address ?? null,
+            });
+            // Two-phase write: conflict outcome is a broadcast_failed for lifecycle (Phase 3)
+            this.writeLedgerResolvedBroadcast(walletIndex, gapNonce, "failed");
+          } catch { /* fail-open — classification is advisory */ }
+        }
+
         return null;
       }
       this.log("warn", "gap_fill_rejected", {
@@ -2707,6 +2729,46 @@ export class NonceDO {
       this.log("debug", "ledger_resolved_broadcast_write_error", {
         walletIndex, nonce, outcome, error: e instanceof Error ? e.message : String(e),
       });
+    }
+  }
+
+  /**
+   * Lightweight on-demand occupant check for a single nonce.
+   * Phase 3 scope: single-nonce Hiro fetch + classifyOccupant at decision points.
+   * Full multi-nonce mempool sweep (Phase 4 reconcile) uses the tx-schemas reconcile() helper.
+   *
+   * Used at:
+   * (a) /nonce/state reads — enriches occupied nonces with observed classification
+   * (b) ConflictingNonceInMempool branches — classify before deciding next action
+   * (c) Pre-RBF decision — classify before attempting replace-by-fee
+   *
+   * Fail-open: returns null on any error so callers can fall back to legacy handling.
+   */
+  private async performOnDemandOccupantCheck(
+    walletIndex: number,
+    nonce: number
+  ): Promise<{
+    hiroTx: import("@aibtc/tx-schemas").HiroSponsorTxView | null;
+    classification: OccupantClassification;
+    ledger: SponsorLedger;
+  } | null> {
+    try {
+      let sponsorAddr = (await this.getStoredSponsorAddressForWallet(walletIndex)) ?? "";
+      if (!sponsorAddr) {
+        try {
+          const pk = await this.derivePrivateKeyForWallet(walletIndex);
+          if (pk) {
+            const net = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+            sponsorAddr = getAddressFromPrivateKey(pk, net);
+          }
+        } catch { /* fail-open */ }
+      }
+      const hiroTx = await this.fetchOccupant(walletIndex, nonce);
+      const ledger = this.buildSponsorLedger(walletIndex, sponsorAddr);
+      const classification = classifyOccupant(hiroTx, sponsorAddr, ledger, nonce);
+      return { hiroTx, classification, ledger };
+    } catch {
+      return null; // Fail-open
     }
   }
 
@@ -5193,12 +5255,37 @@ export class NonceDO {
         const settlementTimes = this.computeSettlementPercentiles(walletIndex);
 
         // WalletCapacity from tx-schemas (Phase 2: present when USE_WALLET_CAPACITY_STATE=true)
+        // Phase 3: also run on-demand occupant classification for each occupied nonce
+        // so /nonce/state callers get full occupant identity without a separate request.
         let walletCapacityResult: WalletCapacity | undefined;
         if (this.isWalletCapacityEnabled()) {
           try {
             walletCapacityResult = await this.buildWalletCapacity(walletIndex, address);
           } catch {
             // Fail-open: walletCapacity absent does not break the observable state response
+          }
+
+          // On-demand occupant check for each occupied nonce (Phase 3).
+          // Emits a debug log per occupied nonce with full occupant identity.
+          // This satisfies the "on-demand reconcile on /nonce/state reads" requirement.
+          if (walletCapacityResult && walletCapacityResult.occupiedNonces.length > 0) {
+            for (const occ of walletCapacityResult.occupiedNonces) {
+              try {
+                const occupantCheck = await this.performOnDemandOccupantCheck(walletIndex, occ.nonce);
+                if (occupantCheck) {
+                  this.log("debug", "nonce_state_occupant_classified", {
+                    walletIndex,
+                    nonce: occ.nonce,
+                    classification_kind: occupantCheck.classification.kind,
+                    occupant_txid: occupantCheck.hiroTx?.tx_id ?? null,
+                    occupant_sender: occupantCheck.hiroTx?.sender_address ?? null,
+                    occupant_sponsor: occupantCheck.hiroTx?.sponsor_address ?? null,
+                    rbf_attempts: occ.rbfAttempts,
+                    occupant_visible: occ.occupantVisible,
+                  });
+                }
+              } catch { /* fail-open — occupant check is advisory */ }
+            }
           }
         }
 
@@ -5575,6 +5662,21 @@ export class NonceDO {
                WHERE wallet_index = ? AND nonce = ?`,
               result.reason, now, walletIndex, nonce
             );
+            // Phase 3: classify the conflict occupant (flag-gated, fail-open).
+            if (this.isWalletCapacityEnabled()) {
+              try {
+                const probeSponsorAddr = (await this.getStoredSponsorAddressForWallet(walletIndex)) ?? "";
+                const probeHiroTx = await this.fetchOccupant(walletIndex, nonce);
+                const probeLedger = this.buildSponsorLedger(walletIndex, probeSponsorAddr);
+                const probeClassification = classifyOccupant(probeHiroTx, probeSponsorAddr, probeLedger, nonce);
+                this.log("info", "probe_conflict_classified", {
+                  walletIndex, nonce,
+                  classification_kind: probeClassification.kind,
+                  occupant_txid: probeHiroTx?.tx_id ?? null,
+                  occupant_sender: probeHiroTx?.sender_address ?? null,
+                });
+              } catch { /* fail-open */ }
+            }
             conflict++;
           } else {
             this.sql.exec(
@@ -7451,6 +7553,25 @@ export class NonceDO {
               requestedRetryAfterMs: action.retryAfterMs,
             });
           }
+
+          // Phase 3: on ConflictingNonceInMempool, classify the sponsor-nonce occupant (flag-gated).
+          if (result.reason === "ConflictingNonceInMempool" && this.isWalletCapacityEnabled()) {
+            try {
+              const bbSponsorAddr = (await this.getStoredSponsorAddressForWallet(entry.wallet_index)) ?? "";
+              const bbHiroTx = await this.fetchOccupant(entry.wallet_index, entry.sponsor_nonce);
+              const bbLedger = this.buildSponsorLedger(entry.wallet_index, bbSponsorAddr);
+              const bbClassification = classifyOccupant(bbHiroTx, bbSponsorAddr, bbLedger, entry.sponsor_nonce);
+              this.log("info", "bounded_broadcast_conflict_classified", {
+                walletIndex: entry.wallet_index,
+                sponsorNonce: entry.sponsor_nonce,
+                classification_kind: bbClassification.kind,
+                occupant_txid: bbHiroTx?.tx_id ?? null,
+                occupant_sender: bbHiroTx?.sender_address ?? null,
+                occupant_sponsor: bbHiroTx?.sponsor_address ?? null,
+              });
+            } catch { /* fail-open — classification is advisory */ }
+          }
+
           errors++;
         }
       } catch (e) {
