@@ -31,6 +31,7 @@ import {
   type StoredSponsorStatusSnapshot,
 } from "../services/sponsor-status";
 import { parseBroadcastOutcome, decideBroadcastAction } from "../utils/broadcast-outcome";
+import type { WalletCapacity, OccupiedNonce } from "@aibtc/tx-schemas";
 
 const APP_ID = "x402-relay";
 
@@ -258,6 +259,10 @@ interface ObservableWalletState {
   replayBufferDepth?: number;
   /** Settlement time percentiles for this wallet (last 24h, null if no data) */
   settlementTimes?: SettlementTimeStats;
+  /** tx-schemas WalletCapacity — present when USE_WALLET_CAPACITY_STATE=true.
+   *  Contains occupied nonce details (rbfAttempts, occupantVisible, abandonAfter)
+   *  derived from the ledger as a single source of truth. */
+  walletCapacity?: WalletCapacity;
 }
 
 /**
@@ -3052,6 +3057,175 @@ export class NonceDO {
     return `stuck_tx:${walletIndex}:${nonce}`;
   }
 
+  // ---------------------------------------------------------------------------
+  // Phase 2 (sponsor-ledger-integration): WalletCapacity helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Check whether the USE_WALLET_CAPACITY_STATE feature flag is enabled.
+   * Default: true (enabled). Set env var to "false" for one-revision rollback.
+   */
+  private isWalletCapacityEnabled(): boolean {
+    const flag = this.env.USE_WALLET_CAPACITY_STATE;
+    if (flag === undefined || flag === null) return true;
+    return flag.toLowerCase() !== "false";
+  }
+
+  /**
+   * Build a tx-schemas WalletCapacity object for a wallet from the SQLite ledger
+   * and in-memory frontier/head state.
+   *
+   * OccupiedNonce rows are derived from nonce_intents rows in conflict/failed state
+   * that have had gap-fill attempts (gap_fill_attempts > 0). This is the ledger-native
+   * equivalent of the stuck_tx:{walletIndex}:{nonce} DO storage entries.
+   *
+   * Dual-read during migration: also reads stuck_tx:* DO storage to merge in more
+   * precise rbfAttempts when both sources are present. Phase 6 sweeps the DO keys.
+   *
+   * This method is always synchronous on the SQL side but async for DO storage reads.
+   */
+  private async buildWalletCapacity(
+    walletIndex: number,
+    sponsorAddress: string
+  ): Promise<WalletCapacity> {
+    const chainFrontier = this.getChainFrontier(walletIndex) ?? 0;
+    const assignmentHead = this.ledgerGetWalletHead(walletIndex) ?? chainFrontier;
+    const inFlightCount = this.ledgerInFlightCount(walletIndex);
+    const available = Math.max(0, this.walletHeadroom(walletIndex));
+
+    // Query ledger for nonces that are occupied (conflict/failed with RBF history)
+    // These are the sponsor-wallet conflict slots the relay has been trying to clear.
+    type OccupantSqlRow = {
+      nonce: number;
+      gap_fill_attempts: number | null;
+      occupant_visible: number | null;
+      abandon_after: string | null;
+      sender_address: string | null;
+      sponsor_address: string | null;
+      assigned_at: string;
+    };
+    let occupantRows: OccupantSqlRow[] = [];
+    try {
+      occupantRows = (this.sql
+        .exec(
+          `SELECT nonce, gap_fill_attempts, occupant_visible, abandon_after,
+                  sender_address, sponsor_address, assigned_at
+           FROM nonce_intents
+           WHERE wallet_index = ? AND state IN ('conflict', 'failed')
+             AND gap_fill_attempts > 0
+           ORDER BY nonce ASC
+           LIMIT 50`,
+          walletIndex
+        )
+        .toArray() as OccupantSqlRow[]);
+    } catch {
+      // Fail-open: return empty occupiedNonces on SQL error
+    }
+
+    // Build OccupiedNonce array, enriched with DO storage stuck_tx data where available.
+    const occupiedNonces: OccupiedNonce[] = [];
+    const defaultAbandonAfterMs = Date.now() + STUCK_TX_AGE_MS * 4;
+
+    for (const row of occupantRows) {
+      // Attempt dual-read from DO storage for more precise RBF state
+      let rbfAttempts = row.gap_fill_attempts ?? 0;
+      try {
+        const stuckKey = this.walletStuckTxKey(walletIndex, row.nonce);
+        const stuckState = await this.state.storage.get<StuckTxState>(stuckKey);
+        if (stuckState) {
+          // Prefer DO storage count if larger (it was written by broadcastRbfForNonce)
+          rbfAttempts = Math.max(rbfAttempts, stuckState.rbfAttempts);
+        }
+      } catch {
+        // Fail-open: use SQL count
+      }
+
+      // occupantVisible: 1 = visible, 0 = ghost, null = unknown (treat as visible)
+      const occupantVisible = row.occupant_visible !== null
+        ? row.occupant_visible === 1
+        : true;
+
+      const abandonAfter = row.abandon_after
+        ?? new Date(defaultAbandonAfterMs).toISOString();
+
+      // Build lastOccupant from known identity fields
+      const occupantAddress = row.sender_address ?? row.sponsor_address;
+      const lastOccupant = occupantAddress
+        ? { address: occupantAddress }
+        : undefined;
+
+      occupiedNonces.push({
+        nonce: row.nonce,
+        conflictedAt: row.assigned_at,
+        occupantVisible,
+        rbfAttempts,
+        maxRbfAttempts: MAX_RBF_ATTEMPTS,
+        abandonAfter,
+        lastOccupant,
+      });
+    }
+
+    return {
+      walletIndex,
+      sponsorAddress,
+      chainFrontier,
+      assignmentHead,
+      inFlightCount,
+      chainingLimit: CHAINING_LIMIT,
+      available,
+      occupiedNonces,
+      recentFailures: occupiedNonces.length,
+      recentFailureWindow: STUCK_TX_AGE_MS,
+    };
+  }
+
+  /**
+   * Get a tx-schemas WalletCapacity for a wallet index.
+   *
+   * When USE_WALLET_CAPACITY_STATE is disabled (rollback), returns a minimal
+   * WalletCapacity with empty occupiedNonces built from legacy headroom state.
+   * This allows one-revision rollback without schema changes.
+   *
+   * Phase 3+ uses this as the input to classifyOccupant and decideBroadcast.
+   */
+  async getWalletCapacity(walletIndex: number): Promise<WalletCapacity> {
+    // Resolve sponsor address for this wallet
+    let sponsorAddress = await this.getStoredSponsorAddressForWallet(walletIndex);
+    if (!sponsorAddress) {
+      // Derive from env for uninitialized wallets — fail-open with empty string
+      try {
+        const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
+        if (privateKey) {
+          const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+          sponsorAddress = getAddressFromPrivateKey(privateKey, network);
+        }
+      } catch { /* fail-open */ }
+      sponsorAddress = sponsorAddress ?? "";
+    }
+
+    if (!this.isWalletCapacityEnabled()) {
+      // Legacy fallback: return minimal WalletCapacity without ledger-derived occupants
+      const chainFrontier = this.getChainFrontier(walletIndex) ?? 0;
+      const assignmentHead = this.ledgerGetWalletHead(walletIndex) ?? chainFrontier;
+      const inFlightCount = this.ledgerInFlightCount(walletIndex);
+      const available = Math.max(0, this.walletHeadroom(walletIndex));
+      return {
+        walletIndex,
+        sponsorAddress,
+        chainFrontier,
+        assignmentHead,
+        inFlightCount,
+        chainingLimit: CHAINING_LIMIT,
+        available,
+        occupiedNonces: [],
+        recentFailures: 0,
+        recentFailureWindow: STUCK_TX_AGE_MS,
+      };
+    }
+
+    return this.buildWalletCapacity(walletIndex, sponsorAddress);
+  }
+
   /**
    * Compute the escalated gap-fill fee for a nonce based on prior attempts.
    * Returns baseFee + priorAttempts (capped at MAX_BROADCAST_FEE), or baseFee if no prior attempts.
@@ -4680,6 +4854,16 @@ export class NonceDO {
         // Settlement time percentiles for this wallet (last 24h)
         const settlementTimes = this.computeSettlementPercentiles(walletIndex);
 
+        // WalletCapacity from tx-schemas (Phase 2: present when USE_WALLET_CAPACITY_STATE=true)
+        let walletCapacityResult: WalletCapacity | undefined;
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            walletCapacityResult = await this.buildWalletCapacity(walletIndex, address);
+          } catch {
+            // Fail-open: walletCapacity absent does not break the observable state response
+          }
+        }
+
         return {
           walletIndex,
           sponsorAddress: address,
@@ -4694,6 +4878,7 @@ export class NonceDO {
           queueDepth: queueState.total,
           replayBufferDepth: replayDepth,
           settlementTimes,
+          walletCapacity: walletCapacityResult,
         };
       })
     );
@@ -8169,6 +8354,24 @@ export class NonceDO {
       try {
         const state = await this.getObservableNonceState();
         return this.jsonResponse(state);
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    // GET /wallet-capacity/:walletIndex — tx-schemas WalletCapacity for a specific wallet.
+    // Returns a WalletCapacity object derived from the SQLite ledger and in-memory state.
+    // Used by relay, sponsor, and settle endpoints for pre-flight state checks (Phase 3+).
+    // When USE_WALLET_CAPACITY_STATE=false, returns minimal capacity with empty occupiedNonces.
+    const wcMatch = url.pathname.match(/^\/wallet-capacity\/(\d+)$/);
+    if (request.method === "GET" && wcMatch) {
+      const walletIndex = parseInt(wcMatch[1], 10);
+      if (isNaN(walletIndex) || walletIndex < 0) {
+        return this.badRequest("Invalid walletIndex");
+      }
+      try {
+        const capacity = await this.getWalletCapacity(walletIndex);
+        return this.jsonResponse(capacity);
       } catch (error) {
         return this.internalError(error);
       }
