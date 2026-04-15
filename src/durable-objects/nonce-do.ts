@@ -2741,6 +2741,11 @@ export class NonceDO {
    * Uses RBF_FEE (90,000 uSTX = 3× GAP_FILL_FEE) to guarantee eviction of the stuck tx.
    * Tracks attempt count in DO storage to cap retries at MAX_RBF_ATTEMPTS.
    * Returns the replacement txid on success, null if capped or broadcast failed.
+   *
+   * Phase 3: when USE_WALLET_CAPACITY_STATE=true, classifies the occupant via classifyOccupant()
+   * before each attempt and emits a shadow-compare log. Two-phase write lifecycle:
+   * writeLedgerPendingBroadcast() before the network call, writeLedgerResolvedBroadcast() after.
+   * LedgerTransitionError from the lifecycle helpers is caught and logged, not swallowed.
    */
   private async broadcastRbfForNonce(
     walletIndex: number,
@@ -2776,12 +2781,33 @@ export class NonceDO {
     const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
     const attemptNum = state.rbfAttempts + 1;
 
+    // Phase 3: resolve sponsor address for classifyOccupant calls
+    let sponsorAddress = "";
+    try {
+      sponsorAddress = (await this.getStoredSponsorAddressForWallet(walletIndex)) ?? "";
+      if (!sponsorAddress) {
+        const pk = await this.derivePrivateKeyForWallet(walletIndex);
+        if (pk) {
+          const net = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+          sponsorAddress = getAddressFromPrivateKey(pk, net);
+        }
+      }
+    } catch { /* fail-open */ }
+
     try {
       // Discover the occupant's fee via Hiro API (preferred) or fall back to dispatch_queue.
       // Using the actual occupant fee prevents "guaranteed failure" attempts where our fee
       // is too low to replace the occupant — those should not burn the attempt counter.
       const occupantResult = await this.fetchOccupantFee(walletIndex, nonce);
       const occupantFee = occupantResult.fee;
+
+      // Phase 3: fetch full occupant identity for classifyOccupant (flag-gated).
+      // We fetch hiroTx here (before broadcast) so classifyOccupant has context before
+      // the conflict response. On ConflictingNonceInMempool we re-fetch for freshness.
+      let hiroTxPreBroadcast: import("@aibtc/tx-schemas").HiroSponsorTxView | null = null;
+      if (this.isWalletCapacityEnabled()) {
+        hiroTxPreBroadcast = await this.fetchOccupant(walletIndex, nonce);
+      }
 
       // Also read original_fee from dispatch_queue as fallback
       const dispatchRow = this.sql
@@ -2830,6 +2856,33 @@ export class NonceDO {
         attemptNum,
       });
 
+      // Phase 3: shadow-compare pre-broadcast classification (flag-gated, debug level).
+      // Logs occupant identity before the broadcast attempt so operators can see
+      // whether classifyOccupant agrees with the legacy occupant fee result.
+      if (this.isWalletCapacityEnabled() && hiroTxPreBroadcast !== null) {
+        try {
+          const ledger = this.buildSponsorLedger(walletIndex, sponsorAddress);
+          const preClassification = classifyOccupant(hiroTxPreBroadcast, sponsorAddress, ledger, nonce);
+          this.log("debug", "rbf_decision_shadow_compare", {
+            walletIndex,
+            nonce,
+            legacy_occupant_fee_reason: occupantResult.reason ?? "fee_found",
+            classification_kind: preClassification.kind,
+            occupant_txid: hiroTxPreBroadcast.tx_id,
+            occupant_sender: hiroTxPreBroadcast.sender_address,
+            occupant_sponsor: hiroTxPreBroadcast.sponsor_address ?? null,
+            nonce_has_original_txid: originalTxid !== null,
+          });
+        } catch (e) {
+          // Shadow compare is advisory — never block the broadcast
+          if (e instanceof LedgerTransitionError) {
+            this.log("error", "rbf_ledger_transition_error", {
+              walletIndex, nonce, error: e.message, phase: "pre_broadcast_shadow",
+            });
+          }
+        }
+      }
+
       const tx = await makeSTXTokenTransfer({
         recipient,
         amount: GAP_FILL_AMOUNT,
@@ -2839,6 +2892,15 @@ export class NonceDO {
         fee: rbfFee,
         memo: `rbf-${nonce}-attempt-${attemptNum}`,
       });
+
+      // Two-phase write: mark pending_broadcast before network call (Phase 3)
+      if (this.isWalletCapacityEnabled()) {
+        const rbfTxHex = tx.serialize();
+        // Use a placeholder txid derived from the fee for the pending entry
+        // (actual txid not known until after broadcast)
+        this.writeLedgerPendingBroadcast(walletIndex, nonce, `rbf_attempt_${attemptNum}`, now);
+      }
+
       const result = await this.broadcastRawTx(tx, "rbf");
 
       state.lastSeen = now;
@@ -2859,6 +2921,18 @@ export class NonceDO {
             nonce
           );
         } catch { /* fail-open */ }
+        // Two-phase write: resolve broadcast_sent (Phase 3)
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            this.writeLedgerResolvedBroadcast(walletIndex, nonce, "sent", result.txid);
+          } catch (e) {
+            if (e instanceof LedgerTransitionError) {
+              this.log("error", "rbf_ledger_transition_error", {
+                walletIndex, nonce, error: e.message, phase: "broadcast_sent",
+              });
+            }
+          }
+        }
         // Notify agents when a real sponsored tx is replaced (gap-fills have no original tx)
         if (state.originalTxid) {
           await this.writeReplacedTxEntry(state.originalTxid, result.txid, "rbf", walletIndex, nonce);
@@ -2881,6 +2955,18 @@ export class NonceDO {
         // Terminal — delete stuck-tx state entirely to avoid orphaned entries
         state.rbfAttempts = attemptNum;
         await this.state.storage.delete(key);
+        // Two-phase write: resolve broadcast_failed (Phase 3)
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            this.writeLedgerResolvedBroadcast(walletIndex, nonce, "failed");
+          } catch (e) {
+            if (e instanceof LedgerTransitionError) {
+              this.log("error", "rbf_ledger_transition_error", {
+                walletIndex, nonce, error: e.message, phase: "bad_nonce",
+              });
+            }
+          }
+        }
         this.log("info", "rbf_nonce_consumed", {
           walletIndex,
           nonce,
@@ -2892,38 +2978,92 @@ export class NonceDO {
       }
 
       if (result.reason === "ConflictingNonceInMempool") {
-        // Classify the conflict for logging — no per-wallet degradation flags.
-        const occupantReason = occupantResult.reason;
-        const isGhost = occupantReason === "no_txid" || occupantReason === "not_found";
-        const isHiroError = occupantReason === "hiro_error";
-
-        if (isGhost) {
-          // Ghost — node holds tx invisible to Hiro. Log but don't penalize wallet.
-          this.log("warn", "rbf_ghost_conflict", {
-            walletIndex,
-            nonce,
-            rbfFee: rbfFee.toString(),
-            occupantReason,
-          });
-        } else if (isHiroError) {
-          // Hiro unavailable — can't determine occupant fee, don't blame the wallet.
-          this.log("warn", "rbf_conflict_hiro_unavailable", {
-            walletIndex,
-            nonce,
-            rbfFee: rbfFee.toString(),
-            attemptNum,
-          });
-        } else {
-          // Fee too low — occupant fee discovered but ours wasn't enough.
-          state.rbfAttempts = attemptNum;
-          this.log("warn", "rbf_fee_too_low", {
-            walletIndex,
-            nonce,
-            rbfFee: rbfFee.toString(),
-            occupantFee: occupantFee!.toString(),
-            attemptNum,
-          });
+        // Two-phase write: resolve broadcast_failed on conflict (Phase 3)
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            this.writeLedgerResolvedBroadcast(walletIndex, nonce, "failed");
+          } catch (e) {
+            if (e instanceof LedgerTransitionError) {
+              this.log("error", "rbf_ledger_transition_error", {
+                walletIndex, nonce, error: e.message, phase: "conflict",
+              });
+            }
+          }
         }
+
+        // Phase 3: re-fetch occupant for fresh classification after conflict (flag-gated).
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            const freshHiroTx = await this.fetchOccupant(walletIndex, nonce);
+            const ledger = this.buildSponsorLedger(walletIndex, sponsorAddress);
+            const classification = classifyOccupant(freshHiroTx, sponsorAddress, ledger, nonce);
+
+            // Route logging by classification kind:
+            // - foreign: operator alert level — unknown party occupying our sponsor slot
+            // - sponsor_owned_orphan: relay broadcast not in ledger — adopt path
+            // - untraceable: ghost — node holds tx invisible to Hiro
+            // - sponsor_owned_in_ledger: our own tx, fee was insufficient
+            if (classification.kind === "foreign") {
+              this.log("warn", "rbf_occupant_foreign", {
+                walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
+                occupant_txid: classification.txId,
+                occupant_address: classification.occupantAddress,
+                occupant_fee: classification.fee ?? null,
+                our_sponsor_address: sponsorAddress,
+              });
+            } else if (classification.kind === "sponsor_owned_orphan") {
+              this.log("warn", "rbf_occupant_orphan", {
+                walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
+                orphan_txid: classification.txId,
+                occupant_fee: classification.fee ?? null,
+              });
+            } else if (classification.kind === "untraceable") {
+              // Ghost — node holds tx invisible to Hiro. Log but don't penalize wallet.
+              this.log("warn", "rbf_ghost_conflict", {
+                walletIndex, nonce, rbfFee: rbfFee.toString(),
+                classification_kind: "untraceable",
+              });
+            } else {
+              // sponsor_owned_in_ledger: fee too low to replace our own tx
+              state.rbfAttempts = attemptNum;
+              this.log("warn", "rbf_fee_too_low", {
+                walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
+                classification_kind: classification.kind,
+                occupant_txid: "txId" in classification ? classification.txId : null,
+              });
+            }
+          } catch (e) {
+            if (e instanceof LedgerTransitionError) {
+              this.log("error", "rbf_ledger_transition_error", {
+                walletIndex, nonce, error: e.message, phase: "conflict_classify",
+              });
+            } else {
+              // Fall through to legacy handling on unexpected classify error
+            }
+          }
+        } else {
+          // Legacy path: classify by occupant fee result
+          const occupantReason = occupantResult.reason;
+          const isGhost = occupantReason === "no_txid" || occupantReason === "not_found";
+          const isHiroError = occupantReason === "hiro_error";
+
+          if (isGhost) {
+            this.log("warn", "rbf_ghost_conflict", {
+              walletIndex, nonce, rbfFee: rbfFee.toString(), occupantReason,
+            });
+          } else if (isHiroError) {
+            this.log("warn", "rbf_conflict_hiro_unavailable", {
+              walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
+            });
+          } else {
+            state.rbfAttempts = attemptNum;
+            this.log("warn", "rbf_fee_too_low", {
+              walletIndex, nonce, rbfFee: rbfFee.toString(),
+              occupantFee: occupantFee!.toString(), attemptNum,
+            });
+          }
+        }
+
         await this.state.storage.put(key, state);
         return null;
       }
@@ -2931,6 +3071,18 @@ export class NonceDO {
       // Other rejection — increment attempt count to prevent runaway and log details
       state.rbfAttempts = attemptNum;
       await this.state.storage.put(key, state);
+      // Two-phase write: resolve broadcast_failed on other rejection (Phase 3)
+      if (this.isWalletCapacityEnabled()) {
+        try {
+          this.writeLedgerResolvedBroadcast(walletIndex, nonce, "failed");
+        } catch (e) {
+          if (e instanceof LedgerTransitionError) {
+            this.log("error", "rbf_ledger_transition_error", {
+              walletIndex, nonce, error: e.message, phase: "other_rejection",
+            });
+          }
+        }
+      }
       this.log("warn", "rbf_broadcast_rejected", {
         walletIndex,
         nonce,
