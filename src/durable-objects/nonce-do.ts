@@ -2856,16 +2856,7 @@ export class NonceDO {
     ledger: SponsorLedger;
   } | null> {
     try {
-      let sponsorAddr = (await this.getStoredSponsorAddressForWallet(walletIndex)) ?? "";
-      if (!sponsorAddr) {
-        try {
-          const pk = await this.derivePrivateKeyForWallet(walletIndex);
-          if (pk) {
-            const net = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
-            sponsorAddr = getAddressFromPrivateKey(pk, net);
-          }
-        } catch { /* fail-open */ }
-      }
+      const sponsorAddr = await this.resolveSponsorAddress(walletIndex);
       const hiroTx = await this.fetchOccupant(walletIndex, nonce);
       const ledger = this.buildSponsorLedger(walletIndex, sponsorAddr);
       const classification = classifyOccupant(hiroTx, sponsorAddr, ledger, nonce);
@@ -2962,17 +2953,7 @@ export class NonceDO {
     const attemptNum = state.rbfAttempts + 1;
 
     // Phase 3: resolve sponsor address for classifyOccupant calls
-    let sponsorAddress = "";
-    try {
-      sponsorAddress = (await this.getStoredSponsorAddressForWallet(walletIndex)) ?? "";
-      if (!sponsorAddress) {
-        const pk = await this.derivePrivateKeyForWallet(walletIndex);
-        if (pk) {
-          const net = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
-          sponsorAddress = getAddressFromPrivateKey(pk, net);
-        }
-      }
-    } catch { /* fail-open */ }
+    const sponsorAddress = await this.resolveSponsorAddress(walletIndex);
 
     try {
       // Discover the occupant's fee via Hiro API (preferred) or fall back to dispatch_queue.
@@ -3548,6 +3529,24 @@ export class NonceDO {
     await this.state.storage.put(this.sponsorAddressKey(walletIndex), address);
   }
 
+  /**
+   * Resolve the sponsor address for a wallet. Prefers the stored value; falls back
+   * to deriving it from the sponsor private key. Returns "" if both sources fail.
+   * Used by classifyOccupant call sites that need an address but must never throw.
+   */
+  private async resolveSponsorAddress(walletIndex: number): Promise<string> {
+    const stored = await this.getStoredSponsorAddressForWallet(walletIndex);
+    if (stored) return stored;
+    try {
+      const pk = await this.derivePrivateKeyForWallet(walletIndex);
+      if (pk) {
+        const net = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+        return getAddressFromPrivateKey(pk, net);
+      }
+    } catch { /* fail-open */ }
+    return "";
+  }
+
   /** Get the current round-robin wallet index. */
   private async getNextWalletIndex(): Promise<number> {
     return (await this.state.storage.get<number>(NEXT_WALLET_INDEX_KEY)) ?? 0;
@@ -3728,19 +3727,7 @@ export class NonceDO {
    * Phase 3+ uses this as the input to classifyOccupant and decideBroadcast.
    */
   async getWalletCapacity(walletIndex: number): Promise<WalletCapacity> {
-    // Resolve sponsor address for this wallet
-    let sponsorAddress = await this.getStoredSponsorAddressForWallet(walletIndex);
-    if (!sponsorAddress) {
-      // Derive from env for uninitialized wallets — fail-open with empty string
-      try {
-        const privateKey = await this.derivePrivateKeyForWallet(walletIndex);
-        if (privateKey) {
-          const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
-          sponsorAddress = getAddressFromPrivateKey(privateKey, network);
-        }
-      } catch { /* fail-open */ }
-      sponsorAddress = sponsorAddress ?? "";
-    }
+    const sponsorAddress = await this.resolveSponsorAddress(walletIndex);
 
     if (!this.isWalletCapacityEnabled()) {
       // Legacy fallback: return minimal WalletCapacity without ledger-derived occupants
