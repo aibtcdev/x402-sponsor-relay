@@ -3554,6 +3554,90 @@ export class NonceDO {
   }
 
   // ---------------------------------------------------------------------------
+  // Phase 6 (sponsor-ledger-integration): stuck_tx:* DO-storage sweep migration
+  // ---------------------------------------------------------------------------
+
+  /**
+   * One-shot migration: enumerate all stuck_tx:* DO-storage keys left over from
+   * Phase 2's dual-write and delete them once their data has been folded into the
+   * nonce_intents ledger rows.
+   *
+   * For each key:
+   * - If the corresponding ledger row already has gap_fill_attempts > 0 or a txid,
+   *   the data was already migrated — delete the key immediately.
+   * - Otherwise copy the StuckTxState.rbfAttempts into gap_fill_attempts on the
+   *   ledger row and then delete the key.
+   *
+   * Idempotent: safe to call on every alarm cycle — absent keys produce zero count.
+   * Gated behind USE_WALLET_CAPACITY_STATE — returns immediately if flag is off.
+   */
+  private async sweepStuckTxStorage(): Promise<void> {
+    if (!this.isWalletCapacityEnabled()) return;
+
+    let keysSwept = 0;
+    let walletsSeen = new Set<number>();
+
+    try {
+      const entries = await this.state.storage.list<StuckTxState>({
+        prefix: "stuck_tx:",
+      });
+
+      for (const [key, stuckState] of entries) {
+        // Parse walletIndex and nonce from "stuck_tx:{walletIndex}:{nonce}"
+        const parts = key.split(":");
+        if (parts.length !== 3) continue;
+        const walletIndex = parseInt(parts[1] ?? "", 10);
+        const nonce = parseInt(parts[2] ?? "", 10);
+        if (isNaN(walletIndex) || isNaN(nonce)) continue;
+
+        walletsSeen.add(walletIndex);
+
+        try {
+          // Check if ledger row already has this data
+          type LedgerCheckRow = { gap_fill_attempts: number | null; txid: string | null };
+          const rows = this.sql
+            .exec<LedgerCheckRow>(
+              "SELECT gap_fill_attempts, txid FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+              walletIndex,
+              nonce
+            )
+            .toArray();
+
+          const row = rows[0];
+          const alreadyMigrated =
+            row && ((row.gap_fill_attempts !== null && row.gap_fill_attempts > 0) || row.txid !== null);
+
+          if (!alreadyMigrated && row && stuckState && stuckState.rbfAttempts > 0) {
+            // Copy rbfAttempts into ledger so buildWalletCapacity can read it natively
+            this.sql.exec(
+              "UPDATE nonce_intents SET gap_fill_attempts = ? WHERE wallet_index = ? AND nonce = ? AND (gap_fill_attempts IS NULL OR gap_fill_attempts < ?)",
+              stuckState.rbfAttempts,
+              walletIndex,
+              nonce,
+              stuckState.rbfAttempts
+            );
+          }
+
+          await this.state.storage.delete(key);
+          keysSwept++;
+        } catch {
+          // Fail-open: skip this key on error; it will be retried next alarm cycle
+        }
+      }
+    } catch {
+      // Fail-open: if storage.list() fails, skip the sweep silently
+      return;
+    }
+
+    if (keysSwept > 0) {
+      this.log("info", "stuck_tx_storage_swept", {
+        walletCount: walletsSeen.size,
+        keysSwept,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Phase 2 (sponsor-ledger-integration): WalletCapacity helpers
   // ---------------------------------------------------------------------------
 
@@ -7996,6 +8080,10 @@ export class NonceDO {
         await this.cleanupLegacyDegradationKeys();
         this.recycleReplayBuffer();
         await this.retrySeedFirstTxSenders();
+
+        // Phase 6: sweep stuck_tx:* DO-storage keys left over from Phase 2 dual-write.
+        // Idempotent and fail-open — no-op once all keys are swept.
+        try { await this.sweepStuckTxStorage(); } catch { /* fail-open */ }
 
         // Snapshot gin rummy state for alarm diagnostics
         const senderHandTotal = this.sql
