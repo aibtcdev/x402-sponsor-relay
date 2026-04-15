@@ -19,6 +19,7 @@
     "test:fees": "set -a && . ./.env && set +a && tsx scripts/test-fees.ts",
     "test:queue": "set -a && . ./.env && set +a && tsx scripts/test-queue.ts",
     "test:payment-id": "set -a && . ./.env && set +a && tsx scripts/test-payment-id.ts",
+    "test:synthetic": "set -a && . ./.env && set +a && tsx scripts/test-synthetic-conflicts.ts",
     "keys": "set -a && . ./.env && set +a && tsx scripts/manage-api-keys.ts",
     "test": "vitest run",
     "test:watch": "vitest"
