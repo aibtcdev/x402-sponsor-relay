@@ -878,78 +878,36 @@ export class NonceDO {
     // required by SponsorLedgerSchema so Phase 2 can adopt tx-schemas helpers without
     // a second migration. All additions use check-then-add (PRAGMA table_info) pattern.
     // ---------------------------------------------------------------------------
+    const addNonceIntentsColumn = (name: string, type: string): void => {
+      try {
+        const cols = this.sql
+          .exec<{ name: string }>(
+            "SELECT name FROM pragma_table_info('nonce_intents') WHERE name = ?",
+            name
+          )
+          .toArray();
+        if (cols.length === 0) {
+          this.sql.exec(`ALTER TABLE nonce_intents ADD COLUMN ${name} ${type}`);
+        }
+      } catch { /* already present or error — fail-open */ }
+    };
 
     // sponsored: whether the occupying tx was submitted as a sponsored transaction.
-    try {
-      const cols = this.sql
-        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'sponsored'")
-        .toArray();
-      if (cols.length === 0) {
-        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN sponsored INTEGER DEFAULT NULL");
-      }
-    } catch { /* already present or error — fail-open */ }
-
+    addNonceIntentsColumn("sponsored", "INTEGER DEFAULT NULL");
     // sponsor_address: the sponsor address recorded on the occupying tx (Hiro response).
-    try {
-      const cols = this.sql
-        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'sponsor_address'")
-        .toArray();
-      if (cols.length === 0) {
-        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN sponsor_address TEXT DEFAULT NULL");
-      }
-    } catch { /* already present or error — fail-open */ }
-
+    addNonceIntentsColumn("sponsor_address", "TEXT DEFAULT NULL");
     // sender_address: the origin address of the tx occupying this nonce slot.
-    try {
-      const cols = this.sql
-        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'sender_address'")
-        .toArray();
-      if (cols.length === 0) {
-        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN sender_address TEXT DEFAULT NULL");
-      }
-    } catch { /* already present or error — fail-open */ }
-
+    addNonceIntentsColumn("sender_address", "TEXT DEFAULT NULL");
     // occupant_visible: 1 if the occupying tx is visible in Hiro mempool/chain; 0 if ghost.
-    try {
-      const cols = this.sql
-        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'occupant_visible'")
-        .toArray();
-      if (cols.length === 0) {
-        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN occupant_visible INTEGER DEFAULT NULL");
-      }
-    } catch { /* already present or error — fail-open */ }
-
+    addNonceIntentsColumn("occupant_visible", "INTEGER DEFAULT NULL");
     // abandon_after: ISO-8601 timestamp after which this nonce slot should be quarantined.
-    try {
-      const cols = this.sql
-        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'abandon_after'")
-        .toArray();
-      if (cols.length === 0) {
-        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN abandon_after TEXT DEFAULT NULL");
-      }
-    } catch { /* already present or error — fail-open */ }
-
-    // status: SponsorLedgerEntry lifecycle status (pending_broadcast | broadcast_sent | broadcast_failed).
+    addNonceIntentsColumn("abandon_after", "TEXT DEFAULT NULL");
+    // status: SponsorLedgerEntry lifecycle (pending_broadcast | broadcast_sent | broadcast_failed).
     // Required in tx-schemas 1.0.0 — must be non-null on every row before Phase 2 schema parses.
-    try {
-      const cols = this.sql
-        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'status'")
-        .toArray();
-      if (cols.length === 0) {
-        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN status TEXT DEFAULT NULL");
-      }
-    } catch { /* already present or error — fail-open */ }
-
+    addNonceIntentsColumn("status", "TEXT DEFAULT NULL");
     // broadcast_at: ISO-8601 timestamp of when the broadcast was initiated (beginPendingBroadcast).
     // Distinct from broadcasted_at which is the Hiro response timestamp. Used by reconcile() grace math.
-    try {
-      const cols = this.sql
-        .exec<{ name: string }>("SELECT name FROM pragma_table_info('nonce_intents') WHERE name = 'broadcast_at'")
-        .toArray();
-      if (cols.length === 0) {
-        this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN broadcast_at TEXT DEFAULT NULL");
-      }
-    } catch { /* already present or error — fail-open */ }
+    addNonceIntentsColumn("broadcast_at", "TEXT DEFAULT NULL");
 
     // Backfill: set status on existing rows that predate this migration.
     // - Rows with a txid (broadcasted, confirmed) → broadcast_sent
