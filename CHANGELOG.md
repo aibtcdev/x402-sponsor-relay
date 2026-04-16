@@ -7,6 +7,18 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.30.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.29.0...x402-sponsor-relay-v1.30.0) (2026-04-16)
+
+
+### Features
+
+* integrate @aibtc/tx-schemas for sponsor wallet nonce state (closes [#338](https://github.com/aibtcdev/x402-sponsor-relay/issues/338)) ([#339](https://github.com/aibtcdev/x402-sponsor-relay/issues/339)) ([8eb1f03](https://github.com/aibtcdev/x402-sponsor-relay/commit/8eb1f03f0263fb8819eb07d19b5ec8acae8313b3))
+
+
+### Bug Fixes
+
+* **reconcile:** reduce mempool query limit to 50 (Hiro endpoint max) ([#343](https://github.com/aibtcdev/x402-sponsor-relay/issues/343)) ([c317bc8](https://github.com/aibtcdev/x402-sponsor-relay/commit/c317bc8467c81bf89d34aced6b03c21e3aa3adbc)), closes [#342](https://github.com/aibtcdev/x402-sponsor-relay/issues/342)
+
 ## [1.29.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.28.0...x402-sponsor-relay-v1.29.0) (2026-04-14)
 
 
