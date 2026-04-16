@@ -2559,13 +2559,14 @@ export class NonceDO {
     // principal appears as sender OR sponsor. Required because sponsored txs have
     // the user (not the relay) as origin sender, so ?sender_address=<sponsor> on
     // /extended/v1/tx/mempool would miss them entirely.
-    const url = `${base}/extended/v1/address/${encodeURIComponent(sponsorAddress)}/mempool?limit=200&offset=0`;
+    const url = `${base}/extended/v1/address/${encodeURIComponent(sponsorAddress)}/mempool?limit=50&offset=0`;
     const response = await fetch(url, {
       headers,
       signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
     });
     if (!response.ok) {
-      throw new Error(`Hiro mempool fetch failed: ${response.status} ${response.statusText}`);
+      const body = await response.text().catch(() => "");
+      throw new Error(`Hiro mempool fetch failed: ${response.status} ${response.statusText} url=${url} body=${body}`);
     }
     const data = (await response.json()) as { results?: unknown[]; total?: number };
     const results = Array.isArray(data?.results) ? data.results : [];
