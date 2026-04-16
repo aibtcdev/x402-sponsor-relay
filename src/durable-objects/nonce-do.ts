@@ -31,6 +31,23 @@ import {
   type StoredSponsorStatusSnapshot,
 } from "../services/sponsor-status";
 import { parseBroadcastOutcome, decideBroadcastAction } from "../utils/broadcast-outcome";
+import type {
+  WalletCapacity,
+  OccupiedNonce,
+  SponsorLedger,
+  SponsorLedgerEntry,
+  OccupantClassification,
+  HiroSponsorTxView,
+  ReconcileResult as TxReconcileResult,
+} from "@aibtc/tx-schemas";
+import {
+  classifyOccupant,
+  beginPendingBroadcast,
+  resolveBroadcast,
+  LedgerTransitionError,
+  HiroSponsorTxViewSchema,
+  reconcile as txReconcile,
+} from "@aibtc/tx-schemas";
 
 const APP_ID = "x402-relay";
 
@@ -258,6 +275,10 @@ interface ObservableWalletState {
   replayBufferDepth?: number;
   /** Settlement time percentiles for this wallet (last 24h, null if no data) */
   settlementTimes?: SettlementTimeStats;
+  /** tx-schemas WalletCapacity — present when USE_WALLET_CAPACITY_STATE=true.
+   *  Contains occupied nonce details (rbfAttempts, occupantVisible, abandonAfter)
+   *  derived from the ledger as a single source of truth. */
+  walletCapacity?: WalletCapacity;
 }
 
 /**
@@ -524,6 +545,14 @@ const ALARM_CONFIRMATION_CURSOR_KEY = "alarm_confirmation_cursor";
 
 /** Maximum reconcile_confirmed/reconcile_aborted events processed per alarm tick */
 const MAX_CONFIRMATION_EVENTS_PER_TICK = 50;
+
+/**
+ * Pending-broadcast sweep timeout (Phase 4).
+ * nonce_intents rows stuck in status='pending_broadcast' past this age are swept
+ * to 'broadcast_failed' by runPendingBroadcastSweep() on each alarm cycle.
+ * 60s is generous — the two-phase write should resolve in milliseconds under normal conditions.
+ */
+const PENDING_BROADCAST_SWEEP_TIMEOUT_MS = 60_000;
 
 /** Payment statuses that should never be regressed by notification processors */
 const TERMINAL_PAYMENT_STATUSES = new Set(["confirmed", "failed", "replaced"]);
@@ -843,6 +872,62 @@ export class NonceDO {
         this.sql.exec("ALTER TABLE nonce_intents ADD COLUMN gap_fill_attempts INTEGER DEFAULT 0");
       }
     } catch { /* already present or error — fail-open */ }
+
+    // ---------------------------------------------------------------------------
+    // Phase 1 (sponsor-ledger-integration): extend nonce_intents with 7 new columns
+    // required by SponsorLedgerSchema so Phase 2 can adopt tx-schemas helpers without
+    // a second migration. All additions use check-then-add (PRAGMA table_info) pattern.
+    // ---------------------------------------------------------------------------
+    const addNonceIntentsColumn = (name: string, type: string): void => {
+      try {
+        const cols = this.sql
+          .exec<{ name: string }>(
+            "SELECT name FROM pragma_table_info('nonce_intents') WHERE name = ?",
+            name
+          )
+          .toArray();
+        if (cols.length === 0) {
+          this.sql.exec(`ALTER TABLE nonce_intents ADD COLUMN ${name} ${type}`);
+        }
+      } catch { /* already present or error — fail-open */ }
+    };
+
+    // sponsored: whether the occupying tx was submitted as a sponsored transaction.
+    addNonceIntentsColumn("sponsored", "INTEGER DEFAULT NULL");
+    // sponsor_address: the sponsor address recorded on the occupying tx (Hiro response).
+    addNonceIntentsColumn("sponsor_address", "TEXT DEFAULT NULL");
+    // sender_address: the origin address of the tx occupying this nonce slot.
+    addNonceIntentsColumn("sender_address", "TEXT DEFAULT NULL");
+    // occupant_visible: 1 if the occupying tx is visible in Hiro mempool/chain; 0 if ghost.
+    addNonceIntentsColumn("occupant_visible", "INTEGER DEFAULT NULL");
+    // abandon_after: ISO-8601 timestamp after which this nonce slot should be quarantined.
+    addNonceIntentsColumn("abandon_after", "TEXT DEFAULT NULL");
+    // status: SponsorLedgerEntry lifecycle (pending_broadcast | broadcast_sent | broadcast_failed).
+    // Required in tx-schemas 1.0.0 — must be non-null on every row before Phase 2 schema parses.
+    addNonceIntentsColumn("status", "TEXT DEFAULT NULL");
+    // broadcast_at: ISO-8601 timestamp of when the broadcast was initiated (beginPendingBroadcast).
+    // Distinct from broadcasted_at which is the Hiro response timestamp. Used by reconcile() grace math.
+    addNonceIntentsColumn("broadcast_at", "TEXT DEFAULT NULL");
+
+    // Backfill: set status on existing rows that predate this migration.
+    // - Rows with a txid (broadcasted, confirmed) → broadcast_sent
+    // - Rows in terminal states without txid (failed, conflict, expired) → broadcast_failed
+    // - Rows in 'assigned' state (still in-flight, no broadcast yet) → status remains NULL
+    //   (Phase 3 will set pending_broadcast via beginPendingBroadcast before the network call)
+    // Fail-open: if backfill errors, the system continues but Phase 2 will handle stragglers.
+    try {
+      this.sql.exec(`
+        UPDATE nonce_intents
+        SET status = CASE
+          WHEN txid IS NOT NULL THEN 'broadcast_sent'
+          WHEN state IN ('failed', 'conflict', 'expired', 'confirmed') THEN 'broadcast_failed'
+          ELSE NULL
+        END
+        WHERE status IS NULL
+      `);
+    } catch (e) {
+      console.warn("[nonce-do] Phase 1 backfill of nonce_intents.status failed (fail-open):", e);
+    }
 
     // Replay buffer: sender txs waiting for a fresh sponsor nonce assignment.
     // Populated when a dispatched slot is stuck and needs to be flushed.
@@ -2325,13 +2410,13 @@ export class NonceDO {
           } else if (existingState === null) {
             // Case (b): no ledger entry — insert a conflict entry so reconciler can handle it
             this.log("info", "gap_fill_conflict_unknown_occupant", { walletIndex, nonce: gapNonce });
-            const now = new Date().toISOString();
+            const nowConflict = new Date().toISOString();
             this.sql.exec(
               `INSERT OR IGNORE INTO nonce_intents (wallet_index, nonce, state, assigned_at)
                VALUES (?, ?, 'conflict', ?)`,
               walletIndex,
               gapNonce,
-              now
+              nowConflict
             );
           } else {
             // Case (c): ledger entry with no txid — mark conflict to stop re-queuing
@@ -2349,6 +2434,23 @@ export class NonceDO {
             );
           }
         } catch { /* fail-open */ }
+
+        // Phase 3: classify the occupant for observability (flag-gated, fail-open).
+        // This tells operators whether the conflict is ours, foreign, or untraceable.
+        if (this.isWalletCapacityEnabled()) {
+          const check = await this.performOnDemandOccupantCheck(walletIndex, gapNonce);
+          if (check) {
+            this.log("info", "gap_fill_conflict_classified", {
+              walletIndex,
+              nonce: gapNonce,
+              classification_kind: check.classification.kind,
+              ...this.occupantLogFields(check.hiroTx),
+            });
+            // Two-phase write: conflict outcome is a broadcast_failed for lifecycle (Phase 3)
+            this.writeLedgerResolvedBroadcast(walletIndex, gapNonce, "failed");
+          }
+        }
+
         return null;
       }
       this.log("warn", "gap_fill_rejected", {
@@ -2370,24 +2472,37 @@ export class NonceDO {
   }
 
   /**
-   * Fetch the fee paid by the current occupant of a sponsor nonce slot.
-   * Used by broadcastRbfForNonce to compute the minimum fee needed to replace the occupant.
+   * Fetch the full Hiro TX view for the current occupant of a sponsor nonce slot.
+   * Returns the HiroSponsorTxView (fee_rate, sponsored, sponsor_address, sender_address, etc.)
+   * or null when the occupant is untraceable or Hiro is unavailable.
    *
    * Strategy:
    * - Look up txid from nonce_intents for (walletIndex, sponsorNonce).
-   * - If txid found: GET /extended/v1/tx/{txid} from Hiro → extract fee_rate.
-   *   This works for mempool txs (Hiro returns fee_rate for pending txs).
-   * - If no txid: return null — the occupant is a "ghost" (node holds a tx invisible to Hiro).
+   * - If no txid: return null (no known tx to look up — occupant untraceable).
+   * - GET /extended/v1/tx/{txid} from Hiro → parse and validate as HiroSponsorTxView.
+   * - If not OK or parse fails: return null (fail-open).
    *
-   * Fail-open: returns null on any network/parse error.
+   * Phase 3: replaces fetchOccupantFee(). Downstream callers use the full identity fields
+   * (sponsored, sponsor_address, sender_address) with classifyOccupant().
    */
-  private async fetchOccupantFee(
+  private async fetchOccupant(
     walletIndex: number,
     sponsorNonce: number
-  ): Promise<
-    | { fee: bigint; source: "hiro"; reason?: undefined }
-    | { fee: null; source?: undefined; reason: "no_txid" | "not_found" | "hiro_error" }
-  > {
+  ): Promise<HiroSponsorTxView | null> {
+    const result = await this.fetchOccupantWithStatus(walletIndex, sponsorNonce);
+    return result.tx;
+  }
+
+  /**
+   * Same as fetchOccupant but preserves Hiro outage vs normal-miss distinction.
+   * Used by the deprecated fetchOccupantFee path which branches on hiro_error to
+   * avoid incrementing the RBF attempt counter during transient API blindness.
+   */
+  private async fetchOccupantWithStatus(
+    walletIndex: number,
+    sponsorNonce: number
+  ): Promise<{ tx: HiroSponsorTxView | null; reason: "found" | "no_txid" | "not_found" | "hiro_error" }> {
+    let txid: string | null = null;
     try {
       const rows = this.sql
         .exec<{ txid: string | null }>(
@@ -2396,28 +2511,358 @@ export class NonceDO {
           sponsorNonce
         )
         .toArray();
-      const txid = rows[0]?.txid ?? null;
-      if (!txid) return { fee: null, reason: "no_txid" };
+      txid = rows[0]?.txid ?? null;
+    } catch {
+      return { tx: null, reason: "no_txid" };
+    }
+    if (!txid) return { tx: null, reason: "no_txid" };
 
-      const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
-      const headers = getHiroHeaders(this.env.HIRO_API_KEY);
-      const response = await fetch(`${base}/extended/v1/tx/${txid}`, {
+    const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    let response: Response;
+    try {
+      response = await fetch(`${base}/extended/v1/tx/${txid}`, {
         headers,
         signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
       });
-      if (!response.ok) {
-        // 404 = tx not in Hiro's index (evicted/unknown). Other errors = transient Hiro failure.
-        return { fee: null, reason: response.status === 404 ? "not_found" : "hiro_error" };
+    } catch {
+      return { tx: null, reason: "hiro_error" };
+    }
+    if (response.status === 404) return { tx: null, reason: "not_found" };
+    if (!response.ok) return { tx: null, reason: "hiro_error" };
+
+    try {
+      const data = await response.json();
+      const parsed = HiroSponsorTxViewSchema.safeParse(data);
+      if (!parsed.success) return { tx: null, reason: "not_found" };
+      return { tx: parsed.data, reason: "found" };
+    } catch {
+      return { tx: null, reason: "hiro_error" };
+    }
+  }
+
+  /**
+   * Fetch all mempool transactions sponsored by the given address in a single Hiro call.
+   * Returns a nonce-indexed map suitable for passing to tx-schemas reconcile().
+   *
+   * Phase 4: used by runSchemaReconcileForWallet() to build the mempoolReadByNonce input.
+   * One call per sponsor address per alarm cycle (not per-txid).
+   *
+   * Throws on HTTP/network error — callers must wrap in try/catch and fail-open.
+   */
+  private async fetchMempoolForSponsor(
+    sponsorAddress: string
+  ): Promise<Record<number, HiroSponsorTxView>> {
+    const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    // Use /extended/v1/address/{principal}/mempool — returns mempool txs where the
+    // principal appears as sender OR sponsor. Required because sponsored txs have
+    // the user (not the relay) as origin sender, so ?sender_address=<sponsor> on
+    // /extended/v1/tx/mempool would miss them entirely.
+    const url = `${base}/extended/v1/address/${encodeURIComponent(sponsorAddress)}/mempool?limit=200&offset=0`;
+    const response = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      throw new Error(`Hiro mempool fetch failed: ${response.status} ${response.statusText}`);
+    }
+    const data = (await response.json()) as { results?: unknown[]; total?: number };
+    const results = Array.isArray(data?.results) ? data.results : [];
+    if (typeof data?.total === "number" && data.total > results.length) {
+      this.log("warn", "mempool_snapshot_truncated", {
+        sponsorAddress,
+        total: data.total,
+        fetched: results.length,
+      });
+    }
+    const byNonce: Record<number, HiroSponsorTxView> = {};
+    for (const item of results) {
+      const parsed = HiroSponsorTxViewSchema.safeParse(item);
+      if (!parsed.success) continue;
+      const tx = parsed.data;
+      // Only include txs where this address is the sponsor (not gap-fills where it's also origin)
+      if (tx.sponsor_address !== sponsorAddress) continue;
+      if (tx.sponsor_nonce === undefined) continue;
+      byNonce[tx.sponsor_nonce] = tx;
+    }
+    return byNonce;
+  }
+
+  /**
+   * Sweep nonce_intents rows stuck in status='pending_broadcast' past PENDING_BROADCAST_SWEEP_TIMEOUT_MS.
+   * Resolves each stale row to 'broadcast_failed' with reason 'sweep_timeout'.
+   *
+   * Phase 4: called from alarm() after reconcileNonceForWallet() so two-phase write has
+   * had ample time to complete. Catches LedgerTransitionError per-row (concurrent path
+   * may have already resolved the entry). Fail-open — never throws.
+   */
+  private runPendingBroadcastSweep(walletIndex: number): void {
+    try {
+      const thresholdMs = Date.now() - PENDING_BROADCAST_SWEEP_TIMEOUT_MS;
+      const threshold = new Date(thresholdMs).toISOString();
+      type SweepRow = { nonce: number; txid: string | null; broadcast_at: string };
+      let staleRows: SweepRow[] = [];
+      try {
+        staleRows = this.sql
+          .exec<SweepRow>(
+            `SELECT nonce, txid, broadcast_at FROM nonce_intents
+             WHERE wallet_index = ? AND status = 'pending_broadcast'
+               AND broadcast_at IS NOT NULL AND broadcast_at < ?
+             ORDER BY nonce ASC LIMIT 20`,
+            walletIndex,
+            threshold
+          )
+          .toArray();
+      } catch {
+        return; // SQL error — fail-open
       }
-      const data = (await response.json()) as Record<string, unknown>;
-      const feeRate = data.fee_rate;
-      if (typeof feeRate === "string" || typeof feeRate === "number") {
+      for (const row of staleRows) {
+        try {
+          this.writeLedgerResolvedBroadcast(walletIndex, row.nonce, "failed", undefined, "sweep_timeout");
+          this.log("info", "ledger_pending_broadcast_swept", {
+            walletIndex,
+            nonce: row.nonce,
+            txid: row.txid ?? null,
+            broadcastAt: row.broadcast_at,
+            reason: "sweep_timeout",
+          });
+        } catch (e) {
+          if (e instanceof LedgerTransitionError) {
+            // Concurrent path already resolved — expected, skip silently
+          } else {
+            this.log("debug", "ledger_pending_broadcast_sweep_error", {
+              walletIndex,
+              nonce: row.nonce,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+      }
+    } catch (e) {
+      this.log("debug", "pending_broadcast_sweep_outer_error", {
+        walletIndex,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Fetch the fee paid by the current occupant of a sponsor nonce slot.
+   * Delegates to fetchOccupant() and extracts fee_rate for backward compatibility.
+   *
+   * @deprecated Use fetchOccupant() + classifyOccupant() instead (Phase 3+).
+   */
+  private async fetchOccupantFee(
+    walletIndex: number,
+    sponsorNonce: number
+  ): Promise<
+    | { fee: bigint; source: "hiro"; reason?: undefined }
+    | { fee: null; source?: undefined; reason: "no_txid" | "not_found" | "hiro_error" }
+  > {
+    const { tx: hiroTx, reason } = await this.fetchOccupantWithStatus(walletIndex, sponsorNonce);
+    if (!hiroTx) {
+      return { fee: null, reason: reason === "found" ? "not_found" : reason };
+    }
+
+    const feeRate = hiroTx.fee_rate;
+    if (feeRate !== undefined) {
+      try {
         const fee = BigInt(feeRate);
         if (fee > 0n) return { fee, source: "hiro" };
-      }
-      return { fee: null, reason: "not_found" };
+      } catch { /* invalid fee string */ }
+    }
+    return { fee: null, reason: "not_found" };
+  }
+
+  /**
+   * Build a SponsorLedger from nonce_intents rows for a wallet.
+   * Used as input for beginPendingBroadcast, resolveBroadcast, and classifyOccupant.
+   *
+   * Only includes rows with a txid and status set (broadcast lifecycle rows).
+   * Rows missing status default to 'broadcast_sent' for legacy compatibility.
+   * Fail-open: returns empty ledger on error.
+   */
+  private buildSponsorLedger(walletIndex: number, sponsorAddress: string): SponsorLedger {
+    type LedgerRow = {
+      nonce: number;
+      txid: string;
+      status: string | null;
+      broadcast_at: string | null;
+      broadcasted_at: string | null;
+      assigned_at: string;
+      gap_fill_attempts: number | null;
+      original_fee: string | null;
+    };
+
+    let rows: LedgerRow[] = [];
+    try {
+      // Join with dispatch_queue to get original_fee when available
+      rows = (this.sql
+        .exec(
+          `SELECT ni.nonce, ni.txid, ni.status, ni.broadcast_at, ni.broadcasted_at,
+                  ni.assigned_at, ni.gap_fill_attempts,
+                  dq.original_fee
+           FROM nonce_intents ni
+           LEFT JOIN dispatch_queue dq
+             ON dq.wallet_index = ni.wallet_index AND dq.sponsor_nonce = ni.nonce
+           WHERE ni.wallet_index = ? AND ni.txid IS NOT NULL
+           ORDER BY ni.nonce ASC
+           LIMIT 200`,
+          walletIndex
+        )
+        .toArray() as LedgerRow[]);
     } catch {
-      return { fee: null, reason: "hiro_error" };
+      // Fail-open: return empty ledger
+      return { sponsorAddress, entries: {} };
+    }
+
+    const entries: Record<string, SponsorLedgerEntry> = {};
+    for (const row of rows) {
+      // Legacy rows with NULL status default to 'broadcast_sent'.
+      const status: "pending_broadcast" | "broadcast_sent" | "broadcast_failed" =
+        row.status === "pending_broadcast" || row.status === "broadcast_failed"
+          ? row.status
+          : "broadcast_sent";
+
+      entries[row.nonce.toString()] = {
+        nonce: row.nonce,
+        txId: row.txid,
+        fee: row.original_fee ?? "0",
+        status,
+        // broadcastAt: prefer broadcast_at (lifecycle), fall back to broadcasted_at, then assigned_at
+        broadcastAt: row.broadcast_at ?? row.broadcasted_at ?? row.assigned_at,
+        rbfAttempts: row.gap_fill_attempts ?? 0,
+      };
+    }
+
+    return { sponsorAddress, entries };
+  }
+
+  /**
+   * Write pending_broadcast status to the ledger before a network broadcast call.
+   * Part of the two-phase broadcast lifecycle (Phase 3).
+   * Fail-open — never throws; errors logged at debug.
+   */
+  private writeLedgerPendingBroadcast(
+    walletIndex: number,
+    nonce: number,
+    txid: string,
+    broadcastAt: string
+  ): void {
+    try {
+      // COALESCE preserves the existing (mempool-known) txid on RBF retries.
+      // First broadcast: txid IS NULL → writes the new txid.
+      // RBF: txid already set → keeps the on-chain/mempool txid; the new attempt
+      // txid is recorded only in the nonce_events detail below.  After a successful
+      // RBF broadcast, the caller updates txid to the replacement txid explicitly.
+      this.sql.exec(
+        `UPDATE nonce_intents
+         SET status = 'pending_broadcast', broadcast_at = ?, txid = COALESCE(txid, ?)
+         WHERE wallet_index = ? AND nonce = ?`,
+        broadcastAt,
+        txid,
+        walletIndex,
+        nonce
+      );
+      this.sql.exec(
+        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+         VALUES (?, ?, 'pending_broadcast', ?, ?)`,
+        walletIndex,
+        nonce,
+        JSON.stringify({ txid, broadcastAt }),
+        broadcastAt
+      );
+    } catch (e) {
+      this.log("debug", "ledger_pending_broadcast_write_error", {
+        walletIndex, nonce, error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Write resolved broadcast status (broadcast_sent | broadcast_failed) after a network call.
+   * Part of the two-phase broadcast lifecycle (Phase 3).
+   * Fail-open — never throws; errors logged at debug.
+   */
+  private writeLedgerResolvedBroadcast(
+    walletIndex: number,
+    nonce: number,
+    outcome: "sent" | "failed",
+    txid?: string,
+    reason?: string
+  ): void {
+    try {
+      const now = new Date().toISOString();
+      const newStatus = outcome === "sent" ? "broadcast_sent" : "broadcast_failed";
+      this.sql.exec(
+        `UPDATE nonce_intents SET status = ? WHERE wallet_index = ? AND nonce = ?`,
+        newStatus, walletIndex, nonce
+      );
+      this.sql.exec(
+        `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+         VALUES (?, ?, 'broadcast_resolved', ?, ?)`,
+        walletIndex,
+        nonce,
+        JSON.stringify({ outcome, txid: txid ?? null, reason: reason ?? null }),
+        now
+      );
+    } catch (e) {
+      this.log("debug", "ledger_resolved_broadcast_write_error", {
+        walletIndex, nonce, outcome, error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  /**
+   * Build the standard occupant_* fields used by classification log events.
+   * Consistent shape lets operators query logs across call sites (gap fill,
+   * probe, bounded broadcast, RBF) without branching on event name.
+   */
+  private occupantLogFields(
+    hiroTx: HiroSponsorTxView | null
+  ): {
+    occupant_txid: string | null;
+    occupant_sender: string | null;
+    occupant_sponsor: string | null;
+    occupant_fee: string | null;
+  } {
+    return {
+      occupant_txid: hiroTx?.tx_id ?? null,
+      occupant_sender: hiroTx?.sender_address ?? null,
+      occupant_sponsor: hiroTx?.sponsor_address ?? null,
+      occupant_fee: hiroTx?.fee_rate ?? null,
+    };
+  }
+
+  /**
+   * Lightweight on-demand occupant check for a single nonce.
+   * Phase 3 scope: single-nonce Hiro fetch + classifyOccupant at decision points.
+   * Full multi-nonce mempool sweep (Phase 4 reconcile) uses the tx-schemas reconcile() helper.
+   *
+   * Used at:
+   * (a) /nonce/state reads — enriches occupied nonces with observed classification
+   * (b) ConflictingNonceInMempool branches — classify before deciding next action
+   * (c) Pre-RBF decision — classify before attempting replace-by-fee
+   *
+   * Fail-open: returns null on any error so callers can fall back to legacy handling.
+   */
+  private async performOnDemandOccupantCheck(
+    walletIndex: number,
+    nonce: number
+  ): Promise<{
+    hiroTx: HiroSponsorTxView | null;
+    classification: OccupantClassification;
+    ledger: SponsorLedger;
+  } | null> {
+    try {
+      const sponsorAddr = await this.resolveSponsorAddress(walletIndex);
+      const hiroTx = await this.fetchOccupant(walletIndex, nonce);
+      const ledger = this.buildSponsorLedger(walletIndex, sponsorAddr);
+      const classification = classifyOccupant(hiroTx, sponsorAddr, ledger, nonce);
+      return { hiroTx, classification, ledger };
+    } catch {
+      return null; // Fail-open
     }
   }
 
@@ -2452,6 +2897,11 @@ export class NonceDO {
    * Uses RBF_FEE (90,000 uSTX = 3× GAP_FILL_FEE) to guarantee eviction of the stuck tx.
    * Tracks attempt count in DO storage to cap retries at MAX_RBF_ATTEMPTS.
    * Returns the replacement txid on success, null if capped or broadcast failed.
+   *
+   * Phase 3: when USE_WALLET_CAPACITY_STATE=true, classifies the occupant via classifyOccupant()
+   * before each attempt and emits a shadow-compare log. Two-phase write lifecycle:
+   * writeLedgerPendingBroadcast() before the network call, writeLedgerResolvedBroadcast() after.
+   * LedgerTransitionError from the lifecycle helpers is caught and logged, not swallowed.
    */
   private async broadcastRbfForNonce(
     walletIndex: number,
@@ -2481,11 +2931,26 @@ export class NonceDO {
         maxAttempts: MAX_RBF_ATTEMPTS,
         originalTxid: state.originalTxid,
       });
+      // Enrich with occupant identity for operator diagnosis (flag-gated, fail-open).
+      if (this.isWalletCapacityEnabled()) {
+        try {
+          const maxReachedOccupant = await this.fetchOccupant(walletIndex, nonce);
+          this.log("warn", "rbf_max_attempts_occupant", {
+            walletIndex,
+            nonce,
+            ...this.occupantLogFields(maxReachedOccupant),
+            our_ledger_txid: state.originalTxid,
+          });
+        } catch { /* fail-open — enrichment is advisory */ }
+      }
       return null;
     }
 
     const { network, recipient } = await this.getFlushRecipientAsync(walletIndex);
     const attemptNum = state.rbfAttempts + 1;
+
+    // Phase 3: resolve sponsor address for classifyOccupant calls
+    const sponsorAddress = await this.resolveSponsorAddress(walletIndex);
 
     try {
       // Discover the occupant's fee via Hiro API (preferred) or fall back to dispatch_queue.
@@ -2493,6 +2958,14 @@ export class NonceDO {
       // is too low to replace the occupant — those should not burn the attempt counter.
       const occupantResult = await this.fetchOccupantFee(walletIndex, nonce);
       const occupantFee = occupantResult.fee;
+
+      // Phase 3: fetch full occupant identity for classifyOccupant (flag-gated).
+      // We fetch hiroTx here (before broadcast) so classifyOccupant has context before
+      // the conflict response. On ConflictingNonceInMempool we re-fetch for freshness.
+      let hiroTxPreBroadcast: HiroSponsorTxView | null = null;
+      if (this.isWalletCapacityEnabled()) {
+        hiroTxPreBroadcast = await this.fetchOccupant(walletIndex, nonce);
+      }
 
       // Also read original_fee from dispatch_queue as fallback
       const dispatchRow = this.sql
@@ -2541,6 +3014,33 @@ export class NonceDO {
         attemptNum,
       });
 
+      // Phase 3: shadow-compare pre-broadcast classification (flag-gated, debug level).
+      // Logs occupant identity before the broadcast attempt so operators can see
+      // whether classifyOccupant agrees with the legacy occupant fee result.
+      if (this.isWalletCapacityEnabled() && hiroTxPreBroadcast !== null) {
+        try {
+          const ledger = this.buildSponsorLedger(walletIndex, sponsorAddress);
+          const preClassification = classifyOccupant(hiroTxPreBroadcast, sponsorAddress, ledger, nonce);
+          this.log("debug", "rbf_decision_shadow_compare", {
+            walletIndex,
+            nonce,
+            legacy_occupant_fee_reason: occupantResult.reason ?? "fee_found",
+            classification_kind: preClassification.kind,
+            occupant_txid: hiroTxPreBroadcast.tx_id,
+            occupant_sender: hiroTxPreBroadcast.sender_address,
+            occupant_sponsor: hiroTxPreBroadcast.sponsor_address ?? null,
+            nonce_has_original_txid: originalTxid !== null,
+          });
+        } catch (e) {
+          // Shadow compare is advisory — never block the broadcast
+          if (e instanceof LedgerTransitionError) {
+            this.log("error", "rbf_ledger_transition_error", {
+              walletIndex, nonce, error: e.message, phase: "pre_broadcast_shadow",
+            });
+          }
+        }
+      }
+
       const tx = await makeSTXTokenTransfer({
         recipient,
         amount: GAP_FILL_AMOUNT,
@@ -2550,6 +3050,15 @@ export class NonceDO {
         fee: rbfFee,
         memo: `rbf-${nonce}-attempt-${attemptNum}`,
       });
+
+      // Two-phase write: mark pending_broadcast before network call (Phase 3).
+      // Compute the real txid from the signed tx so downstream schema tooling
+      // (buildSponsorLedger / classifyOccupant / reconcile) can see in-flight entries.
+      if (this.isWalletCapacityEnabled()) {
+        const pendingTxid = `0x${tx.txid()}`;
+        this.writeLedgerPendingBroadcast(walletIndex, nonce, pendingTxid, now);
+      }
+
       const result = await this.broadcastRawTx(tx, "rbf");
 
       state.lastSeen = now;
@@ -2570,6 +3079,18 @@ export class NonceDO {
             nonce
           );
         } catch { /* fail-open */ }
+        // Two-phase write: resolve broadcast_sent (Phase 3)
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            this.writeLedgerResolvedBroadcast(walletIndex, nonce, "sent", result.txid);
+          } catch (e) {
+            if (e instanceof LedgerTransitionError) {
+              this.log("error", "rbf_ledger_transition_error", {
+                walletIndex, nonce, error: e.message, phase: "broadcast_sent",
+              });
+            }
+          }
+        }
         // Notify agents when a real sponsored tx is replaced (gap-fills have no original tx)
         if (state.originalTxid) {
           await this.writeReplacedTxEntry(state.originalTxid, result.txid, "rbf", walletIndex, nonce);
@@ -2592,6 +3113,18 @@ export class NonceDO {
         // Terminal — delete stuck-tx state entirely to avoid orphaned entries
         state.rbfAttempts = attemptNum;
         await this.state.storage.delete(key);
+        // Two-phase write: resolve broadcast_failed (Phase 3)
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            this.writeLedgerResolvedBroadcast(walletIndex, nonce, "failed");
+          } catch (e) {
+            if (e instanceof LedgerTransitionError) {
+              this.log("error", "rbf_ledger_transition_error", {
+                walletIndex, nonce, error: e.message, phase: "bad_nonce",
+              });
+            }
+          }
+        }
         this.log("info", "rbf_nonce_consumed", {
           walletIndex,
           nonce,
@@ -2603,38 +3136,107 @@ export class NonceDO {
       }
 
       if (result.reason === "ConflictingNonceInMempool") {
-        // Classify the conflict for logging — no per-wallet degradation flags.
-        const occupantReason = occupantResult.reason;
-        const isGhost = occupantReason === "no_txid" || occupantReason === "not_found";
-        const isHiroError = occupantReason === "hiro_error";
-
-        if (isGhost) {
-          // Ghost — node holds tx invisible to Hiro. Log but don't penalize wallet.
-          this.log("warn", "rbf_ghost_conflict", {
-            walletIndex,
-            nonce,
-            rbfFee: rbfFee.toString(),
-            occupantReason,
-          });
-        } else if (isHiroError) {
-          // Hiro unavailable — can't determine occupant fee, don't blame the wallet.
-          this.log("warn", "rbf_conflict_hiro_unavailable", {
-            walletIndex,
-            nonce,
-            rbfFee: rbfFee.toString(),
-            attemptNum,
-          });
-        } else {
-          // Fee too low — occupant fee discovered but ours wasn't enough.
-          state.rbfAttempts = attemptNum;
-          this.log("warn", "rbf_fee_too_low", {
-            walletIndex,
-            nonce,
-            rbfFee: rbfFee.toString(),
-            occupantFee: occupantFee!.toString(),
-            attemptNum,
-          });
+        // Two-phase write: resolve broadcast_failed on conflict (Phase 3)
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            this.writeLedgerResolvedBroadcast(walletIndex, nonce, "failed");
+          } catch (e) {
+            if (e instanceof LedgerTransitionError) {
+              this.log("error", "rbf_ledger_transition_error", {
+                walletIndex, nonce, error: e.message, phase: "conflict",
+              });
+            }
+          }
         }
+
+        // Phase 3: re-fetch occupant for fresh classification after conflict (flag-gated).
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            const freshHiroTx = await this.fetchOccupant(walletIndex, nonce);
+            const ledger = this.buildSponsorLedger(walletIndex, sponsorAddress);
+            const classification = classifyOccupant(freshHiroTx, sponsorAddress, ledger, nonce);
+            const occupantFields = this.occupantLogFields(freshHiroTx);
+            const baseLog = {
+              walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
+              ...occupantFields,
+              our_ledger_txid: state.originalTxid,
+            };
+
+            // Route logging by classification kind:
+            // - foreign: operator alert level — unknown party occupying our sponsor slot
+            // - sponsor_owned_orphan: relay broadcast not in ledger — adopt path
+            // - untraceable: ghost — node holds tx invisible to Hiro
+            // - sponsor_owned_in_ledger: our own tx, fee was insufficient
+            if (classification.kind === "foreign") {
+              // classification.* fields take precedence over raw hiroTx fields when present
+              const foreignLog = {
+                ...baseLog,
+                occupant_txid: classification.txId,
+                occupant_sponsor: classification.occupantAddress,
+                occupant_fee: classification.fee ?? null,
+              };
+              this.log("warn", "rbf_occupant_foreign", foreignLog);
+              // Operator alert channel — foreign occupant in sponsor slot warrants operator attention.
+              this.log("warn", "operator_alert_foreign_occupant", {
+                ...foreignLog,
+                message: "Unknown party occupying sponsor nonce slot — possible wallet misuse",
+              });
+            } else if (classification.kind === "sponsor_owned_orphan") {
+              this.log("warn", "rbf_occupant_orphan", {
+                ...baseLog,
+                occupant_txid: classification.txId,
+                orphan_txid: classification.txId,
+                occupant_fee: classification.fee ?? null,
+              });
+            } else if (classification.kind === "untraceable") {
+              // Ghost — node holds tx invisible to Hiro. Log but don't penalize wallet.
+              this.log("warn", "rbf_occupant_untraceable", {
+                ...baseLog,
+                classification_kind: "untraceable",
+              });
+            } else {
+              // sponsor_owned_in_ledger: fee too low to replace our own tx
+              state.rbfAttempts = attemptNum;
+              this.log("warn", "rbf_fee_too_low", {
+                walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
+                classification_kind: classification.kind,
+                occupant_txid: "txId" in classification ? classification.txId : null,
+              });
+            }
+          } catch (e) {
+            if (e instanceof LedgerTransitionError) {
+              this.log("error", "rbf_ledger_transition_error", {
+                walletIndex, nonce, error: e.message, phase: "conflict_classify",
+              });
+            }
+            // Otherwise fall through to legacy handling on unexpected classify error
+          }
+        } else {
+          // Legacy path: classify by occupant fee result
+          const occupantReason = occupantResult.reason;
+          const isGhost = occupantReason === "no_txid" || occupantReason === "not_found";
+          const isHiroError = occupantReason === "hiro_error";
+
+          if (isGhost) {
+            // Legacy path: occupant identity not available (no fetchOccupant in legacy mode).
+            this.log("warn", "rbf_occupant_untraceable", {
+              walletIndex, nonce, rbfFee: rbfFee.toString(), occupantReason,
+              ...this.occupantLogFields(null),
+              our_ledger_txid: state.originalTxid,
+            });
+          } else if (isHiroError) {
+            this.log("warn", "rbf_conflict_hiro_unavailable", {
+              walletIndex, nonce, rbfFee: rbfFee.toString(), attemptNum,
+            });
+          } else {
+            state.rbfAttempts = attemptNum;
+            this.log("warn", "rbf_fee_too_low", {
+              walletIndex, nonce, rbfFee: rbfFee.toString(),
+              occupantFee: occupantFee!.toString(), attemptNum,
+            });
+          }
+        }
+
         await this.state.storage.put(key, state);
         return null;
       }
@@ -2642,6 +3244,18 @@ export class NonceDO {
       // Other rejection — increment attempt count to prevent runaway and log details
       state.rbfAttempts = attemptNum;
       await this.state.storage.put(key, state);
+      // Two-phase write: resolve broadcast_failed on other rejection (Phase 3)
+      if (this.isWalletCapacityEnabled()) {
+        try {
+          this.writeLedgerResolvedBroadcast(walletIndex, nonce, "failed");
+        } catch (e) {
+          if (e instanceof LedgerTransitionError) {
+            this.log("error", "rbf_ledger_transition_error", {
+              walletIndex, nonce, error: e.message, phase: "other_rejection",
+            });
+          }
+        }
+      }
       this.log("warn", "rbf_broadcast_rejected", {
         walletIndex,
         nonce,
@@ -2906,6 +3520,24 @@ export class NonceDO {
     await this.state.storage.put(this.sponsorAddressKey(walletIndex), address);
   }
 
+  /**
+   * Resolve the sponsor address for a wallet. Prefers the stored value; falls back
+   * to deriving it from the sponsor private key. Returns "" if both sources fail.
+   * Used by classifyOccupant call sites that need an address but must never throw.
+   */
+  private async resolveSponsorAddress(walletIndex: number): Promise<string> {
+    const stored = await this.getStoredSponsorAddressForWallet(walletIndex);
+    if (stored) return stored;
+    try {
+      const pk = await this.derivePrivateKeyForWallet(walletIndex);
+      if (pk) {
+        const net = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+        return getAddressFromPrivateKey(pk, net);
+      }
+    } catch { /* fail-open */ }
+    return "";
+  }
+
   /** Get the current round-robin wallet index. */
   private async getNextWalletIndex(): Promise<number> {
     return (await this.state.storage.get<number>(NEXT_WALLET_INDEX_KEY)) ?? 0;
@@ -2952,6 +3584,247 @@ export class NonceDO {
   /** KV key for per-nonce RBF attempt state (stuck mempool tx tracking) */
   private walletStuckTxKey(walletIndex: number, nonce: number): string {
     return `stuck_tx:${walletIndex}:${nonce}`;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 6 (sponsor-ledger-integration): stuck_tx:* DO-storage sweep migration
+  // ---------------------------------------------------------------------------
+
+  /**
+   * One-shot migration: enumerate all stuck_tx:* DO-storage keys left over from
+   * Phase 2's dual-write and delete them once their data has been folded into the
+   * nonce_intents ledger rows.
+   *
+   * For each key:
+   * - If the corresponding ledger row already has gap_fill_attempts > 0 or a txid,
+   *   the data was already migrated — delete the key immediately.
+   * - Otherwise copy the StuckTxState.rbfAttempts into gap_fill_attempts on the
+   *   ledger row and then delete the key.
+   *
+   * Idempotent: safe to call on every alarm cycle — absent keys produce zero count.
+   * Gated behind USE_WALLET_CAPACITY_STATE — returns immediately if flag is off.
+   */
+  private async sweepStuckTxStorage(): Promise<void> {
+    if (!this.isWalletCapacityEnabled()) return;
+
+    let keysSwept = 0;
+    let walletsSeen = new Set<number>();
+
+    try {
+      const entries = await this.state.storage.list<StuckTxState>({
+        prefix: "stuck_tx:",
+      });
+
+      for (const [key, stuckState] of entries) {
+        // Parse walletIndex and nonce from "stuck_tx:{walletIndex}:{nonce}"
+        const parts = key.split(":");
+        if (parts.length !== 3) continue;
+        const walletIndex = parseInt(parts[1] ?? "", 10);
+        const nonce = parseInt(parts[2] ?? "", 10);
+        if (isNaN(walletIndex) || isNaN(nonce)) continue;
+
+        walletsSeen.add(walletIndex);
+
+        try {
+          // Check if ledger row already has this data
+          type LedgerCheckRow = { gap_fill_attempts: number | null; txid: string | null };
+          const rows = this.sql
+            .exec<LedgerCheckRow>(
+              "SELECT gap_fill_attempts, txid FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+              walletIndex,
+              nonce
+            )
+            .toArray();
+
+          const row = rows[0];
+          const alreadyMigrated =
+            row && ((row.gap_fill_attempts !== null && row.gap_fill_attempts > 0) || row.txid !== null);
+
+          if (!alreadyMigrated && row && stuckState && stuckState.rbfAttempts > 0) {
+            // Copy rbfAttempts into ledger so buildWalletCapacity can read it natively
+            this.sql.exec(
+              "UPDATE nonce_intents SET gap_fill_attempts = ? WHERE wallet_index = ? AND nonce = ? AND (gap_fill_attempts IS NULL OR gap_fill_attempts < ?)",
+              stuckState.rbfAttempts,
+              walletIndex,
+              nonce,
+              stuckState.rbfAttempts
+            );
+          }
+
+          await this.state.storage.delete(key);
+          keysSwept++;
+        } catch {
+          // Fail-open: skip this key on error; it will be retried next alarm cycle
+        }
+      }
+    } catch {
+      // Fail-open: if storage.list() fails, skip the sweep silently
+      return;
+    }
+
+    if (keysSwept > 0) {
+      this.log("info", "stuck_tx_storage_swept", {
+        walletCount: walletsSeen.size,
+        keysSwept,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase 2 (sponsor-ledger-integration): WalletCapacity helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Check whether the USE_WALLET_CAPACITY_STATE feature flag is enabled.
+   * Default: true (enabled). Set env var to "false" for one-revision rollback.
+   */
+  private isWalletCapacityEnabled(): boolean {
+    const flag = this.env.USE_WALLET_CAPACITY_STATE;
+    if (flag === undefined || flag === null) return true;
+    return flag.toLowerCase() !== "false";
+  }
+
+  /**
+   * Build a tx-schemas WalletCapacity object for a wallet from the SQLite ledger
+   * and in-memory frontier/head state.
+   *
+   * OccupiedNonce rows are derived from nonce_intents rows in conflict/failed state
+   * that have had gap-fill attempts (gap_fill_attempts > 0). This is the ledger-native
+   * equivalent of the stuck_tx:{walletIndex}:{nonce} DO storage entries.
+   *
+   * Dual-read during migration: also reads stuck_tx:* DO storage to merge in more
+   * precise rbfAttempts when both sources are present. Phase 6 sweeps the DO keys.
+   *
+   * This method is always synchronous on the SQL side but async for DO storage reads.
+   */
+  private async buildWalletCapacity(
+    walletIndex: number,
+    sponsorAddress: string
+  ): Promise<WalletCapacity> {
+    const chainFrontier = this.getChainFrontier(walletIndex) ?? 0;
+    const assignmentHead = this.ledgerGetWalletHead(walletIndex) ?? chainFrontier;
+    const inFlightCount = this.ledgerInFlightCount(walletIndex);
+    const available = Math.max(0, this.walletHeadroom(walletIndex));
+
+    // Query ledger for nonces that are occupied (conflict/failed with RBF history)
+    // These are the sponsor-wallet conflict slots the relay has been trying to clear.
+    type OccupantSqlRow = {
+      nonce: number;
+      gap_fill_attempts: number | null;
+      occupant_visible: number | null;
+      abandon_after: string | null;
+      sender_address: string | null;
+      sponsor_address: string | null;
+      assigned_at: string;
+    };
+    let occupantRows: OccupantSqlRow[] = [];
+    try {
+      occupantRows = (this.sql
+        .exec(
+          `SELECT nonce, gap_fill_attempts, occupant_visible, abandon_after,
+                  sender_address, sponsor_address, assigned_at
+           FROM nonce_intents
+           WHERE wallet_index = ? AND state IN ('conflict', 'failed')
+             AND gap_fill_attempts > 0
+           ORDER BY nonce ASC
+           LIMIT 50`,
+          walletIndex
+        )
+        .toArray() as OccupantSqlRow[]);
+    } catch {
+      // Fail-open: return empty occupiedNonces on SQL error
+    }
+
+    // Build OccupiedNonce array, enriched with DO storage stuck_tx data where available.
+    const occupiedNonces: OccupiedNonce[] = [];
+    const defaultAbandonAfterMs = Date.now() + STUCK_TX_AGE_MS * 4;
+
+    for (const row of occupantRows) {
+      // Attempt dual-read from DO storage for more precise RBF state
+      let rbfAttempts = row.gap_fill_attempts ?? 0;
+      try {
+        const stuckKey = this.walletStuckTxKey(walletIndex, row.nonce);
+        const stuckState = await this.state.storage.get<StuckTxState>(stuckKey);
+        if (stuckState) {
+          // Prefer DO storage count if larger (it was written by broadcastRbfForNonce)
+          rbfAttempts = Math.max(rbfAttempts, stuckState.rbfAttempts);
+        }
+      } catch {
+        // Fail-open: use SQL count
+      }
+
+      // occupantVisible: 1 = visible, 0 = ghost, null = unknown (treat as visible)
+      const occupantVisible = row.occupant_visible !== null
+        ? row.occupant_visible === 1
+        : true;
+
+      const abandonAfter = row.abandon_after
+        ?? new Date(defaultAbandonAfterMs).toISOString();
+
+      // Build lastOccupant from known identity fields
+      const occupantAddress = row.sender_address ?? row.sponsor_address;
+      const lastOccupant = occupantAddress
+        ? { address: occupantAddress }
+        : undefined;
+
+      occupiedNonces.push({
+        nonce: row.nonce,
+        conflictedAt: row.assigned_at,
+        occupantVisible,
+        rbfAttempts,
+        maxRbfAttempts: MAX_RBF_ATTEMPTS,
+        abandonAfter,
+        lastOccupant,
+      });
+    }
+
+    return {
+      walletIndex,
+      sponsorAddress,
+      chainFrontier,
+      assignmentHead,
+      inFlightCount,
+      chainingLimit: CHAINING_LIMIT,
+      available,
+      occupiedNonces,
+      recentFailures: occupiedNonces.length,
+      recentFailureWindow: STUCK_TX_AGE_MS,
+    };
+  }
+
+  /**
+   * Get a tx-schemas WalletCapacity for a wallet index.
+   *
+   * When USE_WALLET_CAPACITY_STATE is disabled (rollback), returns a minimal
+   * WalletCapacity with empty occupiedNonces built from legacy headroom state.
+   * This allows one-revision rollback without schema changes.
+   *
+   * Phase 3+ uses this as the input to classifyOccupant and decideBroadcast.
+   */
+  async getWalletCapacity(walletIndex: number): Promise<WalletCapacity> {
+    const sponsorAddress = await this.resolveSponsorAddress(walletIndex);
+
+    if (!this.isWalletCapacityEnabled()) {
+      // Legacy fallback: return minimal WalletCapacity without ledger-derived occupants
+      const chainFrontier = this.getChainFrontier(walletIndex) ?? 0;
+      const assignmentHead = this.ledgerGetWalletHead(walletIndex) ?? chainFrontier;
+      const inFlightCount = this.ledgerInFlightCount(walletIndex);
+      const available = Math.max(0, this.walletHeadroom(walletIndex));
+      return {
+        walletIndex,
+        sponsorAddress,
+        chainFrontier,
+        assignmentHead,
+        inFlightCount,
+        chainingLimit: CHAINING_LIMIT,
+        available,
+        occupiedNonces: [],
+        recentFailures: 0,
+        recentFailureWindow: STUCK_TX_AGE_MS,
+      };
+    }
+
+    return this.buildWalletCapacity(walletIndex, sponsorAddress);
   }
 
   /**
@@ -3315,9 +4188,11 @@ export class NonceDO {
         if (currentState !== "assigned") {
           return;
         }
+        // Dual-write: status='broadcast_failed' (Phase 1 SponsorLedgerSchema alignment).
+        // Expired = nonce slot was reserved but never dispatched to the network.
         this.sql.exec(
           `UPDATE nonce_intents
-           SET state = 'expired'
+           SET state = 'expired', status = 'broadcast_failed'
            WHERE wallet_index = ? AND nonce = ? AND state = 'assigned'`,
           walletIndex,
           nonce
@@ -3387,15 +4262,18 @@ export class NonceDO {
       }
 
       if (txid) {
-        // Broadcast accepted — record txid, status, node URL
+        // Broadcast accepted — record txid, status, node URL.
+        // Dual-write: status='broadcast_sent', broadcast_at=now (Phase 1 SponsorLedgerSchema alignment).
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = 'broadcasted', txid = ?, http_status = ?,
-               broadcast_node = ?, broadcasted_at = ?
+               broadcast_node = ?, broadcasted_at = ?,
+               status = 'broadcast_sent', broadcast_at = ?
            WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted')`,
           txid,
           httpStatus ?? 200,
           nodeUrl ?? null,
+          now,
           now,
           walletIndex,
           nonce
@@ -3417,10 +4295,12 @@ export class NonceDO {
           errorReason !== undefined &&
           errorReason.includes("ConflictingNonceInMempool");
         const newState = isConflict ? "conflict" : "failed";
+        // Dual-write: status='broadcast_failed' (Phase 1 SponsorLedgerSchema alignment).
         this.sql.exec(
           `UPDATE nonce_intents
            SET state = ?, http_status = ?, broadcast_node = ?,
-               error_reason = ?, broadcasted_at = ?
+               error_reason = ?, broadcasted_at = ?,
+               status = 'broadcast_failed'
            WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted')`,
           newState,
           httpStatus ?? null,
@@ -4575,6 +5455,20 @@ export class NonceDO {
         // Settlement time percentiles for this wallet (last 24h)
         const settlementTimes = this.computeSettlementPercentiles(walletIndex);
 
+        // WalletCapacity from tx-schemas (Phase 2: present when USE_WALLET_CAPACITY_STATE=true).
+        // The per-nonce on-demand Hiro fetch was removed — on /nonce/state it fanned out
+        // to one Hiro call per occupied nonce, added latency, and the result (debug-level
+        // shadow-compare log) wasn't returned to the caller. The alarm-driven reconcile
+        // covers the same ground once per cycle with a single address-filtered mempool read.
+        let walletCapacityResult: WalletCapacity | undefined;
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            walletCapacityResult = await this.buildWalletCapacity(walletIndex, address);
+          } catch {
+            // Fail-open: walletCapacity absent does not break the observable state response
+          }
+        }
+
         return {
           walletIndex,
           sponsorAddress: address,
@@ -4589,6 +5483,7 @@ export class NonceDO {
           queueDepth: queueState.total,
           replayBufferDepth: replayDepth,
           settlementTimes,
+          walletCapacity: walletCapacityResult,
         };
       })
     );
@@ -4947,6 +5842,17 @@ export class NonceDO {
                WHERE wallet_index = ? AND nonce = ?`,
               result.reason, now, walletIndex, nonce
             );
+            // Phase 3: classify the conflict occupant (flag-gated, fail-open).
+            if (this.isWalletCapacityEnabled()) {
+              const check = await this.performOnDemandOccupantCheck(walletIndex, nonce);
+              if (check) {
+                this.log("info", "probe_conflict_classified", {
+                  walletIndex, nonce,
+                  classification_kind: check.classification.kind,
+                  ...this.occupantLogFields(check.hiroTx),
+                });
+              }
+            }
             conflict++;
           } else {
             this.sql.exec(
@@ -5851,13 +6757,49 @@ export class NonceDO {
       this.ledgerAdvanceWalletHead(walletIndex, possible_next_nonce);
       this.incrementCounter(STATE_KEYS.conflictsDetected);
 
+      // Attribute the forward bump cause so operators can distinguish routine
+      // confirmation catch-up from cold-start races or external wallet use.
+      //
+      // (a) untracked_broadcast — relay broadcast a tx that confirmed, but head
+      //     was not advanced (e.g. concurrent write, DO restart mid-broadcast).
+      //     Evidence: ledger has broadcasted entries at or above previousNonce.
+      // (b) do_cold_start — DO storage was empty at this reconcile tick (no ledger
+      //     entries at all), so head is being seeded for the first time here.
+      //     Note: the true cold-start (previousNonce === null) returns early above;
+      //     this catches the case where head was set but the ledger is empty.
+      // (c) external_wallet_op — chain advanced but relay has no broadcast evidence
+      //     in the gap. Possible unauthorized external use of the sponsor key.
+      let forwardBumpCause: "untracked_broadcast" | "do_cold_start" | "external_wallet_op";
+      const hasOurBroadcastAbovePrevious =
+        broadcastedByNonce.size > 0 &&
+        [...broadcastedByNonce.keys()].some((n) => n >= previousNonce);
+
+      if (hasOurBroadcastAbovePrevious) {
+        forwardBumpCause = "untracked_broadcast";
+      } else if (broadcastedByNonce.size === 0 && this.ledgerReservedCount(walletIndex) === 0) {
+        forwardBumpCause = "do_cold_start";
+      } else {
+        forwardBumpCause = "external_wallet_op";
+      }
+
       this.log("warn", "nonce_reconcile_forward_bump", {
         walletIndex,
         previousNonce,
         newNonce: possible_next_nonce,
         hiroNextNonce: possible_next_nonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
+        cause: forwardBumpCause,
       });
+
+      // Operator alert for external wallet use — requires investigation.
+      if (forwardBumpCause === "external_wallet_op") {
+        this.log("warn", "operator_alert_external_wallet_op", {
+          walletIndex,
+          previousNonce,
+          newNonce: possible_next_nonce,
+          message: "Sponsor wallet nonce advanced externally — possible unauthorized key use",
+        });
+      }
 
       return {
         previousNonce,
@@ -5946,6 +6888,127 @@ export class NonceDO {
       changed: gapFillFilled.length > 0 || rbfAttempted.length > 0 || headBumpNonce !== null,
       reason: `nonce is consistent with chain state${gapFilledSummary}${rbfSummary}${headBumpSummary}`,
     };
+  }
+
+  /**
+   * Phase 4: Run tx-schemas reconcile() for a single wallet using a pre-fetched mempool snapshot.
+   *
+   * Inputs:
+   * - ledger: built from nonce_intents via buildSponsorLedger()
+   * - wallet: WalletCapacity from buildWalletCapacity()
+   * - mempoolSnapshot: nonce-indexed mempool read from fetchMempoolForSponsor()
+   *
+   * Handles reconcile result:
+   * - inFlightPendingIndex: grace-window entries — leave completely alone (no adopt/quarantine/re-broadcast)
+   * - unpriceableOrphans: quarantine + advance head + retire dispatch entry + operator alert
+   *
+   * Fail-open: catches all errors, never re-throws. Wrapped in try/catch matching alarm semantics.
+   */
+  private async runSchemaReconcileForWallet(
+    walletIndex: number,
+    address: string,
+    mempoolSnapshot: Record<number, HiroSponsorTxView>
+  ): Promise<void> {
+    try {
+      const ledger = this.buildSponsorLedger(walletIndex, address);
+      const wallet = await this.buildWalletCapacity(walletIndex, address);
+
+      const result: TxReconcileResult = txReconcile(
+        wallet,
+        ledger,
+        mempoolSnapshot,
+        address,
+        { justBroadcastGraceSeconds: 30 }
+      );
+
+      this.log("debug", "schema_reconcile_result", {
+        walletIndex,
+        adopted: result.adopted,
+        dropped: result.dropped,
+        inFlightPendingIndex: result.inFlightPendingIndex,
+        unpriceableOrphans: result.unpriceableOrphans,
+      });
+
+      // Grace-window entries: left completely alone this cycle
+      if (result.inFlightPendingIndex.length > 0) {
+        this.log("debug", "schema_reconcile_in_flight_grace", {
+          walletIndex,
+          nonces: result.inFlightPendingIndex,
+          message: "grace-window entries — skipping adopt/quarantine/re-broadcast",
+        });
+      }
+
+      // Handle unpriceable orphans: quarantine + advance head + retire dispatch + operator alert
+      for (const nonce of result.unpriceableOrphans) {
+        try {
+          // Operator-level alert: sponsor address is the sponsor of a mempool tx but fee_rate is missing
+          this.log("warn", "schema_reconcile_unpriceable_orphan", {
+            walletIndex,
+            nonce,
+            operator_alert: true,
+            message: "sponsor-owned orphan tx lacks fee_rate — quarantining slot",
+          });
+
+          // Persist quarantine to nonce_intents: mark as conflict with quarantine reason
+          try {
+            this.sql.exec(
+              `UPDATE nonce_intents
+               SET state = 'conflict', error_reason = 'quarantined:unpriceable_orphan'
+               WHERE wallet_index = ? AND nonce = ?
+                 AND state NOT IN ('confirmed', 'failed')`,
+              walletIndex,
+              nonce
+            );
+            const now = new Date().toISOString();
+            this.sql.exec(
+              `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
+               VALUES (?, ?, 'quarantine_unpriceable_orphan', ?, ?)`,
+              walletIndex,
+              nonce,
+              JSON.stringify({ reason: "unpriceable_orphan" }),
+              now
+            );
+          } catch (sqlErr) {
+            this.log("debug", "schema_reconcile_quarantine_sql_error", {
+              walletIndex,
+              nonce,
+              error: sqlErr instanceof Error ? sqlErr.message : String(sqlErr),
+            });
+          }
+
+          // Advance assignment head past quarantined nonce to restore capacity
+          const currentHead = this.ledgerGetWalletHead(walletIndex);
+          if (currentHead !== null && currentHead <= nonce) {
+            this.ledgerAdvanceWalletHead(walletIndex, nonce + 1);
+          }
+
+          // Retire dispatch_queue entry for this (walletIndex, nonce) to release dispatch slot
+          try {
+            this.sql.exec(
+              `UPDATE dispatch_queue SET state = 'retired'
+               WHERE wallet_index = ? AND sponsor_nonce = ? AND state NOT IN ('confirmed', 'retired')`,
+              walletIndex,
+              nonce
+            );
+          } catch {
+            // Fail-open — dispatch entry may not exist
+          }
+        } catch (orphanErr) {
+          this.log("debug", "schema_reconcile_orphan_handling_error", {
+            walletIndex,
+            nonce,
+            error: orphanErr instanceof Error ? orphanErr.message : String(orphanErr),
+          });
+        }
+      }
+    } catch (e) {
+      this.log("warn", "schema_reconcile_error", {
+        walletIndex,
+        address,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      // Never re-throw — fail-open matching alarm semantics
+    }
   }
 
   /**
@@ -6823,6 +7886,29 @@ export class NonceDO {
               requestedRetryAfterMs: action.retryAfterMs,
             });
           }
+
+          // Phase 3: on ConflictingNonceInMempool, classify the sponsor-nonce occupant (flag-gated).
+          if (result.reason === "ConflictingNonceInMempool" && this.isWalletCapacityEnabled()) {
+            const check = await this.performOnDemandOccupantCheck(entry.wallet_index, entry.sponsor_nonce);
+            if (check) {
+              // Fetch our ledger txid for cross-reference in operator tools
+              const bbLedgerTxid = this.sql
+                .exec<{ txid: string | null }>(
+                  "SELECT txid FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
+                  entry.wallet_index,
+                  entry.sponsor_nonce
+                )
+                .toArray()[0]?.txid ?? null;
+              this.log("info", "bounded_broadcast_conflict_classified", {
+                walletIndex: entry.wallet_index,
+                sponsorNonce: entry.sponsor_nonce,
+                classification_kind: check.classification.kind,
+                ...this.occupantLogFields(check.hiroTx),
+                our_ledger_txid: bbLedgerTxid,
+              });
+            }
+          }
+
           errors++;
         }
       } catch (e) {
@@ -7007,6 +8093,10 @@ export class NonceDO {
         this.recycleReplayBuffer();
         await this.retrySeedFirstTxSenders();
 
+        // Phase 6: sweep stuck_tx:* DO-storage keys left over from Phase 2 dual-write.
+        // Idempotent and fail-open — no-op once all keys are swept.
+        try { await this.sweepStuckTxStorage(); } catch { /* fail-open */ }
+
         // Snapshot gin rummy state for alarm diagnostics
         const senderHandTotal = this.sql
           .exec<{ cnt: number }>("SELECT COUNT(*) as cnt FROM sender_hand")
@@ -7045,9 +8135,46 @@ export class NonceDO {
           if (wallet) reconcileWallets.push(wallet);
         }
 
+        // ---------------------------------------------------------------------------
+        // Phase 4: Pre-fetch address-filtered mempool snapshots for schema reconcile.
+        // One Hiro call per wallet being reconciled (not per-txid).
+        // Fail-open: API blindness logs reconcile_skipped_api_blind and skips that wallet.
+        // Only runs when USE_WALLET_CAPACITY_STATE flag is enabled.
+        // ---------------------------------------------------------------------------
+        const walletMempoolSnapshots = new Map<
+          number,
+          Record<number, HiroSponsorTxView> | null
+        >();
+        if (this.isWalletCapacityEnabled()) {
+          for (const { walletIndex, address } of reconcileWallets) {
+            try {
+              const snapshot = await this.fetchMempoolForSponsor(address);
+              walletMempoolSnapshots.set(walletIndex, snapshot);
+            } catch (mempoolErr) {
+              walletMempoolSnapshots.set(walletIndex, null);
+              this.log("warn", "reconcile_skipped_api_blind", {
+                walletIndex,
+                address,
+                reason: mempoolErr instanceof Error ? mempoolErr.message : String(mempoolErr),
+              });
+            }
+          }
+        }
+
         for (const { walletIndex, address } of reconcileWallets) {
           // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
           await this.reconcileNonceForWallet(walletIndex, address);
+
+          // Phase 4: schema-driven reconcile via tx-schemas reconcile().
+          // Only runs when USE_WALLET_CAPACITY_STATE=true AND mempool fetch succeeded.
+          // Null snapshot = API blind cycle; skip reconcile to avoid misclassifying ledger entries.
+          if (this.isWalletCapacityEnabled()) {
+            const mempoolSnapshot = walletMempoolSnapshots.get(walletIndex);
+            if (mempoolSnapshot !== null && mempoolSnapshot !== undefined) {
+              await this.runSchemaReconcileForWallet(walletIndex, address, mempoolSnapshot);
+            }
+            // If mempoolSnapshot is null, reconcile_skipped_api_blind was already logged above
+          }
 
           // Clean up StuckTxState entries for nonces that have been confirmed on-chain.
           const cached = this.hiroNonceCache.get(walletIndex);
@@ -7086,6 +8213,22 @@ export class NonceDO {
           ? (walletCursor + MAX_RECONCILE_WALLETS) % walletCount
           : 0;
         this.setStateValue(ALARM_WALLET_CURSOR_KEY, nextWalletCursor);
+
+        // ---------------------------------------------------------------------------
+        // Phase 4: Pending-broadcast sweep — resolve nonce_intents rows stuck in
+        // status='pending_broadcast' past PENDING_BROADCAST_SWEEP_TIMEOUT_MS.
+        // Runs after schema reconcile so auto-promotions (pending→sent on mempool confirm)
+        // have already been applied. Behind USE_WALLET_CAPACITY_STATE flag.
+        // ---------------------------------------------------------------------------
+        if (this.isWalletCapacityEnabled()) {
+          try {
+            for (const { walletIndex } of reconcileWallets) {
+              this.runPendingBroadcastSweep(walletIndex);
+            }
+          } catch {
+            // Fail-open — sweep errors must not interrupt the alarm cycle
+          }
+        }
 
         // ---------------------------------------------------------------------------
         // Sweep held sender hands: try to dispatch pending runs (bounded per tick)
@@ -8064,6 +9207,24 @@ export class NonceDO {
       try {
         const state = await this.getObservableNonceState();
         return this.jsonResponse(state);
+      } catch (error) {
+        return this.internalError(error);
+      }
+    }
+
+    // GET /wallet-capacity/:walletIndex — tx-schemas WalletCapacity for a specific wallet.
+    // Returns a WalletCapacity object derived from the SQLite ledger and in-memory state.
+    // Used by relay, sponsor, and settle endpoints for pre-flight state checks (Phase 3+).
+    // When USE_WALLET_CAPACITY_STATE=false, returns minimal capacity with empty occupiedNonces.
+    const wcMatch = url.pathname.match(/^\/wallet-capacity\/(\d+)$/);
+    if (request.method === "GET" && wcMatch) {
+      const walletIndex = parseInt(wcMatch[1], 10);
+      if (isNaN(walletIndex) || walletIndex < 0) {
+        return this.badRequest("Invalid walletIndex");
+      }
+      try {
+        const capacity = await this.getWalletCapacity(walletIndex);
+        return this.jsonResponse(capacity);
       } catch (error) {
         return this.internalError(error);
       }

@@ -5,6 +5,10 @@ import type {
   SponsorStatusResult,
 } from "../types";
 
+// Re-export canonical tx-schemas wallet state types so callers import from one place.
+// Phase 2: establishes the type bridge. Phase 3+ wires these into decision points.
+export type { WalletCapacity, OccupiedNonce } from "@aibtc/tx-schemas";
+
 export const SPONSOR_STATUS_SNAPSHOT_FRESH_MS = 5 * 60 * 1000;
 export const SPONSOR_STATUS_SNAPSHOT_EXPIRED_MS = 10 * 60 * 1000;
 export const SPONSOR_STATUS_RECONCILIATION_FRESH_MS = 5 * 60 * 1000;

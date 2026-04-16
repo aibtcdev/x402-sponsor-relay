@@ -81,6 +81,11 @@ export interface Env {
   CHAINHOOK_AUTH_TOKEN?: string;
   // Base URL for payment status check URLs (e.g. "https://x402-relay.aibtc.dev")
   RELAY_BASE_URL?: string;
+  /** Feature flag: use WalletCapacity from tx-schemas as pool state shape.
+   *  Default "true". Set to "false" to restore legacy reads for one-revision rollback.
+   *  Controls whether NonceDO.getWalletCapacity() populates occupiedNonces from ledger
+   *  or returns an empty array (legacy path). */
+  USE_WALLET_CAPACITY_STATE?: string;
 }
 
 /**

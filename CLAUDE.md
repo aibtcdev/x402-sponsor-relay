@@ -668,6 +668,32 @@ Note: `/stats` `settlementTimes` percentiles (p50/p95) exclude gap-fill transact
 
 **Idempotency:** Submitting the same sponsored tx hex within 5 minutes returns the cached result from KV (dedup). Safe for agents to retry on network failure.
 
+**Sponsor nonce conflict log vocabulary (NonceDO):**
+
+These log events are emitted by `src/durable-objects/nonce-do.ts` when sponsor nonce collisions
+are detected. Each carries `{occupant_txid, occupant_sender, occupant_sponsor, occupant_fee,
+our_ledger_txid}` so operators can diagnose without cross-referencing Hiro manually.
+
+- `rbf_occupant_untraceable` (warn) — RBF attempted but nonce occupant is invisible to Hiro
+  (ghost tx held by node). In the flag-gated path all 5 occupant fields are present (null when
+  untraceable). In the legacy path occupant fields are explicitly null. Renamed from `rbf_ghost_conflict`.
+- `rbf_occupant_foreign` (warn) — Occupant is a tx sponsored by a different sponsor key.
+  Also emits `operator_alert_foreign_occupant` for dashboard/alert filter.
+- `rbf_occupant_orphan` (warn) — Occupant is ours (sponsor key matches) but not in the ledger.
+  The `adoptOrphan` path should self-heal. Both `occupant_txid` and `orphan_txid` fields present.
+- `rbf_max_attempts_occupant` (warn) — Companion log to `rbf_max_attempts_reached` with full
+  occupant identity fetched at the point of giving up (flag-gated, fail-open).
+- `nonce_reconcile_forward_bump` (warn) — Chain advanced past stored head. Carries `cause` field:
+  - `untracked_broadcast` — our tx confirmed but head was not advanced (e.g. DO restart)
+  - `do_cold_start` — ledger empty, seeding head for the first time
+  - `external_wallet_op` — chain moved forward without relay broadcasts (possible external key use)
+- `operator_alert_external_wallet_op` (warn) — Emitted when `nonce_reconcile_forward_bump` cause
+  is `external_wallet_op`. Indicates potential unauthorized use of the sponsor private key.
+- `operator_alert_foreign_occupant` (warn) — Emitted alongside `rbf_occupant_foreign` for any
+  alerting tooling that filters on the `operator_alert_*` event name prefix.
+- `reconcile_skipped_api_blind` (warn) — Hiro API was unreachable during reconcile; cycle skipped
+  (fail-open). Reconcile resumes automatically when Hiro recovers.
+
 ## Known Issues and Mitigations
 
 ### Receipt Consumption Race Condition
