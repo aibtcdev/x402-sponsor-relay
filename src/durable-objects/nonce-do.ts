@@ -4850,6 +4850,54 @@ export class NonceDO {
       throw new Error("Missing sponsor address");
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 1 (outside lock): Pre-fetch Hiro nonce data for any wallets that
+    // need initialization or whose lookahead-guard cache has expired. Hiro I/O
+    // must NOT happen inside blockConcurrencyWhile — with N wallets, sequential
+    // fetches inside the lock can exceed Cloudflare's ~30 s limit.
+    // -------------------------------------------------------------------------
+
+    // Compute effectiveWalletCount from in-memory SQL state (no I/O).
+    const storedDynamicPre = this.getStateValue("dynamic_wallet_count");
+    const effectiveWalletCountPre = Math.max(
+      1,
+      Math.min(
+        Math.max(walletCount, storedDynamicPre ?? 0),
+        this.getSponsorWalletMax()
+      )
+    );
+    const resolveAddressPre = (wi: number): string =>
+      addresses?.[String(wi)] ?? sponsorAddress;
+
+    // Collect wallet indices that need a fresh Hiro fetch:
+    //   - unseeded (ledgerGetWalletHead === null): must fetch to initialize
+    //   - lookahead cache expired or missing: needed for stale-head / cap guards
+    const walletsFetchNeeded: number[] = [];
+    for (let i = 0; i < effectiveWalletCountPre; i++) {
+      const needsSeed = this.ledgerGetWalletHead(i) === null;
+      const cached = this.hiroNonceCache.get(i);
+      const cacheExpired = !cached || Date.now() >= cached.expiresAt;
+      if (needsSeed || cacheExpired) {
+        walletsFetchNeeded.push(i);
+      }
+    }
+
+    // Pre-fetch in parallel — null entry means Hiro was unreachable for that wallet.
+    const prefetchMap = new Map<number, HiroNonceInfo | null>();
+    await Promise.all(
+      walletsFetchNeeded.map(async (wi) => {
+        try {
+          const info = await this.fetchNonceInfo(resolveAddressPre(wi));
+          prefetchMap.set(wi, info);
+        } catch (_e) {
+          prefetchMap.set(wi, null);
+        }
+      })
+    );
+
+    // -------------------------------------------------------------------------
+    // Phase 2 (inside lock): All state reads and mutations. No Hiro I/O.
+    // -------------------------------------------------------------------------
     return this.state.blockConcurrencyWhile(async () => {
       const currentAlarm = await this.state.storage.getAlarm();
       if (currentAlarm === null) {
@@ -4874,13 +4922,44 @@ export class NonceDO {
       const resolveAddress = (wi: number): string =>
         addresses?.[String(wi)] ?? sponsorAddress;
 
+      // Seed any uninitialized wallets from the pre-fetched data (no Hiro I/O here).
+      // If a wallet's pre-fetch failed (null), initWalletHeadFromHiro will attempt a live
+      // fetch as a fallback — this is intentional; cold-start is the rare path.
+      for (let i = 0; i < effectiveWalletCount; i++) {
+        if (this.ledgerGetWalletHead(i) === null) {
+          const prefetched = prefetchMap.get(i);
+          if (prefetched) {
+            // Apply pre-fetched seed directly without a Hiro call.
+            this.ledgerAdvanceWalletHead(i, prefetched.possible_next_nonce);
+            this.advanceChainFrontier(i, prefetched.possible_next_nonce);
+            this.hiroNonceCache.set(i, {
+              value: prefetched.possible_next_nonce,
+              expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
+            });
+          } else {
+            // Pre-fetch failed or was not attempted — fall back to live fetch.
+            // This path only triggers on genuine cold-start with Hiro unreachable.
+            await this.initWalletHeadFromHiro(i, resolveAddress(i));
+          }
+        } else {
+          // Wallet already seeded — update cache from pre-fetched data if available.
+          const prefetched = prefetchMap.get(i);
+          if (prefetched) {
+            this.hiroNonceCache.set(i, {
+              value: prefetched.possible_next_nonce,
+              expiresAt: Date.now() + HIRO_NONCE_CACHE_TTL_MS,
+            });
+            this.advanceChainFrontier(i, prefetched.possible_next_nonce);
+          }
+        }
+      }
+
       // Scan all wallets and select the one with the most available headroom.
       // No degradation flags — per-nonce occupied tracking handles conflicts.
       let totalMempoolDepth = 0;
       const eligibleWallets: Array<{ walletIndex: number; headroom: number }> = [];
 
       for (let i = 0; i < effectiveWalletCount; i++) {
-        await this.initWalletHeadFromHiro(i, resolveAddress(i));
         const headroom = this.walletHeadroom(i);
         if (headroom > 0) {
           eligibleWallets.push({ walletIndex: i, headroom });
@@ -4916,8 +4995,9 @@ export class NonceDO {
       // Store the per-wallet sponsor address (used by alarm reconciliation)
       await this.setStoredSponsorAddressForWallet(walletIndex, resolveAddress(walletIndex));
 
-      // Fetch current Hiro possible_next_nonce (with 30s cache) for stale-head guard.
-      // Also used by lookahead cap guard below. Fail-open: null means Hiro unreachable.
+      // Retrieve current Hiro possible_next_nonce from cache (populated during pre-fetch).
+      // fetchNextNonceForWallet checks the cache first and avoids a live Hiro call when
+      // the cache is warm (pre-fetched above). Fail-open: null means Hiro unreachable.
       const walletAddr = resolveAddress(walletIndex);
       const hiroNextNonce = await this.fetchNextNonceForWallet(walletIndex, walletAddr);
 
@@ -6095,12 +6175,19 @@ export class NonceDO {
   private async reconcileNonceForWallet(
     walletIndex: number,
     sponsorAddress: string,
+    prefetchedNonceInfo?: HiroNonceInfo | null,
   ): Promise<ReconcileResult | null> {
     let nonceInfo: HiroNonceInfo;
-    try {
-      nonceInfo = await this.fetchNonceInfo(sponsorAddress);
-    } catch (_e) {
-      return null;
+    if (prefetchedNonceInfo !== undefined) {
+      // Called with a pre-fetched result: null means Hiro was unreachable — skip silently.
+      if (prefetchedNonceInfo === null) return null;
+      nonceInfo = prefetchedNonceInfo;
+    } else {
+      try {
+        nonceInfo = await this.fetchNonceInfo(sponsorAddress);
+      } catch (_e) {
+        return null;
+      }
     }
 
     this.setStateValue(STATE_KEYS.lastHiroSync, Date.now());
@@ -8086,6 +8173,41 @@ export class NonceDO {
   }
 
   async alarm(): Promise<void> {
+    // ---------------------------------------------------------------------------
+    // Phase 1 (outside lock): Determine which wallets to reconcile and pre-fetch
+    // their nonce info from Hiro in parallel. Hiro I/O must NOT happen inside
+    // blockConcurrencyWhile — with N wallets, sequential fetches inside the lock
+    // can exceed Cloudflare's ~30 s limit, crashing the DO and all queued requests.
+    // ---------------------------------------------------------------------------
+    const initializedWallets = await this.getInitializedWallets();
+
+    // Compute the reconcile slice before taking the lock so we can pre-fetch.
+    // walletCursor is read from SQL (fast, no I/O) — safe to read outside the lock.
+    const walletCursorPre = this.getStateValue(ALARM_WALLET_CURSOR_KEY) ?? 0;
+    const walletCountPre = initializedWallets.length;
+    const reconcileWalletsPre: Array<{ walletIndex: number; address: string }> = [];
+    for (let i = 0; i < MAX_RECONCILE_WALLETS && i < walletCountPre; i++) {
+      const idx = (walletCursorPre + i) % walletCountPre;
+      const wallet = initializedWallets[idx];
+      if (wallet) reconcileWalletsPre.push(wallet);
+    }
+
+    // Pre-fetch nonce infos in parallel — null means Hiro was unreachable for that wallet.
+    const prefetchedNonceInfos = new Map<number, HiroNonceInfo | null>();
+    await Promise.all(
+      reconcileWalletsPre.map(async ({ walletIndex, address }) => {
+        try {
+          const info = await this.fetchNonceInfo(address);
+          prefetchedNonceInfos.set(walletIndex, info);
+        } catch (_e) {
+          prefetchedNonceInfos.set(walletIndex, null);
+        }
+      })
+    );
+
+    // ---------------------------------------------------------------------------
+    // Phase 2 (inside lock): All state mutations happen here. No Hiro I/O.
+    // ---------------------------------------------------------------------------
     await this.state.blockConcurrencyWhile(async () => {
       try {
         // --- Preamble: migration, cleanup, replay recycling, seed upgrades ---
@@ -8118,8 +8240,6 @@ export class NonceDO {
           });
         }
 
-        const initializedWallets = await this.getInitializedWallets();
-
         // ---------------------------------------------------------------------------
         // Bounded reconciliation: process MAX_RECONCILE_WALLETS wallets per tick.
         // Round-robin cursor advances each tick so all wallets reconcile over time.
@@ -8128,7 +8248,7 @@ export class NonceDO {
         const walletCursor = this.getStateValue(ALARM_WALLET_CURSOR_KEY) ?? 0;
         const walletCount = initializedWallets.length;
 
-        // Determine which wallets to reconcile this tick
+        // Determine which wallets to reconcile this tick (same slice as pre-fetch)
         const reconcileWallets: Array<{ walletIndex: number; address: string }> = [];
         for (let i = 0; i < MAX_RECONCILE_WALLETS && i < walletCount; i++) {
           const idx = (walletCursor + i) % walletCount;
@@ -8163,8 +8283,13 @@ export class NonceDO {
         }
 
         for (const { walletIndex, address } of reconcileWallets) {
-          // reconcileNonceForWallet returns null when Hiro is unreachable — skip silently
-          await this.reconcileNonceForWallet(walletIndex, address);
+          // Pass pre-fetched nonce info — reconcileNonceForWallet skips Hiro fetch when provided.
+          // If walletIndex is missing from map (shouldn't happen), fall back to live fetch.
+          // null means Hiro was unreachable; reconcile returns null and is skipped silently.
+          const prefetched: HiroNonceInfo | null | undefined = prefetchedNonceInfos.has(walletIndex)
+            ? prefetchedNonceInfos.get(walletIndex)
+            : undefined;
+          await this.reconcileNonceForWallet(walletIndex, address, prefetched);
 
           // Phase 4: schema-driven reconcile via tx-schemas reconcile().
           // Only runs when USE_WALLET_CAPACITY_STATE=true AND mempool fetch succeeded.
