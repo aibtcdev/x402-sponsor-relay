@@ -7,6 +7,19 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.29.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.28.0...x402-sponsor-relay-v1.29.0) (2026-04-14)
+
+
+### Features
+
+* **nonce:** proactively update payment records after reconciliation ([#337](https://github.com/aibtcdev/x402-sponsor-relay/issues/337)) ([acc8d2f](https://github.com/aibtcdev/x402-sponsor-relay/commit/acc8d2f7e8088091561f9292a54b9aeefc7653a7))
+
+
+### Bug Fixes
+
+* **payment:** self-heal mempool payments on status poll ([#334](https://github.com/aibtcdev/x402-sponsor-relay/issues/334)) ([9516161](https://github.com/aibtcdev/x402-sponsor-relay/commit/9516161b8df87bf37594af27522e306c9fc48eee))
+* **payment:** self-heal mempool payments on status poll ([#335](https://github.com/aibtcdev/x402-sponsor-relay/issues/335)) ([9516161](https://github.com/aibtcdev/x402-sponsor-relay/commit/9516161b8df87bf37594af27522e306c9fc48eee))
+
 ## [1.28.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.27.5...x402-sponsor-relay-v1.28.0) (2026-04-10)
 
 
