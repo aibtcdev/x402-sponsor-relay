@@ -135,7 +135,7 @@ const SCENARIOS: ConflictScenario[] = [
       " cause=do_cold_start. This is automated: checks GET /nonce/state for shape validity.",
     automated: true,
     manual_steps: [
-      "1. Hit GET /nonce/state and verify the response shape matches WalletCapacity.",
+      "1. Hit GET /nonce/state and verify the response returns the expected envelope.",
       "2. For a full cold-start test: wrangler DO delete, redeploy, observe logs for" +
         " nonce_reconcile_forward_bump with cause=do_cold_start.",
     ],
@@ -162,12 +162,13 @@ const SCENARIOS: ConflictScenario[] = [
           };
         }
 
-        // Validate that the wallets array contains WalletCapacity-shaped entries
-        const wallets = body.wallets as Array<Record<string, unknown>> | undefined;
+        // Response envelope is { success, requestId, state: { wallets: [...] } }.
+        const state = body.state as Record<string, unknown> | undefined;
+        const wallets = state?.wallets as Array<Record<string, unknown>> | undefined;
         if (!Array.isArray(wallets)) {
           return {
             passed: false,
-            notes: [`/nonce/state response missing wallets array`],
+            notes: [`/nonce/state response missing state.wallets array`],
           };
         }
 
@@ -175,19 +176,18 @@ const SCENARIOS: ConflictScenario[] = [
         for (const w of wallets.slice(0, 3)) {
           const hasRequired =
             typeof w.walletIndex === "number" &&
-            typeof w.chainFrontier === "number" &&
-            typeof w.assignmentHead === "number" &&
-            typeof w.available === "number" &&
-            Array.isArray(w.occupiedNonces);
+            typeof w.sponsorAddress === "string" &&
+            Array.isArray(w.pendingTxs) &&
+            Array.isArray(w.gaps);
           if (!hasRequired) {
             shapeOk = false;
-            notes.push(`Wallet entry missing required WalletCapacity fields: ${JSON.stringify(w)}`);
+            notes.push(`Wallet entry missing required fields: ${JSON.stringify(w)}`);
           }
         }
 
         if (shapeOk) {
           notes.push(
-            `GET /nonce/state returned ${wallets.length} wallet(s) with valid WalletCapacity shape.`
+            `GET /nonce/state returned ${wallets.length} wallet(s) with valid ObservableWalletState shape.`
           );
           notes.push(
             "For a full cold-start forward-bump test, reset DO storage and observe logs for" +

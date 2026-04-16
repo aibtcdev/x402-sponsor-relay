@@ -2489,6 +2489,20 @@ export class NonceDO {
     walletIndex: number,
     sponsorNonce: number
   ): Promise<HiroSponsorTxView | null> {
+    const result = await this.fetchOccupantWithStatus(walletIndex, sponsorNonce);
+    return result.tx;
+  }
+
+  /**
+   * Same as fetchOccupant but preserves Hiro outage vs normal-miss distinction.
+   * Used by the deprecated fetchOccupantFee path which branches on hiro_error to
+   * avoid incrementing the RBF attempt counter during transient API blindness.
+   */
+  private async fetchOccupantWithStatus(
+    walletIndex: number,
+    sponsorNonce: number
+  ): Promise<{ tx: HiroSponsorTxView | null; reason: "found" | "no_txid" | "not_found" | "hiro_error" }> {
+    let txid: string | null = null;
     try {
       const rows = this.sql
         .exec<{ txid: string | null }>(
@@ -2497,23 +2511,33 @@ export class NonceDO {
           sponsorNonce
         )
         .toArray();
-      const txid = rows[0]?.txid ?? null;
-      if (!txid) return null; // No known txid — occupant untraceable
+      txid = rows[0]?.txid ?? null;
+    } catch {
+      return { tx: null, reason: "no_txid" };
+    }
+    if (!txid) return { tx: null, reason: "no_txid" };
 
-      const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
-      const headers = getHiroHeaders(this.env.HIRO_API_KEY);
-      const response = await fetch(`${base}/extended/v1/tx/${txid}`, {
+    const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+    const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+    let response: Response;
+    try {
+      response = await fetch(`${base}/extended/v1/tx/${txid}`, {
         headers,
         signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
       });
-      if (!response.ok) return null; // 404 = evicted, 5xx = transient — both untraceable
+    } catch {
+      return { tx: null, reason: "hiro_error" };
+    }
+    if (response.status === 404) return { tx: null, reason: "not_found" };
+    if (!response.ok) return { tx: null, reason: "hiro_error" };
 
+    try {
       const data = await response.json();
       const parsed = HiroSponsorTxViewSchema.safeParse(data);
-      if (!parsed.success) return null; // Unexpected shape — treat as untraceable
-      return parsed.data;
+      if (!parsed.success) return { tx: null, reason: "not_found" };
+      return { tx: parsed.data, reason: "found" };
     } catch {
-      return null; // Network/parse error — fail-open
+      return { tx: null, reason: "hiro_error" };
     }
   }
 
@@ -2531,8 +2555,11 @@ export class NonceDO {
   ): Promise<Record<number, HiroSponsorTxView>> {
     const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
     const headers = getHiroHeaders(this.env.HIRO_API_KEY);
-    // Request up to 200 entries — sponsor wallet is unlikely to have more in-flight
-    const url = `${base}/extended/v1/tx/mempool?sender_address=${encodeURIComponent(sponsorAddress)}&limit=200&offset=0`;
+    // Use /extended/v1/address/{principal}/mempool — returns mempool txs where the
+    // principal appears as sender OR sponsor. Required because sponsored txs have
+    // the user (not the relay) as origin sender, so ?sender_address=<sponsor> on
+    // /extended/v1/tx/mempool would miss them entirely.
+    const url = `${base}/extended/v1/address/${encodeURIComponent(sponsorAddress)}/mempool?limit=200&offset=0`;
     const response = await fetch(url, {
       headers,
       signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS),
@@ -2547,9 +2574,8 @@ export class NonceDO {
       const parsed = HiroSponsorTxViewSchema.safeParse(item);
       if (!parsed.success) continue;
       const tx = parsed.data;
-      // Only include transactions where this address is the sponsor (not the origin sender)
+      // Only include txs where this address is the sponsor (not gap-fills where it's also origin)
       if (tx.sponsor_address !== sponsorAddress) continue;
-      // sponsor_nonce is the slot we care about for reconciliation
       if (tx.sponsor_nonce === undefined) continue;
       byNonce[tx.sponsor_nonce] = tx;
     }
@@ -2586,7 +2612,7 @@ export class NonceDO {
       }
       for (const row of staleRows) {
         try {
-          this.writeLedgerResolvedBroadcast(walletIndex, row.nonce, "failed");
+          this.writeLedgerResolvedBroadcast(walletIndex, row.nonce, "failed", undefined, "sweep_timeout");
           this.log("info", "ledger_pending_broadcast_swept", {
             walletIndex,
             nonce: row.nonce,
@@ -2627,19 +2653,10 @@ export class NonceDO {
     | { fee: bigint; source: "hiro"; reason?: undefined }
     | { fee: null; source?: undefined; reason: "no_txid" | "not_found" | "hiro_error" }
   > {
-    // Check if we have a txid in ledger first (to distinguish no_txid from not_found)
-    const rows = this.sql
-      .exec<{ txid: string | null }>(
-        "SELECT txid FROM nonce_intents WHERE wallet_index = ? AND nonce = ? LIMIT 1",
-        walletIndex,
-        sponsorNonce
-      )
-      .toArray();
-    const txid = rows[0]?.txid ?? null;
-    if (!txid) return { fee: null, reason: "no_txid" };
-
-    const hiroTx = await this.fetchOccupant(walletIndex, sponsorNonce);
-    if (!hiroTx) return { fee: null, reason: "not_found" };
+    const { tx: hiroTx, reason } = await this.fetchOccupantWithStatus(walletIndex, sponsorNonce);
+    if (!hiroTx) {
+      return { fee: null, reason: reason === "found" ? "not_found" : reason };
+    }
 
     const feeRate = hiroTx.fee_rate;
     if (feeRate !== undefined) {
@@ -2727,11 +2744,15 @@ export class NonceDO {
     broadcastAt: string
   ): void {
     try {
+      // Persist the real txid (post-signing, pre-broadcast) so buildSponsorLedger's
+      // WHERE txid IS NOT NULL filter includes pending_broadcast rows. Without this
+      // the tx-schemas reconcile() / classifyOccupant() path can't see in-flight entries.
       this.sql.exec(
         `UPDATE nonce_intents
-         SET status = 'pending_broadcast', broadcast_at = ?
+         SET status = 'pending_broadcast', broadcast_at = ?, txid = ?
          WHERE wallet_index = ? AND nonce = ?`,
         broadcastAt,
+        txid,
         walletIndex,
         nonce
       );
@@ -2759,7 +2780,8 @@ export class NonceDO {
     walletIndex: number,
     nonce: number,
     outcome: "sent" | "failed",
-    txid?: string
+    txid?: string,
+    reason?: string
   ): void {
     try {
       const now = new Date().toISOString();
@@ -2773,7 +2795,7 @@ export class NonceDO {
          VALUES (?, ?, 'broadcast_resolved', ?, ?)`,
         walletIndex,
         nonce,
-        JSON.stringify({ outcome, txid: txid ?? null }),
+        JSON.stringify({ outcome, txid: txid ?? null, reason: reason ?? null }),
         now
       );
     } catch (e) {
@@ -3020,10 +3042,12 @@ export class NonceDO {
         memo: `rbf-${nonce}-attempt-${attemptNum}`,
       });
 
-      // Two-phase write: mark pending_broadcast before network call (Phase 3)
-      // Use a placeholder txid for the pending entry (actual txid not known until after broadcast).
+      // Two-phase write: mark pending_broadcast before network call (Phase 3).
+      // Compute the real txid from the signed tx so downstream schema tooling
+      // (buildSponsorLedger / classifyOccupant / reconcile) can see in-flight entries.
       if (this.isWalletCapacityEnabled()) {
-        this.writeLedgerPendingBroadcast(walletIndex, nonce, `rbf_attempt_${attemptNum}`, now);
+        const pendingTxid = `0x${tx.txid()}`;
+        this.writeLedgerPendingBroadcast(walletIndex, nonce, pendingTxid, now);
       }
 
       const result = await this.broadcastRawTx(tx, "rbf");
@@ -5422,38 +5446,17 @@ export class NonceDO {
         // Settlement time percentiles for this wallet (last 24h)
         const settlementTimes = this.computeSettlementPercentiles(walletIndex);
 
-        // WalletCapacity from tx-schemas (Phase 2: present when USE_WALLET_CAPACITY_STATE=true)
-        // Phase 3: also run on-demand occupant classification for each occupied nonce
-        // so /nonce/state callers get full occupant identity without a separate request.
+        // WalletCapacity from tx-schemas (Phase 2: present when USE_WALLET_CAPACITY_STATE=true).
+        // The per-nonce on-demand Hiro fetch was removed — on /nonce/state it fanned out
+        // to one Hiro call per occupied nonce, added latency, and the result (debug-level
+        // shadow-compare log) wasn't returned to the caller. The alarm-driven reconcile
+        // covers the same ground once per cycle with a single address-filtered mempool read.
         let walletCapacityResult: WalletCapacity | undefined;
         if (this.isWalletCapacityEnabled()) {
           try {
             walletCapacityResult = await this.buildWalletCapacity(walletIndex, address);
           } catch {
             // Fail-open: walletCapacity absent does not break the observable state response
-          }
-
-          // On-demand occupant check for each occupied nonce (Phase 3).
-          // Emits a debug log per occupied nonce with full occupant identity.
-          // This satisfies the "on-demand reconcile on /nonce/state reads" requirement.
-          if (walletCapacityResult && walletCapacityResult.occupiedNonces.length > 0) {
-            for (const occ of walletCapacityResult.occupiedNonces) {
-              try {
-                const occupantCheck = await this.performOnDemandOccupantCheck(walletIndex, occ.nonce);
-                if (occupantCheck) {
-                  this.log("debug", "nonce_state_occupant_classified", {
-                    walletIndex,
-                    nonce: occ.nonce,
-                    classification_kind: occupantCheck.classification.kind,
-                    occupant_txid: occupantCheck.hiroTx?.tx_id ?? null,
-                    occupant_sender: occupantCheck.hiroTx?.sender_address ?? null,
-                    occupant_sponsor: occupantCheck.hiroTx?.sponsor_address ?? null,
-                    rbf_attempts: occ.rbfAttempts,
-                    occupant_visible: occ.occupantVisible,
-                  });
-                }
-              } catch { /* fail-open — occupant check is advisory */ }
-            }
           }
         }
 

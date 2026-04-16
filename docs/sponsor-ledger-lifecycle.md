@@ -10,20 +10,28 @@ legacy nonce-state reads without a schema change.
 
 ## Two-Phase Broadcast Lifecycle
 
-Every outbound sponsor broadcast must follow this sequence — raw `status` writes are
-forbidden outside the schema layer:
+Every outbound sponsor broadcast follows this sequence. Relay code routes all
+status writes through `writeLedgerPendingBroadcast()` / `writeLedgerResolvedBroadcast()`
+(which enforce the valid transition order and emit `nonce_events` for each step) —
+direct `UPDATE nonce_intents SET status=...` statements are not introduced outside
+those helpers.
 
 ```
-beginPendingBroadcast(entry)    → status: pending_broadcast, broadcastAt: <now ISO>
+writeLedgerPendingBroadcast(walletIndex, nonce, txid, now)
+                                → status: pending_broadcast, broadcast_at: <now ISO>, txid: <real txid>
   │
   ├── broadcastTransaction()
   │
-  ├─ success → resolveBroadcast(entry, { outcome: 'broadcast_sent', txid })
+  ├─ success → writeLedgerResolvedBroadcast(..., 'sent', txid)
   │               status: broadcast_sent
   │
-  └─ failure → resolveBroadcast(entry, { outcome: 'broadcast_failed', reason })
+  └─ failure → writeLedgerResolvedBroadcast(..., 'failed', undefined, reason)
                   status: broadcast_failed
 ```
+
+The tx-schemas lifecycle helpers (`beginPendingBroadcast` / `resolveBroadcast`) remain
+imported and will be substituted for the relay's thin wrappers when Phase 6 flips the
+flag to production.
 
 `LedgerTransitionError` is thrown on invalid transitions (e.g. resolving an already-
 resolved entry). The relay catches and logs this; it does not swallow it.
@@ -44,12 +52,14 @@ broadcast. No code path may proceed while any entry is unresolved.
 
 ## classifyOccupant Outputs
 
-| Classification | Meaning |
-|---------------|---------|
-| `ours_tracked` | Occupant txid is in the ledger; normal RBF path |
-| `ours_orphan` | Occupant sponsor matches ours; txid not in ledger — adopt |
-| `foreign` | Occupant sender/sponsor is an external wallet — operator alert |
-| `unpriceable` | Occupant fee exceeds relay ceiling; quarantine after MAX_RBF_ATTEMPTS |
+Matches `OccupantClassification.kind` in `@aibtc/tx-schemas`:
+
+| Kind | Meaning |
+|------|---------|
+| `sponsor_owned_in_ledger` | Occupant sponsor matches ours AND txid is in the ledger; normal RBF path |
+| `sponsor_owned_orphan` | Occupant sponsor matches ours but txid is not in the ledger — adopt |
+| `foreign` | Occupant sender/sponsor is an external wallet — operator alert + hold |
+| `untraceable` | No Hiro record for the slot (404 / parse error / no known txid) |
 
 ## Reconcile Flow
 
@@ -72,8 +82,10 @@ alarm() or on-demand trigger
         pending_broadcast > PENDING_BROADCAST_SWEEP_TIMEOUT_MS → broadcast_failed
 ```
 
-On-demand reconcile runs at every decision point: pre-broadcast, ConflictingNonceInMempool,
-`/nonce/state` reads, and pre-RBF. The alarm is a safety net for idle wallets.
+On-demand reconcile runs at the request-path decision points: pre-broadcast,
+`ConflictingNonceInMempool`, and pre-RBF. `/nonce/state` reads no longer fan out
+one Hiro call per occupied nonce — the alarm-driven reconcile covers that ground
+with a single address-filtered mempool snapshot per cycle.
 
 ## Grace Window
 
