@@ -10,11 +10,14 @@ legacy nonce-state reads without a schema change.
 
 ## Two-Phase Broadcast Lifecycle
 
-Every outbound sponsor broadcast follows this sequence. Relay code routes all
-status writes through `writeLedgerPendingBroadcast()` / `writeLedgerResolvedBroadcast()`
-(which enforce the valid transition order and emit `nonce_events` for each step) —
-direct `UPDATE nonce_intents SET status=...` statements are not introduced outside
-those helpers.
+New broadcast paths (gap-fill RBF, bounded-broadcast) route `status` writes through
+`writeLedgerPendingBroadcast()` / `writeLedgerResolvedBroadcast()` which enforce
+the valid transition order and emit `nonce_events` for each step.
+
+Legacy paths (the original `broadcastAndRecord*` family, expiry backfill, on-chain
+abort detection) still update `nonce_intents.status` directly via dual-write
+statements that keep `state` and `status` in sync. These will be migrated to the
+helper functions when Phase 6 retires the legacy decision tree.
 
 ```
 writeLedgerPendingBroadcast(walletIndex, nonce, txid, now)

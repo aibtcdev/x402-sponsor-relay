@@ -2744,12 +2744,14 @@ export class NonceDO {
     broadcastAt: string
   ): void {
     try {
-      // Persist the real txid (post-signing, pre-broadcast) so buildSponsorLedger's
-      // WHERE txid IS NOT NULL filter includes pending_broadcast rows. Without this
-      // the tx-schemas reconcile() / classifyOccupant() path can't see in-flight entries.
+      // COALESCE preserves the existing (mempool-known) txid on RBF retries.
+      // First broadcast: txid IS NULL → writes the new txid.
+      // RBF: txid already set → keeps the on-chain/mempool txid; the new attempt
+      // txid is recorded only in the nonce_events detail below.  After a successful
+      // RBF broadcast, the caller updates txid to the replacement txid explicitly.
       this.sql.exec(
         `UPDATE nonce_intents
-         SET status = 'pending_broadcast', broadcast_at = ?, txid = ?
+         SET status = 'pending_broadcast', broadcast_at = ?, txid = COALESCE(txid, ?)
          WHERE wallet_index = ? AND nonce = ?`,
         broadcastAt,
         txid,

@@ -33,8 +33,8 @@ interface ConflictScenario {
   slug: string;
   description: string;
   automated: boolean;
-  manual_steps: string[];
-  expected_logs: string[];
+  manualSteps: string[];
+  expectedLogs: string[];
   run?: (relayUrl: string) => Promise<{ passed: boolean; notes: string[] }>;
 }
 
@@ -51,7 +51,7 @@ const SCENARIOS: ConflictScenario[] = [
       " same nonce slot the relay has reserved. The relay should classify the occupant" +
       " as `foreign`, emit operator alerts, and NOT perform blind RBF.",
     automated: false,
-    manual_steps: [
+    manualSteps: [
       "1. Identify the sponsor wallet address for a relay instance (GET /nonce/state → wallets[i].sponsorAddress).",
       "2. Obtain testnet funds for an INDEPENDENT wallet (not the sponsor).",
       "3. Note the sponsor wallet's current possible_next_nonce N from Hiro API.",
@@ -61,7 +61,7 @@ const SCENARIOS: ConflictScenario[] = [
       "5. Submit a normal relay request via POST /relay that would use nonce N.",
       "6. Observe one alarm cycle (~60s).",
     ],
-    expected_logs: [
+    expectedLogs: [
       "rbf_occupant_foreign — occupant classified as foreign (sender != sponsor)",
       "operator_alert_foreign_occupant — operator page with occupant identity fields",
       "nonce_reconcile_forward_bump with cause: external_wallet_op (if nonce advances)",
@@ -79,7 +79,7 @@ const SCENARIOS: ConflictScenario[] = [
       " the assignment head must advance past the slot, dispatch must be released, and" +
       " an operator alert must fire.",
     automated: false,
-    manual_steps: [
+    manualSteps: [
       "1. Identify a sponsor wallet with a stuck nonce slot (conflict or gap_fill state).",
       "2. Manually set MAX_RBF_ATTEMPTS to a small value (e.g. 1) in nonce-do.ts for testing.",
       "3. Set the occupant's fee in the mempool to a value above the relay's fee ceiling.",
@@ -89,7 +89,7 @@ const SCENARIOS: ConflictScenario[] = [
       "7. Verify assignment head advances past the quarantined slot.",
       "8. Verify subsequent relay requests can use nonce slots after the quarantined one.",
     ],
-    expected_logs: [
+    expectedLogs: [
       "rbf_max_attempts_reached with rbfAttempts >= MAX_RBF_ATTEMPTS AND originalTxid != null",
       "rbf_max_attempts_occupant with full occupant identity (occupant_txid, occupant_sender, occupant_fee)",
       "operator_alert_unpriceable_orphan or similar quarantine page",
@@ -107,7 +107,7 @@ const SCENARIOS: ConflictScenario[] = [
       " for. The reconcile() cycle should classify this as `ours_orphan` and trigger" +
       " adoptOrphan, importing the broadcast into the ledger without re-broadcasting.",
     automated: false,
-    manual_steps: [
+    manualSteps: [
       "1. Broadcast a transaction from the relay sponsor wallet via an external tool" +
         " (e.g. Hiro Explorer, scripts/test-sponsor.ts) to create an orphan in the mempool.",
       "2. Delete or reset the NonceDO storage to simulate a cold-start" +
@@ -116,7 +116,7 @@ const SCENARIOS: ConflictScenario[] = [
       "4. Observe that the relay does NOT re-broadcast the same nonce.",
       "5. Observe that the ledger row is created with status=broadcast_sent via adoptOrphan.",
     ],
-    expected_logs: [
+    expectedLogs: [
       "classifyOccupant output: ours_orphan (sponsor matches, txid not in ledger)",
       "decideBroadcast output: adopt",
       "adoptOrphan execution log with the imported txid",
@@ -134,12 +134,12 @@ const SCENARIOS: ConflictScenario[] = [
       " the Hiro-reported possible_next_nonce and emit nonce_reconcile_forward_bump with" +
       " cause=do_cold_start. This is automated: checks GET /nonce/state for shape validity.",
     automated: true,
-    manual_steps: [
+    manualSteps: [
       "1. Hit GET /nonce/state and verify the response returns the expected envelope.",
       "2. For a full cold-start test: wrangler DO delete, redeploy, observe logs for" +
         " nonce_reconcile_forward_bump with cause=do_cold_start.",
     ],
-    expected_logs: [
+    expectedLogs: [
       "nonce_reconcile_forward_bump with cause: do_cold_start (when DO storage reset)",
       "nonce_reconcile_forward_bump with cause: untracked_broadcast (ledger missing entry)",
       "nonce_reconcile_forward_bump with cause: external_wallet_op (sponsor used outside relay)",
@@ -242,11 +242,11 @@ function printScenario(s: ConflictScenario): void {
 
   if (!s.automated) {
     console.log("Manual Steps:");
-    for (const step of s.manual_steps) console.log(`  ${step}`);
+    for (const step of s.manualSteps) console.log(`  ${step}`);
   }
 
   console.log("\nExpected Log Events:");
-  for (const log of s.expected_logs) console.log(`  - ${log}`);
+  for (const log of s.expectedLogs) console.log(`  - ${log}`);
   console.log("");
 }
 
