@@ -2567,8 +2567,15 @@ export class NonceDO {
     if (!response.ok) {
       throw new Error(`Hiro mempool fetch failed: ${response.status} ${response.statusText}`);
     }
-    const data = (await response.json()) as { results?: unknown[] };
+    const data = (await response.json()) as { results?: unknown[]; total?: number };
     const results = Array.isArray(data?.results) ? data.results : [];
+    if (typeof data?.total === "number" && data.total > results.length) {
+      this.log("warn", "mempool_snapshot_truncated", {
+        sponsorAddress,
+        total: data.total,
+        fetched: results.length,
+      });
+    }
     const byNonce: Record<number, HiroSponsorTxView> = {};
     for (const item of results) {
       const parsed = HiroSponsorTxViewSchema.safeParse(item);

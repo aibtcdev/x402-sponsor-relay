@@ -8,7 +8,6 @@ import type {
 // Re-export canonical tx-schemas wallet state types so callers import from one place.
 // Phase 2: establishes the type bridge. Phase 3+ wires these into decision points.
 export type { WalletCapacity, OccupiedNonce } from "@aibtc/tx-schemas";
-import type { WalletCapacity } from "@aibtc/tx-schemas";
 
 export const SPONSOR_STATUS_SNAPSHOT_FRESH_MS = 5 * 60 * 1000;
 export const SPONSOR_STATUS_SNAPSHOT_EXPIRED_MS = 10 * 60 * 1000;
@@ -128,24 +127,4 @@ export function toSponsorStatusResult(
       freshness: snapshotFreshness,
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2 (sponsor-ledger-integration): WalletCapacity bridge utilities
-// ---------------------------------------------------------------------------
-
-/**
- * Extract the available nonce count from a tx-schemas WalletCapacity.
- * Minimal bridge function for Phase 2 — Phase 3+ will expand usage.
- */
-export function walletCapacityAvailable(capacity: WalletCapacity): number {
-  return capacity.available;
-}
-
-/**
- * Check whether a WalletCapacity has any occupied nonces (stuck RBF slots).
- * Used by Phase 3 decision points to skip RBF path when no occupants exist.
- */
-export function walletCapacityHasOccupants(capacity: WalletCapacity): boolean {
-  return capacity.occupiedNonces.length > 0;
 }
