@@ -342,6 +342,61 @@ describe("NonceDO stale sender repair helpers", () => {
     expect(conservativeBumpSenderFrontier).toHaveBeenCalledWith("ST999", 7);
   });
 
+  it("lets on-demand sender repair bypass the stale-age gate", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-03-31T20:10:00.000Z"));
+
+    const repair = (NonceDO as any).prototype.repairSenderWedge;
+    const fetchNonceInfo = vi.fn().mockResolvedValue({
+      possible_next_nonce: 7,
+      last_executed_tx_nonce: 6,
+      last_mempool_tx_nonce: null,
+      detected_missing_nonces: [],
+      detected_mempool_nonces: [],
+    });
+    const conservativeBumpSenderFrontier = vi.fn().mockReturnValue({
+      advanced: true,
+      previousFrontier: 3,
+      prunedCount: 1,
+    });
+    const checkAndAssignRun = vi.fn();
+
+    const status = await repair.call({
+      getSenderState: () => ({
+        next_expected_nonce: 3,
+        last_refresh_attempt_at: null,
+        last_refresh_failure_at: null,
+      }),
+      getHand: () => [
+        {
+          sender_nonce: 7,
+          received_at: "2026-03-31T20:09:30.000Z",
+          expires_at: "2026-03-31T20:20:00.000Z",
+          payment_id: "pay_young_gap",
+        },
+      ],
+      evaluateStaleSenderRepairCandidate: (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate,
+      maybeRepairStaleSenderFrontier: (NonceDO as any).prototype.maybeRepairStaleSenderFrontier,
+      recordSenderRefreshAttempt: vi.fn(),
+      recordSenderRefreshFailure: vi.fn(),
+      fetchNonceInfo,
+      conservativeBumpSenderFrontier,
+      checkAndAssignRun,
+      buildSenderWedgeStatus: (NonceDO as any).prototype.buildSenderWedgeStatus,
+      log: vi.fn(),
+    }, "STYOUNG");
+
+    expect(fetchNonceInfo).toHaveBeenCalledWith("STYOUNG");
+    expect(conservativeBumpSenderFrontier).toHaveBeenCalledWith("STYOUNG", 7);
+    expect(checkAndAssignRun).toHaveBeenCalledWith("STYOUNG");
+    expect(status).toEqual(
+      expect.objectContaining({
+        senderAddress: "STYOUNG",
+        repairTriggered: true,
+        repairAdvanced: true,
+      })
+    );
+  });
+
   it("applies a short failure backoff after a Hiro refresh error", () => {
     const nowMs = Date.parse("2026-03-31T20:10:00.000Z");
     const evaluate = (NonceDO as any).prototype.evaluateStaleSenderRepairCandidate;

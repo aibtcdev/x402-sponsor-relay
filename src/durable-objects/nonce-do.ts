@@ -1615,7 +1615,12 @@ export class NonceDO {
   private evaluateStaleSenderRepairCandidate(
     stateRow: Pick<SenderStateRow, "next_expected_nonce" | "last_refresh_attempt_at" | "last_refresh_failure_at"> | null,
     hand: Array<Pick<SenderHandRow, "sender_nonce" | "received_at" | "expires_at">>,
-    nowMs: number
+    nowMs: number,
+    opts?: {
+      ignoreAgeThreshold?: boolean;
+      ignoreAttemptCooldown?: boolean;
+      ignoreFailureBackoff?: boolean;
+    }
   ): StaleSenderRepairCandidate | null {
     if (!stateRow || hand.length === 0) {
       return null;
@@ -1642,7 +1647,7 @@ export class NonceDO {
     }
 
     const oldestHeldAgeMs = Math.max(0, nowMs - oldestHeldAt);
-    if (oldestHeldAgeMs < STALE_SENDER_REPAIR_HOLD_AGE_MS) {
+    if (!opts?.ignoreAgeThreshold && oldestHeldAgeMs < STALE_SENDER_REPAIR_HOLD_AGE_MS) {
       return null;
     }
 
@@ -1650,6 +1655,7 @@ export class NonceDO {
       ? new Date(stateRow.last_refresh_attempt_at).getTime()
       : null;
     if (
+      !opts?.ignoreAttemptCooldown &&
       lastRefreshAttemptMs !== null &&
       Number.isFinite(lastRefreshAttemptMs) &&
       nowMs - lastRefreshAttemptMs < SENDER_REFRESH_COOLDOWN_MS
@@ -1661,6 +1667,7 @@ export class NonceDO {
       ? new Date(stateRow.last_refresh_failure_at).getTime()
       : null;
     if (
+      !opts?.ignoreFailureBackoff &&
       lastRefreshFailureMs !== null &&
       Number.isFinite(lastRefreshFailureMs) &&
       nowMs - lastRefreshFailureMs < SENDER_REFRESH_FAILURE_BACKOFF_MS
@@ -1752,13 +1759,21 @@ export class NonceDO {
     return { advanced: true, previousFrontier, prunedCount };
   }
 
-  private async maybeRepairStaleSenderFrontier(senderAddress: string): Promise<boolean> {
+  private async maybeRepairStaleSenderFrontier(
+    senderAddress: string,
+    opts?: {
+      ignoreAgeThreshold?: boolean;
+      ignoreAttemptCooldown?: boolean;
+      ignoreFailureBackoff?: boolean;
+    }
+  ): Promise<boolean> {
     const nowMs = Date.now();
     const stateRow = this.getSenderState(senderAddress);
     const candidate = this.evaluateStaleSenderRepairCandidate(
       stateRow,
       this.getHand(senderAddress),
-      nowMs
+      nowMs,
+      opts
     );
     if (!candidate) {
       return false;
@@ -1871,7 +1886,11 @@ export class NonceDO {
   }
 
   private async repairSenderWedge(senderAddress: string): Promise<SenderWedgeStatus> {
-    const repairAdvanced = await this.maybeRepairStaleSenderFrontier(senderAddress);
+    // On-demand repair is allowed to bypass the stale-age gate so an already-confirmed
+    // low nonce can immediately release a newly-held sender payment.
+    const repairAdvanced = await this.maybeRepairStaleSenderFrontier(senderAddress, {
+      ignoreAgeThreshold: true,
+    });
     if (repairAdvanced) {
       await this.checkAndAssignRun(senderAddress);
     }

@@ -224,6 +224,25 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       );
     }
 
+    // Stale-low frontier — refresh from Hiro once before treating this as a real gap.
+    // This mirrors the cold-cache path for senders who advanced outside the relay.
+    if (nonceCheck.outcome === "gap") {
+      await seedSenderNonceFromHiro(
+        kv,
+        signerHash,
+        senderAddress,
+        network,
+        this.env.HIRO_API_KEY
+      );
+      nonceCheck = await checkSenderNonce(
+        kv,
+        signerHash,
+        senderNonce,
+        senderAddress,
+        network
+      );
+    }
+
     // Stale nonce — reject immediately, no sponsor slot wasted
     if (nonceCheck.outcome === "stale") {
       return {
