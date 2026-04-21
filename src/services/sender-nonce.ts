@@ -327,13 +327,19 @@ export async function seedSenderNonceFromHiro(
       detected_missing_nonces?: number[];
     };
 
-    const lastConfirmed = data.last_executed_tx_nonce ?? -1;
+    const existing = await getCache(kv, signerHash);
+    const lastConfirmed = Math.max(
+      existing?.lastConfirmed ?? -1,
+      data.last_executed_tx_nonce ?? -1
+    );
     // possible_next_nonce accounts for pending txs in mempool
-    const lastSeen = Math.max(lastConfirmed, data.possible_next_nonce - 1);
+    const fetchedLastSeen = Math.max(lastConfirmed, data.possible_next_nonce - 1);
+    const lastSeen = Math.max(existing?.lastSeen ?? -1, fetchedLastSeen);
 
     const cache: SenderNonceCache = {
       lastSeen,
       lastConfirmed,
+      lastTxid: existing?.lastTxid,
       updatedAt: new Date().toISOString(),
     };
 

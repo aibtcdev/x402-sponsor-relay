@@ -1618,8 +1618,6 @@ export class NonceDO {
     nowMs: number,
     opts?: {
       ignoreAgeThreshold?: boolean;
-      ignoreAttemptCooldown?: boolean;
-      ignoreFailureBackoff?: boolean;
     }
   ): StaleSenderRepairCandidate | null {
     if (!stateRow || hand.length === 0) {
@@ -1655,7 +1653,6 @@ export class NonceDO {
       ? new Date(stateRow.last_refresh_attempt_at).getTime()
       : null;
     if (
-      !opts?.ignoreAttemptCooldown &&
       lastRefreshAttemptMs !== null &&
       Number.isFinite(lastRefreshAttemptMs) &&
       nowMs - lastRefreshAttemptMs < SENDER_REFRESH_COOLDOWN_MS
@@ -1667,7 +1664,6 @@ export class NonceDO {
       ? new Date(stateRow.last_refresh_failure_at).getTime()
       : null;
     if (
-      !opts?.ignoreFailureBackoff &&
       lastRefreshFailureMs !== null &&
       Number.isFinite(lastRefreshFailureMs) &&
       nowMs - lastRefreshFailureMs < SENDER_REFRESH_FAILURE_BACKOFF_MS
@@ -1763,8 +1759,6 @@ export class NonceDO {
     senderAddress: string,
     opts?: {
       ignoreAgeThreshold?: boolean;
-      ignoreAttemptCooldown?: boolean;
-      ignoreFailureBackoff?: boolean;
     }
   ): Promise<boolean> {
     const nowMs = Date.now();

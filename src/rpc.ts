@@ -205,6 +205,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       senderAddress,
       network
     );
+    let seededSenderNonce = false;
 
     // Cold cache — seed from Hiro and re-check
     if (nonceCheck.outcome === "unknown") {
@@ -215,6 +216,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
         network,
         this.env.HIRO_API_KEY
       );
+      seededSenderNonce = true;
       nonceCheck = await checkSenderNonce(
         kv,
         signerHash,
@@ -226,7 +228,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
 
     // Stale-low frontier — refresh from Hiro once before treating this as a real gap.
     // This mirrors the cold-cache path for senders who advanced outside the relay.
-    if (nonceCheck.outcome === "gap") {
+    if (nonceCheck.outcome === "gap" && !seededSenderNonce) {
       await seedSenderNonceFromHiro(
         kv,
         signerHash,

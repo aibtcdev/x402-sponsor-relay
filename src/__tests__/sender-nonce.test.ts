@@ -1,6 +1,14 @@
-import { describe, expect, it } from "vitest";
-import { checkSenderNonce, markInFlight } from "../services/sender-nonce";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  checkSenderNonce,
+  markInFlight,
+  seedSenderNonceFromHiro,
+} from "../services/sender-nonce";
 import { MemoryKV } from "./helpers/memory-kv";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("sender nonce recovery boundaries", () => {
   it("treats stale sender nonces as sender-owned recovery", async () => {
@@ -71,6 +79,41 @@ describe("sender nonce recovery boundaries", () => {
       outcome: "duplicate",
       provided: 12,
       lastSeen: 12,
+    });
+  });
+
+  it("keeps Hiro refresh monotonic when cached sender state is newer", async () => {
+    const kv = new MemoryKV();
+    await kv.put(
+      "sender_nonce:signer_refresh",
+      JSON.stringify({
+        lastSeen: 12,
+        lastConfirmed: 11,
+        lastTxid: "0xabc123",
+        updatedAt: new Date().toISOString(),
+      })
+    );
+
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        last_executed_tx_nonce: 9,
+        possible_next_nonce: 10,
+        detected_missing_nonces: [],
+      }), { status: 200 })
+    );
+
+    const seeded = await seedSenderNonceFromHiro(
+      kv,
+      "signer_refresh",
+      "STTESTREFRESH000000000000000000000000",
+      "testnet"
+    );
+
+    expect(seeded).toEqual({
+      lastSeen: 12,
+      lastConfirmed: 11,
+      lastTxid: "0xabc123",
+      updatedAt: expect.any(String),
     });
   });
 });

@@ -4,7 +4,12 @@ import {
   RpcCheckPaymentResultSchema,
   RpcSubmitPaymentResultSchema,
 } from "@aibtc/tx-schemas";
-import { AnchorMode, makeRandomPrivKey, makeSTXTokenTransfer } from "@stacks/transactions";
+import {
+  AnchorMode,
+  deserializeTransaction,
+  makeRandomPrivKey,
+  makeSTXTokenTransfer,
+} from "@stacks/transactions";
 
 vi.mock("cloudflare:workers", () => ({
   WorkerEntrypoint: class {
@@ -314,6 +319,7 @@ describe("submitPayment duplicate reuse", () => {
   it("reconciles stale sender gap cache from Hiro before accepting a new payment", async () => {
     const kv = new MemoryKV();
     const txHex = await getSubmitPaymentTxHex(26n);
+    const signerHash = deserializeTransaction(txHex).auth.spendingCondition.signer;
     const queueSend = vi.fn(async () => {});
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({
@@ -324,7 +330,7 @@ describe("submitPayment duplicate reuse", () => {
     );
 
     await kv.put(
-      "sender_nonce:f6d5c77b5384e0c4c22bd705c8066842b8ff6dda",
+      `sender_nonce:${signerHash}`,
       JSON.stringify({
         lastSeen: 24,
         lastConfirmed: 24,
