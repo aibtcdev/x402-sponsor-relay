@@ -4,7 +4,12 @@ import {
   RpcCheckPaymentResultSchema,
   RpcSubmitPaymentResultSchema,
 } from "@aibtc/tx-schemas";
-import { AnchorMode, makeRandomPrivKey, makeSTXTokenTransfer } from "@stacks/transactions";
+import {
+  AnchorMode,
+  deserializeTransaction,
+  makeRandomPrivKey,
+  makeSTXTokenTransfer,
+} from "@stacks/transactions";
 
 vi.mock("cloudflare:workers", () => ({
   WorkerEntrypoint: class {
@@ -63,6 +68,21 @@ async function getDuplicateReuseTxHex(): Promise<string> {
   }
 
   return duplicateReuseTxHexPromise;
+}
+
+async function getSubmitPaymentTxHex(nonce: bigint): Promise<string> {
+  const transaction = await makeSTXTokenTransfer({
+    recipient: "ST37NMC4HGFQ1H2JSFP4H3TMNQBF4PY0MVSD1GV7Z",
+    amount: 1n,
+    senderKey: makeRandomPrivKey(),
+    network: "testnet",
+    memo: `submit-${nonce.toString()}`,
+    anchorMode: AnchorMode.Any,
+    sponsored: true,
+    fee: 0n,
+    nonce,
+  });
+  return transaction.serialize();
 }
 
 afterEach(() => {
@@ -294,6 +314,57 @@ describe("submitPayment duplicate reuse", () => {
     await putPaymentArtifact(kv, txArtifactHash, terminalRecord.paymentId);
     expect(await getReusablePaymentRecord(kv, txArtifactHash)).toBeNull();
     expect(await getPaymentIdByArtifact(kv, txArtifactHash)).toBeNull();
+  });
+
+  it("reconciles stale sender gap cache from Hiro before accepting a new payment", async () => {
+    const kv = new MemoryKV();
+    const txHex = await getSubmitPaymentTxHex(26n);
+    const signerHash = deserializeTransaction(txHex).auth.spendingCondition.signer;
+    const queueSend = vi.fn(async () => {});
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        last_executed_tx_nonce: 25,
+        possible_next_nonce: 26,
+        detected_missing_nonces: [],
+      }), { status: 200 })
+    );
+
+    await kv.put(
+      `sender_nonce:${signerHash}`,
+      JSON.stringify({
+        lastSeen: 24,
+        lastConfirmed: 24,
+        updatedAt: new Date().toISOString(),
+      })
+    );
+
+    const env = {
+      RELAY_KV: kv,
+      STACKS_NETWORK: "testnet",
+      RELAY_BASE_URL: "https://x402-relay.aibtc.dev",
+      PAYMENT_QUEUE: {
+        send: queueSend,
+      },
+    } as unknown as Env;
+
+    const rpc = new RelayRPC(executionContext, env);
+    const result = RpcSubmitPaymentResultSchema.parse(
+      await rpc.submitPayment(txHex)
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      accepted: true,
+      paymentId: expect.stringMatching(/^pay_/),
+      status: "queued",
+      senderNonce: {
+        provided: 26,
+        expected: 26,
+        healthy: true,
+      },
+      checkStatusUrl: expect.stringMatching(/^https:\/\/x402-relay\.aibtc\.dev\/payment\/pay_/),
+    });
+    expect(queueSend).toHaveBeenCalledTimes(1);
   });
 });
 
