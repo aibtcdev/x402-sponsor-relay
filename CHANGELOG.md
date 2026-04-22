@@ -7,6 +7,14 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.30.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.30.0...x402-sponsor-relay-v1.30.1) (2026-04-21)
+
+
+### Bug Fixes
+
+* **health:** derive status from nonce pool health instead of hardcoded "ok" ([#316](https://github.com/aibtcdev/x402-sponsor-relay/issues/316)) ([0bc5061](https://github.com/aibtcdev/x402-sponsor-relay/commit/0bc5061ead5b57541a9c1998d8cebd8b170d5728))
+* **nonce:** reconcile stale sender gaps before queueing ([#349](https://github.com/aibtcdev/x402-sponsor-relay/issues/349)) ([1759e9d](https://github.com/aibtcdev/x402-sponsor-relay/commit/1759e9d40e0ac72cd6b6c3fab32a81ddab36999a))
+
 ## [1.30.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.29.0...x402-sponsor-relay-v1.30.0) (2026-04-16)
 
 
