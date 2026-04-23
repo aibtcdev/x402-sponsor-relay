@@ -7,6 +7,21 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.31.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.30.1...x402-sponsor-relay-v1.31.0) (2026-04-23)
+
+
+### Features
+
+* **rpc:** route submitPayment through PaymentIdService for V2 idempotency parity (closes [#351](https://github.com/aibtcdev/x402-sponsor-relay/issues/351)) ([#355](https://github.com/aibtcdev/x402-sponsor-relay/issues/355)) ([97f0b6b](https://github.com/aibtcdev/x402-sponsor-relay/commit/97f0b6bfedc5d14d29f9cab7629eb46a5c52d523))
+
+
+### Bug Fixes
+
+* **dedup:** extend liveness fail-closed to 502, add JSDoc + regression tests ([#354](https://github.com/aibtcdev/x402-sponsor-relay/issues/354)) ([b2f1823](https://github.com/aibtcdev/x402-sponsor-relay/commit/b2f18237194e43dfe69762908f74150be170151d))
+* **dedup:** treat Hiro 429/503 as dead in verifyTxidAlive (closes [#267](https://github.com/aibtcdev/x402-sponsor-relay/issues/267)) ([#271](https://github.com/aibtcdev/x402-sponsor-relay/issues/271)) ([0ec1e00](https://github.com/aibtcdev/x402-sponsor-relay/commit/0ec1e009479e619a487ec1a9047fb453e890cb57))
+* **nonce:** move fetchMempoolForSponsor outside alarm() blockConcurrencyWhile (closes [#350](https://github.com/aibtcdev/x402-sponsor-relay/issues/350)) ([#353](https://github.com/aibtcdev/x402-sponsor-relay/issues/353)) ([74344d8](https://github.com/aibtcdev/x402-sponsor-relay/commit/74344d806aee9b5a9ac548deaaa0f831d5c52180))
+* **nonce:** move Hiro fetches outside blockConcurrencyWhile to prevent cold start crashes ([307bb3c](https://github.com/aibtcdev/x402-sponsor-relay/commit/307bb3c29e8cc550fe15838b64e948a030e11682)), closes [#324](https://github.com/aibtcdev/x402-sponsor-relay/issues/324)
+
 ## [1.30.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.30.0...x402-sponsor-relay-v1.30.1) (2026-04-21)
 
 
