@@ -1205,10 +1205,14 @@ export class SettlementService {
    * Used to validate "pending" dedup entries before returning them to callers.
    *
    * Returns true  if the tx is pending, success, dropped (transient), or the API
-   *               is unreachable (fail-open).
-   * Returns false if the tx is 404 (never indexed / evicted) or abort_* (terminal).
+   *               returns an unexpected error (fail-open).
+   * Returns false if the tx is 404 (never indexed / evicted), abort_* (terminal),
+   *               or if Hiro is rate-limited (429) / unavailable (502/503).
    *
    * Note: dropped_* statuses are treated as alive — see isTxDropped() for rationale.
+   * Note: 429/502/503 are fail-closed because Hiro cannot confirm the txid. Invalidating
+   *       the dedup entry allows a fresh broadcast retry. The worst case — a valid pending
+   *       tx gets invalidated — results in a retryable nonce conflict, not a double spend.
    */
   private async verifyTxidAlive(txid: string): Promise<boolean> {
     try {
@@ -1225,12 +1229,11 @@ export class SettlementService {
         return false;
       }
 
-      // 429 (rate-limit) and 503 (service unavailable): Hiro cannot confirm the txid.
-      // Treat as dead to invalidate the dedup entry and allow a fresh broadcast retry.
-      // This prevents phantom txids from stale dedup entries being served when Hiro is
-      // transiently unavailable. Worst case: a valid pending tx gets invalidated and
-      // the caller retries — the fresh broadcast will fail with nonce conflict (retryable).
-      if (response.status === 429 || response.status === 503) {
+      // 429 (rate-limit), 502 (bad gateway), and 503 (service unavailable): Hiro cannot
+      // confirm the txid. Treat as dead to invalidate the dedup entry and allow a fresh
+      // broadcast retry. This prevents phantom txids from stale dedup entries being served
+      // when Hiro is transiently unavailable.
+      if (response.status === 429 || response.status === 502 || response.status === 503) {
         this.logger.debug("Hiro API rate-limited/unavailable during liveness check, invalidating", {
           txid,
           status: response.status,
