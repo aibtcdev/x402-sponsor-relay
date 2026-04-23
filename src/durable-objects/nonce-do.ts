@@ -8218,6 +8218,22 @@ export class NonceDO {
       })
     );
 
+    // Pre-fetch mempool snapshots in parallel — null means Hiro was unreachable for that wallet.
+    // Must stay outside blockConcurrencyWhile; sequential I/O inside the lock risks the 30 s budget.
+    const prefetchedMempoolSnapshots = new Map<number, Record<number, HiroSponsorTxView> | null>();
+    if (this.isWalletCapacityEnabled()) {
+      await Promise.all(
+        reconcileWalletsPre.map(async ({ walletIndex, address }) => {
+          try {
+            const snapshot = await this.fetchMempoolForSponsor(address);
+            prefetchedMempoolSnapshots.set(walletIndex, snapshot);
+          } catch (_e) {
+            prefetchedMempoolSnapshots.set(walletIndex, null);
+          }
+        })
+      );
+    }
+
     // ---------------------------------------------------------------------------
     // Phase 2 (inside lock): All state mutations happen here. No Hiro I/O.
     // ---------------------------------------------------------------------------
@@ -8270,8 +8286,8 @@ export class NonceDO {
         }
 
         // ---------------------------------------------------------------------------
-        // Phase 4: Pre-fetch address-filtered mempool snapshots for schema reconcile.
-        // One Hiro call per wallet being reconciled (not per-txid).
+        // Phase 4: Consume pre-fetched mempool snapshots for schema reconcile.
+        // Snapshots were fetched in parallel outside the lock (prefetchedMempoolSnapshots).
         // Fail-open: API blindness logs reconcile_skipped_api_blind and skips that wallet.
         // Only runs when USE_WALLET_CAPACITY_STATE flag is enabled.
         // ---------------------------------------------------------------------------
@@ -8281,15 +8297,13 @@ export class NonceDO {
         >();
         if (this.isWalletCapacityEnabled()) {
           for (const { walletIndex, address } of reconcileWallets) {
-            try {
-              const snapshot = await this.fetchMempoolForSponsor(address);
-              walletMempoolSnapshots.set(walletIndex, snapshot);
-            } catch (mempoolErr) {
-              walletMempoolSnapshots.set(walletIndex, null);
+            const snapshot = prefetchedMempoolSnapshots.get(walletIndex) ?? null;
+            walletMempoolSnapshots.set(walletIndex, snapshot);
+            if (snapshot === null) {
               this.log("warn", "reconcile_skipped_api_blind", {
                 walletIndex,
                 address,
-                reason: mempoolErr instanceof Error ? mempoolErr.message : String(mempoolErr),
+                reason: "mempool pre-fetch failed",
               });
             }
           }
