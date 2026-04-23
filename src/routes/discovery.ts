@@ -945,6 +945,33 @@ https://x402-relay.aibtc.com/topics/errors
 
 ---
 
+## Internal Service Binding (RPC)
+
+For internal Cloudflare Workers that consume the relay via service binding
+(landing-page, agent-news), the RelayRPC WorkerEntrypoint exposes:
+
+  submitPayment(txHex, settle?, paymentIdentifier?) → SubmitPaymentResult
+  checkPayment(paymentId)                            → CheckPaymentResult
+  getSponsorStatus()                                 → SponsorStatusResult
+
+### submitPayment — payment-identifier Support
+
+The third argument paymentIdentifier provides client-controlled idempotency
+on the RPC path, matching the behavior of POST /settle on the HTTP path.
+
+  submitPayment(txHex, settle, "pay_01J7QZXK5XRGBVMK3N9RTNF4WW")
+
+Same id + same payload → returns original accepted result (original paymentId)
+Same id + different payload → { accepted: false, code: "PAYMENT_IDENTIFIER_CONFLICT" }
+Omitted → falls back to tx artifact dedup (existing behavior)
+
+Format: 16–128 chars, [a-zA-Z0-9_-]+, "pay_" prefix recommended.
+TTL: 300 seconds (KV prefix: "payid:rpc:").
+
+Full RPC parity docs: https://x402-relay.aibtc.com/topics/x402-v2-facilitator
+
+---
+
 ## Rate Limiting
 
 - POST /relay: 10 requests/minute per sender address (from transaction)
@@ -1848,6 +1875,52 @@ Skip it when:
    Relay verifies, broadcasts, and returns { success: true, transaction: "0x..." }.
 
 6. Client presents the transaction ID to the resource server as proof of payment.
+
+## RPC submitPayment — payment-identifier Parity
+
+The service-binding RPC method submitPayment() also supports the payment-identifier
+extension, providing the same idempotency guarantee as POST /settle for internal
+consumers (landing-page, agent-news).
+
+### Signature
+
+submitPayment(txHex: string, settle?: SettleOptions, paymentIdentifier?: string): Promise<SubmitPaymentResult>
+
+The third argument paymentIdentifier is optional. When supplied, it must be 16–128
+characters, matching [a-zA-Z0-9_-]+ (same constraints as the HTTP extension).
+
+### Behavior
+
+Same id + same payload (txHex + settle):
+  Returns the original accepted result containing the original paymentId.
+  No new queue write, no new nonce consumed.
+
+Same id + different payload (tx was rebuilt):
+  Returns accepted: false, code: "PAYMENT_IDENTIFIER_CONFLICT", retryable: false.
+  Generate a new payment-identifier for the rebuilt transaction.
+
+Extension omitted:
+  Falls back to tx artifact dedup (existing behavior, unchanged).
+
+### Example (TypeScript, service binding)
+
+const result = await env.X402_RELAY.submitPayment(
+  txHex,
+  { expectedRecipient: "SP...", minAmount: "1000000" },
+  "pay_01J7QZXK5XRGBVMK3N9RTNF4WW"   // stable id for this payment intent
+);
+
+if (!result.accepted && result.code === "PAYMENT_IDENTIFIER_CONFLICT") {
+  // Same id was used with a different payload — generate a new id for the rebuilt tx
+}
+
+### KV Namespace
+
+RPC cache entries use the "payid:rpc:" prefix, separate from HTTP cache entries
+("payid:settle:", "payid:verify:"). The same payment-identifier can be used on
+both RPC and HTTP paths without cross-namespace collisions.
+
+Cache TTL: 300 seconds (same as HTTP payment-identifier cache).
 
 ## Notes
 

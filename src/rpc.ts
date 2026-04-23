@@ -25,6 +25,7 @@ import type {
   RpcSubmitPaymentResult as SubmitPaymentResult,
 } from "@aibtc/tx-schemas/rpc";
 import { RPC_ERROR_CODES } from "@aibtc/tx-schemas/rpc";
+import { PaymentIdService } from "./services/payment-identifier";
 import type { Env, SettleOptions, SponsorStatusResult } from "./types";
 import {
   buildPaymentCheckStatusUrl,
@@ -103,7 +104,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
    */
   async submitPayment(
     txHex: string,
-    settle?: SettleOptions
+    settle?: SettleOptions,
+    paymentIdentifier?: string
   ): Promise<SubmitPaymentResult> {
     const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
       component: "rpc",
@@ -146,6 +148,31 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     }
 
     const txArtifactHash = await computePaymentArtifactHash(cleanHex);
+
+    // Payment-identifier cache check — lookup before nonce check so a retry with
+    // the same id + same payload does not re-enter the nonce validation path.
+    const paymentIdService = new PaymentIdService(kv, logger);
+    let payloadHash: string | undefined;
+    if (paymentIdentifier) {
+      payloadHash = await paymentIdService.computePayloadHash(cleanHex, settle ?? null);
+      const cacheResult = await paymentIdService.checkPaymentId(paymentIdentifier, payloadHash, "rpc");
+      if (cacheResult.status === "hit") {
+        logger.info("payment-identifier cache hit, returning cached RPC response", {
+          id: paymentIdentifier,
+        });
+        return cacheResult.response as SubmitPaymentResult;
+      }
+      if (cacheResult.status === "conflict") {
+        logger.warn("payment-identifier conflict on RPC submitPayment", { id: paymentIdentifier });
+        return {
+          accepted: false,
+          error: "Payment identifier already used with a different transaction",
+          code: "PAYMENT_IDENTIFIER_CONFLICT",
+          retryable: false,
+        };
+      }
+    }
+
     const existingRecord = await getReusablePaymentRecord(kv, txArtifactHash);
     if (existingRecord) {
       const reusedStatus = projectReusablePaymentStatus(existingRecord.status);
@@ -408,7 +435,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       }, "warn");
     }
 
-    return {
+    const acceptedResult: SubmitPaymentResult = {
       accepted: true,
       paymentId,
       status: acceptedStatus,
@@ -416,6 +443,14 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       warning,
       checkStatusUrl,
     };
+
+    if (paymentIdentifier && payloadHash) {
+      this.ctx.waitUntil(
+        paymentIdService.recordPaymentId(paymentIdentifier, payloadHash, acceptedResult, "rpc").catch(() => {})
+      );
+    }
+
+    return acceptedResult;
   }
 
   /**
