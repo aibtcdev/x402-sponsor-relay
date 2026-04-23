@@ -1,11 +1,16 @@
 import type { Logger } from "../types";
 
 const PAYMENT_ID_TTL_SECONDS = 300;
-const PAYMENT_ID_SETTLE_PREFIX = "payid:settle:";
-const PAYMENT_ID_VERIFY_PREFIX = "payid:verify:";
 
 /** Endpoint discriminant for KV key namespacing. */
-export type PaymentIdEndpoint = "settle" | "verify";
+export type PaymentIdEndpoint = "settle" | "verify" | "rpc";
+
+/** Map each endpoint to its KV key prefix — single source of truth. */
+const ENDPOINT_PREFIX: Record<PaymentIdEndpoint, string> = {
+  settle: "payid:settle:",
+  verify: "payid:verify:",
+  rpc:    "payid:rpc:",
+};
 
 /**
  * JSON.stringify replacer that sorts object keys recursively.
@@ -109,8 +114,7 @@ export class PaymentIdService {
       return { status: "miss" };
     }
 
-    const prefix = endpoint === "settle" ? PAYMENT_ID_SETTLE_PREFIX : PAYMENT_ID_VERIFY_PREFIX;
-    const key = `${prefix}${id}`;
+    const key = `${ENDPOINT_PREFIX[endpoint]}${id}`;
 
     try {
       const entry = await this.kv.get<CachedPaymentIdEntry>(key, "json");
@@ -163,8 +167,7 @@ export class PaymentIdService {
       return;
     }
 
-    const prefix = endpoint === "settle" ? PAYMENT_ID_SETTLE_PREFIX : PAYMENT_ID_VERIFY_PREFIX;
-    const key = `${prefix}${id}`;
+    const key = `${ENDPOINT_PREFIX[endpoint]}${id}`;
     const entry: CachedPaymentIdEntry = {
       payloadHash,
       response,

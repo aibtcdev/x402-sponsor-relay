@@ -35,7 +35,7 @@
     "vite": "7.3.2"
   },
   "dependencies": {
-    "@aibtc/tx-schemas": "^1.0.0",
+    "@aibtc/tx-schemas": "^1.1.0",
     "@noble/curves": "^2.0.1",
     "@scure/btc-signer": "^2.0.1",
     "@stacks/common": "^7.3.1",
