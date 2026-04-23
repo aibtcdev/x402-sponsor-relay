@@ -6798,11 +6798,9 @@ export class NonceDO {
 
         for (const { walletIndex, address } of reconcileWallets) {
           // Pass pre-fetched nonce info — reconcileNonceForWallet skips Hiro fetch when provided.
-          // If walletIndex is missing from map (shouldn't happen), fall back to live fetch.
-          // null means Hiro was unreachable; reconcile returns null and is skipped silently.
-          const prefetched: HiroNonceInfo | null | undefined = prefetchedNonceInfos.has(walletIndex)
-            ? prefetchedNonceInfos.get(walletIndex)
-            : undefined;
+          // Map.get returns undefined for absent keys (fall back to live fetch) and null for
+          // wallets where Hiro was unreachable (reconcile returns null and is skipped silently).
+          const prefetched = prefetchedNonceInfos.get(walletIndex);
           await this.reconcileNonceForWallet(walletIndex, address, prefetched);
 
           // Clean up StuckTxState entries for nonces that have been confirmed on-chain.
