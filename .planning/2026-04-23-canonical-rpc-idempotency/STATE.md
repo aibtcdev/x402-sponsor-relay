@@ -1,6 +1,6 @@
 # Quest State
 
-Current Phase: 5
+Current Phase: 7
 Quest Status: active
 
 ## Activity Log
@@ -38,3 +38,16 @@ Quest Status: active
   - 225 tests pass (6 new). arc0btc PAT lacked PR review scope; merged as whoabuddy after CI green.
   - Release-please PR #30 opened automatically: chore(main): release tx-schemas 1.1.0.
   - Phase 5 must merge PR #30 before proceeding to relay adoption.
+- 2026-04-23: Phase 5 completed. Squash-merged release-please PR #30 (1e2cb46) into aibtcdev/tx-schemas main.
+  - Workflow run #24824422315: release-please job (11s) + publish job (29s), both green.
+  - `npm view @aibtc/tx-schemas@1.1.0 version` → `1.1.0` confirmed ~60s after merge.
+  - Published: paymentIdentifier schema, RPC field, PAYMENT_IDENTIFIER_CONFLICT error code.
+  - Phase 6 (relay adoption of 1.1.0) can now proceed.
+- 2026-04-23: Phase 6 completed. Squash-merged PR #355 into x402-sponsor-relay main (commit 97f0b6b).
+  - @aibtc/tx-schemas bumped to ^1.1.0. submitPayment(txHex, settle?, paymentIdentifier?) new optional 3rd arg.
+  - PaymentIdService extended with "rpc" endpoint; ENDPOINT_PREFIX lookup map eliminates ternary duplication.
+  - Cache lookup before checkSenderNonce: hit+same → cached paymentId; hit+different → PAYMENT_IDENTIFIER_CONFLICT; miss → normal flow, store on accept.
+  - Discovery docs updated: /llms-full.txt Internal Service Binding section, /topics/x402-v2-facilitator RPC parity section.
+  - 11 new tests (117 total). Simplifier caught real hash behavior fact (null ≠ undefined in JSON.stringify).
+  - arc0btc PAT still lacks PR review scope; merged as whoabuddy after independent re-read.
+  - Post-deploy log monitoring pending (Cloudflare auto-deploys from main). Phase 7 (close #292) is next.

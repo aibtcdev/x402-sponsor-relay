@@ -18,11 +18,11 @@ Status: `completed`
 
 ## Phase 5: Release tx-schemas + publish to npm
 Goal: Merge the release-please PR generated from Phase 4 to cut the new minor version and publish `@aibtc/tx-schemas` to npm. No code change in this phase — gating step so downstream phases can install the new version.
-Status: `pending`
+Status: `completed`
 
 ## Phase 6: Relay RPC routes through PaymentIdService (#351)
 Goal: In x402-sponsor-relay, bump `@aibtc/tx-schemas` to the new version and route RPC `submitPayment` through the existing `PaymentIdService`. Cache hit + same payload → idempotent return; cache hit + different payload → `PAYMENT_IDENTIFIER_CONFLICT`. Ship pure-additive (no SHA-256 fallback yet). Update `/llms-full.txt` and `/topics/x402-v2-facilitator` discovery docs to describe the RPC parity. Add tests mirroring the V2 path's cache hit/miss/conflict cases. Depends on Phase 5.
-Status: `pending`
+Status: `completed`
 
 ## Phase 7: Close PR #292 with redirect
 Goal: Close PR #292 with a comment explaining that the canonical client-supplied `payment-identifier` path shipped in #351, linking to the new docs, and noting the SHA-256 fallback for unaware clients can be re-evaluated as a follow-up if needed. Update issue #277 to reflect resolution path. Depends on Phase 6 merging.
