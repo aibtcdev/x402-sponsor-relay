@@ -66,19 +66,27 @@ export class StxVerifyService {
    */
   verifyMessage(signature: string, message: string): StxVerifyResult {
     try {
+      // Normalize signature: strip optional 0x/0X prefix and validate hex shape
+      const normSig = StxVerifyService.normalizeSignatureHex(signature);
+      if (!normSig.ok) {
+        this.logger.warn("Plain message signature format invalid", { error: normSig.error });
+        return { valid: false, error: normSig.error, code: normSig.code };
+      }
+      const normalizedSignature = normSig.value;
+
       // Hash the message using Stacks prefix
       const messageHash = hashMessage(message);
       const messageHashHex = bytesToHex(messageHash);
 
       // Recover public key from signature
-      const recoveredPubKey = publicKeyFromSignatureRsv(messageHashHex, signature);
+      const recoveredPubKey = publicKeyFromSignatureRsv(messageHashHex, normalizedSignature);
 
       // Derive Stacks address from public key
       const recoveredAddress = getAddressFromPublicKey(recoveredPubKey, this.network);
 
       // Verify signature
       const valid = verifyMessageSignatureRsv({
-        signature,
+        signature: normalizedSignature,
         message,
         publicKey: recoveredPubKey,
       });
@@ -130,6 +138,14 @@ export class StxVerifyService {
     expectedAddress?: string;
   }): StxVerifyResult {
     try {
+      // Normalize signature: strip optional 0x/0X prefix and validate hex shape
+      const normSig = StxVerifyService.normalizeSignatureHex(opts.signature);
+      if (!normSig.ok) {
+        this.logger.warn("SIP-018 signature format invalid", { error: normSig.error });
+        return { valid: false, error: normSig.error, code: normSig.code };
+      }
+      const normalizedSignature = normSig.value;
+
       // Encode structured data according to SIP-018
       const encodedBytes = encodeStructuredDataBytes({
         message: opts.message,
@@ -141,7 +157,7 @@ export class StxVerifyService {
       const hashHex = bytesToHex(hash);
 
       // Recover public key from signature
-      const recoveredPubKey = publicKeyFromSignatureRsv(hashHex, opts.signature);
+      const recoveredPubKey = publicKeyFromSignatureRsv(hashHex, normalizedSignature);
 
       // Derive Stacks address from public key
       const recoveredAddress = getAddressFromPublicKey(recoveredPubKey, this.network);
@@ -359,6 +375,33 @@ export class StxVerifyService {
    */
   static generateSelfServiceMessage(): string {
     return `${STX_MESSAGES.BASE} | ${new Date().toISOString()}`;
+  }
+
+  /**
+   * Normalize a hex signature string for use with publicKeyFromSignatureRsv.
+   *
+   * Strips an optional leading 0x/0X prefix (wallets like Leather/Xverse include it;
+   * Stacks.js expects raw hex and would produce "0x0x…" if given a prefixed string).
+   * Validates that the result is exactly 130 hex characters (65-byte RSV signature).
+   *
+   * Returns { ok: true, value } on success or { ok: false, code, error } for invalid input.
+   * Callers must emit logger.warn (not logger.error) and return INVALID_SIGNATURE on failure
+   * to avoid ERROR-level noise for client-malformed input.
+   */
+  private static normalizeSignatureHex(
+    sig: string
+  ): { ok: true; value: string } | { ok: false; code: "INVALID_SIGNATURE"; error: string } {
+    // Strip optional 0x / 0X prefix
+    const stripped = sig.startsWith("0x") || sig.startsWith("0X") ? sig.slice(2) : sig;
+    // RSV signature = 32 bytes r + 32 bytes s + 1 byte v = 65 bytes = 130 hex chars
+    if (!/^[0-9a-fA-F]{130}$/.test(stripped)) {
+      return {
+        ok: false,
+        code: "INVALID_SIGNATURE",
+        error: `Invalid signature format: expected 130 hex chars (65 bytes RSV), got ${stripped.length}`,
+      };
+    }
+    return { ok: true, value: stripped };
   }
 }
 
