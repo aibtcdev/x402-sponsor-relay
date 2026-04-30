@@ -8960,7 +8960,35 @@ export class NonceDO {
       }
 
       // -------------------------------------------------------------------------
-      // Step 3: Advance wallet head to flushEnd so /assign starts past the
+      // Step 3: Enqueue failed nonces into probe_queue for alarm-driven RBF when
+      // probeDepth is set. A failed gap_fill means the nonce is occupied by a
+      // ghost entry the node won't evict — exactly what the backward probe handles.
+      // This mirrors the empty-range probe path but seeds it with known-stuck
+      // nonces instead of backward enumeration.
+      // -------------------------------------------------------------------------
+      let probeEnqueued = 0;
+      if (probeDepth && probeDepth > 0 && failedNonces.length > 0) {
+        const now = new Date().toISOString();
+        for (const { nonce } of failedNonces) {
+          this.sql.exec(
+            `INSERT INTO probe_queue (wallet_index, nonce, state, created_at)
+             VALUES (?, ?, 'pending', ?)
+             ON CONFLICT (wallet_index, nonce) DO UPDATE SET state = 'pending', created_at = excluded.created_at`,
+            walletIndex,
+            nonce,
+            now
+          );
+          probeEnqueued++;
+        }
+        this.log("info", "flush_wallet_probe_enqueued_on_failure", {
+          walletIndex,
+          probeEnqueued,
+          failedNonces: failedNonces.map((f) => f.nonce),
+        });
+      }
+
+      // -------------------------------------------------------------------------
+      // Step 4: Advance wallet head to flushEnd so /assign starts past the
       // flushed range. Setting it to flushStart would cause immediate conflicts
       // with the self-transfers we just broadcast.
       // -------------------------------------------------------------------------
@@ -8974,6 +9002,7 @@ export class NonceDO {
         retracted,
         filledCount: filled.length,
         failedCount: failedNonces.length,
+        probeEnqueued,
         newHead: flushEnd,
         replayBufferDepth,
       });
@@ -8988,6 +9017,10 @@ export class NonceDO {
         failed: failedNonces,
         newHead: flushEnd,
         replayBufferDepth,
+        ...(probeEnqueued > 0 && {
+          probeEnqueued,
+          note: "Failed nonces enqueued for alarm-driven RBF processing (5/tick, RBF_FEE). Check GET /nonce/state for progress.",
+        }),
         ...(rawFlushEnd > flushStart + MAX_ADMIN_GAP_FILLS && {
           capped: true,
           totalNonceRange: rawFlushEnd - flushStart,
