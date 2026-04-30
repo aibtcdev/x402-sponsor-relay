@@ -13,6 +13,10 @@ The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard th
 5. Storing payment receipts for verification and resource access
 6. Returning the settlement status, sponsored tx hex, and receipt token to the agent
 
+## For downstream consumers
+
+If you're building a worker that calls the relay (landing-page, agent-news, mcp-server, x402-api, skills, etc.), start with **[docs/post-337-downstream-contracts.md](./docs/post-337-downstream-contracts.md)** — it covers the RPC service binding (preferred over HTTP), the `/health` shape, and the canonical error contract.
+
 ## API
 
 ### POST /sponsor
