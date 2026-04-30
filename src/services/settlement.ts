@@ -52,8 +52,10 @@ const MAX_POLL_DELAY_MS = 8_000;
  *  After broadcasting, if the first polling round times out, we retry
  *  polling (without re-broadcasting) since the tx is already in mempool. */
 const POLL_RETRY_ROUNDS = 2;
-/** Reserve a tail window for degraded REST polling if tx streaming is unavailable. */
-const STREAM_FALLBACK_TAIL_MS = 30_000;
+/** Cap on tx-stream wait. The Hiro WebSocket either delivers a terminal
+ *  update within seconds or errors fast — there's no value in waiting longer.
+ *  REST polling is the long-tail strategy; this is just a head-start. */
+const STREAM_BUDGET_MS = 30_000;
 
 // Hiro API timeout configuration
 /** Timeout for each broadcast attempt POST to Hiro /v2/transactions (ms).
@@ -647,12 +649,11 @@ export class SettlementService {
       ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
       : DEFAULT_POLL_TIME_MS;
 
-    const fallbackBudgetMs = Math.min(
-      STREAM_FALLBACK_TAIL_MS,
-      effectivePollTimeMs,
-      Math.max(10_000, Math.floor(effectivePollTimeMs / 3))
-    );
-    const streamBudgetMs = Math.max(0, effectivePollTimeMs - fallbackBudgetMs);
+    // Stream gets a short head-start (≤ STREAM_BUDGET_MS); REST polling gets
+    // the bulk of the budget. Previously the split was reversed and a
+    // fast-erroring stream consumed ~150s before fallback kicked in.
+    const streamBudgetMs = Math.min(STREAM_BUDGET_MS, effectivePollTimeMs);
+    const fallbackBudgetMs = Math.max(0, effectivePollTimeMs - streamBudgetMs);
 
     const initialStatus = await this.fetchHiroTxStatus(txid);
     if (initialStatus) {
