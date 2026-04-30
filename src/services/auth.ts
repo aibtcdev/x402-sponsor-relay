@@ -678,12 +678,12 @@ export class AuthService {
       throw new DuplicateAddressError(type, address);
     }
 
-    const { apiKey, keyId, keyHash } = await this.generateKeyPair("test");
+    const { apiKey, keyId, keyHash } = await this.generateKeyPair("live");
     const { createdAt, expiresAt } = AuthService.createKeyDates();
 
     const metadata: ApiKeyMetadata = {
       keyId,
-      appName: `${type}:${address.slice(0, 8)}`,
+      appName: `${type}:${address}`,
       contactEmail: `${type}+${address}@x402relay.system`,
       tier: "free",
       createdAt,
