@@ -7,6 +7,13 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.32.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.32.0...x402-sponsor-relay-v1.32.1) (2026-04-30)
+
+
+### Bug Fixes
+
+* **nonce:** enqueue failed gap_fill nonces into probe_queue when probeDepth set ([#365](https://github.com/aibtcdev/x402-sponsor-relay/issues/365)) ([39657d7](https://github.com/aibtcdev/x402-sponsor-relay/commit/39657d7a3fb0bce68e51dec628face55032ae26a))
+
 ## [1.32.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.31.0...x402-sponsor-relay-v1.32.0) (2026-04-30)
 
 
