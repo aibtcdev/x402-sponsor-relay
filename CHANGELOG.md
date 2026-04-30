@@ -7,6 +7,21 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.32.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.31.0...x402-sponsor-relay-v1.32.0) (2026-04-30)
+
+
+### Features
+
+* **logs:** downgrade bookkeeping lifecycle warns + add responsibleParty ([#364](https://github.com/aibtcdev/x402-sponsor-relay/issues/364)) ([5665e69](https://github.com/aibtcdev/x402-sponsor-relay/commit/5665e69eab2f5d8f2e6e68ba9e874f96ae7a4a2c))
+
+
+### Bug Fixes
+
+* **auth:** use full address in appName + drop "test" prefix from provisioned keys ([#362](https://github.com/aibtcdev/x402-sponsor-relay/issues/362)) ([e2fd750](https://github.com/aibtcdev/x402-sponsor-relay/commit/e2fd75039d2113bbc06cc070ac1cbe919a0b6c95))
+* **security:** upgrade lodash to 4.18.0 (CVE-2026-4800) ([#359](https://github.com/aibtcdev/x402-sponsor-relay/issues/359)) ([0199890](https://github.com/aibtcdev/x402-sponsor-relay/commit/0199890d9a3a33125a098a650fdb4fa502d99c9a))
+* **stream:** improve Hiro tx stream error logging and reduce stream budget ([#363](https://github.com/aibtcdev/x402-sponsor-relay/issues/363)) ([f195e32](https://github.com/aibtcdev/x402-sponsor-relay/commit/f195e327473533f2368b28b72a192610df685ed7))
+* **stx-verify:** strip 0x prefix and validate signature hex (closes [#344](https://github.com/aibtcdev/x402-sponsor-relay/issues/344)) ([#357](https://github.com/aibtcdev/x402-sponsor-relay/issues/357)) ([f78e6a7](https://github.com/aibtcdev/x402-sponsor-relay/commit/f78e6a73a5d1e3f826e12d1953414ba3a97b854f))
+
 ## [1.31.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.30.1...x402-sponsor-relay-v1.31.0) (2026-04-23)
 
 
