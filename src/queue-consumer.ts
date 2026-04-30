@@ -104,6 +104,10 @@ async function processPaymentMessage(
   // Guard: if txid already set, a prior attempt broadcast this tx successfully.
   // Skip re-sponsoring to avoid burning a fresh nonce slot.
   if (record.txid) {
+    // #327: Idempotent retry reusing an existing broadcast is bookkeeping,
+    // not an incident — emit at info level. Keep the human-readable
+    // `Payment already has txid…` line at warn so operators still see one
+    // message per occurrence in human-tail logs.
     emitPaymentLifecycleEvent(logger, "payment.fallback_used", {
       route: "PAYMENT_QUEUE",
       paymentId,
@@ -114,7 +118,7 @@ async function processPaymentMessage(
       compatShimUsed: false,
       txid: record.txid,
       attempt,
-    }, "warn");
+    });
     logger.warn("Payment already has txid, skipping re-sponsor", {
       paymentId,
       txid: record.txid,
@@ -191,6 +195,9 @@ async function processPaymentMessage(
         if (record.senderAddress) {
           await repairSenderWedgeDO(env, logger, record.senderAddress);
         }
+        // #327: a nonce-gap hold is normal sender-side handling, not an
+        // unresolved incident — emit at info level.
+        // #328: attribute to sender so dashboards can split sender-vs-sponsor.
         emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
           route: "PAYMENT_QUEUE",
           paymentId,
@@ -199,7 +206,8 @@ async function processPaymentMessage(
           checkStatusUrlPresent: false,
           compatShimUsed: false,
           attempt,
-        }, "warn");
+          responsibleParty: "sender",
+        });
         message.ack();
         return;
       }
@@ -238,6 +246,7 @@ async function processPaymentMessage(
 
     if (isRetryable && attempt < MAX_ATTEMPTS) {
       // Let the queue retry with backoff
+      // #328: sponsor-side contention (rate limit / capacity / DO unavailable).
       emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
         route: "PAYMENT_QUEUE",
         paymentId,
@@ -248,6 +257,7 @@ async function processPaymentMessage(
         terminalReason: undefined,
         attempt,
         code,
+        responsibleParty: "sponsor",
       }, "warn");
       logger.warn("Sponsor contention, retrying via queue", {
         paymentId,
@@ -324,6 +334,9 @@ async function processPaymentMessage(
         await releaseNonceDO(env, logger, sponsorNonce, undefined, walletIndex);
       }
 
+      // #328: attribute contention to the responsible wallet so operators
+      // can tell sender-side congestion (origin chaining) from sponsor-side
+      // contention (nonce conflicts, sponsor-pool chaining limits).
       emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
         route: "PAYMENT_QUEUE",
         paymentId,
@@ -336,6 +349,7 @@ async function processPaymentMessage(
         checkStatusUrlPresent: false,
         compatShimUsed: false,
         attempt,
+        responsibleParty: isOriginChaining ? "sender" : "sponsor",
       }, "warn");
       logger.warn("Broadcast contention, retrying via queue", {
         paymentId,
