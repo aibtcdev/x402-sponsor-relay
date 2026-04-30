@@ -228,9 +228,17 @@ export async function waitForHiroTxConfirmationViaStream(
     };
 
     const handleError = (event: unknown) => {
+      // Cloudflare Workers WebSocket error events have non-enumerable
+      // properties, so JSON.stringify(event) was always producing "{}".
+      // Extract the diagnostic fields the runtime exposes (mirroring the
+      // close-event handler below).
+      const err = event as { message?: string; type?: string; code?: number };
       logger.warn("Hiro tx stream errored; falling back", {
         txid,
-        error: JSON.stringify(event),
+        type: err?.type ?? null,
+        code: err?.code ?? null,
+        message:
+          err?.message ?? "(WebSocket error event with no enumerable properties)",
       });
       finish(null, "error");
     };
