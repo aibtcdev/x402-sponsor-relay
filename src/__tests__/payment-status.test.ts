@@ -374,7 +374,7 @@ describe("payment polling runtime alignment", () => {
     const record = createPaymentRecord("pay_submitted", "testnet");
     await putPaymentRecord(kv, record);
 
-    const infoSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const env = {
@@ -407,24 +407,6 @@ describe("payment polling runtime alignment", () => {
     );
     expect(rpcResult.terminalReason).toBeUndefined();
     expect(httpResult.terminalReason).toBeUndefined();
-    expect(infoSpy).toHaveBeenCalledWith("[INFO] payment.poll", expect.objectContaining({
-      service: "relay",
-      route: "rpc.checkPayment",
-      paymentId: "pay_submitted",
-      status: "queued",
-      checkStatusUrl_present: true,
-      compat_shim_used: true,
-      repo_version: expect.any(String),
-    }));
-    expect(infoSpy).toHaveBeenCalledWith("[INFO] payment.poll", expect.objectContaining({
-      service: "relay",
-      route: "GET /payment/:id",
-      paymentId: "pay_submitted",
-      status: "queued",
-      checkStatusUrl_present: true,
-      compat_shim_used: true,
-      repo_version: expect.any(String),
-    }));
     expect(warnSpy).toHaveBeenCalledWith("[WARN] payment.fallback_used", expect.objectContaining({
       service: "relay",
       paymentId: "pay_submitted",

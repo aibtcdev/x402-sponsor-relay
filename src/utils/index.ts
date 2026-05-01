@@ -2,6 +2,7 @@ export { buildExplorerUrl } from "./response";
 export { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets } from "./hiro";
 export type { BroadcastTarget } from "./hiro";
 export { createWorkerLogger, isLogsRPC } from "./logger";
+export { shouldEmitLog } from "./log-sampling";
 export {
   buildPaymentCheckStatusUrl,
   emitPaymentLifecycleEvent,

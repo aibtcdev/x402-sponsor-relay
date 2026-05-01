@@ -1,4 +1,5 @@
 import type { Logger, LogsRPC } from "../types";
+import { shouldEmitLog } from "./log-sampling";
 
 const APP_ID = "x402-relay";
 
@@ -29,11 +30,14 @@ function createRpcLogger(
     message: string,
     context?: Record<string, unknown>
   ) => {
+    const mergedContext = {
+      ...baseContext,
+      ...context,
+    };
+    if (!shouldEmitLog(level, message, mergedContext)) return;
+
     try {
-      const result = logs[level](APP_ID, message, {
-        ...baseContext,
-        ...context,
-      });
+      const result = logs[level](APP_ID, message, mergedContext);
       const promise = Promise.resolve(result).catch(() => {});
       try {
         ctx.waitUntil(promise);
@@ -64,7 +68,10 @@ function createRpcLogger(
 function createConsoleLogger(baseContext: Record<string, unknown>): Logger {
   return {
     info: (message, context) => {
-      console.log(`[INFO] ${message}`, { ...baseContext, ...context });
+      const mergedContext = { ...baseContext, ...context };
+      if (shouldEmitLog("info", message, mergedContext)) {
+        console.log(`[INFO] ${message}`, mergedContext);
+      }
     },
     warn: (message, context) => {
       console.warn(`[WARN] ${message}`, { ...baseContext, ...context });

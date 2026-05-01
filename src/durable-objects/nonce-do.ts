@@ -18,6 +18,7 @@ import type {
   HandSubmitResult,
   RunDispatchResult,
 } from "../types";
+import { shouldEmitLog } from "../utils/log-sampling";
 import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 import {
   getPaymentRecord,
@@ -2122,6 +2123,8 @@ export class NonceDO {
     message: string,
     context?: Record<string, unknown>
   ): void {
+    if (!shouldEmitLog(level, message, context)) return;
+
     if (isLogsRPC(this.env.LOGS)) {
       this.state.waitUntil(this.env.LOGS[level](APP_ID, message, context));
     } else {
