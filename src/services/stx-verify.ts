@@ -11,10 +11,48 @@ import {
   hashMessage,
   verifyMessageSignatureRsv,
 } from "@stacks/encryption";
-import { bytesToHex } from "@stacks/common";
-import { sha256 } from "@noble/hashes/sha256";
+import { bytesToHex, hexToBytes } from "@stacks/common";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { secp256k1 } from "@noble/curves/secp256k1.js";
 import type { Logger, Sip018Auth } from "../types";
 import { SIP018_DOMAIN } from "../types";
+
+/**
+ * Expand a hex signature into recovery candidates covering RSV, VRS, and raw r||s formats.
+ *
+ * Stacks signers disagree on byte ordering and recovery-id convention:
+ *   - @stacks/encryption signMessageHashRsv → 65-byte RSV (r||s||v), v ∈ {0,1}
+ *   - Leather wallet older paths / some BIP-137 signers → 65-byte VRS (v||r||s), v ∈ {27,28}
+ *   - @noble/curves raw output → 64-byte r||s, recovery bit separate
+ *
+ * Returns up to 4 candidates; each is tried in order and the first whose recovered
+ * pubkey hashes to the expected address wins.
+ */
+function signatureCandidates(sigHex: string): Array<{ rsBytes: Uint8Array; recoveryId: 0 | 1 }> {
+  const sigBytes = hexToBytes(sigHex.replace(/^0x/, ""));
+  const out: Array<{ rsBytes: Uint8Array; recoveryId: 0 | 1 }> = [];
+
+  if (sigBytes.length === 64) {
+    // Raw r||s — recovery id is unknown, try both
+    out.push({ rsBytes: sigBytes, recoveryId: 0 });
+    out.push({ rsBytes: sigBytes, recoveryId: 1 });
+  } else if (sigBytes.length === 65) {
+    // RSV layout: r(32) || s(32) || v(1)
+    const vRsv = sigBytes[64];
+    const recRsv = vRsv === 27 || vRsv === 28 ? ((vRsv - 27) as 0 | 1) : (vRsv as 0 | 1);
+    if (recRsv === 0 || recRsv === 1) {
+      out.push({ rsBytes: sigBytes.slice(0, 64) as Uint8Array, recoveryId: recRsv });
+    }
+    // VRS layout: v(1) || r(32) || s(32)
+    const vVrs = sigBytes[0];
+    const recVrs = vVrs === 27 || vVrs === 28 ? ((vVrs - 27) as 0 | 1) : (vVrs as 0 | 1);
+    if (recVrs === 0 || recVrs === 1) {
+      out.push({ rsBytes: sigBytes.slice(1, 65) as Uint8Array, recoveryId: recVrs });
+    }
+  }
+
+  return out;
+}
 
 /**
  * Standard messages for Stacks signature verification
@@ -120,8 +158,16 @@ export class StxVerifyService {
   }
 
   /**
-   * Verify a SIP-018 structured data signature
-   * Recovers the signer's Stacks address from an RSV signature of SIP-018 encoded data.
+   * Verify a SIP-018 structured data signature.
+   *
+   * Accepts three wire formats to handle wallet diversity:
+   *   - 65-byte RSV (r||s||v)  — produced by @stacks/encryption.signMessageHashRsv
+   *   - 65-byte VRS (v||r||s)  — produced by some BIP-137 / Leather wallet paths
+   *   - 64-byte raw r||s       — tries both recoveryId 0 and 1
+   * Recovery bytes 27/28 (BIP-137 convention) are normalized to 0/1.
+   * If expectedAddress is supplied the recovered pubkey is checked against both
+   * mainnet (version 22) and testnet (version 26) address encodings so that
+   * callers need not know which network the signer used.
    */
   verifySip018(opts: {
     signature: string;
@@ -130,45 +176,50 @@ export class StxVerifyService {
     expectedAddress?: string;
   }): StxVerifyResult {
     try {
-      // Encode structured data according to SIP-018
       const encodedBytes = encodeStructuredDataBytes({
         message: opts.message,
         domain: opts.domain,
       });
-
-      // Hash the encoded bytes
       const hash = sha256(encodedBytes);
-      const hashHex = bytesToHex(hash);
 
-      // Recover public key from signature
-      const recoveredPubKey = publicKeyFromSignatureRsv(hashHex, opts.signature);
-
-      // Derive Stacks address from public key
-      const recoveredAddress = getAddressFromPublicKey(recoveredPubKey, this.network);
-
-      // If expectedAddress is provided, verify it matches
-      if (opts.expectedAddress && recoveredAddress !== opts.expectedAddress) {
-        this.logger.warn("SIP-018 signature address mismatch", {
-          expected: opts.expectedAddress,
-          recovered: recoveredAddress,
-        });
+      const candidates = signatureCandidates(opts.signature);
+      if (candidates.length === 0) {
         return {
           valid: false,
-          error: `Signature address mismatch: expected ${opts.expectedAddress}, got ${recoveredAddress}`,
+          error: "Unrecognized signature format: must be 64 or 65 bytes hex",
           code: "INVALID_SIGNATURE",
         };
       }
 
-      this.logger.info("SIP-018 signature verified", {
-        stxAddress: recoveredAddress,
-      });
+      for (const { rsBytes, recoveryId } of candidates) {
+        let pubkeyHex: string;
+        try {
+          const sig = secp256k1.Signature.fromBytes(rsBytes).addRecoveryBit(recoveryId);
+          pubkeyHex = sig.recoverPublicKey(hash).toHex(true);
+        } catch {
+          continue;
+        }
 
-      return {
-        valid: true,
-        stxAddress: recoveredAddress,
-        publicKey: recoveredPubKey,
-        path: "sip018",
-      };
+        if (opts.expectedAddress) {
+          // Check both mainnet and testnet address encodings
+          for (const net of ["mainnet", "testnet"] as const) {
+            if (getAddressFromPublicKey(pubkeyHex, net) === opts.expectedAddress) {
+              this.logger.info("SIP-018 signature verified", { stxAddress: opts.expectedAddress });
+              return { valid: true, stxAddress: opts.expectedAddress, publicKey: pubkeyHex, path: "sip018" };
+            }
+          }
+        } else {
+          const recoveredAddress = getAddressFromPublicKey(pubkeyHex, this.network);
+          this.logger.info("SIP-018 signature verified", { stxAddress: recoveredAddress });
+          return { valid: true, stxAddress: recoveredAddress, publicKey: pubkeyHex, path: "sip018" };
+        }
+      }
+
+      const errMsg = opts.expectedAddress
+        ? `Signature address mismatch: no candidate matched ${opts.expectedAddress}`
+        : "Could not recover public key from signature";
+      this.logger.warn("SIP-018 signature verification failed", { error: errMsg });
+      return { valid: false, error: errMsg, code: "INVALID_SIGNATURE" };
     } catch (error) {
       this.logger.error("SIP-018 verification error", {
         error: error instanceof Error ? error.message : "Unknown error",
