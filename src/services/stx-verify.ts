@@ -1,5 +1,4 @@
 import {
-  publicKeyFromSignatureRsv,
   getAddressFromPublicKey,
   encodeStructuredDataBytes,
   tupleCV,
@@ -7,11 +6,8 @@ import {
   stringAsciiCV,
   type ClarityValue,
 } from "@stacks/transactions";
-import {
-  hashMessage,
-  verifyMessageSignatureRsv,
-} from "@stacks/encryption";
-import { bytesToHex, hexToBytes } from "@stacks/common";
+import { hashMessage } from "@stacks/encryption";
+import { hexToBytes } from "@stacks/common";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import type { Logger, Sip018Auth } from "../types";
@@ -99,50 +95,47 @@ export class StxVerifyService {
   ) {}
 
   /**
-   * Verify a plain Stacks message signature (SIWS-style)
-   * Recovers the signer's Stacks address from an RSV signature of a plain string message.
+   * Verify a plain Stacks message signature (SIWS-style).
+   *
+   * Accepts the same three wire formats as verifySip018 — RSV, VRS, and raw r||s —
+   * so BIP-137 wallets (Leather older paths, v ∈ {27,28}) are not silently rejected.
+   * Recovery bytes 27/28 are normalized to 0/1.
+   *
+   * The returned stxAddress uses this.network's encoding when no expectedAddress is
+   * provided. Callers that need a specific network encoding should convert the returned
+   * publicKey via getAddressFromPublicKey themselves.
    */
   verifyMessage(signature: string, message: string): StxVerifyResult {
     try {
-      // Hash the message using Stacks prefix
       const messageHash = hashMessage(message);
-      const messageHashHex = bytesToHex(messageHash);
-
-      // Recover public key from signature
-      const recoveredPubKey = publicKeyFromSignatureRsv(messageHashHex, signature);
-
-      // Derive Stacks address from public key
-      const recoveredAddress = getAddressFromPublicKey(recoveredPubKey, this.network);
-
-      // Verify signature
-      const valid = verifyMessageSignatureRsv({
-        signature,
-        message,
-        publicKey: recoveredPubKey,
-      });
-
-      if (!valid) {
-        this.logger.warn("Plain message signature verification failed", {
-          message,
-          recoveredAddress,
-        });
+      const candidates = signatureCandidates(signature);
+      if (candidates.length === 0) {
         return {
           valid: false,
-          error: "Invalid signature for message",
+          error: "Unrecognized signature format: must be 64 or 65 bytes hex",
           code: "INVALID_SIGNATURE",
         };
       }
 
-      this.logger.info("Plain message signature verified", {
-        stxAddress: recoveredAddress,
-        message,
-      });
+      for (const { rsBytes, recoveryId } of candidates) {
+        let pubkeyHex: string;
+        try {
+          const sig = secp256k1.Signature.fromBytes(rsBytes).addRecoveryBit(recoveryId);
+          pubkeyHex = sig.recoverPublicKey(messageHash).toHex(true);
+        } catch {
+          continue;
+        }
 
+        const recoveredAddress = getAddressFromPublicKey(pubkeyHex, this.network);
+        this.logger.info("Plain message signature verified", { stxAddress: recoveredAddress, message });
+        return { valid: true, stxAddress: recoveredAddress, publicKey: pubkeyHex, path: "plain-message" };
+      }
+
+      this.logger.warn("Plain message signature verification failed", { message });
       return {
-        valid: true,
-        stxAddress: recoveredAddress,
-        publicKey: recoveredPubKey,
-        path: "plain-message",
+        valid: false,
+        error: "Invalid signature for message",
+        code: "INVALID_SIGNATURE",
       };
     } catch (error) {
       this.logger.error("Plain message verification error", {
