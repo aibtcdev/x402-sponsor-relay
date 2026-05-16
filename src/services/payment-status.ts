@@ -22,6 +22,38 @@ const PAYMENT_ARTIFACT_KEY_PREFIX = "payment_artifact:";
 const PAYMENT_TTL_SECONDS = 86_400; // 24 hours
 
 /**
+ * Settlement buffer added to `holdExpiresAt` when computing the held-record TTL floor.
+ * Gives multi-payment-burst recoveries (where auto-repair may take minutes-to-hours after
+ * the hold expires) a comfortable margin before the PaymentRecord disappears from KV.
+ * Without this, users see `not_found / expired` after a confirmed tx whose hold window
+ * outlived the static 24h base TTL — see #372 for the burst-traffic instance of #284.
+ */
+const SETTLEMENT_BUFFER_SECONDS = 21_600; // 6 hours
+
+/**
+ * Compute the KV `expirationTtl` for a PaymentRecord write.
+ *
+ * For records currently held (`holdExpiresAt` set and in the future), returns
+ * `max(PAYMENT_TTL_SECONDS, secondsUntil(holdExpiresAt) + SETTLEMENT_BUFFER_SECONDS)`
+ * so the record outlives the hold window plus a settlement buffer. For all other
+ * records, returns the static `PAYMENT_TTL_SECONDS`.
+ *
+ * Exported for testability — production callers should use `putPaymentRecord`.
+ */
+export function computePaymentExpirationTtl(
+  record: Pick<PaymentRecord, "holdExpiresAt">,
+  nowMs: number = Date.now()
+): number {
+  if (!record.holdExpiresAt) return PAYMENT_TTL_SECONDS;
+  const holdExpiresMs = Date.parse(record.holdExpiresAt);
+  if (!Number.isFinite(holdExpiresMs) || holdExpiresMs <= nowMs) {
+    return PAYMENT_TTL_SECONDS;
+  }
+  const secondsUntilHoldExpires = Math.ceil((holdExpiresMs - nowMs) / 1000);
+  return Math.max(PAYMENT_TTL_SECONDS, secondsUntilHoldExpires + SETTLEMENT_BUFFER_SECONDS);
+}
+
+/**
  * Payment lifecycle statuses.
  *
  * - submitted: RPC received the request, pre-validation passed
@@ -273,14 +305,20 @@ export async function getPaymentRecord(
 }
 
 /**
- * Write a payment record to KV with 24h TTL.
+ * Write a payment record to KV.
+ *
+ * TTL is the base 24h, extended to `holdExpiresAt + SETTLEMENT_BUFFER_SECONDS` when
+ * the record is held — see `computePaymentExpirationTtl`. This prevents the
+ * `not_found / expired` UX failure mode reported in #372 where a held record's TTL
+ * could elapse during a long recovery window even though the underlying tx
+ * eventually confirmed.
  */
 export async function putPaymentRecord(
   kv: KVNamespace,
   record: PaymentRecord
 ): Promise<void> {
   await kv.put(paymentKey(record.paymentId), JSON.stringify(record), {
-    expirationTtl: PAYMENT_TTL_SECONDS,
+    expirationTtl: computePaymentExpirationTtl(record),
   });
 }
 
