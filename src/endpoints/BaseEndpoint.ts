@@ -66,6 +66,7 @@ export class BaseEndpoint extends OpenAPIRoute {
       settlement?: SettlementResult;
       sponsoredTx?: string;
       receiptId?: string;
+      nonceExpiresAt?: string;
     }
   ) {
     const response: RelaySuccessResponse = {
@@ -76,6 +77,7 @@ export class BaseEndpoint extends OpenAPIRoute {
       ...(opts.settlement && { settlement: opts.settlement }),
       ...(opts.sponsoredTx && { sponsoredTx: opts.sponsoredTx }),
       ...(opts.receiptId && { receiptId: opts.receiptId }),
+      ...(opts.nonceExpiresAt && { nonceExpiresAt: opts.nonceExpiresAt }),
     };
     return c.json(response);
   }
