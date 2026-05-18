@@ -547,12 +547,29 @@ export class Settle extends BaseEndpoint {
         // so isClientError is naturally false for relay congestion.
         const isClientError = clientRejection !== undefined;
 
+        // Log structured attribution from the broadcast-outcome pipeline (#377).
+        // responsible/agentErrorCode are populated by parseBroadcastOutcome + decideBroadcastAction
+        // in settlement.broadcastAndConfirm using reason_data.is_origin from the Stacks node.
+        // Phase 2 will use broadcastResult.responsible to gate re-sponsor recovery.
+        if (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining) {
+          logger.info("Broadcast failure attribution", {
+            responsible: broadcastResult.responsible,
+            agentErrorCode: broadcastResult.agentErrorCode,
+            nonceConflict: broadcastResult.nonceConflict,
+            tooMuchChaining: broadcastResult.tooMuchChaining,
+            isOriginChaining: broadcastResult.isOriginChaining,
+          });
+        }
+
         // Record stats once for all error branches
         c.executionCtx.waitUntil(
           statsService.logFailure("settle", isClientError, failureCtx, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {})
         );
 
         // Sponsor-side issues (nonce conflict or TooMuchChaining) → inline resync + single retry
+        // NOTE: This gate (sponsorNonce !== null) is intentionally preserved from before Phase 1.
+        // Phase 2 will change this gate to use broadcastResult.responsible === "sponsor" so that
+        // pre-sponsored transactions (/settle with pre-signed hex) also get recovery.
         if (sponsorNonce !== null && (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining)) {
           const reason = broadcastResult.nonceConflict ? "nonce_conflict" : "too_much_chaining";
           logger.warn("Sponsor wallet issue on auto-sponsored settle — attempting inline resync + retry", {

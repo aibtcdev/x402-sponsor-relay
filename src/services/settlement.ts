@@ -25,6 +25,8 @@ import type {
 } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REASONS, CLIENT_REJECTION_REASONS, stripHexPrefix } from "../utils";
 import type { BroadcastTarget } from "../utils";
+import { parseBroadcastOutcome, decideBroadcastAction } from "../utils/broadcast-outcome";
+import type { RawBroadcastError } from "../utils/broadcast-outcome";
 import {
   SBTC_CONTRACT_MAINNET,
   SBTC_CONTRACT_NAME,
@@ -860,24 +862,42 @@ export class SettlementService {
               const senderSigner = transaction.auth.spendingCondition.signer;
               const senderNonce = Number(transaction.auth.spendingCondition.nonce);
 
-              if (sponsorNonceForLog === null) {
-                // No relay-assigned sponsor nonce: this is a client pre-signed tx.
-                // Log at INFO — the nonce conflict is the client's problem, not the relay's.
-                this.logger.info("Broadcast rejected due to client nonce conflict (pre-signed tx)", {
+              // Use the structured pipeline to determine who is responsible for the
+              // nonce conflict. parseBroadcastOutcome + decideBroadcastAction reads
+              // reason_data.is_origin from the Stacks node response to distinguish
+              // sender-caused from sponsor-caused conflicts (#377).
+              // This replaces the sponsorNonceForLog === null heuristic which only
+              // approximated attribution by checking whether a relay nonce was assigned.
+              const rawBroadcastErr: RawBroadcastError = {
+                status: broadcastResponse.status,
+                reason: errorDetails,  // errorDetails holds the Stacks reason string (e.g. "ConflictingNonceInMempool")
+                body: responseText,
+                reasonData: reasonData as Record<string, unknown> | undefined,
+              };
+              const broadcastOutcome = parseBroadcastOutcome(rawBroadcastErr);
+              const broadcastDecision = decideBroadcastAction(broadcastOutcome);
+
+              // Log based on structured attribution instead of sponsorNonceForLog heuristic
+              if (broadcastDecision.responsible === "sender") {
+                this.logger.info("Broadcast rejected due to sender nonce conflict", {
                   status: broadcastResponse.status,
                   details: conflictDetails,
                   senderSigner,
                   senderNonce,
+                  responsible: broadcastDecision.responsible,
+                  agentErrorCode: broadcastDecision.agentErrorCode,
+                  sponsorNonce: sponsorNonceForLog,
                   nodeUrl: target.baseUrl,
                 });
               } else {
-                // Relay assigned a sponsor nonce: unexpected conflict on relay side.
+                // sponsor or network responsible
                 this.logger.warn("Broadcast rejected due to nonce conflict", {
                   status: broadcastResponse.status,
                   details: conflictDetails,
                   sponsorNonce: sponsorNonceForLog,
                   senderSigner,
                   senderNonce,
+                  responsible: broadcastDecision.responsible,
                   nodeUrl: target.baseUrl,
                 });
               }
@@ -893,6 +913,10 @@ export class SettlementService {
                 clientRejection: matchedReason,
                 nodeUrl: target.baseUrl,
                 httpStatus: broadcastResponse.status,
+                responsible: broadcastDecision.responsible,
+                agentErrorCode: broadcastDecision.responsible === "sender"
+                  ? broadcastDecision.agentErrorCode
+                  : undefined,
               };
             }
 
@@ -900,8 +924,17 @@ export class SettlementService {
             // The node's reason_data.is_origin distinguishes origin (sender) vs sponsor triggers.
             // On sponsor-side this is relay congestion — retryable after backoff.
             // On origin-side this is the agent's problem — report back, don't penalize sponsor.
-            if (matchedReason === "TooMuchChaining" && sponsorNonceForLog !== null) {
+            if (matchedReason === "TooMuchChaining") {
+              const rawBroadcastErr: RawBroadcastError = {
+                status: broadcastResponse.status,
+                reason: errorDetails,
+                body: responseText,
+                reasonData: reasonData as Record<string, unknown> | undefined,
+              };
+              const chainOutcome = parseBroadcastOutcome(rawBroadcastErr);
+              const chainDecision = decideBroadcastAction(chainOutcome);
               const isOrigin = reasonData?.is_origin === true;
+
               this.logger.warn(
                 isOrigin
                   ? "Origin (sender) chaining limit hit (TooMuchChaining)"
@@ -911,6 +944,10 @@ export class SettlementService {
                   details: errorDetails,
                   sponsorNonce: sponsorNonceForLog,
                   isOrigin,
+                  responsible: chainDecision.responsible,
+                  agentErrorCode: chainDecision.responsible === "sender"
+                    ? chainDecision.agentErrorCode
+                    : undefined,
                   principal: reasonData?.principal,
                   expected: reasonData?.expected,
                   actual: reasonData?.actual,
@@ -927,6 +964,10 @@ export class SettlementService {
                 isOriginChaining: isOrigin,
                 nodeUrl: target.baseUrl,
                 httpStatus: broadcastResponse.status,
+                responsible: chainDecision.responsible,
+                agentErrorCode: chainDecision.responsible === "sender"
+                  ? chainDecision.agentErrorCode
+                  : undefined,
               };
             }
 

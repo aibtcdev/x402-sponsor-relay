@@ -506,6 +506,19 @@ export class Relay extends BaseEndpoint {
         const clientRejection = broadcastResult.clientRejection;
         const isClientError = clientRejection !== undefined;
 
+        // Log structured attribution from the broadcast-outcome pipeline (#377).
+        // responsible/agentErrorCode are populated by parseBroadcastOutcome + decideBroadcastAction
+        // in settlement.broadcastAndConfirm using reason_data.is_origin from the Stacks node.
+        if (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining) {
+          logger.info("Broadcast failure attribution", {
+            responsible: broadcastResult.responsible,
+            agentErrorCode: broadcastResult.agentErrorCode,
+            nonceConflict: broadcastResult.nonceConflict,
+            tooMuchChaining: broadcastResult.tooMuchChaining,
+            isOriginChaining: broadcastResult.isOriginChaining,
+          });
+        }
+
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "internal").catch(() => {}));
         c.executionCtx.waitUntil(
           statsService.logFailure("relay", isClientError, {
@@ -526,6 +539,9 @@ export class Relay extends BaseEndpoint {
         // Sponsor-side issues (nonce conflict or TooMuchChaining) → inline resync + single retry.
         // Mirror the pattern in settle.ts:494-583: await resync, re-sponsor, re-verify, re-broadcast.
         // Only fall back to 409/429 if the retry also fails.
+        // NOTE: broadcastResult.responsible is now available from the structured pipeline.
+        // Recovery still triggers on nonceConflict/tooMuchChaining for backward compat;
+        // Phase 2 will refine the gating to use responsible === "sponsor" instead.
         if (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining) {
           const retryReason = broadcastResult.nonceConflict ? "nonce_conflict" : "too_much_chaining";
           logger.warn("Sponsor wallet issue on relay — attempting inline resync + retry", {
