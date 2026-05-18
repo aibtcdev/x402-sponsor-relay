@@ -418,6 +418,12 @@ export const X402_V2_ERROR_CODES = {
   SIGNATURE_VALIDATION_FAILED: "signature_validation_failed",
   /** Transaction is held pending a sender nonce gap fill — agent must submit missing nonces */
   TRANSACTION_HELD: "transaction_held",
+  /**
+   * Pre-sponsored tx conflict caused by the sender's nonce — relay cannot recover
+   * because the conflict originates from the client's origin spending condition.
+   * Sender must re-sign with the correct nonce before retrying.
+   */
+  SENDER_NONCE_CONFLICT: "sender_nonce_conflict",
 } as const;
 
 /**
@@ -611,7 +617,8 @@ export type RelayErrorCode =
   | "MALFORMED_PAYLOAD"
   | "QUEUE_NOT_FOUND"
   | "QUEUE_ACCESS_DENIED"
-  | "SENDER_NONCE_GAP";
+  | "SENDER_NONCE_GAP"
+  | "SENDER_NONCE_CONFLICT";
 
 /**
  * Default retry-after for SERVICE_DEGRADED responses (seconds).
