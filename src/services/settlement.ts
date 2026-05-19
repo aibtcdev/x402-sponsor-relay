@@ -35,7 +35,7 @@ import {
   SIP010_TRANSFER_FUNCTION,
 } from "../utils/token-contracts";
 import { extractSponsorNonce } from "./sponsor";
-import { waitForHiroTxConfirmationViaStream } from "./hiro-tx-stream";
+import { waitForHiroTxConfirmationViaStream, HiroTxStream, buildHiroTxStreamUrl } from "./hiro-tx-stream";
 
 // Polling configuration
 /** Default max poll time for confirmation polling.
@@ -105,9 +105,36 @@ export class SettlementService {
   private env: Env;
   private logger: Logger;
 
+  /**
+   * Pooled HiroTxStream instances keyed by sender address.
+   * One WS per sender so 20 concurrent /settle calls on the same sender address
+   * open only one Hiro WebSocket instead of twenty.
+   *
+   * Entries are created lazily and never evicted — Cloudflare Workers isolates
+   * are short-lived, so in-memory state self-clears on eviction without leaking
+   * sockets beyond the Worker's lifetime.
+   */
+  private readonly txStreams = new Map<string, HiroTxStream>();
+
   constructor(env: Env, logger: Logger) {
     this.env = env;
     this.logger = logger;
+  }
+
+  /**
+   * Return the pooled HiroTxStream for `senderAddress`, creating one if absent.
+   * All streams for this SettlementService instance share the same WS URL
+   * (derived from the network environment) but each sender gets its own stream
+   * so their txid interests are isolated and lifecycle is independent.
+   */
+  private getOrCreateStream(senderAddress: string): HiroTxStream {
+    let stream = this.txStreams.get(senderAddress);
+    if (!stream) {
+      const url = buildHiroTxStreamUrl(this.env.STACKS_NETWORK);
+      stream = new HiroTxStream(url, this.logger);
+      this.txStreams.set(senderAddress, stream);
+    }
+    return stream;
   }
 
   /**
@@ -640,10 +667,15 @@ export class SettlementService {
   /**
    * Prefer Hiro's tx-update WebSocket stream, then fall back to REST polling with
    * the remaining tail budget if the stream is unavailable or incomplete.
+   *
+   * When `senderAddress` is provided, the stream subscription is multiplexed over
+   * a single pooled WebSocket for that sender (one WS per sender across all
+   * concurrent /settle calls). When absent, a one-shot WS is used (backward compat).
    */
   async awaitConfirmationPublic(
     txid: string,
     maxPollTimeMs?: number,
+    senderAddress?: string,
   ): Promise<BroadcastAndConfirmResult> {
     const effectivePollTimeMs = maxPollTimeMs != null && maxPollTimeMs > 0
       ? Math.min(maxPollTimeMs, MAX_POLL_TIME_MS)
@@ -673,12 +705,31 @@ export class SettlementService {
     }
 
     if (streamBudgetMs > 0) {
-      const streamResult = await waitForHiroTxConfirmationViaStream({
-        txid,
-        network: this.env.STACKS_NETWORK,
-        timeoutMs: streamBudgetMs,
-        logger: this.logger,
-      });
+      let streamResult: BroadcastAndConfirmResult | null;
+      if (senderAddress) {
+        // Pooled path: reuse one WS per sender across concurrent calls.
+        const stream = this.getOrCreateStream(senderAddress);
+        const subscribePromise = stream.subscribe(txid);
+        const timeoutPromise = new Promise<null>((resolve) => {
+          setTimeout(() => {
+            this.logger.info("Pooled Hiro tx stream timed out; falling back to polling", {
+              txid,
+              senderAddress,
+              streamBudgetMs,
+            });
+            resolve(null);
+          }, streamBudgetMs);
+        });
+        streamResult = await Promise.race([subscribePromise, timeoutPromise]);
+      } else {
+        // One-shot path: backward compat when no sender address is available.
+        streamResult = await waitForHiroTxConfirmationViaStream({
+          txid,
+          network: this.env.STACKS_NETWORK,
+          timeoutMs: streamBudgetMs,
+          logger: this.logger,
+        });
+      }
       if (streamResult !== null) {
         return streamResult;
       }
@@ -1043,7 +1094,16 @@ export class SettlementService {
       return { txid, status: "pending" };
     }
 
-    return await this.awaitConfirmationPublic(txid, effectivePollTimeMs);
+    // Extract sender address to enable pooled WS subscription (one WS per sender).
+    // Falls back gracefully to one-shot WS if address extraction fails.
+    let senderAddress: string | undefined;
+    try {
+      senderAddress = this.senderToAddress(transaction, this.env.STACKS_NETWORK);
+    } catch {
+      // Non-fatal — awaitConfirmationPublic falls back to one-shot WS path.
+    }
+
+    return await this.awaitConfirmationPublic(txid, effectivePollTimeMs, senderAddress);
   }
 
   /**
