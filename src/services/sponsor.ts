@@ -506,7 +506,7 @@ export class SponsorService {
   private async fetchNonceFromDO(
     sponsorAddress: string
   ): Promise<
-    | { ok: true; nonce: bigint; walletIndex: number; totalReserved: number }
+    | { ok: true; nonce: bigint; walletIndex: number; totalReserved: number; nonceExpiresAt?: string }
     | ({ ok: false; error: string; status: number } & NonceDOErrorBody)
   > {
     if (!this.env.NONCE_DO) {

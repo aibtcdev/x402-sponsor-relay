@@ -30,6 +30,15 @@ const BROADCAST_RETRY_BASE_DELAY_MS = 1_000;
 const BROADCAST_RETRY_MAX_DELAY_MS = 2_000;
 const BROADCAST_TIMEOUT_MS = 12_000;
 
+/**
+ * Duration in milliseconds that a sponsor nonce slot remains valid after assignment.
+ * Must equal STALE_THRESHOLD_MS in src/durable-objects/nonce-do.ts (10 minutes).
+ * Published on every /sponsor success response as `sponsorNonceValidForMs` so
+ * consumers can derive a relative retry budget without parsing the ISO timestamp.
+ * Update this constant if STALE_THRESHOLD_MS changes.
+ */
+const SPONSOR_NONCE_VALID_FOR_MS = 10 * 60 * 1_000; // 600 000 ms = 10 min
+
 type BroadcastResult =
   | { success: true; txid: string }
   | {
@@ -138,6 +147,19 @@ export class Sponsor extends BaseEndpoint {
                   type: "string" as const,
                   description: "Fee paid by sponsor in microSTX",
                   example: "1000",
+                },
+                nonceExpiresAt: {
+                  type: "string" as const,
+                  format: "date-time",
+                  description:
+                    "ISO 8601 UTC timestamp after which the relay may reclaim this sponsor nonce. Callers MUST NOT retry the same sponsored hex past this timestamp — re-call /sponsor with the same inner client-signed payload to mint a fresh sponsorship instead.",
+                  example: "2026-05-18T12:10:00.000Z",
+                },
+                sponsorNonceValidForMs: {
+                  type: "integer" as const,
+                  description:
+                    "Duration in milliseconds for which this sponsor nonce is valid, equal to the relay's STALE_THRESHOLD_MS constant (600000 = 10 minutes). Use this to derive a relative retry budget without parsing the absolute timestamp.",
+                  example: 600000,
                 },
               },
             },
@@ -486,6 +508,8 @@ export class Sponsor extends BaseEndpoint {
         txid,
         explorerUrl: buildExplorerUrl(txid, c.env.STACKS_NETWORK),
         fee: sponsorResult.fee,
+        nonceExpiresAt: sponsorResult.nonceExpiresAt,
+        sponsorNonceValidForMs: SPONSOR_NONCE_VALID_FOR_MS,
       });
     } catch (e) {
       logger.error("Unexpected error", {
