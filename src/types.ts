@@ -1339,6 +1339,21 @@ export type BroadcastAndConfirmResult =
       clientRejection?: string;
       nodeUrl?: string;
       httpStatus?: number;
+      /**
+       * Who is responsible for this broadcast failure.
+       * Derived from parseBroadcastOutcome + decideBroadcastAction using reason_data.is_origin.
+       * - "sender"  → agent's nonce or transaction is invalid; no sponsor slot consumed
+       * - "sponsor" → relay-side conflict; sponsor wallet should resync or skip nonce
+       * - "network" → transient node/network error; retry after delay
+       * undefined on code paths that predate the structured pipeline.
+       */
+      responsible?: "sender" | "sponsor" | "network";
+      /**
+       * Agent-facing error code when responsible === "sender".
+       * Examples: "sender_nonce_confirmed", "origin_chaining_limit", "invalid_transaction"
+       * Undefined when responsible is "sponsor" or "network".
+       */
+      agentErrorCode?: string;
     };
 
 /**
@@ -1357,6 +1372,10 @@ export type BroadcastOnlyResult =
       clientRejection?: string;
       nodeUrl?: string;
       httpStatus?: number;
+      /** Who is responsible for this broadcast failure (see BroadcastAndConfirmResult). */
+      responsible?: "sender" | "sponsor" | "network";
+      /** Agent-facing error code when responsible === "sender". */
+      agentErrorCode?: string;
     };
 
 /**

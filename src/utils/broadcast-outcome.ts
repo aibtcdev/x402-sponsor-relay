@@ -24,6 +24,16 @@ export interface RawBroadcastError {
  *
  * Maps stacks-core MemPoolRejection reason strings to the tx-schemas
  * discriminated union, extracting isOrigin and other fields from reason_data.
+ *
+ * BadNonce routing: stacks-core emits "BadNonce" in two distinct situations:
+ *   (a) is_origin === true  → the *sender* used a nonce that is already confirmed
+ *       on-chain. Routes to nonce_conflict so decideBroadcastAction returns
+ *       responsible:"sender". No sponsor slot should be penalised.
+ *   (b) is_origin !== true  → the *sponsor* used a nonce below the sponsor chain
+ *       head. Routes to nonce_too_low so decideBroadcastAction returns
+ *       responsible:"sponsor" / action:"skip_nonce".
+ * This mirrors the ConflictingNonceInMempool routing and is the correct fix for
+ * the original bug where all BadNonce cases were attributed to the sponsor.
  */
 export function parseBroadcastOutcome(raw: RawBroadcastError): NodeBroadcastOutcome {
   const { reason, status, reasonData } = raw;
@@ -43,6 +53,13 @@ export function parseBroadcastOutcome(raw: RawBroadcastError): NodeBroadcastOutc
       };
 
     case "BadNonce":
+      // When the origin (sender) caused the bad nonce (is_origin=true), treat it
+      // the same as ConflictingNonceInMempool — the sender is responsible.
+      // When the sponsor caused it (is_origin=false/undefined), the nonce is simply
+      // too low for the sponsor chain — route to nonce_too_low (sponsor responsible).
+      if (isOrigin) {
+        return { outcome: "nonce_conflict", isOrigin: true };
+      }
       return { outcome: "nonce_too_low" };
 
     case "FeeTooLow":
