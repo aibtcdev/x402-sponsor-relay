@@ -561,15 +561,14 @@ export class Settle extends BaseEndpoint {
           });
         }
 
-        // Record stats once for all error branches
+        // Record stats once for all error branches (before entering recovery branches).
+        // The recovery branches may fire additional logFailure calls for more precise reasons.
         c.executionCtx.waitUntil(
           statsService.logFailure("settle", isClientError, failureCtx, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {})
         );
 
         // Sponsor-side issues (nonce conflict or TooMuchChaining) → inline resync + single retry
-        // NOTE: This gate (sponsorNonce !== null) is intentionally preserved from before Phase 1.
-        // Phase 2 will change this gate to use broadcastResult.responsible === "sponsor" so that
-        // pre-sponsored transactions (/settle with pre-signed hex) also get recovery.
+        // Gate: sponsorNonce !== null means the relay auto-sponsored this tx (it owns the conflict).
         if (sponsorNonce !== null && (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining)) {
           const reason = broadcastResult.nonceConflict ? "nonce_conflict" : "too_much_chaining";
           logger.warn("Sponsor wallet issue on auto-sponsored settle — attempting inline resync + retry", {
@@ -667,6 +666,116 @@ export class Settle extends BaseEndpoint {
               : X402_V2_ERROR_CODES.BROADCAST_FAILED,
             200
           );
+        } else if (
+          sponsorNonce === null &&
+          (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining)
+        ) {
+          // Pre-sponsored tx (sponsorNonce === null) had a nonce conflict.
+          // Use Phase 1's responsible signal to determine who caused the conflict.
+          if (broadcastResult.responsible === "sponsor") {
+            // Sponsor-fault: the relay's previous sponsor nonce is stale.
+            // Re-sponsor the inner client-signed payload with a fresh sponsor nonce.
+            // parsedTx holds the original deserialized tx — the client's origin
+            // spending condition is preserved; only the sponsor slot is overwritten.
+            logger.warn("Sponsor-fault conflict on pre-sponsored settle — attempting re-sponsor", {
+              nonceConflict: broadcastResult.nonceConflict,
+              tooMuchChaining: broadcastResult.tooMuchChaining,
+            });
+
+            const reResponsorService = new SponsorService(c.env, logger);
+            await reResponsorService.resyncNonceDO();
+
+            const oldSponsorNonce = extractSponsorNonce(parsedTx);
+            const reSponsorResult = await reResponsorService.sponsorTransaction(parsedTx);
+            if (reSponsorResult.success) {
+              const reSponsoredTx = deserializeTransaction(stripHexPrefix(reSponsorResult.sponsoredTxHex));
+              const newSponsorNonce = extractSponsorNonce(reSponsoredTx);
+              const reSponsorWalletIndex = reSponsorResult.walletIndex;
+              const reSponsorFee = reSponsorResult.fee;
+              const reSponsorHex = reSponsorResult.sponsoredTxHex;
+
+              const reVerifyResult = settlementService.verifyPaymentParams(reSponsorHex, settleOptions);
+              if (reVerifyResult.valid) {
+                const reBroadcastResult = await settlementService.broadcastOnly(reVerifyResult.data.transaction);
+                if (!("error" in reBroadcastResult)) {
+                  const senderAddr = settlementService.senderToAddress(reVerifyResult.data.transaction, c.env.STACKS_NETWORK);
+                  logger.info("settle.responsor_after_conflict", {
+                    old_sponsor_nonce: oldSponsorNonce,
+                    new_sponsor_nonce: newSponsorNonce,
+                    sender: senderAddr,
+                    original_txid: "pre_broadcast",
+                    resigned_txid: reBroadcastResult.txid,
+                  });
+                  return this.handleBroadcastSuccess({
+                    c, logger, txid: reBroadcastResult.txid, txHex, network,
+                    sponsorNonce: newSponsorNonce, sponsorWalletIndex: reSponsorWalletIndex, sponsorFee: reSponsorFee,
+                    verifiedTx: reVerifyResult.data.transaction,
+                    recipient: reVerifyResult.data.recipient,
+                    amount: reVerifyResult.data.amount,
+                    settleOptions, settlementService, statsService,
+                    paymentIdService, paymentIdentifier, paymentIdPayloadHash,
+                    submittedAt,
+                  });
+                } else {
+                  // Retry broadcast failed — release nonce, fall through to error
+                  logger.warn("Re-sponsor broadcast failed for pre-sponsored tx", {
+                    error: reBroadcastResult.error,
+                  });
+                  if (newSponsorNonce !== null) {
+                    c.executionCtx.waitUntil(
+                      Promise.all([
+                        recordBroadcastOutcomeDO(
+                          c.env, logger, newSponsorNonce, reSponsorWalletIndex,
+                          undefined, reBroadcastResult.httpStatus, reBroadcastResult.nodeUrl, reBroadcastResult.details
+                        ),
+                        releaseNonceDO(c.env, logger, newSponsorNonce, undefined, reSponsorWalletIndex),
+                      ]).catch((e) => {
+                        logger.warn("Failed nonce lifecycle after re-sponsor broadcast failure", { error: String(e) });
+                      })
+                    );
+                  }
+                }
+              } else {
+                // Verify failed on re-sponsored tx — release nonce
+                logger.warn("Re-sponsor verify failed for pre-sponsored tx", { error: reVerifyResult.error });
+                if (newSponsorNonce !== null) {
+                  c.executionCtx.waitUntil(
+                    releaseNonceDO(c.env, logger, newSponsorNonce, undefined, reSponsorWalletIndex).catch((e) => {
+                      logger.warn("Failed to release nonce after re-verify failure", { error: String(e) });
+                    })
+                  );
+                }
+              }
+            } else if (!("held" in reSponsorResult && reSponsorResult.held)) {
+              const reFail = reSponsorResult as { error: string; code?: string };
+              logger.warn("Re-sponsor failed for pre-sponsored tx", { error: reFail.error, code: reFail.code });
+            }
+
+            // Re-sponsor did not succeed — schedule resync, record stats, return error
+            this.scheduleNonceResync(c, reResponsorService.resyncNonceDODelayed(), logger);
+            c.executionCtx.waitUntil(
+              statsService.logFailure("settle", false, failureCtx, "sponsor_nonce_conflict").catch(() => {})
+            );
+            return v2Error(
+              broadcastResult.nonceConflict
+                ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
+                : X402_V2_ERROR_CODES.BROADCAST_FAILED,
+              200
+            );
+          } else {
+            // Sender-fault on pre-sponsored tx — no sponsor slot was burned.
+            // Return a distinct code so the sender knows to re-sign with the correct nonce.
+            logger.info("Sender-fault nonce conflict on pre-sponsored settle — no sponsor slot burned", {
+              responsible: broadcastResult.responsible,
+              agentErrorCode: broadcastResult.agentErrorCode,
+              nonceConflict: broadcastResult.nonceConflict,
+            });
+            // Record with sender_nonce_stale (maps to "sender" bucket in TERMINAL_REASON_TO_CATEGORY).
+            c.executionCtx.waitUntil(
+              statsService.logFailure("settle", true, failureCtx, "sender_nonce_stale").catch(() => {})
+            );
+            return v2Error(X402_V2_ERROR_CODES.SENDER_NONCE_CONFLICT, 200);
+          }
         }
 
         if (clientRejection) {
