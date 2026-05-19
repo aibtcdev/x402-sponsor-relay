@@ -644,6 +644,7 @@ export class Relay extends BaseEndpoint {
                   settlement: retrySettlement,
                   sponsoredTx: retrySponsorResult.sponsoredTxHex,
                   receiptId: retryStoredReceipt ? retryReceiptId : undefined,
+                  nonceExpiresAt: retrySponsorResult.nonceExpiresAt,
                 });
               } else {
                 // Retry broadcast also failed — release retry nonce, fall through to error
@@ -840,6 +841,7 @@ export class Relay extends BaseEndpoint {
         settlement,
         sponsoredTx: sponsorResult.sponsoredTxHex,
         receiptId: storedReceipt ? receiptId : undefined,
+        nonceExpiresAt: sponsorResult.nonceExpiresAt,
       });
     } catch (e) {
       logger.error("Unexpected error", {

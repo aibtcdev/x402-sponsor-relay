@@ -723,6 +723,8 @@ export interface RelaySuccessResponse extends BaseSuccessResponse {
   sponsoredTx?: string;
   /** Receipt token for verifying payment via GET /verify/:receiptId */
   receiptId?: string;
+  /** ISO 8601 timestamp after which the relay may reclaim this sponsor nonce. Present when sponsoredTx is included. Callers MUST NOT retry the same sponsored hex past this timestamp — re-call the relay endpoint to mint a fresh sponsorship instead. */
+  nonceExpiresAt?: string;
 }
 
 // =============================================================================
@@ -1519,6 +1521,8 @@ export type HandSubmitResult =
       walletIndex: number;
       /** Sponsor wallet Stacks address */
       sponsorAddress: string;
+      /** ISO 8601 timestamp after which the relay may reclaim this sponsor nonce. Callers MUST NOT retry the same sponsored hex past this timestamp — re-call the sponsor endpoint to mint a fresh sponsorship instead. */
+      nonceExpiresAt: string;
     }
   | {
       dispatched: false;

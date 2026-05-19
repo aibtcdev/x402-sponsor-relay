@@ -79,6 +79,8 @@ export interface SponsorSuccess {
   fee: string;
   /** Index of the wallet that signed this transaction (for nonce release routing) */
   walletIndex: number;
+  /** ISO 8601 timestamp after which the relay may reclaim this sponsor nonce. Callers MUST NOT retry the same sponsored hex past this timestamp — re-call the sponsor endpoint to mint a fresh sponsorship instead. Derived from STALE_THRESHOLD_MS at assignment time. */
+  nonceExpiresAt: string;
 }
 
 /**
@@ -549,7 +551,7 @@ export class SponsorService {
         };
       }
 
-      const data = (await response.json()) as { nonce?: number; walletIndex?: number; totalReserved?: number };
+      const data = (await response.json()) as { nonce?: number; walletIndex?: number; totalReserved?: number; nonceExpiresAt?: string };
       if (typeof data?.nonce !== "number") {
         this.logger.warn("Nonce DO response missing nonce field");
         return { ok: false, error: "NonceDO response missing nonce field", status: 500 };
@@ -557,7 +559,8 @@ export class SponsorService {
 
       const walletIndex = typeof data.walletIndex === "number" ? data.walletIndex : 0;
       const totalReserved = typeof data.totalReserved === "number" ? data.totalReserved : 0;
-      return { ok: true, nonce: BigInt(data.nonce), walletIndex, totalReserved };
+      const nonceExpiresAt = typeof data.nonceExpiresAt === "string" ? data.nonceExpiresAt : undefined;
+      return { ok: true, nonce: BigInt(data.nonce), walletIndex, totalReserved, nonceExpiresAt };
     } catch (e) {
       this.logger.warn("Failed to fetch nonce from NonceDO", {
         error: e instanceof Error ? e.message : String(e),
@@ -804,6 +807,8 @@ export class SponsorService {
     // Track whether NonceDO assigned a nonce so we can release it on any failure path
     let nonceFromDO = false;
     let assignedNonceValue: number | undefined;
+    // ISO 8601 expiry for the assigned sponsor nonce slot (from DO assignment, forwarded to callers)
+    let nonceExpiresAt: string | undefined;
     // Pool pressure data from NonceDO for fee tier selection (0 = no data / low pressure)
     let totalReserved = 0;
 
@@ -875,6 +880,7 @@ export class SponsorService {
         walletIndex = handResult.walletIndex;
         nonceFromDO = true;
         assignedNonceValue = handResult.sponsorNonce;
+        nonceExpiresAt = handResult.nonceExpiresAt;
         this.logger.debug("Transaction dispatched via hand-submit", {
           senderAddress,
           senderNonce,
@@ -903,6 +909,7 @@ export class SponsorService {
           totalReserved = doResult.totalReserved;
           nonceFromDO = true;
           assignedNonceValue = Number(doResult.nonce);
+          nonceExpiresAt = doResult.nonceExpiresAt;
           this.logger.debug("Using legacy NonceDO sponsor nonce (hand-submit fallback)", {
             sponsorNonce: sponsorNonce.toString(),
             walletIndex,
@@ -1078,6 +1085,7 @@ export class SponsorService {
         sponsoredTxHex,
         fee: actualFee,
         walletIndex,
+        nonceExpiresAt: nonceExpiresAt ?? new Date(Date.now() + 10 * 60 * 1000).toISOString(),
       };
     } catch (e) {
       this.logger.error("Failed to sponsor transaction", {
