@@ -392,8 +392,20 @@ Content-Type: application/json
   "requestId": "uuid",
   "txid": "0x...",
   "explorerUrl": "https://explorer.hiro.so/txid/0x...",
-  "fee": "1000"                   // microSTX sponsored by relay
+  "fee": "1000",                   // microSTX sponsored by relay
+  "nonceExpiresAt": "2026-05-18T12:10:00.000Z",  // ISO 8601 UTC — DO NOT retry same hex after this
+  "sponsorNonceValidForMs": 600000                // integer ms = STALE_THRESHOLD_MS (10 min)
 }
+
+### Sponsor Nonce TTL
+
+The relay reclaims sponsor nonces after STALE_THRESHOLD_MS (currently 10 minutes).
+Do NOT rebroadcast the same sponsored hex past nonceExpiresAt — the nonce will
+have been reassigned, causing a ConflictingNonceInMempool error with no recovery.
+
+If your retry loop reaches nonceExpiresAt, call /sponsor again with the same
+inner client-signed payload to obtain fresh sponsored hex and a new TTL.
+See docs/sponsor-nonce-ttl.md for the full consumer adoption checklist.
 
 ### Error Responses
 
@@ -1137,7 +1149,8 @@ Success (200):
     "status": "pending"
   },
   "sponsoredTx": "0x...",      // the fully-signed tx with relay's fee signature
-  "receiptId": "uuid"          // save this for later verification
+  "receiptId": "uuid",         // save this for later verification
+  "nonceExpiresAt": "2026-05-18T12:10:00.000Z"  // DO NOT retry sponsoredTx past this timestamp
 }
 
 Error (4xx/5xx): See https://x402-relay.aibtc.com/topics/errors
@@ -1174,8 +1187,27 @@ Success (200):
   "success": true,
   "txid": "0x...",
   "explorerUrl": "https://explorer.hiro.so/txid/0x...",
-  "fee": "1000"
+  "fee": "1000",
+  "nonceExpiresAt": "2026-05-18T12:10:00.000Z",
+  "sponsorNonceValidForMs": 600000
 }
+
+## Sponsor Nonce TTL
+
+Both /relay (when sponsoredTx is present) and /sponsor success responses include:
+
+- nonceExpiresAt: ISO 8601 UTC timestamp after which the relay may reclaim the sponsor nonce.
+  Do NOT retry the same sponsored hex after this timestamp — re-call /relay or /sponsor instead.
+- sponsorNonceValidForMs: integer ms equal to the relay's STALE_THRESHOLD_MS (currently 600000 = 10 min).
+
+Pattern for retry queues:
+  if (Date.now() < Date.parse(item.nonceExpiresAt)) {
+    // still valid — rebroadcast original hex
+  } else {
+    // expired — re-call /sponsor to get fresh hex and new nonceExpiresAt
+  }
+
+Full consumer guide: https://x402-relay.aibtc.com/docs/sponsor-nonce-ttl (or see docs/sponsor-nonce-ttl.md in repo).
 
 ## Transaction Flow Diagram
 

@@ -128,6 +128,8 @@ const NONCE_FETCH_MAX_DELAY_MS = 5000;
 const HIRO_NONCE_TIMEOUT_MS = 10000;
 /** Timeout for Hiro API wallet balance fetch requests (ms) */
 const HIRO_BALANCE_TIMEOUT_MS = 10000;
+/** Fallback expiry window used when NonceDO does not return nonceExpiresAt. Should track STALE_THRESHOLD_MS in nonce-do.ts — update here if Option B bumps that threshold (e.g. to 90 min). */
+const FALLBACK_NONCE_EXPIRY_MS = 10 * 60 * 1000;
 
 /**
  * Error body returned by NonceDO on assignment failure.
@@ -504,7 +506,7 @@ export class SponsorService {
   private async fetchNonceFromDO(
     sponsorAddress: string
   ): Promise<
-    | { ok: true; nonce: bigint; walletIndex: number; totalReserved: number }
+    | { ok: true; nonce: bigint; walletIndex: number; totalReserved: number; nonceExpiresAt?: string }
     | ({ ok: false; error: string; status: number } & NonceDOErrorBody)
   > {
     if (!this.env.NONCE_DO) {
@@ -1085,7 +1087,7 @@ export class SponsorService {
         sponsoredTxHex,
         fee: actualFee,
         walletIndex,
-        nonceExpiresAt: nonceExpiresAt ?? new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+        nonceExpiresAt: nonceExpiresAt ?? new Date(Date.now() + FALLBACK_NONCE_EXPIRY_MS).toISOString(),
       };
     } catch (e) {
       this.logger.error("Failed to sponsor transaction", {
