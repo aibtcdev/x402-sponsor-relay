@@ -7894,6 +7894,22 @@ export class NonceDO {
         continue;
       }
 
+      // Zombie guard: if the wallet head has advanced past this entry's sponsor_nonce,
+      // the chain has already consumed that nonce slot (via a successful confirm on a
+      // separate broadcast path, RBF, or external use). Retrying broadcast against an
+      // already-confirmed nonce produces ConflictingNonceInMempool indefinitely and
+      // wastes alarm CPU. Retire and move on.
+      const walletHead = this.ledgerGetWalletHead(entry.wallet_index);
+      if (walletHead !== null && entry.sponsor_nonce < walletHead) {
+        this.retireQueuedEntry(entry.wallet_index, entry.sponsor_nonce, "head_advanced_past_nonce");
+        this.log("info", "bounded_broadcast_zombie_retired", {
+          walletIndex: entry.wallet_index,
+          sponsorNonce: entry.sponsor_nonce,
+          walletHead,
+        });
+        continue;
+      }
+
       // Note: no pre-flight headroom gate here. Queued entries already have assigned nonces
       // within the wallet's head-frontier gap — broadcasting them fills the gap rather than
       // expanding it. Headroom measures local gap, not mempool depth, so gating on it would
@@ -8019,10 +8035,45 @@ export class NonceDO {
           errors++;
         }
       } catch (e) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+
+        // Structural-failure retire: certain @stacks/transactions throws indicate the
+        // queued hex is structurally invalid for sponsoring (e.g., non-sponsored auth
+        // type slipped in, malformed bytes). Retrying these forever produces log spam
+        // and never recovers — the hex itself is broken, not a transient failure.
+        // Retire the entry rather than swallow-and-retry.
+        //
+        // Patterns we treat as structural / non-retryable:
+        //   - "Cannot sponsor sign a non-sponsored transaction" (auth.authType !== Sponsored)
+        //   - "Failed to deserialize" / deserializeTransaction throws (malformed hex)
+        //
+        // tx-schemas follow-up: extend NodeBroadcastOutcomeSchema with a local pre-broadcast
+        // outcome variant so decideBroadcastAction owns this classification instead of a
+        // string-match here. Tracked in REGRESSION-NOTES for #373.
+        const isStructuralFailure =
+          /non-sponsored transaction/i.test(errMsg) ||
+          /failed to deserialize/i.test(errMsg) ||
+          /malformed/i.test(errMsg);
+
+        if (isStructuralFailure) {
+          this.retireQueuedEntry(
+            entry.wallet_index,
+            entry.sponsor_nonce,
+            "structural_failure"
+          );
+          this.log("warn", "bounded_broadcast_structural_retire", {
+            walletIndex: entry.wallet_index,
+            sponsorNonce: entry.sponsor_nonce,
+            error: errMsg,
+          });
+          errors++;
+          continue;
+        }
+
         this.log("warn", "bounded_broadcast_error", {
           walletIndex: entry.wallet_index,
           sponsorNonce: entry.sponsor_nonce,
-          error: e instanceof Error ? e.message : String(e),
+          error: errMsg,
         });
         errors++;
       }
