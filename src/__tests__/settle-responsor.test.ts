@@ -205,3 +205,50 @@ describe("Non-conflict broadcast failure does not enter recovery branches", () =
     expect(shouldEnterPreSponsoredPath).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 6. ENABLE_SETTLE_RESPONSOR feature flag — gates the buggy re-sponsor path
+// ---------------------------------------------------------------------------
+
+describe("ENABLE_SETTLE_RESPONSOR feature flag", () => {
+  function shouldEnterResponsorBranch(
+    broadcastResult: BroadcastOnlyResult,
+    sponsorNonce: number | null,
+    envFlag: string | undefined
+  ): boolean {
+    const enabled = envFlag === "true";
+    const inPreSponsoredGate =
+      sponsorNonce === null &&
+      ((broadcastResult as { nonceConflict?: boolean }).nonceConflict === true ||
+        (broadcastResult as { tooMuchChaining?: boolean }).tooMuchChaining === true);
+    return (
+      inPreSponsoredGate &&
+      (broadcastResult as { responsible?: "sender" | "sponsor" | "network" }).responsible === "sponsor" &&
+      enabled
+    );
+  }
+
+  it("OFF by default: sponsor-fault conflict on pre-sponsored tx does NOT enter re-sponsor branch", () => {
+    const broadcastResult = makeBroadcastOnlyError("sponsor");
+    expect(shouldEnterResponsorBranch(broadcastResult, null, undefined)).toBe(false);
+    expect(shouldEnterResponsorBranch(broadcastResult, null, "false")).toBe(false);
+    expect(shouldEnterResponsorBranch(broadcastResult, null, "")).toBe(false);
+  });
+
+  it("ON (\"true\"): sponsor-fault conflict on pre-sponsored tx enters re-sponsor branch", () => {
+    const broadcastResult = makeBroadcastOnlyError("sponsor");
+    expect(shouldEnterResponsorBranch(broadcastResult, null, "true")).toBe(true);
+  });
+
+  it("Flag does NOT affect sender-fault path (always returns SENDER_NONCE_CONFLICT)", () => {
+    const broadcastResult = makeBroadcastOnlyError("sender", "sender_nonce_confirmed");
+    expect(shouldEnterResponsorBranch(broadcastResult, null, "true")).toBe(false);
+    expect(shouldEnterResponsorBranch(broadcastResult, null, "false")).toBe(false);
+  });
+
+  it("Flag does NOT affect auto-sponsored path (sponsorNonce !== null)", () => {
+    const broadcastResult = makeBroadcastOnlyError("sponsor");
+    expect(shouldEnterResponsorBranch(broadcastResult, 42, "true")).toBe(false);
+    expect(shouldEnterResponsorBranch(broadcastResult, 42, "false")).toBe(false);
+  });
+});

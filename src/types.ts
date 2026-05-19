@@ -65,6 +65,17 @@ export interface Env {
   BROADCAST_NODE_URLS?: string;
   /** Recipient address for nonce gap-fill transactions (default: SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC) */
   FLUSH_RECIPIENT?: string;
+  /**
+   * Feature flag for the /settle re-sponsor recovery branch (Phase 2 / issue #373).
+   * Default OFF (any value other than "true"). When OFF, sponsor-fault nonce conflicts
+   * on pre-sponsored /settle calls return CONFLICTING_NONCE (pre-Phase-2 behavior).
+   * When "true", the relay attempts to re-sponsor the inner client-signed payload.
+   * Disabled by default because the current re-sponsor implementation routes through
+   * the hand-submit dispatch queue and wedges the sponsor nonce slot on sign failure
+   * (production incident 2026-05-19T13:00 UTC). Re-enable only after the dispatch-queue
+   * cleanup is rewritten.
+   */
+  ENABLE_SETTLE_RESPONSOR?: string;
   // LOGS is a service binding to worker-logs, typed loosely to avoid complex Service<> generics
   LOGS?: unknown;
   // KV namespace for receipts, dedup, fee cache, and health checks

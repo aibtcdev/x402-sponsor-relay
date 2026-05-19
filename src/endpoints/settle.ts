@@ -672,7 +672,18 @@ export class Settle extends BaseEndpoint {
         ) {
           // Pre-sponsored tx (sponsorNonce === null) had a nonce conflict.
           // Use Phase 1's responsible signal to determine who caused the conflict.
-          if (broadcastResult.responsible === "sponsor") {
+          //
+          // The sponsor-fault re-sponsor path is gated behind ENABLE_SETTLE_RESPONSOR
+          // because the current implementation routes the pre-sponsored tx through
+          // the hand-submit dispatch queue, which then attempts to sponsor-sign a
+          // tx that the broadcast worker treats as non-sponsored — wedging the sponsor
+          // nonce slot until the next reconcile_stale (~22 min). Production incident
+          // 2026-05-19T13:00 UTC stuck 3 wallet-0 nonces. Until the path is rewritten
+          // to bypass the dispatch queue and clean up its own queue entry on failure,
+          // we return CONFLICTING_NONCE for sponsor-fault conflicts as the pre-Phase-2
+          // behavior did.
+          const settleResponsorEnabled = c.env.ENABLE_SETTLE_RESPONSOR === "true";
+          if (broadcastResult.responsible === "sponsor" && settleResponsorEnabled) {
             // Sponsor-fault: the relay's previous sponsor nonce is stale.
             // Re-sponsor the inner client-signed payload with a fresh sponsor nonce.
             // parsedTx holds the original deserialized tx — the client's origin
@@ -762,7 +773,7 @@ export class Settle extends BaseEndpoint {
                 : X402_V2_ERROR_CODES.BROADCAST_FAILED,
               200
             );
-          } else {
+          } else if (broadcastResult.responsible === "sender") {
             // Sender-fault on pre-sponsored tx — no sponsor slot was burned.
             // Return a distinct code so the sender knows to re-sign with the correct nonce.
             logger.info("Sender-fault nonce conflict on pre-sponsored settle — no sponsor slot burned", {
@@ -775,6 +786,23 @@ export class Settle extends BaseEndpoint {
               statsService.logFailure("settle", true, failureCtx, "sender_nonce_stale").catch(() => {})
             );
             return v2Error(X402_V2_ERROR_CODES.SENDER_NONCE_CONFLICT, 200);
+          } else {
+            // Sponsor-fault on pre-sponsored tx, but ENABLE_SETTLE_RESPONSOR is off.
+            // Restore pre-Phase-2 behavior: return CONFLICTING_NONCE without burning a slot.
+            logger.info("Sponsor-fault conflict on pre-sponsored settle — re-sponsor disabled, returning CONFLICTING_NONCE", {
+              responsible: broadcastResult.responsible,
+              nonceConflict: broadcastResult.nonceConflict,
+              tooMuchChaining: broadcastResult.tooMuchChaining,
+            });
+            c.executionCtx.waitUntil(
+              statsService.logFailure("settle", true, failureCtx, "sponsor_nonce_conflict").catch(() => {})
+            );
+            return v2Error(
+              broadcastResult.nonceConflict
+                ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
+                : X402_V2_ERROR_CODES.BROADCAST_FAILED,
+              200
+            );
           }
         }
 
