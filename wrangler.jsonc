@@ -48,7 +48,8 @@
     "STACKS_NETWORK": "testnet",
     "SPONSOR_WALLET_COUNT": "10",
     "SPONSOR_WALLET_MAX": "10",
-    "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB"
+    "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB",
+    "ENABLE_SETTLE_RESPONSOR": "false"
   },
   // Cron trigger: run health check every 5 minutes
   "triggers": {
@@ -74,7 +75,8 @@
         "STACKS_NETWORK": "testnet",
         "SPONSOR_WALLET_COUNT": "10",
         "SPONSOR_WALLET_MAX": "10",
-        "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB"
+        "FLUSH_RECIPIENT": "STEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYRENN2KB",
+        "ENABLE_SETTLE_RESPONSOR": "false"
       },
       // Bindings must be duplicated per environment
       "services": [
@@ -123,7 +125,8 @@
         "STACKS_NETWORK": "mainnet",
         "SPONSOR_WALLET_COUNT": "10",
         "SPONSOR_WALLET_MAX": "10",
-        "FLUSH_RECIPIENT": "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC"
+        "FLUSH_RECIPIENT": "SPEB8Z3TAY2130B8M5THXZEQQ4D6S3RMYT37WTAC",
+        "ENABLE_SETTLE_RESPONSOR": "false"
       },
       // Bindings must be duplicated per environment
       "services": [
