@@ -187,16 +187,26 @@ export class HiroTxStream {
     const resolvers: Resolver[] = [];
     this.pending.set(txid, resolvers);
 
+    // Track whether openSocket() failed synchronously (factory threw).
+    // If so, the txid will have been removed from pending by drainPending().
+    let socketFailed = false;
+
     // Ensure socket is open.
     if (!this.socket) {
       this.openSocket();
+      // If openSocket() failed synchronously, pending no longer contains this txid.
+      socketFailed = !this.pending.has(txid);
     } else if (this.ready) {
       // Socket already open; subscribe immediately.
       this.sendSubscribe(txid);
       this.subscribed.add(txid);
     }
-    // If socket is open but not ready yet, sendQueue will deliver the subscribe
-    // once the open event fires (handled in openSocket → handleOpen).
+    // If socket is open but not ready yet, handleOpen will subscribe when it fires.
+
+    // If the factory threw synchronously, resolve null immediately (fallback).
+    if (socketFailed) {
+      return Promise.resolve(null);
+    }
 
     return new Promise<BroadcastAndConfirmResult | null>((resolve) => {
       resolvers.push(resolve);

@@ -266,17 +266,20 @@ describe("SettlementService.awaitConfirmationPublic", () => {
     expect(pollSpy).not.toHaveBeenCalled();
   });
 
-  it("clamps the fallback poll budget to the caller budget for very small waits", async () => {
+  it("calls pollForConfirmationPublic with the remaining fallback budget when stream returns null", async () => {
+    // Use maxPollTimeMs > STREAM_BUDGET_MS (30s) so there is budget left for polling.
+    // effectivePollTimeMs = 60_000, streamBudgetMs = 30_000, fallbackBudgetMs = 30_000.
     vi.spyOn(service, "fetchHiroTxStatus").mockResolvedValue({ txStatus: "pending" });
     const pollSpy = vi
       .spyOn(service, "pollForConfirmationPublic")
       .mockResolvedValue({ txid: "0xsmall", status: "pending" });
 
-    await expect(service.awaitConfirmationPublic("0xsmall", 5_000)).resolves.toEqual({
+    await expect(service.awaitConfirmationPublic("0xsmall", 60_000)).resolves.toEqual({
       txid: "0xsmall",
       status: "pending",
     });
 
-    expect(pollSpy).toHaveBeenCalledWith("0xsmall", 5_000);
+    // Stream budget = 30_000 (STREAM_BUDGET_MS); fallback budget = 60_000 - 30_000 = 30_000.
+    expect(pollSpy).toHaveBeenCalledWith("0xsmall", 30_000);
   });
 });
