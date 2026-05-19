@@ -7,6 +7,25 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.33.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.32.1...x402-sponsor-relay-v1.33.0) (2026-05-19)
+
+
+### Features
+
+* **relay:** add nonceExpiresAt to /relay and /sponsor responses ([#374](https://github.com/aibtcdev/x402-sponsor-relay/issues/374)) ([#379](https://github.com/aibtcdev/x402-sponsor-relay/issues/379)) ([45723df](https://github.com/aibtcdev/x402-sponsor-relay/commit/45723df77e5083795656e7d021f633cf3c3c6abf))
+* **sponsor:** add sponsorNonceValidForMs and docs to nonce-expires-at contract ([#374](https://github.com/aibtcdev/x402-sponsor-relay/issues/374)) ([#383](https://github.com/aibtcdev/x402-sponsor-relay/issues/383)) ([fcdc61d](https://github.com/aibtcdev/x402-sponsor-relay/commit/fcdc61d9b6f5ab2a0206488de18e260043873362))
+
+
+### Bug Fixes
+
+* **settlement:** attribute nonce conflicts via reason_data.is_origin ([#377](https://github.com/aibtcdev/x402-sponsor-relay/issues/377)) ([#381](https://github.com/aibtcdev/x402-sponsor-relay/issues/381)) ([439c92c](https://github.com/aibtcdev/x402-sponsor-relay/commit/439c92cb6791d7e2df471dab36b52448a7081c77))
+* **settle:** re-sponsor pre-sponsored txs on sponsor-fault conflict ([#373](https://github.com/aibtcdev/x402-sponsor-relay/issues/373)) ([#382](https://github.com/aibtcdev/x402-sponsor-relay/issues/382)) ([939e3db](https://github.com/aibtcdev/x402-sponsor-relay/commit/939e3db8f2196c0dcdccfda576dd0f9d7378d63b))
+
+
+### Performance Improvements
+
+* **settle:** pool Hiro WebSocket subscriptions per sponsor sender ([#376](https://github.com/aibtcdev/x402-sponsor-relay/issues/376)) ([#385](https://github.com/aibtcdev/x402-sponsor-relay/issues/385)) ([39ee1b1](https://github.com/aibtcdev/x402-sponsor-relay/commit/39ee1b15b3d9fcdfb40f0a6730a4a33384f72185))
+
 ## [1.32.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.32.0...x402-sponsor-relay-v1.32.1) (2026-04-30)
 
 
