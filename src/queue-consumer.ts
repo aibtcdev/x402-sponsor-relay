@@ -490,14 +490,16 @@ async function processPaymentMessage(
 }
 
 /**
- * Ensure a payment reaches a terminal state when its queue message is being
- * dead-lettered after exhausting retries on an unhandled error.
+ * Ensure a payment reaches a terminal state when its queue message is about to
+ * be dropped after exhausting retries on an unhandled error.
  *
- * Leaving the record non-terminal at "queued"/"broadcasting" strands it forever:
- * the message is acked into the (unconsumed) DLQ, nothing re-drives it, and the
- * aibtc inbox dedups future sends onto the stuck record — wedging the sender
- * wallet so it can no longer send any message. Marking it failed+retryable
- * releases that dedup so the agent can cleanly resubmit. (#398)
+ * The catch-all below finalizes the message with ack() (it does NOT route to the
+ * DLQ — ack marks the message as successfully handled). So if the record is still
+ * non-terminal at "queued"/"broadcasting" when we drop the message, nothing ever
+ * re-drives it: it's stranded forever, and the aibtc inbox dedups future sends
+ * onto the stuck record — wedging the sender wallet so it can no longer send any
+ * message. Marking it failed+retryable releases that dedup so the agent can
+ * cleanly resubmit. (#398)
  *
  * Fail-open: never throws — a bookkeeping failure here must not block the ack.
  */
@@ -567,10 +569,12 @@ export async function handlePaymentQueue(
       if (message.attempts < MAX_ATTEMPTS) {
         message.retry({ delaySeconds: 5 });
       } else {
-        // Exhausted: guarantee a terminal record before dead-lettering so the
-        // payment can't be stranded at "queued" (the DLQ has no consumer). (#398)
+        // Exhausted: guarantee a terminal record before we drop the message, so
+        // the payment can't be stranded at "queued". Note ack() finalizes the
+        // message — it does NOT route to the DLQ — so this is our only chance to
+        // terminalize it on this path. (#398)
         await finalizeExhaustedPayment(env, message.body.paymentId, logger);
-        message.ack(); // dead letter
+        message.ack(); // final ack — drops the message (not dead-lettered)
       }
     }
   }
