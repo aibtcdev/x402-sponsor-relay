@@ -26,6 +26,7 @@ import {
   getPaymentRecord,
   putPaymentRecord,
   transitionPayment,
+  isTerminalPaymentStatus,
   type PaymentQueueMessage,
   type PaymentRecord,
 } from "./services/payment-status";
@@ -489,6 +490,58 @@ async function processPaymentMessage(
 }
 
 /**
+ * Ensure a payment reaches a terminal state when its queue message is being
+ * dead-lettered after exhausting retries on an unhandled error.
+ *
+ * Leaving the record non-terminal at "queued"/"broadcasting" strands it forever:
+ * the message is acked into the (unconsumed) DLQ, nothing re-drives it, and the
+ * aibtc inbox dedups future sends onto the stuck record — wedging the sender
+ * wallet so it can no longer send any message. Marking it failed+retryable
+ * releases that dedup so the agent can cleanly resubmit. (#398)
+ *
+ * Fail-open: never throws — a bookkeeping failure here must not block the ack.
+ */
+async function finalizeExhaustedPayment(
+  env: Env,
+  paymentId: string,
+  logger: Logger,
+): Promise<void> {
+  try {
+    const kv = env.RELAY_KV;
+    if (!kv) return;
+    const record = await getPaymentRecord(kv, paymentId);
+    // Only terminalize records still in flight — never regress a confirmed/failed one.
+    if (!record || isTerminalPaymentStatus(record.status)) return;
+    const updated = transitionPayment(record, "failed", {
+      error: "Payment processing exhausted retries before broadcast",
+      errorCode: "BROADCAST_EXHAUSTED",
+      terminalReason: "internal_error",
+      retryable: true,
+    });
+    await putPaymentRecord(kv, updated);
+    emitPaymentLifecycleEvent(
+      logger,
+      "payment.finalized",
+      {
+        route: "PAYMENT_QUEUE",
+        paymentId,
+        status: updated.status,
+        terminalReason: updated.terminalReason,
+        action: "exhausted_retries_terminalized",
+        checkStatusUrlPresent: false,
+        compatShimUsed: false,
+      },
+      "warn",
+    );
+  } catch (e) {
+    logger.warn("Failed to finalize exhausted payment before dead-letter", {
+      paymentId,
+      error: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
+/**
  * Queue consumer handler — called by the worker's queue() export.
  */
 export async function handlePaymentQueue(
@@ -514,6 +567,9 @@ export async function handlePaymentQueue(
       if (message.attempts < MAX_ATTEMPTS) {
         message.retry({ delaySeconds: 5 });
       } else {
+        // Exhausted: guarantee a terminal record before dead-lettering so the
+        // payment can't be stranded at "queued" (the DLQ has no consumer). (#398)
+        await finalizeExhaustedPayment(env, message.body.paymentId, logger);
         message.ack(); // dead letter
       }
     }
