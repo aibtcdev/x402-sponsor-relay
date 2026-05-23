@@ -507,6 +507,7 @@ async function finalizeExhaustedPayment(
   env: Env,
   paymentId: string,
   logger: Logger,
+  opts?: { route?: string; error?: string; action?: string },
 ): Promise<void> {
   try {
     const kv = env.RELAY_KV;
@@ -515,7 +516,7 @@ async function finalizeExhaustedPayment(
     // Only terminalize records still in flight — never regress a confirmed/failed one.
     if (!record || isTerminalPaymentStatus(record.status)) return;
     const updated = transitionPayment(record, "failed", {
-      error: "Payment processing exhausted retries before broadcast",
+      error: opts?.error ?? "Payment processing exhausted retries before broadcast",
       errorCode: "BROADCAST_EXHAUSTED",
       terminalReason: "internal_error",
       retryable: true,
@@ -525,18 +526,18 @@ async function finalizeExhaustedPayment(
       logger,
       "payment.finalized",
       {
-        route: "PAYMENT_QUEUE",
+        route: opts?.route ?? "PAYMENT_QUEUE",
         paymentId,
         status: updated.status,
         terminalReason: updated.terminalReason,
-        action: "exhausted_retries_terminalized",
+        action: opts?.action ?? "exhausted_retries_terminalized",
         checkStatusUrlPresent: false,
         compatShimUsed: false,
       },
       "warn",
     );
   } catch (e) {
-    logger.warn("Failed to finalize exhausted payment before dead-letter", {
+    logger.warn("Failed to finalize exhausted payment", {
       paymentId,
       error: e instanceof Error ? e.message : String(e),
     });
@@ -577,5 +578,41 @@ export async function handlePaymentQueue(
         message.ack(); // final ack — drops the message (not dead-lettered)
       }
     }
+  }
+}
+
+/**
+ * Dead-letter queue consumer for x402-payment-dlq-*.
+ *
+ * A message reaches the DLQ only after exhausting the main queue's retries via
+ * message.retry() (e.g. the unbounded capacity-hold retry path), which leaves
+ * the payment record non-terminal at "queued". Nothing else re-drives a DLQ'd
+ * message, so without this consumer the payment is stranded forever — and the
+ * aibtc inbox dedups future sends onto the stuck record, wedging the sender
+ * wallet so it can no longer send any message.
+ *
+ * This consumer enforces the safety-net invariant: no dead-lettered payment is
+ * left non-terminal. It marks the record failed + retryable (via
+ * finalizeExhaustedPayment), releasing the inbox dedup so the agent can cleanly
+ * resubmit. Always acks — never re-throws into an infinite DLQ loop. (#398)
+ */
+export async function handlePaymentDLQ(
+  batch: MessageBatch<PaymentQueueMessage>,
+  env: Env,
+  ctx: ExecutionContext
+): Promise<void> {
+  for (const message of batch.messages) {
+    const logger = createWorkerLogger(env.LOGS, ctx, {
+      component: "payment_dlq",
+      queue: batch.queue,
+      paymentId: message.body.paymentId,
+      attempt: message.attempts,
+    });
+    await finalizeExhaustedPayment(env, message.body.paymentId, logger, {
+      route: "PAYMENT_DLQ",
+      error: "Payment dead-lettered after exhausting queue retries",
+      action: "dlq_terminalized",
+    });
+    message.ack();
   }
 }

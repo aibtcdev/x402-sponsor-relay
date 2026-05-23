@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPaymentRecord, getPaymentRecord, putPaymentRecord, transitionPayment } from "../services/payment-status";
-import { handlePaymentQueue } from "../queue-consumer";
+import { handlePaymentQueue, handlePaymentDLQ } from "../queue-consumer";
 import { MemoryKV } from "./helpers/memory-kv";
 
 const mocks = vi.hoisted(() => ({
@@ -513,5 +513,79 @@ describe("queue consumer recovery boundaries", () => {
     const finalRecord = await getPaymentRecord(kv, "pay_retry");
     // Left for the queue to retry — not prematurely terminalized.
     expect(finalRecord?.status).not.toBe("failed");
+  });
+});
+
+describe("payment DLQ consumer (#398)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("terminalizes a dead-lettered payment still stuck non-terminal", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_dlq", "testnet"),
+      "queued"
+    );
+    record.senderNonce = 3;
+    record.senderAddress = "STDLQ00000000000000000000000000000000";
+    await putPaymentRecord(kv, record);
+
+    const message = createMessage({
+      paymentId: "pay_dlq",
+      txHex: "dlq_tx",
+      network: "testnet",
+      attempt: 5,
+    });
+
+    await handlePaymentDLQ(
+      {
+        queue: "x402-payment-dlq-test",
+        messages: [message],
+      } as unknown as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(message.ack).toHaveBeenCalledTimes(1);
+    const finalRecord = await getPaymentRecord(kv, "pay_dlq");
+    expect(finalRecord).toEqual(
+      expect.objectContaining({
+        status: "failed",
+        retryable: true,
+        terminalReason: "internal_error",
+        errorCode: "BROADCAST_EXHAUSTED",
+      })
+    );
+  });
+
+  it("does not regress an already-terminal dead-lettered payment", async () => {
+    const kv = new MemoryKV();
+    const confirmed = transitionPayment(
+      createPaymentRecord("pay_dlq_confirmed", "testnet"),
+      "confirmed",
+      { txid: "0xdef" }
+    );
+    await putPaymentRecord(kv, confirmed);
+
+    const message = createMessage({
+      paymentId: "pay_dlq_confirmed",
+      txHex: "x",
+      network: "testnet",
+      attempt: 5,
+    });
+
+    await handlePaymentDLQ(
+      {
+        queue: "x402-payment-dlq-test",
+        messages: [message],
+      } as unknown as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(message.ack).toHaveBeenCalledTimes(1);
+    const finalRecord = await getPaymentRecord(kv, "pay_dlq_confirmed");
+    expect(finalRecord?.status).toBe("confirmed");
   });
 });
