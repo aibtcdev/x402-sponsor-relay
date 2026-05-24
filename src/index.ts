@@ -8,7 +8,7 @@ import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
 import { SettlementHealthService } from "./services";
-import { handlePaymentQueue } from "./queue-consumer";
+import { handlePaymentQueue, handlePaymentDLQ } from "./queue-consumer";
 import type { PaymentQueueMessage } from "./services/payment-status";
 export { NonceDO } from "./durable-objects/nonce-do";
 export { StatsDO } from "./durable-objects/stats-do";
@@ -243,12 +243,22 @@ export default {
    * Queue consumer — processes PAYMENT_QUEUE messages serially.
    * Each message: sponsor tx → assign nonce via NonceDO → broadcast → update status.
    * Serial consumption eliminates nonce contention by design.
+   *
+   * Also consumes the dead-letter queue (x402-payment-dlq-*): messages that
+   * exhausted the main queue's retries land there with a still-non-terminal
+   * payment record. handlePaymentDLQ() terminalizes them so they can't be
+   * stranded at "queued" (which would wedge the sender wallet via inbox dedup).
+   * Routed by batch.queue since both queues share this single handler. (#398)
    */
   async queue(
     batch: MessageBatch<PaymentQueueMessage>,
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
-    await handlePaymentQueue(batch, env, ctx);
+    if (batch.queue.includes("-dlq-")) {
+      await handlePaymentDLQ(batch, env, ctx);
+    } else {
+      await handlePaymentQueue(batch, env, ctx);
+    }
   },
 };
