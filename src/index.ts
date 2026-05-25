@@ -9,8 +9,6 @@ import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
 import { SettlementHealthService } from "./services";
 import { handlePaymentQueue, handlePaymentDLQ } from "./queue-consumer";
-import { reconcileStuckPayments } from "./services/payment-reconcile";
-import { createWorkerLogger } from "./utils";
 import type { PaymentQueueMessage } from "./services/payment-status";
 export { NonceDO } from "./durable-objects/nonce-do";
 export { StatsDO } from "./durable-objects/stats-do";
@@ -229,8 +227,7 @@ export default {
   /**
    * Scheduled handler — runs on the cron trigger defined in wrangler.jsonc.
    * Executes a settlement health check every 5 minutes to populate KV history
-   * so that the dashboard uptime24h metric is accurate, and runs the stuck-payment
-   * reconcile sweep (#398) to recover records stranded non-terminal at "queued".
+   * so that the dashboard uptime24h metric is accurate.
    */
   async scheduled(
     _event: ScheduledEvent,
@@ -240,13 +237,6 @@ export default {
     const logger = createNoOpLogger();
     const healthService = new SettlementHealthService(env, logger);
     ctx.waitUntil(healthService.checkHealth());
-
-    // Recover stuck payment records (confirm settled ones, terminalize dead ones)
-    // so the aibtc inbox dedup releases and wedged wallets can resubmit. (#398)
-    const reconcileLogger = createWorkerLogger(env.LOGS, ctx, {
-      component: "payment_reconcile",
-    });
-    ctx.waitUntil(reconcileStuckPayments(env, reconcileLogger));
   },
 
   /**
