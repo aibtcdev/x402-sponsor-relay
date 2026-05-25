@@ -647,6 +647,37 @@ function addMicroSTX(a: string, b: string): string {
   }
 }
 
+/**
+ * Extract the origin (sender) spending-condition signature from a deserialized tx.
+ *
+ * For single-sig sponsored txs the origin signature covers the entire sender-authorized
+ * payload (recipient, amount, nonce, etc.). Two txs from the same sender at the same
+ * nonce WILL have different origin signatures if they represent different payments
+ * (different recipient, amount, or memo). This makes it the strongest and simplest
+ * identity check for "is the on-chain tx the same payment we queued?"
+ *
+ * Returns the 130-char RSV hex string for single-sig conditions, null for multi-sig
+ * (no single `.signature` field). Callers that receive null should treat it as
+ * "cannot verify via signature".
+ *
+ * Module-level (not an instance method) so it can be tested without a NonceDO double.
+ * Never throws.
+ */
+function extractOriginSignature(tx: StacksTransactionWire): string | null {
+  try {
+    const cond = tx.auth?.spendingCondition;
+    if (!cond) return null;
+    // Single-sig conditions carry .signature.data; multi-sig carry .fields instead
+    const sig = (cond as { signature?: { data?: string } }).signature;
+    if (typeof sig?.data === "string" && sig.data.length > 0) {
+      return sig.data;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /** TTL for cached Hiro next_nonce values used by the lookahead cap guard (ms) */
 const HIRO_NONCE_CACHE_TTL_MS = 30 * 1000;
 /** Timeout for Hiro nonce info fetch requests (ms) */
@@ -1403,6 +1434,32 @@ export class NonceDO {
       const match = results.find((tx) => tx.nonce === senderNonce);
       if (!match) return null;
       return { txId: match.tx_id, txStatus: match.tx_status };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Fetch the raw hex of an on-chain transaction from Hiro.
+   *
+   * Mirrors the fetchOnChainRawTx helper in queue-consumer.ts.
+   * Uses GET /extended/v1/tx/{txId}/raw → { raw_tx: "0x..." }.
+   * Returns bare hex (0x prefix stripped) on success, null on any error or timeout.
+   *
+   * Fail-safe: never throws.
+   */
+  private async fetchOnChainRawTx(txId: string): Promise<string | null> {
+    try {
+      const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+      const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+      const url = `${base}/extended/v1/tx/${txId}/raw`;
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS) });
+      if (!response.ok) return null;
+      const json = (await response.json()) as { raw_tx?: string };
+      const rawTx = json?.raw_tx;
+      if (typeof rawTx !== "string" || rawTx.length === 0) return null;
+      // Strip 0x prefix so callers can pass directly to deserializeTransaction
+      return rawTx.startsWith("0x") ? rawTx.slice(2) : rawTx;
     } catch {
       return null;
     }
@@ -6123,29 +6180,149 @@ export class NonceDO {
             // Look up the actual txid so we can wire txid_map → healers can finalize.
             const onChain = await this.lookupSenderNonceTxid(entry.sender_address, entry.sender_nonce);
             if (onChain && onChain.txStatus === "success" && entry.payment_id && this.env.RELAY_KV) {
-              // Wire txid_map so chainhook/confirm-reconcile can pick up the payment.
-              // Transition to mempool — do NOT mark confirmed directly; delegate to healers.
-              await this.env.RELAY_KV.put(`txid_map:${onChain.txId}`, entry.payment_id, {
-                expirationTtl: 86_400,
-              });
-              const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
-              if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
-                const updated = transitionPayment(record, "mempool", { txid: onChain.txId });
-                await putPaymentRecord(this.env.RELAY_KV, updated);
+              // P1 strict-verify: confirm the on-chain tx is OUR payment before crediting.
+              //
+              // A different sender tx could have taken the nonce (e.g. a wallet reset, a
+              // direct broadcast, or a race from another relay). If we wire txid_map for an
+              // unrelated txid, healers would mark this payment confirmed even though no
+              // actual payment was made — a false credit.
+              //
+              // Chosen method — origin spending-condition signature comparison:
+              //   The sender's signature covers the entire origin spending condition plus
+              //   the tx payload (recipient, amount, memo, nonce, fee). Two distinct
+              //   payments from the same sender at the same nonce WILL carry different
+              //   origin signatures. Comparing signatures is therefore both simpler and
+              //   stronger than comparing recipient + amount + token individually.
+              //   Mirrors Mode A's verify-before-credit fix (PR #409 / queue-consumer.ts).
+              //
+              // Three outcomes:
+              //   match      → credit (wire txid_map + transition to mempool)
+              //   mismatch   → terminalize as replaced/superseded, evict, no credit
+              //   uncertainty (fetch or parse fails) → fall through to re-broadcast path
+              const onChainRawHex = await this.fetchOnChainRawTx(onChain.txId);
+              if (onChainRawHex === null) {
+                // Raw-tx fetch failed — cannot verify. Fail safe: do NOT evict-as-confirmed.
+                // Fall through to the re-broadcast path below; the sender nonce conflict
+                // will cause another failure and eventually hit the bounded-retry cap.
+                this.log("warn", "replay_evict_raw_fetch_failed", {
+                  replayId: entry.id,
+                  senderAddress: entry.sender_address,
+                  senderNonce: entry.sender_nonce,
+                  resolvedTxId: onChain.txId,
+                  paymentId: entry.payment_id,
+                });
+                // Fall through — do NOT continue; proceed to re-broadcast path
+              } else {
+                // Deserialize both txs and compare origin signatures
+                let isOurTx = false;
+                try {
+                  const localHex = entry.sender_tx_hex.replace(/^0x/i, "");
+                  const onChainTx = deserializeTransaction(onChainRawHex);
+                  const localTx = deserializeTransaction(localHex);
+                  const onChainSig = extractOriginSignature(onChainTx);
+                  const localSig = extractOriginSignature(localTx);
+                  if (onChainSig !== null && localSig !== null) {
+                    // Single-sig: direct signature comparison (strongest check)
+                    isOurTx = onChainSig === localSig;
+                  } else {
+                    // Multi-sig or parse uncertainty: fall back to raw-hex comparison of the
+                    // origin spending condition only (exclude the sponsor condition which differs).
+                    // Without a reliable field, treat as mismatch (safe direction).
+                    isOurTx = false;
+                  }
+                } catch {
+                  // Deserialization failed — cannot verify. Fail safe: no credit.
+                  this.log("warn", "replay_evict_deserialize_failed", {
+                    replayId: entry.id,
+                    senderAddress: entry.sender_address,
+                    senderNonce: entry.sender_nonce,
+                    resolvedTxId: onChain.txId,
+                    paymentId: entry.payment_id,
+                  });
+                  isOurTx = false;
+                }
+
+                if (isOurTx) {
+                  // MATCH: on-chain tx is our payment. Wire txid_map + transition to mempool.
+                  await this.env.RELAY_KV.put(`txid_map:${onChain.txId}`, entry.payment_id, {
+                    expirationTtl: 86_400,
+                  });
+                  const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                  if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                    const updated = transitionPayment(record, "mempool", { txid: onChain.txId });
+                    await putPaymentRecord(this.env.RELAY_KV, updated);
+                  }
+                  this.removeFromReplayBuffer(entry.id);
+                  this.log("info", "replay_evict_confirmed", {
+                    replayId: entry.id,
+                    senderAddress: entry.sender_address,
+                    senderNonce: entry.sender_nonce,
+                    paymentId: entry.payment_id,
+                    resolvedTxId: onChain.txId,
+                    txStatus: onChain.txStatus,
+                    finalized: true,
+                    verified: true,
+                  });
+                  processed++;
+                  continue;
+                } else {
+                  // MISMATCH: a different/foreign tx took this nonce. Re-broadcasting is futile
+                  // (the nonce is permanently consumed). Terminalize the payment record as
+                  // replaced/superseded (mirrors Mode A's sender_conflict_superseded path in
+                  // queue-consumer.ts) and evict the replay buffer entry. Do NOT write txid_map.
+                  const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                  if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                    const updated = transitionPayment(record, "replaced", {
+                      error: "On-chain tx at sender nonce does not match queued payment (foreign tx superseded nonce)",
+                      terminalReason: "superseded" as const,
+                      retryable: false,
+                    });
+                    await putPaymentRecord(this.env.RELAY_KV, updated);
+                  }
+                  this.removeFromReplayBuffer(entry.id);
+                  this.log("warn", "replay_evict_superseded", {
+                    replayId: entry.id,
+                    senderAddress: entry.sender_address,
+                    senderNonce: entry.sender_nonce,
+                    paymentId: entry.payment_id,
+                    foreignTxId: onChain.txId,
+                    txStatus: onChain.txStatus,
+                  });
+                  processed++;
+                  continue;
+                }
               }
+            } else if (onChain && onChain.txStatus === "success" && !entry.payment_id) {
+              // No payment_id — nothing to verify or credit; just evict.
+              this.removeFromReplayBuffer(entry.id);
+              this.log("info", "replay_evict_confirmed", {
+                replayId: entry.id,
+                senderAddress: entry.sender_address,
+                senderNonce: entry.sender_nonce,
+                paymentId: null,
+                resolvedTxId: onChain.txId,
+                txStatus: onChain.txStatus,
+                finalized: false,
+                verified: false,
+              });
+              processed++;
+              continue;
+            } else {
+              // onChain is null, or txStatus !== "success", or no RELAY_KV — evict without credit
+              this.removeFromReplayBuffer(entry.id);
+              this.log("info", "replay_evict_confirmed", {
+                replayId: entry.id,
+                senderAddress: entry.sender_address,
+                senderNonce: entry.sender_nonce,
+                paymentId: entry.payment_id,
+                resolvedTxId: onChain?.txId ?? null,
+                txStatus: onChain?.txStatus ?? null,
+                finalized: false,
+                verified: false,
+              });
+              processed++;
+              continue;
             }
-            this.removeFromReplayBuffer(entry.id);
-            this.log("info", "replay_evict_confirmed", {
-              replayId: entry.id,
-              senderAddress: entry.sender_address,
-              senderNonce: entry.sender_nonce,
-              paymentId: entry.payment_id,
-              resolvedTxId: onChain?.txId ?? null,
-              txStatus: onChain?.txStatus ?? null,
-              finalized: !!(onChain && onChain.txStatus === "success" && entry.payment_id),
-            });
-            processed++;
-            continue;
           }
 
           // Find a wallet with headroom (prefer a different wallet than the original)
