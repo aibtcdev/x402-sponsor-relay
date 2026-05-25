@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPaymentRecord, getPaymentRecord, putPaymentRecord, transitionPayment } from "../services/payment-status";
-import { handlePaymentQueue } from "../queue-consumer";
+import { handlePaymentQueue, handlePaymentDLQ } from "../queue-consumer";
 import { MemoryKV } from "./helpers/memory-kv";
 
 const mocks = vi.hoisted(() => ({
@@ -436,5 +436,156 @@ describe("queue consumer recovery boundaries", () => {
         senderNonce: undefined,
       })
     );
+  });
+
+  it("terminalizes a non-terminal payment when retries are exhausted, so it can't be stranded at queued (#398)", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_exhaust", "testnet"),
+      "queued"
+    );
+    record.senderNonce = 42;
+    record.senderAddress = "STEXHAUST00000000000000000000000000000";
+    await putPaymentRecord(kv, record);
+
+    mocks.deserializeTransaction.mockReturnValue({
+      auth: { spendingCondition: { signer: "signer_exhaust" } },
+    });
+    // Unhandled error during processing → bubbles to the handler catch-all.
+    mocks.sponsorTransaction.mockRejectedValue(new Error("NonceDO unavailable"));
+
+    // attempts === MAX_ATTEMPTS (5) → drop branch (final ack, not routed to DLQ).
+    const message = createMessage(
+      { paymentId: "pay_exhaust", txHex: "exhaust_tx", network: "testnet", attempt: 5 },
+      5
+    );
+
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(message.ack).toHaveBeenCalledTimes(1);
+    expect(message.retry).not.toHaveBeenCalled();
+
+    const finalRecord = await getPaymentRecord(kv, "pay_exhaust");
+    expect(finalRecord).toEqual(
+      expect.objectContaining({
+        status: "failed",
+        retryable: true,
+        terminalReason: "internal_error",
+        errorCode: "BROADCAST_EXHAUSTED",
+      })
+    );
+  });
+
+  it("does not terminalize while retries remain (under the attempt limit) (#398)", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_retry", "testnet"),
+      "queued"
+    );
+    record.senderNonce = 7;
+    record.senderAddress = "STRETRY000000000000000000000000000000";
+    await putPaymentRecord(kv, record);
+
+    mocks.deserializeTransaction.mockReturnValue({
+      auth: { spendingCondition: { signer: "signer_retry" } },
+    });
+    mocks.sponsorTransaction.mockRejectedValue(new Error("transient"));
+
+    // attempts < MAX_ATTEMPTS → retry, not terminalize.
+    const message = createMessage(
+      { paymentId: "pay_retry", txHex: "retry_tx", network: "testnet", attempt: 2 },
+      2
+    );
+
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(message.retry).toHaveBeenCalledTimes(1);
+    expect(message.ack).not.toHaveBeenCalled();
+
+    const finalRecord = await getPaymentRecord(kv, "pay_retry");
+    // Left for the queue to retry — not prematurely terminalized.
+    expect(finalRecord?.status).not.toBe("failed");
+  });
+});
+
+describe("payment DLQ consumer (#398)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("terminalizes a dead-lettered payment still stuck non-terminal", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_dlq", "testnet"),
+      "queued"
+    );
+    record.senderNonce = 3;
+    record.senderAddress = "STDLQ00000000000000000000000000000000";
+    await putPaymentRecord(kv, record);
+
+    const message = createMessage({
+      paymentId: "pay_dlq",
+      txHex: "dlq_tx",
+      network: "testnet",
+      attempt: 5,
+    });
+
+    await handlePaymentDLQ(
+      {
+        queue: "x402-payment-dlq-test",
+        messages: [message],
+      } as unknown as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(message.ack).toHaveBeenCalledTimes(1);
+    const finalRecord = await getPaymentRecord(kv, "pay_dlq");
+    expect(finalRecord).toEqual(
+      expect.objectContaining({
+        status: "failed",
+        retryable: true,
+        terminalReason: "internal_error",
+        errorCode: "BROADCAST_EXHAUSTED",
+      })
+    );
+  });
+
+  it("does not regress an already-terminal dead-lettered payment", async () => {
+    const kv = new MemoryKV();
+    const confirmed = transitionPayment(
+      createPaymentRecord("pay_dlq_confirmed", "testnet"),
+      "confirmed",
+      { txid: "0xdef" }
+    );
+    await putPaymentRecord(kv, confirmed);
+
+    const message = createMessage({
+      paymentId: "pay_dlq_confirmed",
+      txHex: "x",
+      network: "testnet",
+      attempt: 5,
+    });
+
+    await handlePaymentDLQ(
+      {
+        queue: "x402-payment-dlq-test",
+        messages: [message],
+      } as unknown as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    expect(message.ack).toHaveBeenCalledTimes(1);
+    const finalRecord = await getPaymentRecord(kv, "pay_dlq_confirmed");
+    expect(finalRecord?.status).toBe("confirmed");
   });
 });

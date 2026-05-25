@@ -41,6 +41,11 @@
         "max_batch_size": 1,
         "max_retries": 5,
         "dead_letter_queue": "x402-payment-dlq-dev"
+      },
+      {
+        "queue": "x402-payment-dlq-dev",
+        "max_batch_size": 1,
+        "max_retries": 3
       }
     ]
   },
@@ -108,6 +113,11 @@
             "max_batch_size": 1,
             "max_retries": 5,
             "dead_letter_queue": "x402-payment-dlq-staging"
+          },
+          {
+            "queue": "x402-payment-dlq-staging",
+            "max_batch_size": 1,
+            "max_retries": 3
           }
         ]
       },
@@ -158,6 +168,11 @@
             "max_batch_size": 1,
             "max_retries": 5,
             "dead_letter_queue": "x402-payment-dlq-production"
+          },
+          {
+            "queue": "x402-payment-dlq-production",
+            "max_batch_size": 1,
+            "max_retries": 3
           }
         ]
       },
