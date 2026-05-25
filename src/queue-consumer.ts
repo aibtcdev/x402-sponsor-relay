@@ -21,7 +21,7 @@
 
 import { deserializeTransaction } from "@stacks/transactions";
 import type { Env, Logger } from "./types";
-import { createWorkerLogger, emitPaymentLifecycleEvent } from "./utils";
+import { createWorkerLogger, emitPaymentLifecycleEvent, getHiroBaseUrl, getHiroHeaders } from "./utils";
 import {
   getPaymentRecord,
   putPaymentRecord,
@@ -43,12 +43,88 @@ import {
 /** Max retries before dead-lettering */
 const MAX_ATTEMPTS = 5;
 
+/** Timeout for Hiro address/transactions lookup and raw-tx fetch (ms).
+ *  Mirrors seedSenderNonceFromHiro's HIRO_NONCE_SEED_TIMEOUT_MS value. */
+const HIRO_LOOKUP_TIMEOUT_MS = 8_000;
+
 /** Fields set during retryable contention — cleared on next attempt */
 const TRANSIENT_ERROR_FIELDS: Partial<PaymentRecord> = {
   error: undefined,
   errorCode: undefined,
   retryable: undefined,
 };
+
+/**
+ * Resolve the on-chain transaction for a sender address at a specific nonce.
+ *
+ * Queries Hiro GET /extended/v1/address/{sender}/transactions?limit=50 and finds
+ * the entry whose nonce matches senderNonce. Used to recover the real txid when a
+ * payment is terminated due to a sender-origin ConflictingNonceInMempool — the
+ * sender's own in-flight tx occupied the nonce before the relay could sponsor a new one.
+ *
+ * Never throws — returns null on any error or when no match is found.
+ *
+ * @param env - Worker env (for STACKS_NETWORK and optional HIRO_API_KEY)
+ * @param senderAddress - Stacks sender address (SP... / ST...)
+ * @param senderNonce - The nonce to look up
+ * @returns { txId, txStatus } if a matching tx is found, null otherwise
+ */
+async function lookupTxByAddressNonce(
+  env: Env,
+  senderAddress: string,
+  senderNonce: number
+): Promise<{ txId: string; txStatus: string } | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HIRO_LOOKUP_TIMEOUT_MS);
+  try {
+    const base = getHiroBaseUrl(env.STACKS_NETWORK ?? "testnet");
+    const headers = getHiroHeaders(env.HIRO_API_KEY);
+    const url = `${base}/extended/v1/address/${senderAddress}/transactions?limit=50`;
+    const response = await fetch(url, { headers, signal: controller.signal });
+    if (!response.ok) return null;
+    const json = await response.json() as { results?: Array<{ tx_id: string; tx_status: string; nonce: number }> };
+    const results = json?.results;
+    if (!Array.isArray(results)) return null;
+    const match = results.find((tx) => tx.nonce === senderNonce);
+    if (!match) return null;
+    return { txId: match.tx_id, txStatus: match.tx_status };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Fetch the raw hex of an on-chain transaction from Hiro.
+ *
+ * Uses GET /extended/v1/tx/{txId}/raw which returns { raw_tx: "0x..." }.
+ * Returns the raw hex string (with or without the leading "0x") on success,
+ * null on any error or timeout. Applies the same AbortController timeout as
+ * lookupTxByAddressNonce so a slow Hiro response cannot stall the queue consumer.
+ *
+ * Fail-safe: never throws.
+ */
+async function fetchOnChainRawTx(env: Env, txId: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HIRO_LOOKUP_TIMEOUT_MS);
+  try {
+    const base = getHiroBaseUrl(env.STACKS_NETWORK ?? "testnet");
+    const headers = getHiroHeaders(env.HIRO_API_KEY);
+    const url = `${base}/extended/v1/tx/${txId}/raw`;
+    const response = await fetch(url, { headers, signal: controller.signal });
+    if (!response.ok) return null;
+    const json = await response.json() as { raw_tx?: string };
+    const rawTx = json?.raw_tx;
+    if (typeof rawTx !== "string" || rawTx.length === 0) return null;
+    // Hiro returns "0x<hex>" — strip the prefix so verifyPaymentParams gets bare hex
+    return rawTx.startsWith("0x") ? rawTx.slice(2) : rawTx;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 /**
  * Process a single payment queue message.
@@ -336,8 +412,10 @@ async function processPaymentMessage(
       }
 
       // #328: attribute contention to the responsible wallet so operators
-      // can tell sender-side congestion (origin chaining) from sponsor-side
-      // contention (nonce conflicts, sponsor-pool chaining limits).
+      // can tell sender-side congestion (origin chaining / nonce conflicts) from
+      // sponsor-side contention (chaining limits on sponsor wallets).
+      // ConflictingNonceInMempool (isNonceConflict) is sender-origin: the sender's
+      // own in-flight tx already occupied the nonce before the relay could sponsor.
       emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
         route: "PAYMENT_QUEUE",
         paymentId,
@@ -350,7 +428,7 @@ async function processPaymentMessage(
         checkStatusUrlPresent: false,
         compatShimUsed: false,
         attempt,
-        responsibleParty: isOriginChaining ? "sender" : "sponsor",
+        responsibleParty: (isOriginChaining || isNonceConflict) ? "sender" : "sponsor",
       }, "warn");
       logger.warn("Broadcast contention, retrying via queue", {
         paymentId,
@@ -388,6 +466,168 @@ async function processPaymentMessage(
       );
     }
 
+    // Sender-origin nonce conflict: the sender's own in-flight tx already occupied
+    // the nonce before the relay could sponsor this payment. Resolve the actual
+    // on-chain txid and verify settle requirements so healers can finalize the record
+    // rather than leaving it falsely reported as sponsor_failure. (#397)
+    if (isNonceConflict && record.senderAddress && record.senderNonce !== undefined) {
+      const resolved = await lookupTxByAddressNonce(env, record.senderAddress, record.senderNonce);
+      const settle = message.body.settle;
+
+      if (resolved) {
+        if (resolved.txStatus === "success" && settle) {
+          // P1: Verify the ACTUAL on-chain tx (not the queued txHex) satisfies settle
+          // requirements. A different sender tx could have taken the nonce — verifying
+          // our queued txHex would pass even though resolved.txId points to an unrelated
+          // tx with a different recipient/amount/token.
+          //
+          // Fetch the raw on-chain tx hex via Hiro GET /extended/v1/tx/{txId}/raw and
+          // run verifyPaymentParams against it. On fetch failure or timeout: fail safe —
+          // do NOT write txid_map for an unverified txid; fall through to the
+          // not-resolvable / sender_nonce_duplicate path.
+          const onChainRawHex = await fetchOnChainRawTx(env, resolved.txId);
+          if (onChainRawHex === null) {
+            // Hiro raw-tx fetch failed or timed out — cannot verify; fall through to sender_nonce_duplicate.
+            logger.warn("Sender-origin nonce conflict: raw-tx fetch failed, cannot verify on-chain tx", {
+              paymentId,
+              resolvedTxId: resolved.txId,
+              senderAddress: record.senderAddress,
+              senderNonce: record.senderNonce,
+            });
+          } else {
+            // Reuse the SettlementService instance that was already created for broadcastOnly above.
+            const verifyResult = settlementService.verifyPaymentParams(onChainRawHex, settle);
+            if (verifyResult.valid) {
+              // On-chain tx satisfies settle requirements. Wire in the txid so healers can confirm.
+              // Mirror the normal broadcast-success bookkeeping so chainhook/confirm-reconcile
+              // can finalize the record and keep the sender nonce cache current:
+              //   1. Update sender nonce cache (lastSeen)
+              //   2. Write sender_addr_map so the chainhook healer can look up signerHash
+              //   3. Write txid_map so chainhook can find the paymentId
+              // Transition to mempool — do NOT mark confirmed directly.
+              record = transitionPayment(record, "mempool", { txid: resolved.txId });
+              await putPaymentRecord(kv, record);
+              await kv
+                .put(`txid_map:${resolved.txId}`, paymentId, { expirationTtl: 86_400 })
+                .catch((e) => logger.warn("Failed to write txid mapping on sender conflict resolve", { error: String(e) }));
+              // Mirror updateSenderNonceOnBroadcast + sender_addr_map from the happy broadcast path
+              if (record.senderNonce !== undefined && record.senderAddress) {
+                await updateSenderNonceOnBroadcast(
+                  kv,
+                  signerHash,
+                  record.senderNonce,
+                  resolved.txId
+                ).catch((e) => logger.warn("Failed to update sender nonce cache on conflict resolve", { error: String(e) }));
+                await kv
+                  .put(`sender_addr_map:${record.senderAddress}`, signerHash, { expirationTtl: 86_400 })
+                  .catch((e) => logger.warn("Failed to write sender address mapping on conflict resolve", { error: String(e) }));
+              }
+              emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
+                route: "PAYMENT_QUEUE",
+                paymentId,
+                status: record.status,
+                action: "sender_conflict_resolved_txid",
+                checkStatusUrlPresent: false,
+                compatShimUsed: false,
+                attempt,
+                txid: resolved.txId,
+                responsibleParty: "sender",
+              });
+              logger.info("Sender-origin nonce conflict resolved: txid wired for healers", {
+                paymentId,
+                txid: resolved.txId,
+                senderAddress: record.senderAddress,
+                senderNonce: record.senderNonce,
+              });
+              message.ack();
+              return;
+            } else {
+              // On-chain tx does not match settle requirements — a different/unrelated tx
+              // occupied this nonce (e.g. a different recipient, different amount, or a
+              // non-payment tx). Do NOT write txid_map for an unverified txid.
+              record = transitionPayment(record, "replaced", {
+                error: verifyResult.details ?? verifyResult.error ?? "On-chain tx does not satisfy settle requirements",
+                terminalReason: "superseded",
+                retryable: false,
+              });
+              await putPaymentRecord(kv, record);
+              emitPaymentLifecycleEvent(logger, "payment.finalized", {
+                route: "PAYMENT_QUEUE",
+                paymentId,
+                status: record.status,
+                terminalReason: record.terminalReason,
+                action: "sender_conflict_superseded",
+                checkStatusUrlPresent: false,
+                compatShimUsed: false,
+                attempt,
+                responsibleParty: "sender",
+              }, "warn");
+              logger.warn("Sender-origin nonce conflict: on-chain tx does not satisfy settle requirements", {
+                paymentId,
+                resolvedTxId: resolved.txId,
+                senderAddress: record.senderAddress,
+                senderNonce: record.senderNonce,
+                verifyError: verifyResult.error,
+              });
+              message.ack();
+              return;
+            }
+          }
+        } else if (resolved.txStatus !== "success") {
+          // Tx is in mempool/pending — wire in txid without settle verification.
+          // Leave for healers to finalize on confirmation.
+          record = transitionPayment(record, "mempool", { txid: resolved.txId });
+          await putPaymentRecord(kv, record);
+          await kv
+            .put(`txid_map:${resolved.txId}`, paymentId, { expirationTtl: 86_400 })
+            .catch((e) => logger.warn("Failed to write txid mapping on sender conflict pending", { error: String(e) }));
+          emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
+            route: "PAYMENT_QUEUE",
+            paymentId,
+            status: record.status,
+            action: "sender_conflict_resolved_txid_pending",
+            checkStatusUrlPresent: false,
+            compatShimUsed: false,
+            attempt,
+            txid: resolved.txId,
+            responsibleParty: "sender",
+          });
+          logger.info("Sender-origin nonce conflict: in-flight txid wired, awaiting healer confirmation", {
+            paymentId,
+            txid: resolved.txId,
+            txStatus: resolved.txStatus,
+            senderAddress: record.senderAddress,
+            senderNonce: record.senderNonce,
+          });
+          message.ack();
+          return;
+        }
+        // resolved exists but txStatus=success with no settle, or raw-tx fetch failed
+        // — fall through to sender_nonce_duplicate
+      }
+      // Lookup returned null or unresolvable — fall through to sender_nonce_duplicate
+      record = transitionPayment(record, "failed", {
+        error: broadcastResult.error,
+        errorCode: "SENDER_NONCE_CONFLICT",
+        terminalReason: "sender_nonce_duplicate",
+        retryable: false,
+      });
+      await putPaymentRecord(kv, record);
+      emitPaymentLifecycleEvent(logger, "payment.finalized", {
+        route: "PAYMENT_QUEUE",
+        paymentId,
+        status: record.status,
+        terminalReason: record.terminalReason,
+        action: "sender_conflict_unresolvable",
+        checkStatusUrlPresent: false,
+        compatShimUsed: false,
+        attempt,
+        responsibleParty: "sender",
+      }, "warn");
+      message.ack();
+      return;
+    }
+
     record = transitionPayment(record, "failed", {
       error: broadcastResult.error,
       errorCode: broadcastResult.clientRejection
@@ -395,7 +635,7 @@ async function processPaymentMessage(
         : "BROADCAST_FAILED",
       terminalReason: isOriginChaining
         ? "origin_chaining_limit"
-        : (isTooMuchChaining || isNonceConflict)
+        : isTooMuchChaining
           ? "sponsor_failure"
           : "broadcast_failure",
       retryable: broadcastResult.retryable,
