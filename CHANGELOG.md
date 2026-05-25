@@ -7,6 +7,23 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.34.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.33.2...x402-sponsor-relay-v1.34.0) (2026-05-25)
+
+
+### Features
+
+* **reconcile:** cron sweep to recover stuck payment records ([#398](https://github.com/aibtcdev/x402-sponsor-relay/issues/398)) ([#401](https://github.com/aibtcdev/x402-sponsor-relay/issues/401)) ([6309032](https://github.com/aibtcdev/x402-sponsor-relay/commit/6309032c2f9cba41ecff927c128a7cfad7ccfbfe))
+
+
+### Bug Fixes
+
+* **nonce-do:** evict confirmed sender txs from replay buffer instead of re-broadcasting ([#403](https://github.com/aibtcdev/x402-sponsor-relay/issues/403)) ([#412](https://github.com/aibtcdev/x402-sponsor-relay/issues/412)) ([c951335](https://github.com/aibtcdev/x402-sponsor-relay/commit/c951335af19a1940cefbe25d82842fd799f9232f))
+* **nonce-do:** make confirm-reconcile idempotent and exclude confirmed nonces from in-flight count ([#406](https://github.com/aibtcdev/x402-sponsor-relay/issues/406)) ([7a7ea51](https://github.com/aibtcdev/x402-sponsor-relay/commit/7a7ea5189c7a866a17ac4a45c588076441da0984))
+* **nonce-do:** re-deliver zombie-retired dispatch entries instead of dropping them ([#398](https://github.com/aibtcdev/x402-sponsor-relay/issues/398)) ([#403](https://github.com/aibtcdev/x402-sponsor-relay/issues/403)) ([6388a6e](https://github.com/aibtcdev/x402-sponsor-relay/commit/6388a6e33ca340337dd14ff3870bd943d9e74aba))
+* **queue:** do not wire aborted sender tx as confirmable in nonce-conflict recovery ([#397](https://github.com/aibtcdev/x402-sponsor-relay/issues/397)) ([#411](https://github.com/aibtcdev/x402-sponsor-relay/issues/411)) ([90cd793](https://github.com/aibtcdev/x402-sponsor-relay/commit/90cd793c007eeb348a4663459b94bd1f412f4c81))
+* **queue:** resolve and verify sender-origin nonce conflicts instead of false sponsor_failure ([#397](https://github.com/aibtcdev/x402-sponsor-relay/issues/397)) ([#409](https://github.com/aibtcdev/x402-sponsor-relay/issues/409)) ([c4c31a1](https://github.com/aibtcdev/x402-sponsor-relay/commit/c4c31a1e98306bea0e888ef5bc6c810e29382b8a))
+* **queue:** terminalize payments on retry exhaustion so they can't strand at "queued" ([#398](https://github.com/aibtcdev/x402-sponsor-relay/issues/398)) ([#399](https://github.com/aibtcdev/x402-sponsor-relay/issues/399)) ([1ddb6ad](https://github.com/aibtcdev/x402-sponsor-relay/commit/1ddb6ad513436356df70cab959247a067488f679))
+
 ## [1.33.2](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.33.1...x402-sponsor-relay-v1.33.2) (2026-05-19)
 
 
