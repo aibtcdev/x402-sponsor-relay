@@ -1007,7 +1007,7 @@ export class NonceDO {
       }
     } catch { /* already present or error — fail-open */ }
 
-    // Migration: add broadcast_attempts column to replay_buffer (nullable INTEGER, default 0).
+    // Migration: add broadcast_attempts column to replay_buffer (NOT NULL INTEGER, default 0).
     // Tracks how many times an entry has failed to re-broadcast, used by the bounded-retry
     // eviction cap in processReplayBuffer (#403).
     try {
@@ -6244,14 +6244,29 @@ export class NonceDO {
 
                 if (isOurTx) {
                   // MATCH: on-chain tx is our payment. Wire txid_map + transition to mempool.
-                  await this.env.RELAY_KV.put(`txid_map:${onChain.txId}`, entry.payment_id, {
-                    expirationTtl: 86_400,
-                  });
-                  const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
-                  if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
-                    const updated = transitionPayment(record, "mempool", { txid: onChain.txId });
-                    await putPaymentRecord(this.env.RELAY_KV, updated);
+                  // Best-effort wiring: a KV failure must NOT prevent eviction — better to evict
+                  // and log than to loop forever (#403). Track whether wiring succeeded so the
+                  // log's `finalized` field accurately reflects reality.
+                  let wired = false;
+                  try {
+                    await this.env.RELAY_KV.put(`txid_map:${onChain.txId}`, entry.payment_id, {
+                      expirationTtl: 86_400,
+                    });
+                    const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                    if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                      const updated = transitionPayment(record, "mempool", { txid: onChain.txId });
+                      await putPaymentRecord(this.env.RELAY_KV, updated);
+                    }
+                    wired = true;
+                  } catch (wireErr) {
+                    this.log("error", "replay_evict_confirmed_wire_failed", {
+                      replayId: entry.id,
+                      paymentId: entry.payment_id,
+                      resolvedTxId: onChain.txId,
+                      error: wireErr instanceof Error ? wireErr.message : String(wireErr),
+                    });
                   }
+                  // Always evict once committed (on-chain state is resolved — no retry can help).
                   this.removeFromReplayBuffer(entry.id);
                   this.log("info", "replay_evict_confirmed", {
                     replayId: entry.id,
@@ -6260,7 +6275,7 @@ export class NonceDO {
                     paymentId: entry.payment_id,
                     resolvedTxId: onChain.txId,
                     txStatus: onChain.txStatus,
-                    finalized: true,
+                    finalized: wired,
                     verified: true,
                   });
                   processed++;
@@ -6270,15 +6285,26 @@ export class NonceDO {
                   // (the nonce is permanently consumed). Terminalize the payment record as
                   // replaced/superseded (mirrors Mode A's sender_conflict_superseded path in
                   // queue-consumer.ts) and evict the replay buffer entry. Do NOT write txid_map.
-                  const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
-                  if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
-                    const updated = transitionPayment(record, "replaced", {
-                      error: "On-chain tx at sender nonce does not match queued payment (foreign tx superseded nonce)",
-                      terminalReason: "superseded" as const,
-                      retryable: false,
+                  // Best-effort: terminalization failure must not prevent eviction.
+                  try {
+                    const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                    if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                      const updated = transitionPayment(record, "replaced", {
+                        error: "On-chain tx at sender nonce does not match queued payment (foreign tx superseded nonce)",
+                        terminalReason: "superseded" as const,
+                        retryable: false,
+                      });
+                      await putPaymentRecord(this.env.RELAY_KV, updated);
+                    }
+                  } catch (wireErr) {
+                    this.log("error", "replay_evict_superseded_wire_failed", {
+                      replayId: entry.id,
+                      paymentId: entry.payment_id,
+                      foreignTxId: onChain.txId,
+                      error: wireErr instanceof Error ? wireErr.message : String(wireErr),
                     });
-                    await putPaymentRecord(this.env.RELAY_KV, updated);
                   }
+                  // Always evict — the nonce is permanently consumed regardless.
                   this.removeFromReplayBuffer(entry.id);
                   this.log("warn", "replay_evict_superseded", {
                     replayId: entry.id,
@@ -6307,16 +6333,57 @@ export class NonceDO {
               });
               processed++;
               continue;
+            } else if (onChain && onChain.txStatus !== "success") {
+              // ABORTED: the on-chain tx at this nonce was rejected (abort_by_response /
+              // abort_by_post_condition). The nonce is permanently consumed — re-broadcasting
+              // cannot succeed. Terminalize the payment record BEFORE eviction so it is never
+              // left as a non-terminal orphan. Do NOT write txid_map (the tx was never confirmed).
+              // Best-effort: terminalization failure must not prevent eviction.
+              if (entry.payment_id && this.env.RELAY_KV) {
+                try {
+                  const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                  if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                    const updated = transitionPayment(record, "failed", {
+                      error: `Sender tx aborted on-chain (nonce ${entry.sender_nonce} status: ${onChain.txStatus})`,
+                      terminalReason: "sender_nonce_duplicate" as const,
+                      retryable: false,
+                    });
+                    await putPaymentRecord(this.env.RELAY_KV, updated);
+                  }
+                } catch (wireErr) {
+                  this.log("error", "replay_evict_aborted_wire_failed", {
+                    replayId: entry.id,
+                    paymentId: entry.payment_id,
+                    resolvedTxId: onChain.txId,
+                    txStatus: onChain.txStatus,
+                    error: wireErr instanceof Error ? wireErr.message : String(wireErr),
+                  });
+                }
+              }
+              // Always evict — the nonce is permanently consumed.
+              this.removeFromReplayBuffer(entry.id);
+              this.log("warn", "replay_evict_aborted", {
+                replayId: entry.id,
+                senderAddress: entry.sender_address,
+                senderNonce: entry.sender_nonce,
+                paymentId: entry.payment_id,
+                resolvedTxId: onChain.txId,
+                txStatus: onChain.txStatus,
+              });
+              processed++;
+              continue;
             } else {
-              // onChain is null, or txStatus !== "success", or no RELAY_KV — evict without credit
+              // onChain is null — Hiro couldn't resolve the txid for this nonce.
+              // Cannot determine on-chain state. Evict without credit (the nonce is
+              // confirmed per isSenderNonceConfirmed but we can't identify the tx).
               this.removeFromReplayBuffer(entry.id);
               this.log("info", "replay_evict_confirmed", {
                 replayId: entry.id,
                 senderAddress: entry.sender_address,
                 senderNonce: entry.sender_nonce,
                 paymentId: entry.payment_id,
-                resolvedTxId: onChain?.txId ?? null,
-                txStatus: onChain?.txStatus ?? null,
+                resolvedTxId: null,
+                txStatus: null,
                 finalized: false,
                 verified: false,
               });
@@ -6466,7 +6533,29 @@ export class NonceDO {
             // The evict-on-confirmed check above handles the common case (#403 bug);
             // this cap is a safety net for the edge case where Hiro consistently errors
             // but the tx is also not confirmed (e.g. sponsor wallet exhausted for days).
+            // Terminalize the payment record BEFORE eviction — no committed eviction may
+            // leave a non-terminal orphaned payment record.
             if (newAttempts >= REPLAY_MAX_BROADCAST_ATTEMPTS) {
+              if (entry.payment_id && this.env.RELAY_KV) {
+                try {
+                  const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                  if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                    const updated = transitionPayment(record, "failed", {
+                      error: `Replay buffer eviction after ${newAttempts} failed broadcast attempts`,
+                      terminalReason: "broadcast_failure" as const,
+                      retryable: false,
+                    });
+                    await putPaymentRecord(this.env.RELAY_KV, updated);
+                  }
+                } catch (wireErr) {
+                  this.log("error", "replay_evict_cap_wire_failed", {
+                    replayId: entry.id,
+                    paymentId: entry.payment_id,
+                    attempts: newAttempts,
+                    error: wireErr instanceof Error ? wireErr.message : String(wireErr),
+                  });
+                }
+              }
               this.removeFromReplayBuffer(entry.id);
               this.log("warn", "replay_evict_max_attempts", {
                 replayId: entry.id,

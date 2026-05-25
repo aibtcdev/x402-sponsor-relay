@@ -424,4 +424,164 @@ describe("replay-buffer evict-on-confirmed (#403)", () => {
     // removeFromReplayBuffer should NOT have been called (entry retained for retry)
     expect(removeFromReplayBuffer).not.toHaveBeenCalled();
   });
+
+  it("P1 aborted-confirmed: terminalize payment as failed/sender_nonce_duplicate, NO txid_map, evict, log replay_evict_aborted", async () => {
+    // isSenderNonceConfirmed is true (nonce consumed), but the resolved tx has abort_by_response
+    // status — meaning it was rejected on-chain. The nonce is permanently consumed (can't retry).
+    // The payment must be terminalized to avoid a non-terminal orphan.
+    const { double, removeFromReplayBuffer, broadcastRawTx, kvPut, kvGet, logSpy } =
+      makeDouble({
+        entries: [baseEntry],
+        senderConfirmed: true,
+        onChainTxid: { txId: "0xaborted_txid", txStatus: "abort_by_response" },
+        kvRecord: { status: "queued" },
+      });
+
+    const result = await run(double);
+
+    // Must evict the entry
+    expect(removeFromReplayBuffer).toHaveBeenCalledWith(42);
+
+    // Must NOT re-broadcast (nonce permanently consumed)
+    expect(broadcastRawTx).not.toHaveBeenCalled();
+
+    // Must NOT write txid_map (aborted tx was never confirmed)
+    const txidMapCalls = kvPut.mock.calls.filter(([key]: [string]) =>
+      key.startsWith("txid_map:")
+    );
+    expect(txidMapCalls).toHaveLength(0);
+
+    // Must have looked up the payment record to terminalize it
+    expect(kvGet).toHaveBeenCalled();
+
+    // Must write the terminalized payment record (putPaymentRecord calls kvPut with "payment:" key)
+    const paymentPutCalls = kvPut.mock.calls.filter(([key]: [string]) =>
+      key.startsWith("payment:")
+    );
+    expect(paymentPutCalls).toHaveLength(1);
+    const writtenRecord = JSON.parse(paymentPutCalls[0][1] as string);
+    expect(writtenRecord.status).toBe("failed");
+    expect(writtenRecord.terminalReason).toBe("sender_nonce_duplicate");
+    expect(writtenRecord.retryable).toBe(false);
+
+    // Must emit replay_evict_aborted at warn level (distinct from replay_evict_confirmed)
+    const abortedCall = logSpy.mock.calls.find(
+      ([_level, event]: [string, string]) => event === "replay_evict_aborted"
+    );
+    expect(abortedCall).toBeDefined();
+    expect(abortedCall[0]).toBe("warn");
+    expect(abortedCall[2]).toMatchObject({
+      replayId: 42,
+      senderAddress: "SP1EANQABCDEF",
+      senderNonce: 189,
+      paymentId: "pay_test_abc123",
+      resolvedTxId: "0xaborted_txid",
+      txStatus: "abort_by_response",
+    });
+
+    // Must NOT emit replay_evict_confirmed
+    const confirmedCall = logSpy.mock.calls.find(
+      ([_level, event]: [string, string]) => event === "replay_evict_confirmed"
+    );
+    expect(confirmedCall).toBeUndefined();
+
+    // Counts as processed
+    expect(result).toEqual({ processed: 1, failed: 0 });
+  });
+
+  it("best-effort wiring: KV failure in match path still evicts entry (no infinite loop), finalized: false", async () => {
+    // Simulate a KV write failure in the match path.
+    // The eviction must still proceed — a wiring failure must not trap the entry forever.
+    const { double, removeFromReplayBuffer, broadcastRawTx, logSpy } =
+      makeDouble({
+        entries: [baseEntry],
+        senderConfirmed: true,
+        onChainTxid: { txId: "0xconfirmed_txid", txStatus: "success" },
+        onChainRawHex: "deadbeef", // match
+        kvRecord: { status: "queued" },
+      });
+
+    // Override kvPut to throw on the first call (txid_map write)
+    double.env.RELAY_KV.put = vi.fn(async (_key: string, _value: string) => {
+      throw new Error("KV write failed — simulated");
+    });
+
+    const result = await run(double);
+
+    // Must still evict even though KV wiring threw
+    expect(removeFromReplayBuffer).toHaveBeenCalledWith(42);
+
+    // Must NOT re-broadcast (nonce is confirmed on-chain)
+    expect(broadcastRawTx).not.toHaveBeenCalled();
+
+    // Must emit a wire-failure error log
+    const wireFailCall = logSpy.mock.calls.find(
+      ([_level, event]: [string, string]) => event === "replay_evict_confirmed_wire_failed"
+    );
+    expect(wireFailCall).toBeDefined();
+    expect(wireFailCall[0]).toBe("error");
+
+    // Must emit replay_evict_confirmed with finalized: false (wiring failed)
+    const confirmedCall = logSpy.mock.calls.find(
+      ([_level, event]: [string, string]) => event === "replay_evict_confirmed"
+    );
+    expect(confirmedCall).toBeDefined();
+    expect(confirmedCall[2]).toMatchObject({
+      finalized: false,  // accurately reflects wiring failure
+      verified: true,
+    });
+
+    // Counts as processed (evicted successfully even though wiring failed)
+    expect(result).toEqual({ processed: 1, failed: 0 });
+  });
+
+  it("bounded-retry cap terminalization: payment record is terminalized as failed/broadcast_failure at cap eviction", async () => {
+    const entryAtCap: ReplayEntry = {
+      ...baseEntry,
+      broadcast_attempts: 9, // next failure hits cap (= 10)
+    };
+
+    const { double, removeFromReplayBuffer, kvPut, kvGet, logSpy, sqlExecMock } = makeDouble({
+      entries: [entryAtCap],
+      senderConfirmed: false,
+      broadcastResult: { ok: false, reason: "ConflictingNonceInMempool", status: 409 },
+      kvRecord: { status: "queued" },
+    });
+
+    sqlExecMock.mockImplementation((_query: string, ..._args: unknown[]) => {
+      if (typeof _query === "string" && _query.includes("broadcast_attempts")) {
+        return { toArray: () => [{ broadcast_attempts: 10 }] };
+      }
+      return { toArray: () => [] };
+    });
+
+    await run(double);
+
+    // Must evict
+    expect(removeFromReplayBuffer).toHaveBeenCalledWith(entryAtCap.id);
+
+    // Must have read the payment record
+    expect(kvGet).toHaveBeenCalled();
+
+    // Must write the terminalized payment record
+    const paymentPutCalls = kvPut.mock.calls.filter(([key]: [string]) =>
+      key.startsWith("payment:")
+    );
+    expect(paymentPutCalls).toHaveLength(1);
+    const writtenRecord = JSON.parse(paymentPutCalls[0][1] as string);
+    expect(writtenRecord.status).toBe("failed");
+    expect(writtenRecord.terminalReason).toBe("broadcast_failure");
+    expect(writtenRecord.retryable).toBe(false);
+
+    // Must emit replay_evict_max_attempts
+    const evictCall = logSpy.mock.calls.find(
+      ([_level, event]: [string, string]) => event === "replay_evict_max_attempts"
+    );
+    expect(evictCall).toBeDefined();
+    expect(evictCall[0]).toBe("warn");
+    expect(evictCall[2]).toMatchObject({
+      replayId: entryAtCap.id,
+      attempts: 10,
+    });
+  });
 });
