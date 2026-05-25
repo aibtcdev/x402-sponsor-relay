@@ -53,7 +53,18 @@ export class MemoryKV implements KVNamespace {
     this.store.delete(key);
   }
 
-  async list(): Promise<KVNamespaceListResult<unknown>> {
-    throw new Error("not implemented");
+  async list(options?: {
+    prefix?: string | null;
+    limit?: number | null;
+    cursor?: string | null;
+  }): Promise<KVNamespaceListResult<unknown>> {
+    const prefix = options?.prefix ?? "";
+    const names = [...this.store.keys()].filter((k) => k.startsWith(prefix)).sort();
+    const limited = options?.limit != null ? names.slice(0, options.limit) : names;
+    return {
+      keys: limited.map((name) => ({ name })),
+      list_complete: true,
+      cacheStatus: null,
+    } as KVNamespaceListResult<unknown>;
   }
 }
