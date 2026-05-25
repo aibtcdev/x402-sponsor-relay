@@ -574,33 +574,35 @@ async function processPaymentMessage(
             }
           }
         } else if (resolved.txStatus !== "success") {
-          // Tx is in mempool/pending — wire in txid without settle verification.
-          // Leave for healers to finalize on confirmation.
-          record = transitionPayment(record, "mempool", { txid: resolved.txId });
-          await putPaymentRecord(kv, record);
-          await kv
-            .put(`txid_map:${resolved.txId}`, paymentId, { expirationTtl: 86_400 })
-            .catch((e) => logger.warn("Failed to write txid mapping on sender conflict pending", { error: String(e) }));
-          emitPaymentLifecycleEvent(logger, "payment.retry_decision", {
+          // NOTE: lookupTxByAddressNonce queries Hiro GET /extended/v1/address/{sender}/transactions,
+          // which returns ONLY mined (anchored) transactions — NOT mempool txs.
+          // Therefore a non-"success" tx_status here is an aborted on-chain status
+          // (abort_by_response / abort_by_post_condition), NOT a pending/mempool tx.
+          //
+          // Do NOT wire txid_map or park in "mempool": an aborted tx never confirms, so
+          // chainhook/confirm-reconcile healers would never finalize the record, creating
+          // a stuck-forever payment. Terminalize as sender_nonce_duplicate instead.
+          emitPaymentLifecycleEvent(logger, "payment.finalized", {
             route: "PAYMENT_QUEUE",
             paymentId,
-            status: record.status,
-            action: "sender_conflict_resolved_txid_pending",
+            status: "failed",
+            terminalReason: "sender_nonce_duplicate",
+            action: "sender_conflict_aborted_onchain",
             checkStatusUrlPresent: false,
             compatShimUsed: false,
             attempt,
-            txid: resolved.txId,
+            resolvedTxId: resolved.txId,
+            txStatus: resolved.txStatus,
             responsibleParty: "sender",
-          });
-          logger.info("Sender-origin nonce conflict: in-flight txid wired, awaiting healer confirmation", {
+          }, "warn");
+          logger.warn("Sender-origin nonce conflict: resolved tx is aborted on-chain, terminalizing", {
             paymentId,
-            txid: resolved.txId,
+            resolvedTxId: resolved.txId,
             txStatus: resolved.txStatus,
             senderAddress: record.senderAddress,
             senderNonce: record.senderNonce,
           });
-          message.ack();
-          return;
+          // Fall through to sender_nonce_duplicate terminalization below.
         }
         // resolved exists but txStatus=success with no settle, or raw-tx fetch failed
         // — fall through to sender_nonce_duplicate

@@ -671,7 +671,88 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
   });
 
   // -------------------------------------------------------------------------
-  // 8. Raw-tx fetch fails (timeout or HTTP error) — fail safe, fall back to
+  // 8. REGRESSION: resolved tx has an aborted status (abort_by_response)
+  //    lookupTxByAddressNonce only returns MINED txs, so non-"success" means
+  //    aborted on-chain — NOT pending/mempool. Must terminalize as
+  //    failed/sender_nonce_duplicate and NOT write txid_map or set record.txid.
+  //    (Wiring an aborted tx to "mempool" creates a stuck-forever record.)
+  // -------------------------------------------------------------------------
+  it("terminalizes as failed/sender_nonce_duplicate when resolved tx is aborted on-chain (not wired)", async () => {
+    const kv = new MemoryKV();
+    const record = transitionPayment(
+      createPaymentRecord("pay_aborted", "testnet"),
+      "queued"
+    );
+    record.senderNonce = 55;
+    record.senderAddress = "SP3TVWABORTED000000000000000000000000000";
+    await putPaymentRecord(kv, record);
+
+    mocks.deserializeTransaction.mockImplementation((hex: string) => {
+      if (hex === "aborted_tx") return { auth: { spendingCondition: { signer: "signer_aborted" } } };
+      if (hex === "sponsored_aborted") return { id: "sponsored_aborted" };
+      throw new Error(`unexpected hex: ${hex}`);
+    });
+    mocks.sponsorTransaction.mockResolvedValue({
+      success: true,
+      sponsoredTxHex: "sponsored_aborted",
+      walletIndex: 0,
+      fee: "1000",
+    });
+    mocks.broadcastOnly.mockResolvedValue({
+      error: "ConflictingNonceInMempool",
+      nonceConflict: true,
+      retryable: false,
+    });
+
+    // Hiro address/transactions lookup returns a tx at nonce 55 — but it is ABORTED
+    // (abort_by_response / abort_by_post_condition). The /address/{sender}/transactions
+    // endpoint only returns mined txs, so this is an on-chain abortion, not a mempool tx.
+    mocks.fetch.mockResolvedValueOnce(
+      hiroTxResponse([{ tx_id: "0xabortedtx99", tx_status: "abort_by_response", nonce: 55 }])
+    );
+
+    const message = createMessage(
+      {
+        paymentId: "pay_aborted",
+        txHex: "aborted_tx",
+        network: "testnet",
+        attempt: 5,
+        settle: DEFAULT_SETTLE,
+      },
+      5
+    );
+
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+
+    const finalRecord = await getPaymentRecord(kv, "pay_aborted");
+
+    // Must terminalize as failed/sender_nonce_duplicate — not stuck in mempool
+    expect(finalRecord?.status).toBe("failed");
+    expect(finalRecord?.terminalReason).toBe("sender_nonce_duplicate");
+    // MUST NOT set record.txid to the aborted tx (aborted tx never confirms)
+    expect(finalRecord?.txid).toBeUndefined();
+    // MUST NOT write txid_map (healers would wait forever for a tx that already aborted)
+    const txidMapEntry = await kv.get("txid_map:0xabortedtx99");
+    expect(txidMapEntry).toBeNull();
+    // Must NOT call updateSenderNonceOnBroadcast for an aborted tx
+    expect(mocks.updateSenderNonceOnBroadcast).not.toHaveBeenCalled();
+    // Must NOT fetch raw tx (aborted branch does not need raw hex)
+    expect(mocks.fetch).toHaveBeenCalledTimes(1); // only the address/transactions lookup
+    // verifyPaymentParams must NOT be called (no raw hex to verify)
+    expect(mocks.verifyPaymentParams).not.toHaveBeenCalled();
+    // Message must be acked (not retried)
+    expect(message.ack).toHaveBeenCalledTimes(1);
+    expect(message.retry).not.toHaveBeenCalled();
+    // Never sponsor_failure for a sender-origin conflict
+    expect(finalRecord?.terminalReason).not.toBe("sponsor_failure");
+  });
+
+  // -------------------------------------------------------------------------
+  // 9. Raw-tx fetch fails (timeout or HTTP error) — fail safe, fall back to
   //    sender_nonce_duplicate (do NOT write txid_map for unverified txid)
   // -------------------------------------------------------------------------
   it("falls back to sender_nonce_duplicate when raw-tx fetch fails", async () => {
