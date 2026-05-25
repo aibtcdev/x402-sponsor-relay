@@ -1283,24 +1283,30 @@ export class NonceDO {
         settlementMs = Math.max(0, Date.now() - new Date(startTime).getTime());
       }
 
-      this.sql.exec(
+      // Guard: only transition if not already confirmed. Idempotent — a repeated confirm
+      // call (e.g. reconcile re-processing a historical nonce) must be a no-op: no
+      // settlement_ms recompute, no settlement_confirmed re-emit.
+      const confirmCursor = this.sql.exec(
         `UPDATE dispatch_queue
          SET state = 'confirmed', confirmed_at = ?, settlement_ms = ?
-         WHERE wallet_index = ? AND sponsor_nonce = ?`,
+         WHERE wallet_index = ? AND sponsor_nonce = ? AND state != 'confirmed'`,
         now,
         settlementMs,
         walletIndex,
         sponsorNonce
       );
 
-      // Emit structured log for settlement latency tracking
-      this.log("info", "settlement_confirmed", {
-        walletIndex,
-        sponsorNonce,
-        settlementMs,
-        originalFee: preRow?.original_fee ?? null,
-        senderAddress: preRow?.sender_address ?? null,
-      });
+      // Emit structured log only when a row actually transitioned (rowsWritten > 0).
+      // Re-confirming an already-confirmed nonce must be silent.
+      if (confirmCursor.rowsWritten > 0) {
+        this.log("info", "settlement_confirmed", {
+          walletIndex,
+          sponsorNonce,
+          settlementMs,
+          originalFee: preRow?.original_fee ?? null,
+          senderAddress: preRow?.sender_address ?? null,
+        });
+      }
     } else if (newState === "dispatched") {
       this.sql.exec(
         `UPDATE dispatch_queue SET state = 'dispatched', dispatched_at = ?
@@ -4053,17 +4059,17 @@ export class NonceDO {
   }
 
   /**
-   * Count all in-flight nonces for a wallet: 'assigned' (handed out, awaiting broadcast),
-   * 'broadcasted' (accepted by node, in mempool), and 'confirmed' (broadcast succeeded,
-   * nonce consumed — still pending on-chain despite the ledger state name).
-   * The Stacks node's TooMuchChaining limit (25) counts ALL pending txs from a sender,
-   * so chaining-limit decisions must count all three states.
+   * Count truly in-flight nonces for a wallet: 'assigned' (handed out, awaiting broadcast)
+   * and 'broadcasted' (broadcast accepted by the network; on-chain confirmation handled later
+   * by reconciliation). 'confirmed' nonces have completed the full lifecycle and must not
+   * count against in-flight capacity — including them causes the count to grow monotonically
+   * and inflate chaining-limit headroom calculations.
    * Used as the fallback when chain frontier is not yet available (cold start).
    */
   private ledgerInFlightCount(walletIndex: number): number {
     const rows = this.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted', 'confirmed')",
+        "SELECT COUNT(*) as count FROM nonce_intents WHERE wallet_index = ? AND state IN ('assigned', 'broadcasted')",
         walletIndex
       )
       .toArray();
@@ -4400,8 +4406,10 @@ export class NonceDO {
   // ---------------------------------------------------------------------------
 
   /**
-   * Return all nonce_intents rows for a wallet that have a txid recorded.
-   * Covers both 'confirmed' (successful broadcast) and 'failed' (broadcast attempted) states.
+   * Return all nonce_intents rows for a wallet that have a txid recorded and are not yet
+   * confirmed. Covers 'broadcasted' (in mempool) and 'failed' (broadcast attempted) states.
+   * Excludes 'confirmed' rows — those are already settled and must not be re-scanned on
+   * every alarm tick (which would inflate settlement latency and re-emit settlement_confirmed).
    * Used by reconcileNonceForWallet to cross-reference broadcasted nonces against Hiro state.
    */
   private ledgerGetBroadcastedNonces(walletIndex: number): Array<{
@@ -4412,7 +4420,7 @@ export class NonceDO {
   }> {
     return this.sql
       .exec<{ nonce: number; txid: string; assigned_at: string; broadcasted_at: string | null }>(
-        "SELECT nonce, txid, assigned_at, broadcasted_at FROM nonce_intents WHERE wallet_index = ? AND txid IS NOT NULL",
+        "SELECT nonce, txid, assigned_at, broadcasted_at FROM nonce_intents WHERE wallet_index = ? AND txid IS NOT NULL AND state != 'confirmed'",
         walletIndex
       )
       .toArray();
@@ -4453,8 +4461,9 @@ export class NonceDO {
         walletIndex,
         nonce
       );
-      // Only emit event if the UPDATE actually transitioned the intent (prevents
-      // duplicate reconcile_confirmed events when the nonce is already confirmed)
+      // Emit the reconcile_confirmed event only when nonce_intents actually transitioned
+      // (prevents duplicate events when the intent was already confirmed by releaseNonce or
+      // recordBroadcastOutcome before reconciliation ran).
       if (updateCursor.rowsWritten > 0) {
         this.sql.exec(
           `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
@@ -4465,7 +4474,13 @@ export class NonceDO {
           now
         );
       }
-      // Also advance any matching dispatch queue entry to 'confirmed'
+      // Always attempt to advance dispatch_queue to 'confirmed', unconditionally.
+      // transitionQueueEntry's confirmed branch is self-idempotent (it guards on
+      // AND state != 'confirmed' internally and only logs settlement_confirmed when
+      // a row actually transitions). This decouples the two tables: if nonce_intents
+      // was already confirmed (e.g. releaseNonce ran first) the intent UPDATE above
+      // writes 0 rows, but dispatch_queue still needs to advance — omitting this call
+      // would leave dispatch_queue stuck and prevent settlement side-effects from firing.
       this.transitionQueueEntry(walletIndex, nonce, "confirmed");
     } catch (e) {
       this.log("debug", "ledger_reconcile_confirmed_error", {
@@ -8763,7 +8778,9 @@ export class NonceDO {
       // Remove nonces that are already managed by our ledger (assigned/broadcasted/confirmed).
       // Lower bound covers the full gap range added above (last_executed + 1 or 0)
       // so corridor nonces with existing ledger entries are correctly excluded.
-      // 'confirmed' = broadcast accepted, still pending on-chain — same as ledgerInFlightCount.
+      // Note: 'confirmed' is intentionally included here for gap-skip purposes (we don't
+      // want to gap-fill a nonce the relay already confirmed); this is distinct from
+      // ledgerInFlightCount() which excludes 'confirmed' for chaining-limit calculations.
       const inFlightLowerBound =
         last_executed_tx_nonce !== null ? last_executed_tx_nonce + 1 : 0;
       const inFlightRows = this.sql
