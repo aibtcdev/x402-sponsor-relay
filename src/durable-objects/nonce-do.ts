@@ -4060,9 +4060,10 @@ export class NonceDO {
 
   /**
    * Count truly in-flight nonces for a wallet: 'assigned' (handed out, awaiting broadcast)
-   * and 'broadcasted' (accepted by node, in mempool). 'confirmed' nonces are settled on-chain
-   * and must not count against in-flight capacity — including them causes the count to grow
-   * monotonically and inflate chaining-limit headroom calculations.
+   * and 'broadcasted' (broadcast accepted by the network; on-chain confirmation handled later
+   * by reconciliation). 'confirmed' nonces have completed the full lifecycle and must not
+   * count against in-flight capacity — including them causes the count to grow monotonically
+   * and inflate chaining-limit headroom calculations.
    * Used as the fallback when chain frontier is not yet available (cold start).
    */
   private ledgerInFlightCount(walletIndex: number): number {
@@ -4460,9 +4461,9 @@ export class NonceDO {
         walletIndex,
         nonce
       );
-      // Only emit event and advance dispatch_queue if the UPDATE actually transitioned
-      // the intent (prevents duplicate reconcile_confirmed events and settlement_confirmed
-      // re-emits when the nonce is already confirmed in both tables).
+      // Emit the reconcile_confirmed event only when nonce_intents actually transitioned
+      // (prevents duplicate events when the intent was already confirmed by releaseNonce or
+      // recordBroadcastOutcome before reconciliation ran).
       if (updateCursor.rowsWritten > 0) {
         this.sql.exec(
           `INSERT INTO nonce_events (wallet_index, nonce, event, detail, created_at)
@@ -4472,11 +4473,15 @@ export class NonceDO {
           JSON.stringify({ txid, reason: "chain_advanced_past_nonce" }),
           now
         );
-        // Also advance any matching dispatch queue entry to 'confirmed'.
-        // Gated here so that a repeated reconcile tick over an already-confirmed nonce
-        // does not recompute settlement_ms or re-emit settlement_confirmed.
-        this.transitionQueueEntry(walletIndex, nonce, "confirmed");
       }
+      // Always attempt to advance dispatch_queue to 'confirmed', unconditionally.
+      // transitionQueueEntry's confirmed branch is self-idempotent (it guards on
+      // AND state != 'confirmed' internally and only logs settlement_confirmed when
+      // a row actually transitions). This decouples the two tables: if nonce_intents
+      // was already confirmed (e.g. releaseNonce ran first) the intent UPDATE above
+      // writes 0 rows, but dispatch_queue still needs to advance — omitting this call
+      // would leave dispatch_queue stuck and prevent settlement side-effects from firing.
+      this.transitionQueueEntry(walletIndex, nonce, "confirmed");
     } catch (e) {
       this.log("debug", "ledger_reconcile_confirmed_error", {
         walletIndex,

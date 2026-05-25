@@ -212,3 +212,119 @@ describe("ledgerGetBroadcastedNonces — excludes confirmed rows (#398 Mode C)",
     expect(result[0]).toMatchObject({ nonce: 100, txid: "0xabc" });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Test 4 (P1 regression): ledgerMarkConfirmedByReconcile advances dispatch_queue
+// even when nonce_intents is ALREADY confirmed
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a minimal double for ledgerMarkConfirmedByReconcile.
+ *
+ * ledgerMarkConfirmedByReconcile does:
+ *   1. UPDATE nonce_intents ... AND state != 'confirmed'  → rowsWritten = intentRowsWritten
+ *   2. (if rowsWritten > 0) INSERT INTO nonce_events
+ *   3. (unconditional) this.transitionQueueEntry(walletIndex, nonce, "confirmed")
+ *
+ * transitionQueueEntry is itself a private method on NonceDO, so we mock it directly on
+ * the double rather than trying to replicate its SQL call sequence.  The mock records
+ * whether it was called and, when queueRowsWritten > 0, also calls log("info",
+ * "settlement_confirmed", ...) to simulate the side-effect we are asserting.
+ */
+function makeReconcileDouble(opts: {
+  intentRowsWritten: number;  // 0 = nonce_intents already confirmed; 1 = just transitioned
+  queueRowsWritten: number;   // 0 = dispatch_queue already confirmed; 1 = just transitioned
+}) {
+  const logMock = vi.fn();
+
+  // sql.exec is called by ledgerMarkConfirmedByReconcile directly (UPDATE nonce_intents,
+  // INSERT INTO nonce_events). We route by SQL fragment.
+  const execMock = vi.fn((_sql: string, ..._args: unknown[]): SqlExecResult => {
+    const sql = _sql as string;
+
+    if (sql.includes("UPDATE nonce_intents")) {
+      return { toArray: () => [], rowsWritten: opts.intentRowsWritten };
+    }
+    if (sql.includes("INSERT INTO nonce_events")) {
+      return { toArray: () => [], rowsWritten: 1 };
+    }
+
+    // Fallback — should not be reached in this test path
+    return { toArray: () => [], rowsWritten: 0 };
+  });
+
+  // Mock transitionQueueEntry: if queueRowsWritten > 0 simulate the settlement_confirmed
+  // log that the real method emits on a successful dispatch_queue transition.
+  const transitionQueueEntryMock = vi.fn(
+    (_walletIndex: number, sponsorNonce: number, _state: string) => {
+      if (opts.queueRowsWritten > 0) {
+        logMock("info", "settlement_confirmed", { walletIndex: _walletIndex, sponsorNonce });
+      }
+    }
+  );
+
+  const double = { sql: { exec: execMock }, log: logMock, transitionQueueEntry: transitionQueueEntryMock };
+  return { double, execMock, logMock, transitionQueueEntryMock };
+}
+
+const runLedgerMarkConfirmed = (double: unknown, walletIndex: number, nonce: number, txid: string): void =>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (NonceDO as any).prototype.ledgerMarkConfirmedByReconcile.call(double, walletIndex, nonce, txid);
+
+describe("ledgerMarkConfirmedByReconcile — P1 regression: dispatch_queue advances even when nonce_intents already confirmed (#398 Mode C)", () => {
+  it("advances dispatch_queue to confirmed when nonce_intents was ALREADY confirmed (intentRowsWritten=0)", () => {
+    // Scenario: releaseNonce ran before reconciliation, so nonce_intents.state is already
+    // 'confirmed'. The UPDATE nonce_intents writes 0 rows. transitionQueueEntry must still
+    // be called unconditionally so dispatch_queue can advance and settlement_confirmed fires.
+    const { double, logMock, transitionQueueEntryMock } = makeReconcileDouble({ intentRowsWritten: 0, queueRowsWritten: 1 });
+
+    runLedgerMarkConfirmed(double, 0, 42, "0xdeadbeef");
+
+    // The key invariant: transitionQueueEntry is called even though nonce_intents rowsWritten=0
+    expect(transitionQueueEntryMock).toHaveBeenCalledTimes(1);
+    expect(transitionQueueEntryMock).toHaveBeenCalledWith(0, 42, "confirmed");
+
+    // settlement_confirmed must fire exactly once via transitionQueueEntry (queue transitioned)
+    expect(logMock).toHaveBeenCalledTimes(1);
+    expect(logMock).toHaveBeenCalledWith("info", "settlement_confirmed", expect.objectContaining({ walletIndex: 0, sponsorNonce: 42 }));
+  });
+
+  it("does NOT re-emit settlement_confirmed when both nonce_intents AND dispatch_queue are already confirmed", () => {
+    // Scenario: both tables already confirmed — a second reconcile tick must be a no-op.
+    // transitionQueueEntry is still called (unconditional) but its internal guard silences it.
+    const { double, logMock, transitionQueueEntryMock } = makeReconcileDouble({ intentRowsWritten: 0, queueRowsWritten: 0 });
+
+    runLedgerMarkConfirmed(double, 0, 42, "0xdeadbeef");
+
+    // transitionQueueEntry is called unconditionally
+    expect(transitionQueueEntryMock).toHaveBeenCalledTimes(1);
+    // But queueRowsWritten=0 means dispatch_queue was already confirmed → no settlement_confirmed
+    expect(logMock).not.toHaveBeenCalled();
+  });
+
+  it("emits settlement_confirmed when both tables need to transition (normal happy path)", () => {
+    // Normal happy path: nonce_intents transitions (intentRowsWritten=1) AND dispatch_queue transitions
+    const { double, logMock, transitionQueueEntryMock } = makeReconcileDouble({ intentRowsWritten: 1, queueRowsWritten: 1 });
+
+    runLedgerMarkConfirmed(double, 0, 55, "0xcafebabe");
+
+    // transitionQueueEntry is called unconditionally
+    expect(transitionQueueEntryMock).toHaveBeenCalledTimes(1);
+    expect(transitionQueueEntryMock).toHaveBeenCalledWith(0, 55, "confirmed");
+    // settlement_confirmed fires once via transitionQueueEntry
+    expect(logMock).toHaveBeenCalledTimes(1);
+    expect(logMock).toHaveBeenCalledWith("info", "settlement_confirmed", expect.objectContaining({ walletIndex: 0, sponsorNonce: 55 }));
+  });
+
+  it("settlement_confirmed fires exactly once across two reconcile ticks (idempotency end-to-end)", () => {
+    // Tick 1: both tables transition → settlement_confirmed fires once
+    const { double: d1, logMock: log1 } = makeReconcileDouble({ intentRowsWritten: 1, queueRowsWritten: 1 });
+    runLedgerMarkConfirmed(d1, 0, 77, "0xfeedface");
+    expect(log1).toHaveBeenCalledTimes(1);
+
+    // Tick 2: both already confirmed → transitionQueueEntry still called, but silent
+    const { double: d2, logMock: log2 } = makeReconcileDouble({ intentRowsWritten: 0, queueRowsWritten: 0 });
+    runLedgerMarkConfirmed(d2, 0, 77, "0xfeedface");
+    expect(log2).not.toHaveBeenCalled();
+  });
+});
