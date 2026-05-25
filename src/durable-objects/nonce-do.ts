@@ -1332,6 +1332,22 @@ export class NonceDO {
    * Retire a queued dispatch entry that will never succeed on future broadcast retries.
    * Transitions both dispatch_queue and wallet_hand to 'retired' and releases the ledger slot.
    */
+  /**
+   * Best-effort check: has the sender's nonce already been consumed on-chain?
+   * Used by the zombie-requeue guard (#398) to avoid re-delivering a sender tx that
+   * already landed (a re-send would just be a free BadNonce rejection). Fails toward
+   * re-delivery (returns false) on Hiro error — a re-send of a landed tx is harmless,
+   * but losing a still-deliverable tx is not.
+   */
+  private async isSenderNonceConfirmed(senderAddress: string, senderNonce: number): Promise<boolean> {
+    try {
+      const info = await this.fetchNonceInfo(senderAddress);
+      return info.last_executed_tx_nonce !== null && senderNonce <= info.last_executed_tx_nonce;
+    } catch {
+      return false;
+    }
+  }
+
   private retireQueuedEntry(walletIndex: number, sponsorNonce: number, reason: string): void {
     this.transitionQueueEntry(walletIndex, sponsorNonce, "retired");
     this.sql.exec(
@@ -7865,8 +7881,9 @@ export class NonceDO {
         sender_address: string;
         sender_nonce: number;
         sponsor_nonce: number;
+        is_gap_fill: number | null;
       }>(
-        `SELECT wallet_index, payment_id, sender_tx_hex, sender_address, sender_nonce, sponsor_nonce
+        `SELECT wallet_index, payment_id, sender_tx_hex, sender_address, sender_nonce, sponsor_nonce, is_gap_fill
          FROM dispatch_queue
          WHERE state = 'queued'
          ORDER BY wallet_index ASC, sponsor_nonce ASC
@@ -7894,19 +7911,55 @@ export class NonceDO {
         continue;
       }
 
-      // Zombie guard: if the wallet head has advanced past this entry's sponsor_nonce,
-      // the chain has already consumed that nonce slot (via a successful confirm on a
-      // separate broadcast path, RBF, or external use). Retrying broadcast against an
-      // already-confirmed nonce produces ConflictingNonceInMempool indefinitely and
-      // wastes alarm CPU. Retire and move on.
+      // Zombie guard: the wallet head advanced past this entry's sponsor_nonce, so that
+      // sponsor slot is already consumed on-chain — broadcasting against it would just
+      // produce ConflictingNonceInMempool. Always retire the dead sponsor slot.
+      //
+      // But the SENDER tx may still be unsent and deliverable — dropping it here strands
+      // the payment at "queued" and the message never delivers (#398). So re-queue the
+      // sender tx to the replay buffer to be re-sponsored with a FRESH nonce, which also
+      // advances the payment record so it can reach "confirmed". Guards:
+      //  - skip if the sender nonce already confirmed on-chain (the tx landed some other
+      //    way — a re-send would be a wasted/rejected tx),
+      //  - skip if this entry is itself a replay (is_gap_fill=1) — bounds re-delivery to
+      //    a single attempt and prevents a re-queue loop.
       const walletHead = this.ledgerGetWalletHead(entry.wallet_index);
       if (walletHead !== null && entry.sponsor_nonce < walletHead) {
         this.retireQueuedEntry(entry.wallet_index, entry.sponsor_nonce, "head_advanced_past_nonce");
-        this.log("info", "bounded_broadcast_zombie_retired", {
-          walletIndex: entry.wallet_index,
-          sponsorNonce: entry.sponsor_nonce,
-          walletHead,
-        });
+
+        let skipReason: string | null = null;
+        if (entry.is_gap_fill === 1) {
+          skipReason = "already_replayed_no_requeue";
+        } else if (await this.isSenderNonceConfirmed(entry.sender_address, entry.sender_nonce)) {
+          skipReason = "sender_nonce_already_confirmed";
+        }
+
+        if (skipReason) {
+          this.log("info", "bounded_broadcast_zombie_retired", {
+            walletIndex: entry.wallet_index,
+            sponsorNonce: entry.sponsor_nonce,
+            walletHead,
+            reason: skipReason,
+          });
+        } else {
+          // Re-deliver: re-sponsored with a fresh nonce on the next alarm cycle.
+          this.addToReplayBuffer(
+            entry.wallet_index,
+            entry.sender_tx_hex,
+            entry.sender_address,
+            entry.sender_nonce,
+            entry.sponsor_nonce,
+            entry.payment_id
+          );
+          this.log("info", "bounded_broadcast_zombie_requeued", {
+            walletIndex: entry.wallet_index,
+            sponsorNonce: entry.sponsor_nonce,
+            walletHead,
+            senderAddress: entry.sender_address,
+            senderNonce: entry.sender_nonce,
+            action: "requeued_to_replay_buffer",
+          });
+        }
         continue;
       }
 
