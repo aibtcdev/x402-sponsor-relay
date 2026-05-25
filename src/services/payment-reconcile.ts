@@ -62,6 +62,11 @@ export async function reconcileStuckPayments(env: Env, logger: Logger): Promise<
 
   try {
     const list = await kv.list({ prefix: PAYMENT_KEY_PREFIX, limit: 1000 });
+    // At current volumes one page covers all records. If that ever stops being
+    // true, surface it — records past page 1 would be silently skipped this tick.
+    if (!list.list_complete) {
+      logger.warn("reconcile_stuck_payments_truncated", { limit: 1000 });
+    }
     for (const key of list.keys) {
       if (acted >= MAX_ACTIONS_PER_RUN) break;
 
@@ -76,8 +81,8 @@ export async function reconcileStuckPayments(env: Env, logger: Logger): Promise<
       const startedAt = record.queuedAt ?? record.submittedAt;
       if (startedAt && now - new Date(startedAt).getTime() < STALE_MS) continue;
 
-      // Need a sender identity to look up the on-chain nonce.
-      if (!record.senderAddress || record.senderNonce === undefined) continue;
+      // Need a sender identity to look up the on-chain nonce (== null covers null + undefined).
+      if (!record.senderAddress || record.senderNonce == null) continue;
 
       scanned++;
       try {
@@ -200,7 +205,14 @@ async function reconcileOne(
   return true;
 }
 
-/** Find the sender's transaction occupying a specific nonce (within recent history). */
+/**
+ * Find the sender's transaction occupying a specific nonce (within recent history).
+ * For a stuck payment the target nonce sits at/near the chain frontier, so the
+ * recent window covers it; a miss returns null (fail-open — retried next cron).
+ *
+ * Note: this endpoint caps `limit` at 50 (limit=100 → HTTP 400), so 50 is the
+ * max single-page window. If a deeper window is ever needed, paginate via offset.
+ */
 async function fetchSenderTxAtNonce(
   baseUrl: string,
   headers: Record<string, string>,
@@ -209,10 +221,10 @@ async function fetchSenderTxAtNonce(
 ): Promise<HiroTx | null> {
   const res = await fetch(`${baseUrl}/extended/v1/address/${sender}/transactions?limit=50`, { headers });
   if (!res.ok) return null;
-  const data = (await res.json()) as { results?: Array<Record<string, unknown>> };
-  for (const r of data.results ?? []) {
-    const tx = ((r.tx as HiroTx | undefined) ?? (r as unknown as HiroTx));
-    if (typeof tx.nonce !== "number") continue;
+  // The /extended/v1/address/{principal}/transactions endpoint returns flat tx
+  // objects in `results` (not the `{ tx: ... }` wrapper some other endpoints use).
+  const data = (await res.json()) as { results?: HiroTx[] };
+  for (const tx of data.results ?? []) {
     if (tx.nonce === nonce) return tx;
   }
   return null;
