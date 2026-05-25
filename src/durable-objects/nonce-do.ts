@@ -536,6 +536,14 @@ const MAX_SWEEP_SENDERS = 5;
 const MAX_BROADCASTS_PER_TICK = 10;
 /** Maximum probe broadcasts per alarm tick (backward ghost eviction) */
 const MAX_PROBES_PER_TICK = 5;
+/**
+ * Maximum failed broadcast attempts before a replay_buffer entry is evicted.
+ * One attempt per alarm tick (ticks are 30-60s apart) → 10 attempts ≈ 5-10 minutes.
+ * A genuinely-unsent tx would confirm within this window if sponsor wallets are healthy.
+ * Entries in structural failure (e.g. sponsor nonce exhausted) should not loop forever.
+ * The cap is a safety net — the evict-on-confirmed check (#403 fix) handles the common case.
+ */
+const REPLAY_MAX_BROADCAST_ATTEMPTS = 10;
 
 /** nonce_state key for the round-robin wallet reconciliation cursor */
 const ALARM_WALLET_CURSOR_KEY = "alarm_wallet_cursor";
@@ -636,6 +644,37 @@ function addMicroSTX(a: string, b: string): string {
     return (BigInt(a || "0") + BigInt(b || "0")).toString();
   } catch {
     return a || "0";
+  }
+}
+
+/**
+ * Extract the origin (sender) spending-condition signature from a deserialized tx.
+ *
+ * For single-sig sponsored txs the origin signature covers the entire sender-authorized
+ * payload (recipient, amount, nonce, etc.). Two txs from the same sender at the same
+ * nonce WILL have different origin signatures if they represent different payments
+ * (different recipient, amount, or memo). This makes it the strongest and simplest
+ * identity check for "is the on-chain tx the same payment we queued?"
+ *
+ * Returns the 130-char RSV hex string for single-sig conditions, null for multi-sig
+ * (no single `.signature` field). Callers that receive null should treat it as
+ * "cannot verify via signature".
+ *
+ * Module-level (not an instance method) so it can be tested without a NonceDO double.
+ * Never throws.
+ */
+function extractOriginSignature(tx: StacksTransactionWire): string | null {
+  try {
+    const cond = tx.auth?.spendingCondition;
+    if (!cond) return null;
+    // Single-sig conditions carry .signature.data; multi-sig carry .fields instead
+    const sig = (cond as { signature?: { data?: string } }).signature;
+    if (typeof sig?.data === "string" && sig.data.length > 0) {
+      return sig.data;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -965,6 +1004,18 @@ export class NonceDO {
         .toArray();
       if (cols.length === 0) {
         this.sql.exec("ALTER TABLE replay_buffer ADD COLUMN payment_id TEXT");
+      }
+    } catch { /* already present or error — fail-open */ }
+
+    // Migration: add broadcast_attempts column to replay_buffer (NOT NULL INTEGER, default 0).
+    // Tracks how many times an entry has failed to re-broadcast, used by the bounded-retry
+    // eviction cap in processReplayBuffer (#403).
+    try {
+      const cols = this.sql
+        .exec<{ name: string }>("SELECT name FROM pragma_table_info('replay_buffer') WHERE name = 'broadcast_attempts'")
+        .toArray();
+      if (cols.length === 0) {
+        this.sql.exec("ALTER TABLE replay_buffer ADD COLUMN broadcast_attempts INTEGER NOT NULL DEFAULT 0");
       }
     } catch { /* already present or error — fail-open */ }
 
@@ -1354,6 +1405,66 @@ export class NonceDO {
     }
   }
 
+  /**
+   * Look up the on-chain txid for a confirmed sender nonce.
+   * Queries Hiro GET /extended/v1/address/{sender}/transactions and finds the tx
+   * matching the given nonce. Returns {txId, txStatus} on success, null on any error.
+   *
+   * Used by the replay-buffer evict-on-confirmed path (#403) to wire the txid_map entry
+   * so healers (chainhook / confirm-reconcile) can finalize the payment record.
+   *
+   * Fail-safe: returns null on timeout, HTTP error, or missing nonce — caller must
+   * handle null gracefully (evict without finalization wiring).
+   */
+  private async lookupSenderNonceTxid(
+    senderAddress: string,
+    senderNonce: number
+  ): Promise<{ txId: string; txStatus: string } | null> {
+    try {
+      const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+      const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+      const url = `${base}/extended/v1/address/${senderAddress}/transactions?limit=50`;
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
+      if (!response.ok) return null;
+      const json = (await response.json()) as {
+        results?: Array<{ tx_id: string; tx_status: string; nonce: number }>;
+      };
+      const results = json?.results;
+      if (!Array.isArray(results)) return null;
+      const match = results.find((tx) => tx.nonce === senderNonce);
+      if (!match) return null;
+      return { txId: match.tx_id, txStatus: match.tx_status };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Fetch the raw hex of an on-chain transaction from Hiro.
+   *
+   * Mirrors the fetchOnChainRawTx helper in queue-consumer.ts.
+   * Uses GET /extended/v1/tx/{txId}/raw → { raw_tx: "0x..." }.
+   * Returns bare hex (0x prefix stripped) on success, null on any error or timeout.
+   *
+   * Fail-safe: never throws.
+   */
+  private async fetchOnChainRawTx(txId: string): Promise<string | null> {
+    try {
+      const base = getHiroBaseUrl(this.env.STACKS_NETWORK ?? "testnet");
+      const headers = getHiroHeaders(this.env.HIRO_API_KEY);
+      const url = `${base}/extended/v1/tx/${txId}/raw`;
+      const response = await fetch(url, { headers, signal: AbortSignal.timeout(HIRO_NONCE_FETCH_TIMEOUT_MS) });
+      if (!response.ok) return null;
+      const json = (await response.json()) as { raw_tx?: string };
+      const rawTx = json?.raw_tx;
+      if (typeof rawTx !== "string" || rawTx.length === 0) return null;
+      // Strip 0x prefix so callers can pass directly to deserializeTransaction
+      return rawTx.startsWith("0x") ? rawTx.slice(2) : rawTx;
+    } catch {
+      return null;
+    }
+  }
+
   private retireQueuedEntry(walletIndex: number, sponsorNonce: number, reason: string): void {
     this.transitionQueueEntry(walletIndex, sponsorNonce, "retired");
     this.sql.exec(
@@ -1407,6 +1518,7 @@ export class NonceDO {
     sender_nonce: number;
     original_sponsor_nonce: number;
     queued_at: string;
+    broadcast_attempts: number;
   }> {
     return this.sql
       .exec<{
@@ -1417,9 +1529,11 @@ export class NonceDO {
         sender_nonce: number;
         original_sponsor_nonce: number;
         queued_at: string;
+        broadcast_attempts: number;
       }>(
         `SELECT id, payment_id, sender_tx_hex, sender_address, sender_nonce,
-                original_sponsor_nonce, queued_at
+                original_sponsor_nonce, queued_at,
+                COALESCE(broadcast_attempts, 0) AS broadcast_attempts
          FROM replay_buffer
          WHERE wallet_index = ?
          ORDER BY queued_at ASC`,
@@ -6030,6 +6144,7 @@ export class NonceDO {
         sender_nonce: number;
         original_sponsor_nonce: number;
         queued_at: string;
+        broadcast_attempts: number;
       }> = [];
 
       for (const { walletIndex } of initializedWallets) {
@@ -6056,6 +6171,227 @@ export class NonceDO {
 
       for (const entry of batch) {
         try {
+          // Evict-on-confirmed: if the sender's nonce is already consumed on-chain, re-broadcasting
+          // would always fail with ConflictingNonceInMempool. Evict the entry and wire finalization
+          // so healers (chainhook / confirm-reconcile) can advance the payment record. (#403)
+          // Fail-safe: isSenderNonceConfirmed returns false on Hiro error — no eviction on uncertainty.
+          const senderConfirmed = await this.isSenderNonceConfirmed(entry.sender_address, entry.sender_nonce);
+          if (senderConfirmed) {
+            // Look up the actual txid so we can wire txid_map → healers can finalize.
+            const onChain = await this.lookupSenderNonceTxid(entry.sender_address, entry.sender_nonce);
+            if (onChain && onChain.txStatus === "success" && entry.payment_id && this.env.RELAY_KV) {
+              // P1 strict-verify: confirm the on-chain tx is OUR payment before crediting.
+              //
+              // A different sender tx could have taken the nonce (e.g. a wallet reset, a
+              // direct broadcast, or a race from another relay). If we wire txid_map for an
+              // unrelated txid, healers would mark this payment confirmed even though no
+              // actual payment was made — a false credit.
+              //
+              // Chosen method — origin spending-condition signature comparison:
+              //   The sender's signature covers the entire origin spending condition plus
+              //   the tx payload (recipient, amount, memo, nonce, fee). Two distinct
+              //   payments from the same sender at the same nonce WILL carry different
+              //   origin signatures. Comparing signatures is therefore both simpler and
+              //   stronger than comparing recipient + amount + token individually.
+              //   Mirrors Mode A's verify-before-credit fix (PR #409 / queue-consumer.ts).
+              //
+              // Three outcomes:
+              //   match      → credit (wire txid_map + transition to mempool)
+              //   mismatch   → terminalize as replaced/superseded, evict, no credit
+              //   uncertainty (fetch or parse fails) → fall through to re-broadcast path
+              const onChainRawHex = await this.fetchOnChainRawTx(onChain.txId);
+              if (onChainRawHex === null) {
+                // Raw-tx fetch failed — cannot verify. Fail safe: do NOT evict-as-confirmed.
+                // Fall through to the re-broadcast path below; the sender nonce conflict
+                // will cause another failure and eventually hit the bounded-retry cap.
+                this.log("warn", "replay_evict_raw_fetch_failed", {
+                  replayId: entry.id,
+                  senderAddress: entry.sender_address,
+                  senderNonce: entry.sender_nonce,
+                  resolvedTxId: onChain.txId,
+                  paymentId: entry.payment_id,
+                });
+                // Fall through — do NOT continue; proceed to re-broadcast path
+              } else {
+                // Deserialize both txs and compare origin signatures
+                let isOurTx = false;
+                try {
+                  const localHex = entry.sender_tx_hex.replace(/^0x/i, "");
+                  const onChainTx = deserializeTransaction(onChainRawHex);
+                  const localTx = deserializeTransaction(localHex);
+                  const onChainSig = extractOriginSignature(onChainTx);
+                  const localSig = extractOriginSignature(localTx);
+                  if (onChainSig !== null && localSig !== null) {
+                    // Single-sig: direct signature comparison (strongest check)
+                    isOurTx = onChainSig === localSig;
+                  } else {
+                    // Multi-sig or parse uncertainty: fall back to raw-hex comparison of the
+                    // origin spending condition only (exclude the sponsor condition which differs).
+                    // Without a reliable field, treat as mismatch (safe direction).
+                    isOurTx = false;
+                  }
+                } catch {
+                  // Deserialization failed — cannot verify. Fail safe: no credit.
+                  this.log("warn", "replay_evict_deserialize_failed", {
+                    replayId: entry.id,
+                    senderAddress: entry.sender_address,
+                    senderNonce: entry.sender_nonce,
+                    resolvedTxId: onChain.txId,
+                    paymentId: entry.payment_id,
+                  });
+                  isOurTx = false;
+                }
+
+                if (isOurTx) {
+                  // MATCH: on-chain tx is our payment. Wire txid_map + transition to mempool.
+                  // Best-effort wiring: a KV failure must NOT prevent eviction — better to evict
+                  // and log than to loop forever (#403). Track whether wiring succeeded so the
+                  // log's `finalized` field accurately reflects reality.
+                  let wired = false;
+                  try {
+                    await this.env.RELAY_KV.put(`txid_map:${onChain.txId}`, entry.payment_id, {
+                      expirationTtl: 86_400,
+                    });
+                    const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                    if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                      const updated = transitionPayment(record, "mempool", { txid: onChain.txId });
+                      await putPaymentRecord(this.env.RELAY_KV, updated);
+                    }
+                    wired = true;
+                  } catch (wireErr) {
+                    this.log("error", "replay_evict_confirmed_wire_failed", {
+                      replayId: entry.id,
+                      paymentId: entry.payment_id,
+                      resolvedTxId: onChain.txId,
+                      error: wireErr instanceof Error ? wireErr.message : String(wireErr),
+                    });
+                  }
+                  // Always evict once committed (on-chain state is resolved — no retry can help).
+                  this.removeFromReplayBuffer(entry.id);
+                  this.log("info", "replay_evict_confirmed", {
+                    replayId: entry.id,
+                    senderAddress: entry.sender_address,
+                    senderNonce: entry.sender_nonce,
+                    paymentId: entry.payment_id,
+                    resolvedTxId: onChain.txId,
+                    txStatus: onChain.txStatus,
+                    finalized: wired,
+                    verified: true,
+                  });
+                  processed++;
+                  continue;
+                } else {
+                  // MISMATCH: a different/foreign tx took this nonce. Re-broadcasting is futile
+                  // (the nonce is permanently consumed). Terminalize the payment record as
+                  // replaced/superseded (mirrors Mode A's sender_conflict_superseded path in
+                  // queue-consumer.ts) and evict the replay buffer entry. Do NOT write txid_map.
+                  // Best-effort: terminalization failure must not prevent eviction.
+                  try {
+                    const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                    if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                      const updated = transitionPayment(record, "replaced", {
+                        error: "On-chain tx at sender nonce does not match queued payment (foreign tx superseded nonce)",
+                        terminalReason: "superseded" as const,
+                        retryable: false,
+                      });
+                      await putPaymentRecord(this.env.RELAY_KV, updated);
+                    }
+                  } catch (wireErr) {
+                    this.log("error", "replay_evict_superseded_wire_failed", {
+                      replayId: entry.id,
+                      paymentId: entry.payment_id,
+                      foreignTxId: onChain.txId,
+                      error: wireErr instanceof Error ? wireErr.message : String(wireErr),
+                    });
+                  }
+                  // Always evict — the nonce is permanently consumed regardless.
+                  this.removeFromReplayBuffer(entry.id);
+                  this.log("warn", "replay_evict_superseded", {
+                    replayId: entry.id,
+                    senderAddress: entry.sender_address,
+                    senderNonce: entry.sender_nonce,
+                    paymentId: entry.payment_id,
+                    foreignTxId: onChain.txId,
+                    txStatus: onChain.txStatus,
+                  });
+                  processed++;
+                  continue;
+                }
+              }
+            } else if (onChain && onChain.txStatus === "success" && !entry.payment_id) {
+              // No payment_id — nothing to verify or credit; just evict.
+              this.removeFromReplayBuffer(entry.id);
+              this.log("info", "replay_evict_confirmed", {
+                replayId: entry.id,
+                senderAddress: entry.sender_address,
+                senderNonce: entry.sender_nonce,
+                paymentId: null,
+                resolvedTxId: onChain.txId,
+                txStatus: onChain.txStatus,
+                finalized: false,
+                verified: false,
+              });
+              processed++;
+              continue;
+            } else if (onChain && onChain.txStatus !== "success") {
+              // ABORTED: the on-chain tx at this nonce was rejected (abort_by_response /
+              // abort_by_post_condition). The nonce is permanently consumed — re-broadcasting
+              // cannot succeed. Terminalize the payment record BEFORE eviction so it is never
+              // left as a non-terminal orphan. Do NOT write txid_map (the tx was never confirmed).
+              // Best-effort: terminalization failure must not prevent eviction.
+              if (entry.payment_id && this.env.RELAY_KV) {
+                try {
+                  const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                  if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                    const updated = transitionPayment(record, "failed", {
+                      error: `Sender tx aborted on-chain (nonce ${entry.sender_nonce} status: ${onChain.txStatus})`,
+                      terminalReason: "sender_nonce_duplicate" as const,
+                      retryable: false,
+                    });
+                    await putPaymentRecord(this.env.RELAY_KV, updated);
+                  }
+                } catch (wireErr) {
+                  this.log("error", "replay_evict_aborted_wire_failed", {
+                    replayId: entry.id,
+                    paymentId: entry.payment_id,
+                    resolvedTxId: onChain.txId,
+                    txStatus: onChain.txStatus,
+                    error: wireErr instanceof Error ? wireErr.message : String(wireErr),
+                  });
+                }
+              }
+              // Always evict — the nonce is permanently consumed.
+              this.removeFromReplayBuffer(entry.id);
+              this.log("warn", "replay_evict_aborted", {
+                replayId: entry.id,
+                senderAddress: entry.sender_address,
+                senderNonce: entry.sender_nonce,
+                paymentId: entry.payment_id,
+                resolvedTxId: onChain.txId,
+                txStatus: onChain.txStatus,
+              });
+              processed++;
+              continue;
+            } else {
+              // onChain is null — isSenderNonceConfirmed says the nonce is consumed, but
+              // lookupSenderNonceTxid could not identify the tx (a transient Hiro error, or
+              // the tx is older than the queried limit=50 window). This is UNCERTAINTY: we
+              // can neither verify-and-credit nor confirm it is a foreign/aborted tx.
+              //
+              // Fail safe — do NOT evict here and do NOT leave the payment as a non-terminal
+              // orphan. Fall through to the re-broadcast path: the sender nonce conflict will
+              // fail again and increment broadcast_attempts, so the bounded-retry cap governs
+              // eventual eviction (and that path terminalizes the payment record).
+              this.log("warn", "replay_evict_unresolved_txid", {
+                replayId: entry.id,
+                senderAddress: entry.sender_address,
+                senderNonce: entry.sender_nonce,
+                paymentId: entry.payment_id,
+              });
+              // Fall through — do NOT continue; proceed to re-broadcast path.
+            }
+          }
+
           // Find a wallet with headroom (prefer a different wallet than the original)
           let targetWallet: { walletIndex: number; headroom: number } | null = null;
 
@@ -6175,6 +6511,13 @@ export class NonceDO {
             // Broadcast failed — release the nonce, keep entry in replay buffer for next cycle
             this.ledgerRelease(targetWallet.walletIndex, freshNonce, undefined, result.reason);
 
+            // Increment attempt counter on the replay_buffer row
+            this.sql.exec(
+              "UPDATE replay_buffer SET broadcast_attempts = COALESCE(broadcast_attempts, 0) + 1 WHERE id = ?",
+              entry.id
+            );
+            const newAttempts = entry.broadcast_attempts + 1;
+
             this.log("warn", "replay_respon_broadcast_failed", {
               replayId: entry.id,
               senderAddress: entry.sender_address,
@@ -6182,7 +6525,47 @@ export class NonceDO {
               freshNonce,
               httpStatus: result.status,
               reason: result.reason,
+              broadcastAttempts: newAttempts,
             });
+
+            // Bounded-retry cap: evict entries that keep failing and are never confirmed.
+            // This prevents indefinite looping when the entry is structurally broken.
+            // The evict-on-confirmed check above handles the common case (#403 bug);
+            // this cap is a safety net for the edge case where Hiro consistently errors
+            // but the tx is also not confirmed (e.g. sponsor wallet exhausted for days).
+            // Terminalize the payment record BEFORE eviction — no committed eviction may
+            // leave a non-terminal orphaned payment record.
+            if (newAttempts >= REPLAY_MAX_BROADCAST_ATTEMPTS) {
+              if (entry.payment_id && this.env.RELAY_KV) {
+                try {
+                  const record = await getPaymentRecord(this.env.RELAY_KV, entry.payment_id);
+                  if (record && !TERMINAL_PAYMENT_STATUSES.has(record.status)) {
+                    const updated = transitionPayment(record, "failed", {
+                      error: `Replay buffer eviction after ${newAttempts} failed broadcast attempts`,
+                      terminalReason: "broadcast_failure" as const,
+                      retryable: false,
+                    });
+                    await putPaymentRecord(this.env.RELAY_KV, updated);
+                  }
+                } catch (wireErr) {
+                  this.log("error", "replay_evict_cap_wire_failed", {
+                    replayId: entry.id,
+                    paymentId: entry.payment_id,
+                    attempts: newAttempts,
+                    error: wireErr instanceof Error ? wireErr.message : String(wireErr),
+                  });
+                }
+              }
+              this.removeFromReplayBuffer(entry.id);
+              this.log("warn", "replay_evict_max_attempts", {
+                replayId: entry.id,
+                senderAddress: entry.sender_address,
+                senderNonce: entry.sender_nonce,
+                paymentId: entry.payment_id,
+                attempts: newAttempts,
+              });
+            }
+
             failed++;
           }
         } catch (e) {
