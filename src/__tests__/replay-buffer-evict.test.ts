@@ -425,6 +425,46 @@ describe("replay-buffer evict-on-confirmed (#403)", () => {
     expect(removeFromReplayBuffer).not.toHaveBeenCalled();
   });
 
+  it("fail-safe: unresolved txid (lookup returns null) does NOT evict or orphan — falls through to re-broadcast", async () => {
+    // isSenderNonceConfirmed=true (nonce consumed) but lookupSenderNonceTxid returns null
+    // (transient Hiro error, or the tx is older than the limit=50 window). UNCERTAINTY:
+    // must NOT evict-as-confirmed and must NOT leave the payment a non-terminal orphan —
+    // fall through to the re-broadcast path so the bounded-retry cap governs eviction.
+    const { double, removeFromReplayBuffer, broadcastRawTx, kvPut, logSpy } = makeDouble({
+      entries: [baseEntry],
+      senderConfirmed: true,
+      onChainTxid: null, // lookupSenderNonceTxid could not resolve the txid
+      broadcastResult: { ok: false, reason: "ConflictingNonceInMempool", status: 409 },
+    });
+
+    await run(double);
+
+    // Must NOT write txid_map (nothing resolved/verified)
+    const txidMapCalls = kvPut.mock.calls.filter(([key]: [string]) =>
+      key.startsWith("txid_map:")
+    );
+    expect(txidMapCalls).toHaveLength(0);
+
+    // Must NOT emit replay_evict_confirmed (no false credit)
+    const confirmedCall = logSpy.mock.calls.find(
+      ([_level, event]: [string, string]) => event === "replay_evict_confirmed"
+    );
+    expect(confirmedCall).toBeUndefined();
+
+    // Must emit the unresolved-txid warning instead
+    const unresolvedCall = logSpy.mock.calls.find(
+      ([_level, event]: [string, string]) => event === "replay_evict_unresolved_txid"
+    );
+    expect(unresolvedCall).toBeDefined();
+    expect(unresolvedCall[0]).toBe("warn");
+
+    // Must fall through to the re-broadcast attempt
+    expect(broadcastRawTx).toHaveBeenCalled();
+
+    // Must NOT evict here (no orphan; bounded-retry cap handles persistent failure later)
+    expect(removeFromReplayBuffer).not.toHaveBeenCalled();
+  });
+
   it("P1 aborted-confirmed: terminalize payment as failed/sender_nonce_duplicate, NO txid_map, evict, log replay_evict_aborted", async () => {
     // isSenderNonceConfirmed is true (nonce consumed), but the resolved tx has abort_by_response
     // status — meaning it was rejected on-chain. The nonce is permanently consumed (can't retry).

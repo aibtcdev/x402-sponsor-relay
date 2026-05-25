@@ -6373,22 +6373,22 @@ export class NonceDO {
               processed++;
               continue;
             } else {
-              // onChain is null — Hiro couldn't resolve the txid for this nonce.
-              // Cannot determine on-chain state. Evict without credit (the nonce is
-              // confirmed per isSenderNonceConfirmed but we can't identify the tx).
-              this.removeFromReplayBuffer(entry.id);
-              this.log("info", "replay_evict_confirmed", {
+              // onChain is null — isSenderNonceConfirmed says the nonce is consumed, but
+              // lookupSenderNonceTxid could not identify the tx (a transient Hiro error, or
+              // the tx is older than the queried limit=50 window). This is UNCERTAINTY: we
+              // can neither verify-and-credit nor confirm it is a foreign/aborted tx.
+              //
+              // Fail safe — do NOT evict here and do NOT leave the payment as a non-terminal
+              // orphan. Fall through to the re-broadcast path: the sender nonce conflict will
+              // fail again and increment broadcast_attempts, so the bounded-retry cap governs
+              // eventual eviction (and that path terminalizes the payment record).
+              this.log("warn", "replay_evict_unresolved_txid", {
                 replayId: entry.id,
                 senderAddress: entry.sender_address,
                 senderNonce: entry.sender_nonce,
                 paymentId: entry.payment_id,
-                resolvedTxId: null,
-                txStatus: null,
-                finalized: false,
-                verified: false,
               });
-              processed++;
-              continue;
+              // Fall through — do NOT continue; proceed to re-broadcast path.
             }
           }
 
