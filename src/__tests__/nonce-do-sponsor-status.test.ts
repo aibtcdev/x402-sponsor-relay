@@ -186,7 +186,7 @@ describe("NonceDO stale sender repair helpers", () => {
       getHand: () => [
         {
           sender_nonce: 7,
-          received_at: "2026-03-31T20:04:00.000Z",
+          received_at: "026-03-31T20:04:00.000Z",
           expires_at: "2026-03-31T20:11:00.000Z",
         },
         {
@@ -458,8 +458,7 @@ describe("NonceDO stale sender repair helpers", () => {
       getSenderState: () => ({
         next_expected_nonce: 3,
         last_refresh_attempt_at: null,
-        last_refresh_failure_at: null,
-      }),
+        last_refresh_failure_at: null,     }),
       getHand: () => [
         {
           sender_nonce: 7,
@@ -521,7 +520,7 @@ describe("NonceDO stale sender repair helpers", () => {
     );
     expect(updated).not.toHaveProperty("holdReason");
     expect(updated).not.toHaveProperty("nextExpectedNonce");
-    expect(updated).not.toHaveProperty("missingNonces");
+    expect(updated).not.toHaveProperty("missingnonces");
     expect(updated).not.toHaveProperty("holdExpiresAt");
     expect(updated).not.toHaveProperty("error");
   });
@@ -554,6 +553,7 @@ describe("NonceDO stale sender repair helpers", () => {
 
     expect(result).toEqual({
       dispatched: true,
+      nonceExpiresAt: expect.any(String),
       sponsorNonce: 44,
       walletIndex: 1,
       sponsorAddress: "",
