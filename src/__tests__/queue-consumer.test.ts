@@ -454,7 +454,7 @@ describe("queue consumer recovery boundaries", () => {
     // Unhandled error during processing → bubbles to the handler catch-all.
     mocks.sponsorTransaction.mockRejectedValue(new Error("NonceDO unavailable"));
 
-    // attempts === MAX_ATTEMPTS (5) → dead-letter branch.
+    // attempts === MAX_ATTEMPTS (5) → drop branch (final ack, not routed to DLQ).
     const message = createMessage(
       { paymentId: "pay_exhaust", txHex: "exhaust_tx", network: "testnet", attempt: 5 },
       5

@@ -495,11 +495,11 @@ async function processPaymentMessage(
  *
  * The catch-all below finalizes the message with ack() (it does NOT route to the
  * DLQ — ack marks the message as successfully handled). So if the record is still
- * non-terminal at "queued"/"broadcasting" when we drop the message, nothing ever
- * re-drives it: it's stranded forever, and the aibtc inbox dedups future sends
- * onto the stuck record — wedging the sender wallet so it can no longer send any
- * message. Marking it failed+retryable releases that dedup so the agent can
- * cleanly resubmit. (#398)
+ * non-terminal when we drop the message (typically "queued"/"broadcasting", but
+ * this guards on any non-terminal status), nothing ever re-drives it: it's
+ * stranded forever, and the aibtc inbox dedups future sends onto the stuck record
+ * — wedging the sender wallet so it can no longer send any message. Marking it
+ * failed+retryable releases that dedup so the agent can cleanly resubmit. (#398)
  *
  * Fail-open: never throws — a bookkeeping failure here must not block the ack.
  */
@@ -513,7 +513,7 @@ async function finalizeExhaustedPayment(
     const kv = env.RELAY_KV;
     if (!kv) return;
     const record = await getPaymentRecord(kv, paymentId);
-    // Only terminalize records still in flight — never regress a confirmed/failed one.
+    // Terminalize any non-terminal record — never regress a confirmed/failed/replaced one.
     if (!record || isTerminalPaymentStatus(record.status)) return;
     const updated = transitionPayment(record, "failed", {
       error: opts?.error ?? "Payment processing exhausted retries before broadcast",
