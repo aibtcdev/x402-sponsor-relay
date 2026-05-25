@@ -722,6 +722,8 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       5
     );
 
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
     await handlePaymentQueue(
       { messages: [message] } as MessageBatch<never>,
       { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
@@ -749,6 +751,26 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
     expect(message.retry).not.toHaveBeenCalled();
     // Never sponsor_failure for a sender-origin conflict
     expect(finalRecord?.terminalReason).not.toBe("sponsor_failure");
+
+    // P2 guard: exactly ONE payment.finalized event, carrying the aborted-onchain action.
+    // The aborted branch is self-contained (persist-then-emit-once) and must NOT fall
+    // through to the unresolvable terminalization, which would emit a second finalized event.
+    const finalizedCalls = warnSpy.mock.calls.filter(
+      ([msg]) => msg === "[WARN] payment.finalized"
+    );
+    expect(finalizedCalls).toHaveLength(1);
+    expect(finalizedCalls[0][1]).toEqual(
+      expect.objectContaining({
+        action: "sender_conflict_aborted_onchain",
+        terminalReason: "sender_nonce_duplicate",
+        responsibleParty: "sender",
+      })
+    );
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      "[WARN] payment.finalized",
+      expect.objectContaining({ action: "sender_conflict_unresolvable" })
+    );
+    warnSpy.mockRestore();
   });
 
   // -------------------------------------------------------------------------

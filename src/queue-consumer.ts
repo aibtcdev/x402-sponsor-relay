@@ -582,11 +582,24 @@ async function processPaymentMessage(
           // Do NOT wire txid_map or park in "mempool": an aborted tx never confirms, so
           // chainhook/confirm-reconcile healers would never finalize the record, creating
           // a stuck-forever payment. Terminalize as sender_nonce_duplicate instead.
+          //
+          // Self-contained terminalization: persist the failed state BEFORE emitting the
+          // single payment.finalized event (so a transient KV failure cannot report the
+          // payment finalized while the message is retried), then ack and return — do NOT
+          // fall through to the unresolvable block below, which would emit a second
+          // payment.finalized for the same payment.
+          record = transitionPayment(record, "failed", {
+            error: broadcastResult.error,
+            errorCode: "SENDER_NONCE_CONFLICT",
+            terminalReason: "sender_nonce_duplicate",
+            retryable: false,
+          });
+          await putPaymentRecord(kv, record);
           emitPaymentLifecycleEvent(logger, "payment.finalized", {
             route: "PAYMENT_QUEUE",
             paymentId,
-            status: "failed",
-            terminalReason: "sender_nonce_duplicate",
+            status: record.status,
+            terminalReason: record.terminalReason,
             action: "sender_conflict_aborted_onchain",
             checkStatusUrlPresent: false,
             compatShimUsed: false,
@@ -602,7 +615,8 @@ async function processPaymentMessage(
             senderAddress: record.senderAddress,
             senderNonce: record.senderNonce,
           });
-          // Fall through to sender_nonce_duplicate terminalization below.
+          message.ack();
+          return;
         }
         // resolved exists but txStatus=success with no settle, or raw-tx fetch failed
         // — fall through to sender_nonce_duplicate
