@@ -29,6 +29,7 @@ import { MemoryKV } from "./helpers/memory-kv";
 import {
   buildNotFoundPaymentRecord,
   computePaymentArtifactHash,
+  computePaymentExpirationTtl,
   createPaymentRecord,
   getReusablePaymentRecord,
   getPaymentIdByArtifact,
@@ -216,6 +217,141 @@ describe("payment status projection", () => {
     expect(failedRecord.nextExpectedNonce).toBeUndefined();
     expect(failedRecord.missingNonces).toBeUndefined();
     expect(failedRecord.holdExpiresAt).toBeUndefined();
+  });
+});
+
+describe("computePaymentExpirationTtl — held-record TTL floor (#372)", () => {
+  const BASE_TTL = 86_400; // PAYMENT_TTL_SECONDS
+  const SETTLEMENT_BUFFER = 21_600; // SETTLEMENT_BUFFER_SECONDS
+  const NOW_MS = Date.parse("2026-05-16T00:00:00.000Z");
+
+  it("returns base TTL when holdExpiresAt is unset", () => {
+    expect(computePaymentExpirationTtl({}, NOW_MS)).toBe(BASE_TTL);
+    expect(computePaymentExpirationTtl({ holdExpiresAt: undefined }, NOW_MS)).toBe(
+      BASE_TTL
+    );
+  });
+
+  it("returns base TTL when holdExpiresAt is in the past", () => {
+    const past = new Date(NOW_MS - 60_000).toISOString();
+    expect(computePaymentExpirationTtl({ holdExpiresAt: past }, NOW_MS)).toBe(BASE_TTL);
+  });
+
+  it("returns base TTL when holdExpiresAt is exactly now (boundary)", () => {
+    const now = new Date(NOW_MS).toISOString();
+    expect(computePaymentExpirationTtl({ holdExpiresAt: now }, NOW_MS)).toBe(BASE_TTL);
+  });
+
+  it("returns base TTL when holdExpiresAt + buffer fits inside base TTL", () => {
+    // holdExpiresAt 1h from now → 3600 + 21600 = 25_200s, well below 86_400 base
+    const oneHour = new Date(NOW_MS + 3_600_000).toISOString();
+    expect(computePaymentExpirationTtl({ holdExpiresAt: oneHour }, NOW_MS)).toBe(
+      BASE_TTL
+    );
+  });
+
+  it("extends TTL when holdExpiresAt + buffer exceeds base TTL", () => {
+    // holdExpiresAt 23h from now → 82_800 + 21_600 = 104_400s > 86_400 base
+    const twentyThreeHours = new Date(NOW_MS + 23 * 3_600_000).toISOString();
+    const ttl = computePaymentExpirationTtl(
+      { holdExpiresAt: twentyThreeHours },
+      NOW_MS
+    );
+    expect(ttl).toBe(82_800 + SETTLEMENT_BUFFER);
+    expect(ttl).toBeGreaterThan(BASE_TTL);
+  });
+
+  it("extends TTL for multi-day hold windows (burst-recovery scenario from #372)", () => {
+    // holdExpiresAt 3d from now → 259_200 + 21_600 = 280_800s
+    const threeDays = new Date(NOW_MS + 3 * 86_400_000).toISOString();
+    const ttl = computePaymentExpirationTtl({ holdExpiresAt: threeDays }, NOW_MS);
+    expect(ttl).toBe(259_200 + SETTLEMENT_BUFFER);
+  });
+
+  it("falls back to base TTL when holdExpiresAt is malformed", () => {
+    expect(
+      computePaymentExpirationTtl({ holdExpiresAt: "not-a-date" }, NOW_MS)
+    ).toBe(BASE_TTL);
+    expect(computePaymentExpirationTtl({ holdExpiresAt: "" }, NOW_MS)).toBe(BASE_TTL);
+  });
+
+  it("uses Date.now() by default", () => {
+    const futureIso = new Date(Date.now() + 3 * 86_400_000).toISOString();
+    const ttl = computePaymentExpirationTtl({ holdExpiresAt: futureIso });
+    expect(ttl).toBeGreaterThan(BASE_TTL);
+  });
+});
+
+describe("putPaymentRecord — TTL is wired through computePaymentExpirationTtl (#372)", () => {
+  const BASE_TTL = 86_400;
+  const SETTLEMENT_BUFFER = 21_600;
+
+  it("writes with base TTL for a non-held record", async () => {
+    const kv = new MemoryKV();
+    const putSpy = vi.spyOn(kv, "put");
+    const record = transitionPayment(
+      createPaymentRecord("pay_ttl_base", "testnet"),
+      "queued"
+    );
+
+    await putPaymentRecord(kv, record);
+
+    expect(putSpy).toHaveBeenCalledTimes(1);
+    const [, , options] = putSpy.mock.calls[0]!;
+    expect(options).toMatchObject({ expirationTtl: BASE_TTL });
+  });
+
+  it("writes with extended TTL when record is held with future holdExpiresAt", async () => {
+    const kv = new MemoryKV();
+    const putSpy = vi.spyOn(kv, "put");
+    // holdExpiresAt 30h from now → 108_000 + 21_600 = 129_600s, > 86_400 base
+    const holdExpiresAt = new Date(Date.now() + 30 * 3_600_000).toISOString();
+    const heldRecord = transitionPayment(
+      createPaymentRecord("pay_ttl_held", "testnet"),
+      "queued",
+      {
+        holdReason: "gap",
+        nextExpectedNonce: 19,
+        missingNonces: [19],
+        holdExpiresAt,
+      }
+    );
+
+    await putPaymentRecord(kv, heldRecord);
+
+    expect(putSpy).toHaveBeenCalledTimes(1);
+    const [, , options] = putSpy.mock.calls[0]!;
+    const expirationTtl = (options as { expirationTtl: number }).expirationTtl;
+    expect(expirationTtl).toBeGreaterThan(BASE_TTL);
+    // Allow small Date.now() drift between the test setup and the put — bound it
+    expect(expirationTtl).toBeGreaterThanOrEqual(108_000 + SETTLEMENT_BUFFER - 5);
+    expect(expirationTtl).toBeLessThanOrEqual(108_000 + SETTLEMENT_BUFFER + 5);
+  });
+
+  it("falls back to base TTL after held → terminal transition (clearHoldMetadata)", async () => {
+    const kv = new MemoryKV();
+    const putSpy = vi.spyOn(kv, "put");
+    const heldRecord = transitionPayment(
+      createPaymentRecord("pay_ttl_terminal", "testnet"),
+      "queued",
+      {
+        holdReason: "gap",
+        nextExpectedNonce: 5,
+        missingNonces: [5],
+        holdExpiresAt: new Date(Date.now() + 30 * 3_600_000).toISOString(),
+      }
+    );
+    const failedRecord = transitionPayment(heldRecord, "failed", {
+      error: "stale",
+      terminalReason: "sender_nonce_stale",
+      retryable: false,
+    });
+
+    await putPaymentRecord(kv, failedRecord);
+
+    expect(failedRecord.holdExpiresAt).toBeUndefined();
+    const [, , options] = putSpy.mock.calls[0]!;
+    expect(options).toMatchObject({ expirationTtl: BASE_TTL });
   });
 });
 
