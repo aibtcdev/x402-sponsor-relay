@@ -1321,8 +1321,8 @@ export class NonceDO {
       // falling back to dispatched_at for pre-migration entries. This ensures settlement
       // percentiles reflect actual user-perceived latency rather than internal queue timing.
       const preRow = this.sql
-        .exec<{ dispatched_at: string | null; submitted_at: string | null; original_fee: string | null; sender_address: string | null }>(
-          "SELECT dispatched_at, submitted_at, original_fee, sender_address FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
+        .exec<{ dispatched_at: string | null; submitted_at: string | null; original_fee: string | null; sender_address: string | null; sender_nonce: number | null }>(
+          "SELECT dispatched_at, submitted_at, original_fee, sender_address, sender_nonce FROM dispatch_queue WHERE wallet_index = ? AND sponsor_nonce = ? LIMIT 1",
           walletIndex,
           sponsorNonce
         )
@@ -1357,6 +1357,13 @@ export class NonceDO {
           originalFee: preRow?.original_fee ?? null,
           senderAddress: preRow?.sender_address ?? null,
         });
+        // Advance sender frontier immediately on relay-confirmed transactions.
+        // Without this, next_expected_nonce stays at its seeded value and the
+        // sender's next sequential nonce is incorrectly held as SENDER_NONCE_GAP
+        // until the alarm-driven stale repair fires (~5 minutes later).
+        if (preRow?.sender_address != null && preRow?.sender_nonce != null) {
+          this.advanceSenderNonce(preRow.sender_address, preRow.sender_nonce);
+        }
       }
     } else if (newState === "dispatched") {
       this.sql.exec(
