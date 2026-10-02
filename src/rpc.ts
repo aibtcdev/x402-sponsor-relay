@@ -138,6 +138,10 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       return { success: false, code: "PAYMENT_MISMATCH", error: verify.error, retryable: false };
     }
     const payer = validation.senderAddress;
+    // A SIP-010 transfer to yourself fails on-chain ((err u2)) — the sponsor would pay for nothing.
+    if (payer === settle.expectedRecipient) {
+      return { success: false, code: "PAYMENT_MISMATCH", error: "Sender and recipient are the same address", retryable: false };
+    }
 
     if (this.env.SPONSOR_RATE_LIMIT) {
       const { success } = await this.env.SPONSOR_RATE_LIMIT.limit({ key: payer });
