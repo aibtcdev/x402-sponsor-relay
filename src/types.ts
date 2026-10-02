@@ -88,6 +88,8 @@ export interface Env {
   STATS_DO?: DurableObjectNamespace;
   // Durable Object namespace: one instance per sponsor wallet, signs + broadcasts serially
   SPONSOR_WALLET_DO?: DurableObjectNamespace;
+  // Private key (hex) of the wallet that sponsors x402 payments (RelayRPC.sponsorPayment)
+  PAYMENT_SPONSOR_PRIVATE_KEY?: string;
   // Cloudflare rate limiter for sponsored payments, keyed by payer address
   SPONSOR_RATE_LIMIT?: RateLimit;
   // Max sponsor fees per UTC day in µSTX (default 10 STX)

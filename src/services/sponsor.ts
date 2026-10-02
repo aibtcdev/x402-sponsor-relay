@@ -1186,17 +1186,18 @@ export class SponsorService {
   /**
    * Sponsor and broadcast a validated sponsored transaction in one step.
    *
-   * The sponsor wallet (wallet 0) is a single SponsorWalletDO that signs and broadcasts one
-   * transaction at a time with a chain-derived nonce — nothing is reserved, queued or held.
+   * The payment sponsor (PAYMENT_SPONSOR_PRIVATE_KEY — its own wallet, separate from the
+   * /sponsor wallets) is a single SponsorWalletDO that signs and broadcasts one transaction at a
+   * time with a chain-derived nonce — nothing is reserved, queued or held.
    */
   async sponsorAndBroadcast(transaction: StacksTransactionWire): Promise<SponsorWalletResult> {
     const ns = this.env.SPONSOR_WALLET_DO;
-    const sponsorKey = await this.getSponsorKeyForWallet(0);
+    const sponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
     if (!ns || !sponsorKey) {
       return {
         ok: false, retryable: false, responsible: "sponsor",
         error: "Service not configured",
-        details: ns ? "Set SPONSOR_MNEMONIC or SPONSOR_PRIVATE_KEY" : "SPONSOR_WALLET_DO binding missing",
+        details: ns ? "Set PAYMENT_SPONSOR_PRIVATE_KEY" : "SPONSOR_WALLET_DO binding missing",
       };
     }
     const spend = this.paymentSpend(transaction);
@@ -1221,17 +1222,26 @@ export class SponsorService {
    * Hiro read failures are logged and skipped — the chain still enforces both, and an
    * outage should not turn into a relay outage. Returns null when the payment may proceed.
    */
-  async preflightSponsoredPayment(transaction: StacksTransactionWire): Promise<{
+  async preflightSponsoredPayment(
+    transaction: StacksTransactionWire,
+    /** Keys of the wallets that would pay; defaults to the /sponsor wallets */
+    sponsorKeys?: string[]
+  ): Promise<{
     code: "INSUFFICIENT_FUNDS" | "SPONSOR_EXHAUSTED";
     error: string;
     retryable: boolean;
   } | null> {
     const network = this.getNetwork();
-    const walletCount = this.getWalletCount();
+    const keys = sponsorKeys ?? [];
+    if (!sponsorKeys) {
+      for (let i = 0; i < this.getWalletCount(); i++) {
+        const key = await this.getSponsorKeyForWallet(i);
+        if (key) keys.push(key);
+      }
+    }
     const sponsorBalances: Array<string | null> = [];
-    for (let i = 0; i < walletCount; i++) {
-      const key = await this.getSponsorKeyForWallet(i);
-      if (key) sponsorBalances.push(await this.fetchWalletBalanceOrNull(getAddressFromPrivateKey(key, network)));
+    for (const key of keys) {
+      sponsorBalances.push(await this.fetchWalletBalanceOrNull(getAddressFromPrivateKey(key, network)));
     }
     const known = sponsorBalances.filter((b): b is string => b !== null);
     const depleted = BigInt(SponsorService.DEPLETED_THRESHOLD);

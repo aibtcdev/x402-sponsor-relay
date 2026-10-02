@@ -144,7 +144,11 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       }
     }
 
-    const preflight = await sponsorService.preflightSponsoredPayment(validation.transaction);
+    const paymentSponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
+    const preflight = await sponsorService.preflightSponsoredPayment(
+      validation.transaction,
+      paymentSponsorKey ? [paymentSponsorKey] : []
+    );
     if (preflight) {
       return { success: false, code: preflight.code, error: preflight.error, retryable: preflight.retryable };
     }
