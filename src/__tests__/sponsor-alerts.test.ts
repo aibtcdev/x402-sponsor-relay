@@ -71,8 +71,7 @@ describe("checkSponsorAlerts", () => {
   it("posts a low-balance alert to Telegram once, then stays quiet", async () => {
     const telegram: string[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-      const url = String(input);
-      if (url.includes("api.telegram.org")) {
+      if (new URL(String(input)).hostname === "api.telegram.org") {
         telegram.push(JSON.parse(String(init?.body)).text);
         return Response.json({ ok: true });
       }
