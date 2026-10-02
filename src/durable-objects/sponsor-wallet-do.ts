@@ -12,7 +12,7 @@ import { createWorkerLogger } from "../utils/logger";
 
 const HIRO_NONCE_TIMEOUT_MS = 10_000;
 /** Default cap on sponsor fees spent per UTC day (µSTX) — override with SPONSOR_DAILY_BUDGET_USTX */
-const DEFAULT_DAILY_BUDGET_USTX = 10_000_000n;
+export const DEFAULT_DAILY_BUDGET_USTX = 10_000_000n;
 
 /** Persisted fee spend for the current UTC day. */
 export interface BudgetStore {
@@ -219,8 +219,10 @@ async function fetchHiroNonces(env: Env, address: string): Promise<HiroNonces> {
  */
 export class SponsorWalletDO {
   private readonly wallet: SponsorWallet;
+  private readonly state: DurableObjectState;
 
   constructor(state: DurableObjectState, env: Env) {
+    this.state = state;
     const logger = createWorkerLogger(env.LOGS, undefined, { component: "sponsor-wallet-do" });
     const settlement = new SettlementService(env, logger);
     this.wallet = new SponsorWallet(
@@ -236,6 +238,12 @@ export class SponsorWalletDO {
   }
 
   async fetch(request: Request): Promise<Response> {
+    // GET: today's fee spend (read by the alert cron)
+    if (request.method === "GET") {
+      const day = new Date().toISOString().slice(0, 10);
+      const stored = await this.state.storage.get<{ day: string; spent: string }>("budget");
+      return Response.json({ day, spent: stored?.day === day ? stored.spent : "0" });
+    }
     const req = (await request.json()) as SponsorWalletRequest;
     return Response.json(await this.wallet.sponsorAndBroadcast(req));
   }

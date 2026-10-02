@@ -94,6 +94,11 @@ export interface Env {
   SPONSOR_RATE_LIMIT?: RateLimit;
   // Max sponsor fees per UTC day in µSTX (default 10 STX)
   SPONSOR_DAILY_BUDGET_USTX?: string;
+  // Telegram destination for payment-sponsor alerts (both required to send)
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
+  // Low-balance alert threshold for the payment sponsor in µSTX (default 10 STX)
+  SPONSOR_ALERT_MIN_USTX?: string;
   // Queue for serial payment processing (eliminates nonce contention)
   PAYMENT_QUEUE?: Queue;
   // Auth token for Hiro chainhook webhooks
