@@ -5,6 +5,7 @@
  * No auth required — service binding = trusted caller.
  *
  * Public methods:
+ * - sponsorPayment(txHex, settle) — sponsor + broadcast an x402 payment now, or fail with a reason
  * - submitPayment(txHex, settle) — validate tx, check sender nonce, enqueue, return paymentId
  * - checkPayment(paymentId)      — return current payment status from KV
  * - getSponsorStatus()           — return the cached relay-owned sponsor status snapshot
@@ -56,7 +57,7 @@ import {
   markInFlight,
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
-import { repairSenderWedgeDO } from "./services";
+import { repairSenderWedgeDO, SettlementService, SponsorService } from "./services";
 
 export type { SubmitPaymentResult, CheckPaymentResult };
 
@@ -92,7 +93,82 @@ function projectRpcErrorCode(errorCode?: string): PublicRpcErrorCode | undefined
  * const sponsorStatus = await env.X402_RELAY.getSponsorStatus();
  * ```
  */
+/** Result of RelayRPC.sponsorPayment(). */
+export type SponsorPaymentResult =
+  | { success: true; txid: string; payer: string; fee: string }
+  | {
+      success: false;
+      code:
+        | "INVALID_TRANSACTION"
+        | "PAYMENT_MISMATCH"
+        | "RATE_LIMITED"
+        | "INSUFFICIENT_FUNDS"
+        | "SPONSOR_EXHAUSTED"
+        | "SENDER_NONCE_CONFLICT"
+        | "BROADCAST_FAILED";
+      error: string;
+      retryable: boolean;
+    };
+
 export class RelayRPC extends WorkerEntrypoint<Env> {
+  /**
+   * Sponsor and broadcast an x402 payment, then return the txid — or fail with a reason.
+   *
+   * Sponsorship is offered only through this service binding (aibtc.com); the public HTTP
+   * /settle never sponsors. Checks run cheapest first so spam is rejected before any Hiro
+   * call or sponsor signature: validate → verify recipient/amount → per-payer rate limit →
+   * sender/sponsor balance preflight → SponsorWalletDO (daily budget, serial nonce, broadcast).
+   */
+  async sponsorPayment(txHex: string, settle: SettleOptions): Promise<SponsorPaymentResult> {
+    const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
+      component: "rpc",
+      route: "rpc.sponsorPayment",
+    });
+    const sponsorService = new SponsorService(this.env, logger);
+
+    const validation = sponsorService.validateTransaction(txHex);
+    if (!validation.valid) {
+      return { success: false, code: "INVALID_TRANSACTION", error: validation.details ?? validation.error, retryable: false };
+    }
+    const verify = new SettlementService(this.env, logger).verifyPaymentParams(txHex, settle);
+    if (!verify.valid) {
+      return { success: false, code: "PAYMENT_MISMATCH", error: verify.error, retryable: false };
+    }
+    const payer = validation.senderAddress;
+
+    if (this.env.SPONSOR_RATE_LIMIT) {
+      const { success } = await this.env.SPONSOR_RATE_LIMIT.limit({ key: payer });
+      if (!success) {
+        logger.warn("Sponsored payment rate limited", { payer });
+        return { success: false, code: "RATE_LIMITED", error: "Too many sponsored payments from this sender — retry in a minute", retryable: true };
+      }
+    }
+
+    const paymentSponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
+    const preflight = await sponsorService.preflightSponsoredPayment(
+      validation.transaction,
+      paymentSponsorKey ? [paymentSponsorKey] : []
+    );
+    if (preflight) {
+      return { success: false, code: preflight.code, error: preflight.error, retryable: preflight.retryable };
+    }
+
+    const sent = await sponsorService.sponsorAndBroadcast(validation.transaction);
+    if (!sent.ok) {
+      const senderFault = sent.responsible === "sender" || sent.clientRejection !== undefined;
+      return {
+        success: false,
+        code: sent.nonceConflict && senderFault ? "SENDER_NONCE_CONFLICT"
+          : sent.error === "Daily sponsor budget reached" ? "SPONSOR_EXHAUSTED"
+          : "BROADCAST_FAILED",
+        error: `${sent.error}: ${sent.details}`,
+        retryable: sent.retryable,
+      };
+    }
+    logger.info("Sponsored payment broadcast", { txid: sent.txid, payer, fee: sent.fee, sponsorNonce: sent.sponsorNonce });
+    return { success: true, txid: sent.txid, payer, fee: sent.fee };
+  }
+
   /**
    * Submit a payment for queue-based processing.
    *
@@ -206,6 +282,13 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
         code: "NOT_SPONSORED",
         retryable: false,
       };
+    }
+
+    // Balance preflight: refuse payments the sender can't cover, and stop accepting
+    // when every sponsor wallet is out of STX, before any nonce or queue state is touched.
+    const preflight = await new SponsorService(this.env, logger).preflightSponsoredPayment(transaction);
+    if (preflight) {
+      return { accepted: false, error: preflight.error, code: preflight.code, retryable: preflight.retryable };
     }
 
     // Extract sender info from spending condition

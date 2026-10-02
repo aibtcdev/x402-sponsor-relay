@@ -8,6 +8,10 @@ import {
   addressHashModeToVersion,
   addressFromVersionHash,
   addressToString,
+  ClarityType,
+  type AddressWire,
+  type ClarityValue,
+  type LengthPrefixedStringWire,
   type StacksTransactionWire,
 } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
@@ -28,6 +32,7 @@ import type {
   SponsorHeld,
 } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix, decodeClarityUint } from "../utils";
+import type { SponsorWalletResult } from "../durable-objects/sponsor-wallet-do";
 import { FeeService } from "./fee";
 
 /**
@@ -850,16 +855,19 @@ export class SponsorService {
 
       if (handResult !== null) {
         if (!handResult.dispatched) {
-          // Tx is held — gap exists in the sender's nonce sequence
+          // Tx is held — a gap in the sender's nonce sequence, or no sponsor
+          // wallet has headroom (holdReason "capacity")
+          const holdLabel = handResult.holdReason === "capacity" ? "no wallet capacity" : "nonce gap";
           this.logger.info(
             mode === "immediate"
-              ? "Nonce gap — rejected (immediate mode, not enqueued)"
-              : "Transaction held in sender hand — nonce gap",
+              ? `Transaction rejected (immediate mode, not enqueued) — ${holdLabel}`
+              : `Transaction held in sender hand — ${holdLabel}`,
             {
               senderAddress,
               senderNonce,
               nextExpected: handResult.nextExpected,
               missingNonces: handResult.missingNonces,
+              holdReason: handResult.holdReason,
               mode,
             }
           );
@@ -1120,6 +1128,11 @@ export class SponsorService {
    * Returns balance as a microSTX string, or "0" on failure.
    */
   private async fetchWalletBalance(address: string): Promise<string> {
+    return (await this.fetchWalletBalanceOrNull(address)) ?? "0";
+  }
+
+  /** As fetchWalletBalance, but null when Hiro could not be read. */
+  private async fetchWalletBalanceOrNull(address: string): Promise<string | null> {
     const cacheKey = `wallet_balance:${address}`;
 
     // Try cache first
@@ -1147,7 +1160,7 @@ export class SponsorService {
           address,
           status: response.status,
         });
-        return "0";
+        return null;
       }
       const data = (await response.json()) as { balance?: string };
       const rawBalance = typeof data?.balance === "string" ? data.balance : "0";
@@ -1166,7 +1179,147 @@ export class SponsorService {
         address,
         error: e instanceof Error ? e.message : String(e),
       });
-      return "0";
+      return null;
+    }
+  }
+
+  /**
+   * Sponsor and broadcast a validated sponsored transaction in one step.
+   *
+   * The payment sponsor (PAYMENT_SPONSOR_PRIVATE_KEY — its own wallet, separate from the
+   * /sponsor wallets) is a single SponsorWalletDO that signs and broadcasts one transaction at a
+   * time with a chain-derived nonce — nothing is reserved, queued or held.
+   */
+  async sponsorAndBroadcast(transaction: StacksTransactionWire): Promise<SponsorWalletResult> {
+    const ns = this.env.SPONSOR_WALLET_DO;
+    const sponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
+    if (!ns || !sponsorKey) {
+      return {
+        ok: false, retryable: false, responsible: "sponsor",
+        error: "Service not configured",
+        details: ns ? "Set PAYMENT_SPONSOR_PRIVATE_KEY" : "SPONSOR_WALLET_DO binding missing",
+      };
+    }
+    const spend = this.paymentSpend(transaction);
+    const fee = await new FeeService(this.env, this.logger).getFeeForType(
+      spend && spend.asset !== "STX" ? "sip010_transfer" : this.payloadToFeeType(transaction.payload.payloadType)
+    );
+    const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/sponsor", {
+      method: "POST",
+      body: JSON.stringify({ txHex: transaction.serialize(), sponsorKey, fee: String(fee) }),
+    });
+    return (await res.json()) as SponsorWalletResult;
+  }
+
+  /**
+   * Balance checks to run before sponsoring a payment, so neither side can make the
+   * sponsor pay for a transaction that is bound to fail:
+   *  - the sender must hold the transferred amount (STX, or the SIP-010 token it calls
+   *    `transfer` on); an underfunded transfer still lands as an abort and the sponsor
+   *    pays its fee
+   *  - at least one sponsor wallet must hold more than the depleted threshold
+   *
+   * Hiro read failures are logged and skipped — the chain still enforces both, and an
+   * outage should not turn into a relay outage. Returns null when the payment may proceed.
+   */
+  async preflightSponsoredPayment(
+    transaction: StacksTransactionWire,
+    /** Keys of the wallets that would pay; defaults to the /sponsor wallets */
+    sponsorKeys?: string[]
+  ): Promise<{
+    code: "INSUFFICIENT_FUNDS" | "SPONSOR_EXHAUSTED";
+    error: string;
+    retryable: boolean;
+  } | null> {
+    const network = this.getNetwork();
+    const keys = sponsorKeys ?? [];
+    if (!sponsorKeys) {
+      for (let i = 0; i < this.getWalletCount(); i++) {
+        const key = await this.getSponsorKeyForWallet(i);
+        if (key) keys.push(key);
+      }
+    }
+    const sponsorBalances: Array<string | null> = [];
+    for (const key of keys) {
+      sponsorBalances.push(await this.fetchWalletBalanceOrNull(getAddressFromPrivateKey(key, network)));
+    }
+    const known = sponsorBalances.filter((b): b is string => b !== null);
+    const depleted = BigInt(SponsorService.DEPLETED_THRESHOLD);
+    if (known.length > 0 && known.length === sponsorBalances.length && known.every((b) => BigInt(b) < depleted)) {
+      this.logger.error("All sponsor wallets depleted — refusing to sponsor", { balances: known });
+      return {
+        code: "SPONSOR_EXHAUSTED",
+        error: "The relay's sponsor wallets are out of STX. Retry later, or send without sponsorship (pay your own fee).",
+        retryable: true,
+      };
+    }
+
+    const spend = this.paymentSpend(transaction);
+    if (!spend) return null;
+    const sender = this.deriveSenderAddress(transaction);
+    const balance = await this.fetchSenderBalance(sender, spend.asset);
+    if (balance === null || balance >= spend.amount) return null;
+
+    const unit = spend.asset === "STX" ? "µSTX" : `base units of ${spend.asset}`;
+    this.logger.info("Sender cannot cover payment — refusing to sponsor", {
+      sender,
+      asset: spend.asset,
+      amount: spend.amount.toString(),
+      balance: balance.toString(),
+    });
+    return {
+      code: "INSUFFICIENT_FUNDS",
+      error: `Sender ${sender} holds ${balance} ${unit}, needs ${spend.amount}. Top up the wallet and re-sign the payment.`,
+      retryable: false,
+    };
+  }
+
+  /** Amount and asset a sponsored payment moves out of the sender, or null for other payloads. */
+  private paymentSpend(transaction: StacksTransactionWire): { asset: string; amount: bigint } | null {
+    const payload = transaction.payload;
+    if (payload.payloadType === PayloadType.TokenTransfer) {
+      return { asset: "STX", amount: payload.amount as bigint };
+    }
+    if (payload.payloadType === PayloadType.ContractCall) {
+      const functionName = (payload.functionName as unknown as LengthPrefixedStringWire).content;
+      const amountCV = (payload.functionArgs as ClarityValue[])[0];
+      if (functionName !== "transfer" || amountCV?.type !== ClarityType.UInt) return null;
+      const contractId = `${addressToString(payload.contractAddress as unknown as AddressWire)}.${
+        (payload.contractName as unknown as LengthPrefixedStringWire).content
+      }`;
+      return { asset: contractId, amount: BigInt(amountCV.value) };
+    }
+    return null;
+  }
+
+  /** Sender balance of STX (unlocked) or a SIP-010 contract id; null when Hiro could not be read. */
+  private async fetchSenderBalance(address: string, asset: string): Promise<bigint | null> {
+    const url = `${getHiroBaseUrl(this.env.STACKS_NETWORK)}/extended/v1/address/${address}/balances`;
+    try {
+      const response = await fetch(url, {
+        headers: getHiroHeaders(this.env.HIRO_API_KEY),
+        signal: AbortSignal.timeout(HIRO_BALANCE_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        this.logger.warn("Hiro balances error during sponsor preflight", { address, status: response.status });
+        return null;
+      }
+      const data = (await response.json()) as {
+        stx?: { balance?: string; locked?: string };
+        fungible_tokens?: Record<string, { balance?: string }>;
+      };
+      if (asset === "STX") {
+        return BigInt(data.stx?.balance ?? "0") - BigInt(data.stx?.locked ?? "0");
+      }
+      // Hiro keys fungible tokens as "<contract id>::<asset name>"
+      const entry = Object.entries(data.fungible_tokens ?? {}).find(([k]) => k.startsWith(`${asset}::`));
+      return BigInt(entry?.[1].balance ?? "0");
+    } catch (e) {
+      this.logger.warn("Failed to read sender balance during sponsor preflight", {
+        address,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
     }
   }
 

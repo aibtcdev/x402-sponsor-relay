@@ -16,6 +16,9 @@ import { getHiroBaseUrl, getHiroHeaders } from "../utils";
 const DEFAULT_CLAMPS: FeeClampConfig = {
   token_transfer: { floor: 180, ceiling: 3000 },
   contract_call: { floor: 3000, ceiling: 50000 },
+  // Hiro's contract_call tier is skewed by heavy calls (medium seen at >2 STX), which pinned
+  // every sBTC payment at the 0.05 STX ceiling; plain SIP-010 transfers confirm at 500-3000.
+  sip010_transfer: { floor: 500, ceiling: 3000 },
   smart_contract: { floor: 10000, ceiling: 50000 },
 };
 
@@ -69,9 +72,11 @@ export class FeeService {
       }
 
       const config = JSON.parse(configJson) as FeeClampConfig;
+      // Configs stored before sip010_transfer existed keep their other clamps
+      config.sip010_transfer ??= DEFAULT_CLAMPS.sip010_transfer;
 
       // Validate required keys and types before trusting KV data
-      const txTypes: FeeTransactionType[] = ["token_transfer", "contract_call", "smart_contract"];
+      const txTypes: FeeTransactionType[] = ["token_transfer", "contract_call", "sip010_transfer", "smart_contract"];
       for (const txType of txTypes) {
         const clamp = config[txType];
         if (
@@ -316,6 +321,7 @@ export class FeeService {
     return {
       token_transfer: this.clampTiers(tokenTransferTiers, config.token_transfer),
       contract_call: this.clampTiers(raw.contract_call, config.contract_call),
+      sip010_transfer: this.clampTiers(raw.contract_call, config.sip010_transfer),
       smart_contract: this.clampTiers(smartContractTiers, config.smart_contract),
     };
   }
@@ -380,6 +386,7 @@ export class FeeService {
     const defaults: FeeEstimates = {
       token_transfer: this.uniformTiers(config.token_transfer.floor),
       contract_call: this.uniformTiers(config.contract_call.floor),
+      sip010_transfer: this.uniformTiers(config.sip010_transfer.floor),
       smart_contract: this.uniformTiers(config.smart_contract.floor),
     };
 

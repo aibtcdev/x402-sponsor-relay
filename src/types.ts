@@ -86,6 +86,14 @@ export interface Env {
   NONCE_DO?: DurableObjectNamespace;
   // Durable Object namespace for atomic stats (replaces KV read-modify-write)
   STATS_DO?: DurableObjectNamespace;
+  // Durable Object namespace: one instance per sponsor wallet, signs + broadcasts serially
+  SPONSOR_WALLET_DO?: DurableObjectNamespace;
+  // Private key (hex) of the wallet that sponsors x402 payments (RelayRPC.sponsorPayment)
+  PAYMENT_SPONSOR_PRIVATE_KEY?: string;
+  // Cloudflare rate limiter for sponsored payments, keyed by payer address
+  SPONSOR_RATE_LIMIT?: RateLimit;
+  // Max sponsor fees per UTC day in µSTX (default 10 STX)
+  SPONSOR_DAILY_BUDGET_USTX?: string;
   // Queue for serial payment processing (eliminates nonce contention)
   PAYMENT_QUEUE?: Queue;
   // Auth token for Hiro chainhook webhooks
@@ -582,6 +590,7 @@ export type RelayErrorCode =
   | "DAILY_LIMIT_EXCEEDED"
   | "SPONSOR_CONFIG_ERROR"
   | "SPONSOR_FAILED"
+  | "SPONSOR_EXHAUSTED"
   | "BROADCAST_FAILED"
   | "BROADCAST_REJECTED"
   | "SETTLEMENT_VERIFICATION_FAILED"
@@ -1220,7 +1229,8 @@ export type TerminalReasonCategory =
 /**
  * Transaction types for fee estimation
  */
-export type FeeTransactionType = "token_transfer" | "contract_call" | "smart_contract";
+/** sip010_transfer: a plain SIP-010 `transfer` call (sBTC, USDCx) — priced from the contract_call tier, clamped narrower */
+export type FeeTransactionType = "token_transfer" | "contract_call" | "sip010_transfer" | "smart_contract";
 
 /**
  * Priority levels for fee estimation
@@ -1248,6 +1258,7 @@ export interface FeePriorityTiers {
 export interface FeeEstimates {
   token_transfer?: FeePriorityTiers;
   contract_call: FeePriorityTiers;
+  sip010_transfer?: FeePriorityTiers;
   smart_contract?: FeePriorityTiers;
   all?: FeePriorityTiers;
 }
@@ -1266,6 +1277,7 @@ export interface FeeClamp {
 export interface FeeClampConfig {
   token_transfer: FeeClamp;
   contract_call: FeeClamp;
+  sip010_transfer: FeeClamp;
   smart_contract: FeeClamp;
 }
 

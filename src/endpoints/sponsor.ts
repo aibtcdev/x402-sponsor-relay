@@ -65,7 +65,7 @@ export class Sponsor extends BaseEndpoint {
     tags: ["Sponsor"],
     summary: "Sponsor and broadcast a transaction",
     description:
-      "Accepts a pre-signed sponsored transaction, adds the sponsor signature, and broadcasts directly to the Stacks network. Unlike /relay, this does NOT perform settlement verification. Requires API key authentication.",
+      "Accepts a pre-signed sponsored transaction, adds the sponsor signature, and broadcasts directly to the Stacks network. It does not perform settlement verification. Requires API key authentication.",
     security: [{ bearerAuth: [] }],
     request: {
       body: {
@@ -256,6 +256,11 @@ export class Sponsor extends BaseEndpoint {
           details: validation.details,
           retryable: false,
         });
+      }
+
+      const preflight = await sponsorService.preflightSponsoredPayment(validation.transaction);
+      if (preflight) {
+        return this.preflightRejectionResponse(c, preflight);
       }
 
       const authService = new AuthService(c.env.API_KEYS_KV, logger);

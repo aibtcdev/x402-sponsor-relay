@@ -225,6 +225,28 @@ export class BaseEndpoint extends OpenAPIRoute {
   /**
    * Return a structured error response with retry guidance
    */
+  /** HTTP response for a SponsorService.preflightSponsoredPayment() rejection. */
+  protected preflightRejectionResponse(
+    c: AppContext,
+    rejection: { code: "INSUFFICIENT_FUNDS" | "SPONSOR_EXHAUSTED"; error: string; retryable: boolean }
+  ): Response {
+    if (rejection.code === "SPONSOR_EXHAUSTED") {
+      return this.err(c, {
+        error: rejection.error,
+        code: "SPONSOR_EXHAUSTED",
+        status: 503,
+        retryable: true,
+        retryAfter: SERVICE_DEGRADED_RETRY_AFTER_S,
+      });
+    }
+    return this.err(c, {
+      error: rejection.error,
+      code: "CLIENT_INSUFFICIENT_FUNDS",
+      status: 422,
+      retryable: false,
+    });
+  }
+
   protected err(
     c: AppContext,
     opts: {

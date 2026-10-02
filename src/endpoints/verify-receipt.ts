@@ -13,7 +13,7 @@ export class Verify extends BaseEndpoint {
     tags: ["Verify"],
     summary: "Verify a payment receipt",
     description:
-      "Look up a payment receipt by ID and return its status. Receipts are created when a transaction is successfully settled via POST /relay. The receiptId is passed as a URL path parameter.",
+      "Look up a payment receipt by ID and return its status. Receipts were created by the former POST /relay endpoint, which has been removed; existing receipts remain readable, but no new ones are issued. The receiptId is passed as a URL path parameter.",
     responses: {
       "200": {
         description: "Receipt found",
