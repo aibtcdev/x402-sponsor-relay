@@ -105,6 +105,9 @@ export type SponsorPaymentResult =
         | "INSUFFICIENT_FUNDS"
         | "SPONSOR_EXHAUSTED"
         | "SENDER_NONCE_CONFLICT"
+        | "SENDER_NONCE_DUPLICATE"
+        | "SENDER_NONCE_STALE"
+        | "SENDER_NONCE_GAP"
         | "BROADCAST_FAILED";
       error: string;
       retryable: boolean;
@@ -158,7 +161,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       const senderFault = sent.responsible === "sender" || sent.clientRejection !== undefined;
       return {
         success: false,
-        code: sent.nonceConflict && senderFault ? "SENDER_NONCE_CONFLICT"
+        code: sent.senderNonceCode ? sent.senderNonceCode
+          : sent.nonceConflict && senderFault ? "SENDER_NONCE_CONFLICT"
           : sent.error === "Daily sponsor budget reached" ? "SPONSOR_EXHAUSTED"
           : "BROADCAST_FAILED",
         error: `${sent.error}: ${sent.details}`,
