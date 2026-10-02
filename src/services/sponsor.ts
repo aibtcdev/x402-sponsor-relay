@@ -850,16 +850,19 @@ export class SponsorService {
 
       if (handResult !== null) {
         if (!handResult.dispatched) {
-          // Tx is held — gap exists in the sender's nonce sequence
+          // Tx is held — a gap in the sender's nonce sequence, or no sponsor
+          // wallet has headroom (holdReason "capacity")
+          const holdLabel = handResult.holdReason === "capacity" ? "no wallet capacity" : "nonce gap";
           this.logger.info(
             mode === "immediate"
-              ? "Nonce gap — rejected (immediate mode, not enqueued)"
-              : "Transaction held in sender hand — nonce gap",
+              ? `Transaction rejected (immediate mode, not enqueued) — ${holdLabel}`
+              : `Transaction held in sender hand — ${holdLabel}`,
             {
               senderAddress,
               senderNonce,
               nextExpected: handResult.nextExpected,
               missingNonces: handResult.missingNonces,
+              holdReason: handResult.holdReason,
               mode,
             }
           );

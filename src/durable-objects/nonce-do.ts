@@ -3446,6 +3446,22 @@ export class NonceDO {
     await this.state.storage.setAlarm(Date.now() + intervalMs);
   }
 
+  /**
+   * Re-arm the alarm if none is scheduled.
+   *
+   * The alarm reschedules itself at the end of every cycle, but if alarm() throws
+   * outside its own catch (e.g. a blockConcurrencyWhile timeout resets the object)
+   * Cloudflare retries it a few times and then drops it. Nothing else re-arms it on
+   * the hand-submit path, and without the alarm queued entries are never broadcast,
+   * so every wallet fills to its chaining limit and all payments hold on "capacity"
+   * indefinitely. Called on every request so any traffic revives a dead alarm.
+   */
+  private async ensureAlarm(): Promise<void> {
+    if ((await this.state.storage.getAlarm()) !== null) return;
+    this.log("warn", "nonce_alarm_rearmed", {});
+    await this.scheduleAlarm(true);
+  }
+
   // ---------------------------------------------------------------------------
   // Dynamic scaling and surge tracking helpers
   // ---------------------------------------------------------------------------
@@ -5063,11 +5079,6 @@ export class NonceDO {
     // Phase 2 (inside lock): All state reads and mutations. No Hiro I/O.
     // -------------------------------------------------------------------------
     return this.state.blockConcurrencyWhile(async () => {
-      const currentAlarm = await this.state.storage.getAlarm();
-      if (currentAlarm === null) {
-        // Assigning a nonce means we have active traffic — schedule at active interval
-        await this.scheduleAlarm(true);
-      }
 
       // Use the larger of the caller-supplied count and the dynamically-scaled count
       // stored in nonce_state. This ensures scale-ups are reflected immediately
@@ -9543,6 +9554,8 @@ export class NonceDO {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    await this.ensureAlarm();
 
     if (request.method === "POST" && url.pathname === "/assign") {
       const { value: body, errorResponse } =
