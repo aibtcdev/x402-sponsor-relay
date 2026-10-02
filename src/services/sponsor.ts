@@ -1206,7 +1206,10 @@ export class SponsorService {
     );
     const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/sponsor", {
       method: "POST",
-      body: JSON.stringify({ txHex: transaction.serialize(), sponsorKey, fee: String(fee) }),
+      body: JSON.stringify({
+        txHex: transaction.serialize(), sponsorKey, fee: String(fee),
+        senderAddress: this.deriveSenderAddress(transaction),
+      }),
     });
     return (await res.json()) as SponsorWalletResult;
   }
