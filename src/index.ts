@@ -8,6 +8,8 @@ import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
 import { SettlementHealthService } from "./services";
+import { checkSponsorAlerts } from "./services/sponsor-alerts";
+import { createWorkerLogger } from "./utils";
 import { handlePaymentQueue, handlePaymentDLQ } from "./queue-consumer";
 import type { PaymentQueueMessage } from "./services/payment-status";
 export { NonceDO } from "./durable-objects/nonce-do";
@@ -235,6 +237,11 @@ export default {
     const logger = createNoOpLogger();
     const healthService = new SettlementHealthService(env, logger);
     ctx.waitUntil(healthService.checkHealth());
+    ctx.waitUntil(
+      checkSponsorAlerts(env, createWorkerLogger(env.LOGS, ctx, { component: "sponsor-alerts" })).catch((e) =>
+        console.error("sponsor alert check failed", e instanceof Error ? e.message : String(e))
+      )
+    );
   },
 
   /**
