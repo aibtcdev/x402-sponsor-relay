@@ -10,18 +10,13 @@ import {
 import {
   StatsService,
   PaymentIdService,
-  SponsorService,
   SettlementService,
   hasSponsorSignature,
-  extractSponsorNonce,
-  releaseNonceDO,
-  recordBroadcastOutcomeDO,
-  nonceLifecycleOnBroadcastSuccess,
 } from "../services";
 import { stripHexPrefix } from "../utils";
 import { checkAndRecordMalformed } from "../middleware";
-import type { AppContext, SettleOptions, X402SettlementResponseV2, X402SettleRequestV2, TxStatusRecord, Logger } from "../types";
-import { CAIP2_NETWORKS, X402_V2_ERROR_CODES, buildQueueInfo } from "../types";
+import type { AppContext, BroadcastOnlyResult, SettleOptions, TokenType, X402SettlementResponseV2, X402SettleRequestV2, TxStatusRecord, Logger } from "../types";
+import { CAIP2_NETWORKS, X402_V2_ERROR_CODES } from "../types";
 
 /** Parameters for the shared post-broadcast success handler */
 interface BroadcastSuccessParams {
@@ -30,9 +25,6 @@ interface BroadcastSuccessParams {
   txid: string;
   txHex: string;
   network: string;
-  sponsorNonce: number | null;
-  sponsorWalletIndex: number;
-  sponsorFee: string | undefined;
   verifiedTx: import("@stacks/transactions").StacksTransactionWire;
   recipient: string;
   amount: string;
@@ -42,8 +34,6 @@ interface BroadcastSuccessParams {
   paymentIdService: PaymentIdService;
   paymentIdentifier: string | undefined;
   paymentIdPayloadHash: string | undefined;
-  /** ISO timestamp of when the client HTTP request arrived at the relay endpoint. */
-  submittedAt: string;
 }
 
 /**
@@ -143,36 +133,18 @@ export class Settle extends BaseEndpoint {
 
   /**
    * Shared post-broadcast success handler used by both the primary and retry paths.
-   * Records nonce lifecycle, dedup, tx status, stats, schedules background polling,
+   * Records dedup, tx status, stats, schedules background polling,
    * and returns the V2 settlement response.
    */
   private async handleBroadcastSuccess(params: BroadcastSuccessParams): Promise<Response> {
     const {
       c, logger, txid, txHex, network,
-      sponsorNonce, sponsorWalletIndex, sponsorFee,
       verifiedTx, recipient, amount,
       settleOptions, settlementService, statsService,
       paymentIdService, paymentIdentifier, paymentIdPayloadHash,
-      submittedAt,
     } = params;
 
     const payer = settlementService.senderToAddress(verifiedTx, c.env.STACKS_NETWORK);
-
-    // Consume the sponsor nonce on broadcast success (fire-and-forget)
-    if (sponsorNonce !== null) {
-      c.executionCtx.waitUntil(
-        nonceLifecycleOnBroadcastSuccess(c.env, logger, {
-          sponsorNonce,
-          walletIndex: sponsorWalletIndex,
-          txid,
-          fee: sponsorFee,
-          senderTxHex: txHex,
-          senderAddress: payer,
-          senderNonce: Number(verifiedTx.auth.spendingCondition.nonce),
-          submittedAt,
-        })
-      );
-    }
 
     // Await dedup + tx status before returning — these must be visible to subsequent
     // requests for idempotency (dedup) and for the background poller (tx status).
@@ -189,9 +161,6 @@ export class Settle extends BaseEndpoint {
       status: "broadcast",
       payer,
       network,
-      walletIndex: sponsorNonce !== null ? sponsorWalletIndex : undefined,
-      sponsorNonce,
-      sponsorFee,
       broadcastAt: new Date().toISOString(),
     };
     await settlementService.recordTxStatus(txStatusRecord);
@@ -208,8 +177,6 @@ export class Settle extends BaseEndpoint {
         sender: payer,
         recipient,
         status: "pending",
-        fee: sponsorFee,
-        walletIndex: sponsorWalletIndex,
       }).catch(() => {})
     );
 
@@ -272,12 +239,47 @@ export class Settle extends BaseEndpoint {
     return c.json(response, 200);
   }
 
+  /** Map a failed broadcast (relay-sponsored or self-paid) to a V2 settle error. */
+  private broadcastFailure(
+    c: AppContext,
+    logger: Logger,
+    failure: Extract<BroadcastOnlyResult, { error: string }>,
+    statsService: StatsService,
+    failureCtx: { tokenType?: TokenType; amount?: string },
+    v2Error: (errorReason: string, status: 200 | 400 | 409 | 500) => Response
+  ): Response {
+    const isClientError = failure.clientRejection !== undefined || failure.responsible === "sender";
+    logger.warn("Broadcast failed", {
+      error: failure.error,
+      details: failure.details,
+      responsible: failure.responsible,
+      clientRejection: failure.clientRejection,
+      nonceConflict: failure.nonceConflict,
+      tooMuchChaining: failure.tooMuchChaining,
+    });
+    c.executionCtx.waitUntil(
+      statsService.logFailure("settle", isClientError, failureCtx, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {})
+    );
+    if (failure.clientRejection) {
+      return v2Error(mapClientRejectionToV2Code(failure.clientRejection), 200);
+    }
+    if (failure.nonceConflict) {
+      return v2Error(
+        failure.responsible === "sender"
+          ? X402_V2_ERROR_CODES.SENDER_NONCE_CONFLICT
+          : X402_V2_ERROR_CODES.CONFLICTING_NONCE,
+        200
+      );
+    }
+    return v2Error(
+      failure.retryable ? X402_V2_ERROR_CODES.BROADCAST_FAILED : X402_V2_ERROR_CODES.TRANSACTION_FAILED,
+      200
+    );
+  }
+
   async handle(c: AppContext) {
     const logger = this.getLogger(c);
     logger.info("x402 V2 settle request received");
-
-    // Capture HTTP request arrival time for user-perceived settlement latency measurement.
-    const submittedAt = new Date().toISOString();
 
     const statsService = new StatsService(c.env, logger);
     const paymentIdService = new PaymentIdService(c.env.RELAY_KV, logger);
@@ -395,122 +397,14 @@ export class Settle extends BaseEndpoint {
         return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
       }
 
-      // Auto-sponsor branch: if the sponsor slot is empty (fee=0n or all-zeros signer),
-      // route through SponsorService to fill it before verification and broadcast.
-      // This handles standard x402 clients that build transactions with sponsored:true, fee:0n.
-      let activeHex = txHex;
-      let sponsorFee: string | undefined;
-      let sponsorNonce: number | null = null;
-      let sponsorWalletIndex = 0;
-
-      // Shared context for failure stats (used by auto-sponsor, verify, and broadcast paths)
+      // Shared context for failure stats
       const failureCtx = { tokenType: settleOptions.tokenType, amount: settleOptions.minAmount };
 
-      // Keep sponsorService and validated tx in outer scope so the nonce-conflict retry path
-      // can re-sponsor the original transaction after an inline resync.
-      let sponsorService: SponsorService | null = null;
-      let validatedTxForRetry: ReturnType<SponsorService["validateTransaction"]> | null = null;
-
-      if (!hasSponsorSignature(parsedTx)) {
-        logger.info("Sponsor slot is empty — auto-sponsoring transaction");
-
-        sponsorService = new SponsorService(c.env, logger);
-
-        // Validate the transaction is sponsorable
-        const validateResult = sponsorService.validateTransaction(txHex);
-        if (!validateResult.valid) {
-          if (validateResult.error === "Malformed transaction payload" && clientIp) {
-            checkAndRecordMalformed(clientIp);
-          }
-          logger.info("Transaction failed sponsor validation", { error: validateResult.error });
-          c.executionCtx.waitUntil(
-            Promise.all([
-              statsService.recordError("validation"),
-              statsService.logFailure("settle", true, failureCtx, "invalid_transaction"),
-            ]).catch(() => {})
-          );
-          return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
-        }
-
-        // Stash for retry path
-        validatedTxForRetry = validateResult;
-
-        // Sponsor the transaction (reserves nonce from NonceDO, adds fee + sponsor sig)
-        const sponsorResult = await sponsorService.sponsorTransaction(validateResult.transaction);
-        if (!sponsorResult.success) {
-          // Gin rummy: tx held — nonce gap exists.
-          // POST /settle must return HTTP 200 per V2 spec; signal held via errorReason.
-          // Include QueueInfo in the response extension so V2 clients can surface the gap info.
-          if ("held" in sponsorResult && sponsorResult.held) {
-            const senderNonce = Number(parsedTx.auth.spendingCondition.nonce);
-            const queue = buildQueueInfo(sponsorResult, senderNonce);
-            logger.warn("Sponsoring held — nonce gap in sender hand", {
-              senderNonce,
-              nextExpected: sponsorResult.nextExpected,
-              missingNonces: sponsorResult.missingNonces,
-            });
-            c.executionCtx.waitUntil(
-              Promise.all([
-                statsService.recordError("sponsoring"),
-                statsService.logFailure("settle", false, failureCtx, "sender_nonce_gap"),
-              ]).catch(() => {})
-            );
-            return c.json({
-              success: false,
-              errorReason: X402_V2_ERROR_CODES.TRANSACTION_HELD,
-              transaction: "",
-              network,
-              queue,
-            }, 200);
-          }
-          const failResult = sponsorResult as { error: string; code?: string };
-          logger.warn("Sponsoring failed", { error: failResult.error, code: failResult.code });
-          c.executionCtx.waitUntil(
-            Promise.all([
-              statsService.recordError("sponsoring"),
-              statsService.logFailure("settle", false, failureCtx, "sponsor_failure"),
-            ]).catch(() => {})
-          );
-          // Transient sponsor failures — signal retryable via BROADCAST_FAILED
-          // Note: SponsorService maps CHAINING_LIMIT_EXCEEDED → RATE_LIMIT_EXCEEDED
-          const isTransient =
-            failResult.code === "LOW_HEADROOM" ||
-            failResult.code === "RATE_LIMIT_EXCEEDED" ||
-            failResult.code === "SERVICE_DEGRADED";
-          const errorReason = isTransient
-            ? X402_V2_ERROR_CODES.BROADCAST_FAILED
-            : X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE;
-          return v2Error(errorReason, 200);
-        }
-
-        // Extract nonce for lifecycle management (release on failure, consume on success)
-        const sponsoredTx = deserializeTransaction(stripHexPrefix(sponsorResult.sponsoredTxHex));
-        sponsorNonce = extractSponsorNonce(sponsoredTx);
-        sponsorWalletIndex = sponsorResult.walletIndex;
-        sponsorFee = sponsorResult.fee;
-        // Use the sponsored hex for verification and broadcast
-        activeHex = sponsorResult.sponsoredTxHex;
-
-        logger.info("Transaction auto-sponsored", {
-          fee: sponsorFee,
-          walletIndex: sponsorWalletIndex,
-          sponsorNonce,
-        });
-      }
-
-      const verifyResult = settlementService.verifyPaymentParams(activeHex, settleOptions);
+      // Recipient / amount / token live in the client-signed payload; the sponsor slot
+      // does not affect them, so verify once before sponsoring or broadcasting.
+      const verifyResult = settlementService.verifyPaymentParams(txHex, settleOptions);
       if (!verifyResult.valid) {
         logger.warn("Payment verification failed", { error: verifyResult.error });
-
-        // Release reserved sponsor nonce (if any) before returning — verify failed pre-broadcast
-        if (sponsorNonce !== null) {
-          c.executionCtx.waitUntil(
-            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
-              logger.warn("Failed to release nonce after verify failure", { error: String(e) });
-            })
-          );
-        }
-
         c.executionCtx.waitUntil(
           Promise.all([
             statsService.recordError("validation"),
@@ -520,320 +414,29 @@ export class Settle extends BaseEndpoint {
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
       }
 
-      // Broadcast only — return immediately after the node accepts the transaction.
-      // Confirmation polling is moved to waitUntil() so callers are not blocked.
-      const broadcastResult = await settlementService.broadcastOnly(
-        verifyResult.data.transaction,
-      );
-
-      if ("error" in broadcastResult) {
-        // Record nonce lifecycle (release reserved nonce on broadcast failure)
-        if (sponsorNonce !== null) {
-          c.executionCtx.waitUntil(
-            Promise.all([
-              recordBroadcastOutcomeDO(
-                c.env, logger, sponsorNonce, sponsorWalletIndex,
-                undefined, broadcastResult.httpStatus, broadcastResult.nodeUrl, broadcastResult.details
-              ),
-              releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex),
-            ]).catch((e) => {
-              logger.warn("Failed nonce lifecycle after broadcast failure", { error: String(e) });
-            })
-          );
-        }
-
-        const clientRejection = broadcastResult.clientRejection;
-        // Sponsor-side TooMuchChaining omits clientRejection in settlement service,
-        // so isClientError is naturally false for relay congestion.
-        const isClientError = clientRejection !== undefined;
-
-        // Log structured attribution from the broadcast-outcome pipeline (#377).
-        // responsible/agentErrorCode are populated by parseBroadcastOutcome + decideBroadcastAction
-        // in settlement.broadcastAndConfirm using reason_data.is_origin from the Stacks node.
-        // Phase 2 will use broadcastResult.responsible to gate re-sponsor recovery.
-        if (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining) {
-          logger.info("Broadcast failure attribution", {
-            responsible: broadcastResult.responsible,
-            agentErrorCode: broadcastResult.agentErrorCode,
-            nonceConflict: broadcastResult.nonceConflict,
-            tooMuchChaining: broadcastResult.tooMuchChaining,
-            isOriginChaining: broadcastResult.isOriginChaining,
-          });
-        }
-
-        // Record stats once for all error branches (before entering recovery branches).
-        // The recovery branches may fire additional logFailure calls for more precise reasons.
+      // Public /settle only broadcasts self-paid (or already-sponsored) transactions.
+      // Sponsorship is offered to aibtc.com alone, over the RelayRPC.sponsorPayment binding.
+      if (!hasSponsorSignature(parsedTx)) {
+        logger.info("Refusing to sponsor on public /settle — sponsorship is service-binding only");
         c.executionCtx.waitUntil(
-          statsService.logFailure("settle", isClientError, failureCtx, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {})
+          statsService.logFailure("settle", true, failureCtx, "not_sponsored").catch(() => {})
         );
-
-        // Sponsor-side issues (nonce conflict or TooMuchChaining) → inline resync + single retry
-        // Gate: sponsorNonce !== null means the relay auto-sponsored this tx (it owns the conflict).
-        if (sponsorNonce !== null && (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining)) {
-          const reason = broadcastResult.nonceConflict ? "nonce_conflict" : "too_much_chaining";
-          logger.warn("Sponsor wallet issue on auto-sponsored settle — attempting inline resync + retry", {
-            reason,
-            sponsorNonce,
-            walletIndex: sponsorWalletIndex,
-          });
-
-          // Inline resync: await directly so the DO is consistent before we re-sponsor.
-          // No delay needed — the conflicting tx was already broadcast before this error,
-          // so Hiro's mempool index has already indexed it.
-          const retrySponsorService = sponsorService ?? new SponsorService(c.env, logger);
-          await retrySponsorService.resyncNonceDO();
-
-          // Re-sponsor with a fresh nonce if we have the validated transaction
-          if (validatedTxForRetry?.valid) {
-            logger.info("Retrying sponsor + broadcast after inline resync", { reason });
-            const retrySponsorResult = await retrySponsorService.sponsorTransaction(validatedTxForRetry.transaction);
-            if (retrySponsorResult.success) {
-              // Re-extract nonce lifecycle values for the retry attempt
-              const retryTx = deserializeTransaction(stripHexPrefix(retrySponsorResult.sponsoredTxHex));
-              const retryNonce = extractSponsorNonce(retryTx);
-              const retryWalletIndex = retrySponsorResult.walletIndex;
-              const retryFee = retrySponsorResult.fee;
-              const retryHex = retrySponsorResult.sponsoredTxHex;
-
-              // Verify payment params on the re-sponsored tx
-              const retryVerifyResult = settlementService.verifyPaymentParams(retryHex, settleOptions);
-              if (retryVerifyResult.valid) {
-                const retryBroadcastResult = await settlementService.broadcastOnly(retryVerifyResult.data.transaction);
-                if (!("error" in retryBroadcastResult)) {
-                  logger.info("Retry after inline resync succeeded", {
-                    txid: retryBroadcastResult.txid,
-                    retryNonce,
-                    retryWalletIndex,
-                  });
-                  return this.handleBroadcastSuccess({
-                    c, logger, txid: retryBroadcastResult.txid, txHex, network,
-                    sponsorNonce: retryNonce, sponsorWalletIndex: retryWalletIndex, sponsorFee: retryFee,
-                    verifiedTx: retryVerifyResult.data.transaction,
-                    recipient: retryVerifyResult.data.recipient,
-                    amount: retryVerifyResult.data.amount,
-                    settleOptions, settlementService, statsService,
-                    paymentIdService, paymentIdentifier, paymentIdPayloadHash,
-                    submittedAt,
-                  });
-                } else {
-                  // Retry broadcast also failed — release retry nonce, fall through to error
-                  logger.warn("Retry broadcast after inline resync also failed", {
-                    error: retryBroadcastResult.error,
-                  });
-                  if (retryNonce !== null) {
-                    c.executionCtx.waitUntil(
-                      Promise.all([
-                        recordBroadcastOutcomeDO(
-                          c.env, logger, retryNonce, retryWalletIndex,
-                          undefined, retryBroadcastResult.httpStatus, retryBroadcastResult.nodeUrl, retryBroadcastResult.details
-                        ),
-                        releaseNonceDO(c.env, logger, retryNonce, undefined, retryWalletIndex),
-                      ]).catch((e) => {
-                        logger.warn("Failed nonce lifecycle after retry broadcast failure", { error: String(e) });
-                      })
-                    );
-                  } else {
-                    logger.warn("Retry broadcast failed but sponsor nonce was null; skipping nonce lifecycle");
-                  }
-                }
-              } else {
-                // Retry verify failed — release retry nonce, fall through to error
-                logger.warn("Retry verify failed after inline resync", { error: retryVerifyResult.error });
-                if (retryNonce !== null) {
-                  c.executionCtx.waitUntil(
-                    releaseNonceDO(c.env, logger, retryNonce, undefined, retryWalletIndex).catch((e) => {
-                      logger.warn("Failed to release retry nonce after verify failure", { error: String(e) });
-                    })
-                  );
-                } else {
-                  logger.warn("Retry verify failed but sponsor nonce was null; skipping nonce release");
-                }
-              }
-            } else if (!("held" in retrySponsorResult && retrySponsorResult.held)) {
-              const retryFail = retrySponsorResult as { error: string; code?: string };
-              logger.warn("Retry sponsor failed after inline resync", {
-                error: retryFail.error,
-                code: retryFail.code,
-              });
-            }
-          }
-
-          // Retry did not succeed — schedule a delayed resync so the pool self-heals
-          this.scheduleNonceResync(c, retrySponsorService.resyncNonceDODelayed(), logger);
-          return v2Error(
-            broadcastResult.nonceConflict
-              ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
-              : X402_V2_ERROR_CODES.BROADCAST_FAILED,
-            200
-          );
-        } else if (
-          sponsorNonce === null &&
-          (broadcastResult.nonceConflict || broadcastResult.tooMuchChaining)
-        ) {
-          // Pre-sponsored tx (sponsorNonce === null) had a nonce conflict.
-          // Use Phase 1's responsible signal to determine who caused the conflict.
-          //
-          // The sponsor-fault re-sponsor path is gated behind ENABLE_SETTLE_RESPONSOR
-          // because the current implementation routes the pre-sponsored tx through
-          // the hand-submit dispatch queue, which then attempts to sponsor-sign a
-          // tx that the broadcast worker treats as non-sponsored — wedging the sponsor
-          // nonce slot until the next reconcile_stale (~22 min). Production incident
-          // 2026-05-19T13:00 UTC stuck 3 wallet-0 nonces. Until the path is rewritten
-          // to bypass the dispatch queue and clean up its own queue entry on failure,
-          // we return CONFLICTING_NONCE for sponsor-fault conflicts as the pre-Phase-2
-          // behavior did.
-          const settleResponsorEnabled = c.env.ENABLE_SETTLE_RESPONSOR === "true";
-          if (broadcastResult.responsible === "sponsor" && settleResponsorEnabled) {
-            // Sponsor-fault: the relay's previous sponsor nonce is stale.
-            // Re-sponsor the inner client-signed payload with a fresh sponsor nonce.
-            // parsedTx holds the original deserialized tx — the client's origin
-            // spending condition is preserved; only the sponsor slot is overwritten.
-            logger.warn("Sponsor-fault conflict on pre-sponsored settle — attempting re-sponsor", {
-              nonceConflict: broadcastResult.nonceConflict,
-              tooMuchChaining: broadcastResult.tooMuchChaining,
-            });
-
-            const reResponsorService = new SponsorService(c.env, logger);
-            await reResponsorService.resyncNonceDO();
-
-            const oldSponsorNonce = extractSponsorNonce(parsedTx);
-            const reSponsorResult = await reResponsorService.sponsorTransaction(parsedTx);
-            if (reSponsorResult.success) {
-              const reSponsoredTx = deserializeTransaction(stripHexPrefix(reSponsorResult.sponsoredTxHex));
-              const newSponsorNonce = extractSponsorNonce(reSponsoredTx);
-              const reSponsorWalletIndex = reSponsorResult.walletIndex;
-              const reSponsorFee = reSponsorResult.fee;
-              const reSponsorHex = reSponsorResult.sponsoredTxHex;
-
-              const reVerifyResult = settlementService.verifyPaymentParams(reSponsorHex, settleOptions);
-              if (reVerifyResult.valid) {
-                const reBroadcastResult = await settlementService.broadcastOnly(reVerifyResult.data.transaction);
-                if (!("error" in reBroadcastResult)) {
-                  const senderAddr = settlementService.senderToAddress(reVerifyResult.data.transaction, c.env.STACKS_NETWORK);
-                  logger.info("settle.responsor_after_conflict", {
-                    old_sponsor_nonce: oldSponsorNonce,
-                    new_sponsor_nonce: newSponsorNonce,
-                    sender: senderAddr,
-                    original_txid: "pre_broadcast",
-                    resigned_txid: reBroadcastResult.txid,
-                  });
-                  return this.handleBroadcastSuccess({
-                    c, logger, txid: reBroadcastResult.txid, txHex, network,
-                    sponsorNonce: newSponsorNonce, sponsorWalletIndex: reSponsorWalletIndex, sponsorFee: reSponsorFee,
-                    verifiedTx: reVerifyResult.data.transaction,
-                    recipient: reVerifyResult.data.recipient,
-                    amount: reVerifyResult.data.amount,
-                    settleOptions, settlementService, statsService,
-                    paymentIdService, paymentIdentifier, paymentIdPayloadHash,
-                    submittedAt,
-                  });
-                } else {
-                  // Retry broadcast failed — release nonce, fall through to error
-                  logger.warn("Re-sponsor broadcast failed for pre-sponsored tx", {
-                    error: reBroadcastResult.error,
-                  });
-                  if (newSponsorNonce !== null) {
-                    c.executionCtx.waitUntil(
-                      Promise.all([
-                        recordBroadcastOutcomeDO(
-                          c.env, logger, newSponsorNonce, reSponsorWalletIndex,
-                          undefined, reBroadcastResult.httpStatus, reBroadcastResult.nodeUrl, reBroadcastResult.details
-                        ),
-                        releaseNonceDO(c.env, logger, newSponsorNonce, undefined, reSponsorWalletIndex),
-                      ]).catch((e) => {
-                        logger.warn("Failed nonce lifecycle after re-sponsor broadcast failure", { error: String(e) });
-                      })
-                    );
-                  }
-                }
-              } else {
-                // Verify failed on re-sponsored tx — release nonce
-                logger.warn("Re-sponsor verify failed for pre-sponsored tx", { error: reVerifyResult.error });
-                if (newSponsorNonce !== null) {
-                  c.executionCtx.waitUntil(
-                    releaseNonceDO(c.env, logger, newSponsorNonce, undefined, reSponsorWalletIndex).catch((e) => {
-                      logger.warn("Failed to release nonce after re-verify failure", { error: String(e) });
-                    })
-                  );
-                }
-              }
-            } else if (!("held" in reSponsorResult && reSponsorResult.held)) {
-              const reFail = reSponsorResult as { error: string; code?: string };
-              logger.warn("Re-sponsor failed for pre-sponsored tx", { error: reFail.error, code: reFail.code });
-            }
-
-            // Re-sponsor did not succeed — schedule resync, record stats, return error
-            this.scheduleNonceResync(c, reResponsorService.resyncNonceDODelayed(), logger);
-            c.executionCtx.waitUntil(
-              statsService.logFailure("settle", false, failureCtx, "sponsor_nonce_conflict").catch(() => {})
-            );
-            return v2Error(
-              broadcastResult.nonceConflict
-                ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
-                : X402_V2_ERROR_CODES.BROADCAST_FAILED,
-              200
-            );
-          } else if (broadcastResult.responsible === "sender") {
-            // Sender-fault on pre-sponsored tx — no sponsor slot was burned.
-            // Return a distinct code so the sender knows to re-sign with the correct nonce.
-            logger.info("Sender-fault nonce conflict on pre-sponsored settle — no sponsor slot burned", {
-              responsible: broadcastResult.responsible,
-              agentErrorCode: broadcastResult.agentErrorCode,
-              nonceConflict: broadcastResult.nonceConflict,
-            });
-            // Record with sender_nonce_stale (maps to "sender" bucket in TERMINAL_REASON_TO_CATEGORY).
-            c.executionCtx.waitUntil(
-              statsService.logFailure("settle", true, failureCtx, "sender_nonce_stale").catch(() => {})
-            );
-            return v2Error(X402_V2_ERROR_CODES.SENDER_NONCE_CONFLICT, 200);
-          } else {
-            // Sponsor-fault on pre-sponsored tx, but ENABLE_SETTLE_RESPONSOR is off.
-            // Restore pre-Phase-2 behavior: return CONFLICTING_NONCE without burning a slot.
-            logger.info("Sponsor-fault conflict on pre-sponsored settle — re-sponsor disabled, returning CONFLICTING_NONCE", {
-              responsible: broadcastResult.responsible,
-              nonceConflict: broadcastResult.nonceConflict,
-              tooMuchChaining: broadcastResult.tooMuchChaining,
-            });
-            c.executionCtx.waitUntil(
-              statsService.logFailure("settle", true, failureCtx, "sponsor_nonce_conflict").catch(() => {})
-            );
-            return v2Error(
-              broadcastResult.nonceConflict
-                ? X402_V2_ERROR_CODES.CONFLICTING_NONCE
-                : X402_V2_ERROR_CODES.BROADCAST_FAILED,
-              200
-            );
-          }
-        }
-
-        if (clientRejection) {
-          logger.warn("Broadcast rejected by node (client error)", {
-            error: broadcastResult.error,
-            clientRejection,
-          });
-          return v2Error(mapClientRejectionToV2Code(clientRejection), 200);
-        } else {
-          logger.warn("Broadcast/confirm failed", {
-            error: broadcastResult.error,
-            retryable: broadcastResult.retryable,
-          });
-          const errorReason = broadcastResult.retryable
-            ? X402_V2_ERROR_CODES.BROADCAST_FAILED
-            : X402_V2_ERROR_CODES.TRANSACTION_FAILED;
-          return v2Error(errorReason, 200);
-        }
+        return v2Error(X402_V2_ERROR_CODES.INVALID_TRANSACTION_STATE, 200);
       }
 
-      // Broadcast succeeded — delegate to shared success handler
+      const broadcastResult = await settlementService.broadcastOnly(verifyResult.data.transaction);
+      if ("error" in broadcastResult) {
+        return this.broadcastFailure(c, logger, broadcastResult, statsService, failureCtx, v2Error);
+      }
+      const txid = broadcastResult.txid;
+
       return this.handleBroadcastSuccess({
-        c, logger, txid: broadcastResult.txid, txHex, network,
-        sponsorNonce, sponsorWalletIndex, sponsorFee,
+        c, logger, txid, txHex, network,
         verifiedTx: verifyResult.data.transaction,
         recipient: verifyResult.data.recipient,
         amount: verifyResult.data.amount,
         settleOptions, settlementService, statsService,
         paymentIdService, paymentIdentifier, paymentIdPayloadHash,
-        submittedAt,
       });
     } catch (e) {
       logger.error("Unexpected settle error", {

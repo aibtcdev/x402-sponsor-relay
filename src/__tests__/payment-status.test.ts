@@ -321,12 +321,14 @@ describe("submitPayment duplicate reuse", () => {
     const txHex = await getSubmitPaymentTxHex(26n);
     const signerHash = deserializeTransaction(txHex).auth.spendingCondition.signer;
     const queueSend = vi.fn(async () => {});
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({
-        last_executed_tx_nonce: 25,
-        possible_next_nonce: 26,
-        detected_missing_nonces: [],
-      }), { status: 200 })
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) =>
+      String(input).includes("/balances")
+        ? new Response(JSON.stringify({ stx: { balance: "1000000", locked: "0" } }), { status: 200 })
+        : new Response(JSON.stringify({
+            last_executed_tx_nonce: 25,
+            possible_next_nonce: 26,
+            detected_missing_nonces: [],
+          }), { status: 200 })
     );
 
     await kv.put(
@@ -352,7 +354,8 @@ describe("submitPayment duplicate reuse", () => {
       await rpc.submitPayment(txHex)
     );
 
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // one sender-balance preflight read + one nonce reseed
+    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).includes("/balances"))).toHaveLength(1);
     expect(result).toEqual({
       accepted: true,
       paymentId: expect.stringMatching(/^pay_/),

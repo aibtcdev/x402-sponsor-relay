@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { fromHono } from "chanfana";
 import type { Env, AppVariables, Logger } from "./types";
 import { loggerMiddleware, authMiddleware, requireAuthMiddleware } from "./middleware";
-import { Health, SponsorStatus, Relay, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceState, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook, QueueRead, QueueCancel } from "./endpoints";
+import { Health, SponsorStatus, Sponsor, DashboardStats, TransactionLog, Verify, Access, Provision, ProvisionStx, Fees, FeesConfig, NonceStatsEndpoint, NonceState, NonceReset, NonceFillGaps, NonceHistory, NonceSurgeHistory, Settle, SettleStatus, VerifyV2, Supported, Wallets, PaymentStatus, Chainhook, QueueRead, QueueCancel } from "./endpoints";
 import { dashboard } from "./dashboard";
 import { discovery } from "./routes/discovery";
 import { VERSION } from "./version";
@@ -12,6 +12,7 @@ import { handlePaymentQueue, handlePaymentDLQ } from "./queue-consumer";
 import type { PaymentQueueMessage } from "./services/payment-status";
 export { NonceDO } from "./durable-objects/nonce-do";
 export { StatsDO } from "./durable-objects/stats-do";
+export { SponsorWalletDO } from "./durable-objects/sponsor-wallet-do";
 export { RelayRPC } from "./rpc";
 
 // Create Hono app with type safety
@@ -46,7 +47,6 @@ const openapi = fromHono(app, {
     },
     tags: [
       { name: "Health", description: "Service health endpoints" },
-      { name: "Relay", description: "Transaction relay endpoints (native settlement)" },
       { name: "Sponsor", description: "Transaction sponsor endpoints (direct broadcast)" },
       { name: "Verify", description: "Payment receipt verification" },
       { name: "Access", description: "Protected resource access" },
@@ -87,7 +87,6 @@ const openapi = fromHono(app, {
 // Register endpoints with Chanfana (casts needed for extended endpoint classes)
 openapi.get("/health", Health as unknown as typeof Health);
 openapi.get("/status/sponsor", SponsorStatus as unknown as typeof SponsorStatus);
-openapi.post("/relay", Relay as unknown as typeof Relay);
 openapi.post("/sponsor", Sponsor as unknown as typeof Sponsor);
 openapi.get("/verify/:receiptId", Verify as unknown as typeof Verify);
 openapi.post("/access", Access as unknown as typeof Access);
@@ -134,7 +133,6 @@ app.get("/", (c) => {
     agentDiscovery: "/llms.txt",
     dashboard: "/dashboard",
     endpoints: {
-      relay: "POST /relay - Submit sponsored transaction for native settlement",
       sponsor: "POST /sponsor - Sponsor and broadcast transaction (direct, requires API key)",
       verify: "GET /verify/:receiptId - Verify a payment receipt",
       access: "POST /access - Access protected resource with receipt",
@@ -157,14 +155,14 @@ app.get("/", (c) => {
       chainhook: "POST /webhook/chainhook - Hiro chainhook transaction webhook",
       queueRead: "GET /queue/:senderAddress - Agent queue state (SIP-018 auth required)",
       queueCancel: "DELETE /queue/:senderAddress/:walletIndex/:sponsorNonce - Cancel queued tx (SIP-018 auth required)",
-      settle: "POST /settle - x402 V2 facilitator settle",
+      settle: "POST /settle - x402 V2 facilitator settle (self-paid; sponsorship is aibtc.com-only via service binding)",
       settleStatus: "GET /settle/status/:txid - Transaction settlement status",
       verifyV2: "POST /verify - x402 V2 facilitator verify",
       supported: "GET /supported - x402 V2 supported payment kinds",
     },
     payment: {
       tokens: ["STX", "sBTC", "USDCx"],
-      flow: "Agent signs sponsored tx -> POST /relay sponsors + settles natively",
+      flow: "Agent signs a self-paid tx -> POST /settle verifies + broadcasts",
     },
     related: {
       github: "https://github.com/aibtcdev/x402-sponsor-relay",

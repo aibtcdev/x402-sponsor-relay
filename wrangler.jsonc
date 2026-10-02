@@ -19,12 +19,15 @@
   "durable_objects": {
     "bindings": [
       { "name": "NONCE_DO", "class_name": "NonceDO" },
-      { "name": "STATS_DO", "class_name": "StatsDO" }
+      { "name": "STATS_DO", "class_name": "StatsDO" },
+      { "name": "SPONSOR_WALLET_DO", "class_name": "SponsorWalletDO" }
     ]
   },
+  "ratelimits": [{ "name": "SPONSOR_RATE_LIMIT", "namespace_id": "2026100201", "simple": { "limit": 10, "period": 60 } }],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["NonceDO"] },
-    { "tag": "v2", "new_sqlite_classes": ["StatsDO"] }
+    { "tag": "v2", "new_sqlite_classes": ["StatsDO"] },
+    { "tag": "v3", "new_sqlite_classes": ["SponsorWalletDO"] }
   ],
   "kv_namespaces": [
     { "binding": "RELAY_KV", "id": "5de48f1c8a1746e49d09fbf1c7072a5f" },
@@ -90,12 +93,15 @@
       "durable_objects": {
         "bindings": [
           { "name": "NONCE_DO", "class_name": "NonceDO" },
-          { "name": "STATS_DO", "class_name": "StatsDO" }
+          { "name": "STATS_DO", "class_name": "StatsDO" },
+          { "name": "SPONSOR_WALLET_DO", "class_name": "SponsorWalletDO" }
         ]
       },
+      "ratelimits": [{ "name": "SPONSOR_RATE_LIMIT", "namespace_id": "2026100201", "simple": { "limit": 10, "period": 60 } }],
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["NonceDO"] },
-        { "tag": "v2", "new_sqlite_classes": ["StatsDO"] }
+        { "tag": "v2", "new_sqlite_classes": ["StatsDO"] },
+        { "tag": "v3", "new_sqlite_classes": ["SponsorWalletDO"] }
       ],
       // KV namespaces for receipts, dedup, fee cache, health checks, and API keys
       "kv_namespaces": [
@@ -145,12 +151,15 @@
       "durable_objects": {
         "bindings": [
           { "name": "NONCE_DO", "class_name": "NonceDO" },
-          { "name": "STATS_DO", "class_name": "StatsDO" }
+          { "name": "STATS_DO", "class_name": "StatsDO" },
+          { "name": "SPONSOR_WALLET_DO", "class_name": "SponsorWalletDO" }
         ]
       },
+      "ratelimits": [{ "name": "SPONSOR_RATE_LIMIT", "namespace_id": "2026100201", "simple": { "limit": 10, "period": 60 } }],
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["NonceDO"] },
-        { "tag": "v2", "new_sqlite_classes": ["StatsDO"] }
+        { "tag": "v2", "new_sqlite_classes": ["StatsDO"] },
+        { "tag": "v3", "new_sqlite_classes": ["SponsorWalletDO"] }
       ],
       // KV namespaces for receipts, dedup, fee cache, health checks, and API keys
       "kv_namespaces": [

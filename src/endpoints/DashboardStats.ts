@@ -226,7 +226,7 @@ export class DashboardStats extends BaseEndpoint {
                   properties: {
                     relay: {
                       type: "object" as const,
-                      description: "Stats for POST /relay (sponsored transactions with settlement)",
+                      description: "Stats for the former POST /relay endpoint (removed; historical counters only)",
                       properties: {
                         total: { type: "number" as const },
                         success: { type: "number" as const },

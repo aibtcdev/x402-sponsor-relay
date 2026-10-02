@@ -23,7 +23,7 @@ export class Access extends BaseEndpoint {
                 receiptId: {
                   type: "string" as const,
                   format: "uuid",
-                  description: "Receipt ID from a successful relay transaction",
+                  description: "Receipt ID issued by the former POST /relay (existing receipts only)",
                 },
                 resource: {
                   type: "string" as const,

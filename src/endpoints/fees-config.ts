@@ -138,6 +138,7 @@ export class FeesConfig extends BaseEndpoint {
   private static readonly TX_TYPES: FeeTransactionType[] = [
     "token_transfer",
     "contract_call",
+    "sip010_transfer",
     "smart_contract",
   ];
 
@@ -195,6 +196,7 @@ export class FeesConfig extends BaseEndpoint {
       const updatedConfig: FeeClampConfig = {
         token_transfer: { ...currentConfig.token_transfer, ...typedBody.token_transfer },
         contract_call: { ...currentConfig.contract_call, ...typedBody.contract_call },
+        sip010_transfer: { ...currentConfig.sip010_transfer, ...typedBody.sip010_transfer },
         smart_contract: { ...currentConfig.smart_contract, ...typedBody.smart_contract },
       };
 

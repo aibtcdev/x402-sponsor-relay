@@ -4998,6 +4998,44 @@ export class NonceDO {
    * Initialize the per-wallet nonce head from Hiro if not yet seeded.
    * Returns the head nonce to use for the first assignment.
    */
+  /**
+   * Register and seed every configured sponsor wallet that has no ledger head yet.
+   *
+   * The hand-submit path only assigns to wallets with a ledger head, but heads (and the
+   * stored sponsor addresses the alarm reconciles against) were only ever created by the
+   * legacy /assign path. On a fresh DO — or after a sponsor mnemonic rotation and reset —
+   * every hand-submit held on "capacity" forever. Addresses are derived from the
+   * mnemonic here; heads are seeded from Hiro. Runs outside blockConcurrencyWhile (Hiro
+   * I/O) and is a no-op once all wallets are seeded. Hiro failures are logged and retried
+   * on the next request.
+   */
+  private async ensureWalletsSeeded(): Promise<void> {
+    const configured = Math.max(1, parseInt(this.env.SPONSOR_WALLET_COUNT ?? "1", 10) || 1);
+    const walletCount = Math.min(
+      Math.max(configured, this.getStateValue("dynamic_wallet_count") ?? 0),
+      this.getSponsorWalletMax()
+    );
+    const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
+    for (let wi = 0; wi < walletCount; wi++) {
+      if (this.ledgerGetWalletHead(wi) !== null) continue;
+      const pk = await this.derivePrivateKeyForWallet(wi);
+      if (!pk) return;
+      const address = getAddressFromPrivateKey(pk, network);
+      try {
+        await this.setStoredSponsorAddressForWallet(wi, address);
+        const head = await this.initWalletHeadFromHiro(wi, address);
+        this.log("info", "sponsor_wallet_seeded", { walletIndex: wi, address, head });
+      } catch (e) {
+        this.log("warn", "sponsor_wallet_seed_failed", {
+          walletIndex: wi,
+          address,
+          error: e instanceof Error ? e.message : String(e),
+        });
+        return;
+      }
+    }
+  }
+
   private async initWalletHeadFromHiro(
     walletIndex: number,
     sponsorAddress: string
@@ -8711,6 +8749,8 @@ export class NonceDO {
     // blockConcurrencyWhile — with N wallets, sequential fetches inside the lock
     // can exceed Cloudflare's ~30 s limit, crashing the DO and all queued requests.
     // ---------------------------------------------------------------------------
+    // Register/seed configured wallets first so held hands can dispatch on a cold DO.
+    await this.ensureWalletsSeeded();
     const initializedWallets = await this.getInitializedWallets();
 
     // Compute the reconcile slice before taking the lock so we can pre-fetch.
@@ -10231,6 +10271,8 @@ export class NonceDO {
       }
 
       const mode = body.mode ?? "hold";
+
+      await this.ensureWalletsSeeded();
 
       return this.state.blockConcurrencyWhile(async () => {
         try {
