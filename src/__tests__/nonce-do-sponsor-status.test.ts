@@ -554,6 +554,7 @@ describe("NonceDO stale sender repair helpers", () => {
 
     expect(result).toEqual({
       dispatched: true,
+      nonceExpiresAt: expect.any(String),
       sponsorNonce: 44,
       walletIndex: 1,
       sponsorAddress: "",
