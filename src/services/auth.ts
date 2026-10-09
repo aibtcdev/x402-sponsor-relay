@@ -581,6 +581,27 @@ export class AuthService {
   }
 
   /**
+   * Look up a key's metadata (and storage hash) by its keyId, via the
+   * keyId -> keyHash index written by storeKeyMetadata.
+   */
+  private async getMetadataByKeyId(
+    keyId: string
+  ): Promise<{ keyHash: string; metadata: ApiKeyMetadata } | null> {
+    if (!this.kv) {
+      return null;
+    }
+    const keyHash = await this.kv.get(`keyId:${keyId}`);
+    if (!keyHash) {
+      return null;
+    }
+    const metadata = await this.kv.get<ApiKeyMetadata>(`key:${keyHash}`, "json");
+    if (!metadata) {
+      return null;
+    }
+    return { keyHash, metadata };
+  }
+
+  /**
    * Create expiration timestamps for a new key
    */
   private static createKeyDates(): { createdAt: string; expiresAt: string } {
@@ -675,7 +696,20 @@ export class AuthService {
     const indexKey = `${type}:${address}`;
     const existingKeyId = await this.kv.get(indexKey);
     if (existingKeyId) {
-      throw new DuplicateAddressError(type, address);
+      const existing = await this.getMetadataByKeyId(existingKeyId);
+      if (!existing || new Date(existing.metadata.expiresAt) > new Date()) {
+        throw new DuplicateAddressError(type, address);
+      }
+
+      // The address's key has lapsed: deactivate it for hygiene and fall
+      // through to provision a fresh one in its place, rather than 409ing
+      // forever (the address's plaintext key isn't recoverable to renew).
+      existing.metadata.active = false;
+      await this.kv.put(`key:${existing.keyHash}`, JSON.stringify(existing.metadata));
+      this.logger.info(`Expired ${type.toUpperCase()}-provisioned key replaced`, {
+        [type === "btc" ? "btcAddress" : "stxAddress"]: address,
+        previousKeyId: existing.metadata.keyId,
+      });
     }
 
     const { apiKey, keyId, keyHash } = await this.generateKeyPair("live");
