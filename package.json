@@ -28,7 +28,7 @@
     "@types/node": "^25.0.3",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.18",
+    "vitest": "^4.1.0",
     "wrangler": "^4.75.0"
   },
   "overrides": {
