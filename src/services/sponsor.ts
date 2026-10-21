@@ -30,6 +30,7 @@ import type {
   HandSubmitResult,
   SenderWedgeStatus,
   SponsorHeld,
+  SponsorStatusResult,
 } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix, decodeClarityUint } from "../utils";
 import type { SponsorWalletResult } from "../durable-objects/sponsor-wallet-do";
@@ -153,6 +154,9 @@ interface NonceDOErrorBody {
   /** From ALL_WALLETS_DEGRADED — total pool capacity */
   totalCapacity?: number;
 }
+
+/** Minimum STX balance (microSTX) for NonceDO wallet selection — matches MIN_FLUSH_FEE in nonce-do.ts */
+const MIN_SPONSOR_ASSIGN_BALANCE_USTX = "30000";
 
 /**
  * Service for validating and sponsoring Stacks transactions
@@ -508,6 +512,43 @@ export class SponsorService {
    * On NonceDO error: returns a structured error with code instead of null,
    * so callers can propagate the correct HTTP status (e.g. 429 for chaining limit).
    */
+  /**
+   * Cached sponsor readiness from NonceDO (no live Hiro fan-out on the request path).
+   */
+  async fetchSponsorReadiness(): Promise<SponsorStatusResult | null> {
+    if (!this.env.NONCE_DO) return null;
+    try {
+      const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
+      const response = await stub.fetch("https://nonce-do/sponsor-status");
+      if (!response.ok && response.status !== 503) {
+        return null;
+      }
+      return (await response.json()) as SponsorStatusResult;
+    } catch (e) {
+      this.logger.warn("Failed to fetch sponsor readiness", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
+  }
+
+  /** Per-wallet STX balances for NonceDO assignment (microSTX strings). */
+  private async buildWalletBalanceMap(): Promise<Record<string, string>> {
+    const walletCount = this.getWalletCount();
+    const network = this.getNetwork();
+    const balances: Record<string, string> = {};
+    await Promise.all(
+      Array.from({ length: walletCount }, async (_, i) => {
+        const key = await this.getSponsorKeyForWallet(i);
+        if (!key) return;
+        const address = getAddressFromPrivateKey(key, network);
+        const bal = await this.fetchWalletBalanceOrNull(address);
+        if (bal !== null) balances[String(i)] = bal;
+      })
+    );
+    return balances;
+  }
+
   private async fetchNonceFromDO(
     sponsorAddress: string
   ): Promise<
@@ -521,13 +562,20 @@ export class SponsorService {
 
     const walletCount = this.getWalletCount();
     const addresses = walletCount > 1 ? await this.deriveWalletAddresses() : undefined;
+    const walletBalances = await this.buildWalletBalanceMap();
 
     try {
       const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
       const response = await stub.fetch("https://nonce-do/assign", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ sponsorAddress, walletCount, addresses }),
+        body: JSON.stringify({
+          sponsorAddress,
+          walletCount,
+          addresses,
+          walletBalances,
+          minAssignBalanceUstx: MIN_SPONSOR_ASSIGN_BALANCE_USTX,
+        }),
       });
 
       if (!response.ok) {
@@ -592,12 +640,21 @@ export class SponsorService {
     paymentId?: string
   ): Promise<HandSubmitResult | null> {
     if (!this.env.NONCE_DO) return null;
+    const walletBalances = await this.buildWalletBalanceMap();
     try {
       const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
       const response = await stub.fetch("https://nonce-do/hand-submit", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ senderAddress, senderNonce, txHex, mode, paymentId }),
+        body: JSON.stringify({
+          senderAddress,
+          senderNonce,
+          txHex,
+          mode,
+          paymentId,
+          walletBalances,
+          minAssignBalanceUstx: MIN_SPONSOR_ASSIGN_BALANCE_USTX,
+        }),
       });
 
       if (!response.ok) {
@@ -930,8 +987,11 @@ export class SponsorService {
           const isChainingLimit = doResult.code === "CHAINING_LIMIT_EXCEEDED";
           const isLowHeadroom = doResult.code === "LOW_HEADROOM";
           const isAllDegraded = doResult.code === "ALL_WALLETS_DEGRADED";
+          const isSponsorExhausted = doResult.code === "SPONSOR_EXHAUSTED";
           let code: string;
-          if (isAllDegraded) {
+          if (isSponsorExhausted) {
+            code = "SPONSOR_EXHAUSTED";
+          } else if (isAllDegraded) {
             code = "SERVICE_DEGRADED";
           } else if (isChainingLimit) {
             code = "RATE_LIMIT_EXCEEDED";
@@ -951,7 +1011,12 @@ export class SponsorService {
 
           let details: string;
           let retryAfter: number | undefined;
-          if (isAllDegraded) {
+          if (isSponsorExhausted) {
+            details =
+              doResult.error ??
+              "The relay's sponsor wallets are out of STX or ineligible for assignment. Retry later, or send without sponsorship (pay your own fee).";
+            retryAfter = SERVICE_DEGRADED_RETRY_AFTER_S;
+          } else if (isAllDegraded) {
             const totalReserved = doResult.totalReserved ?? 0;
             const totalCapacity = doResult.totalCapacity ?? 0;
             details =

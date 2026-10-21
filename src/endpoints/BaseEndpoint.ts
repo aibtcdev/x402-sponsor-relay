@@ -108,6 +108,11 @@ export class BaseEndpoint extends OpenAPIRoute {
       status = 503;
       retryable = true;
       retryAfter = failure.retryAfter ?? 10;
+    } else if (failure.code === "SPONSOR_EXHAUSTED") {
+      code = "SPONSOR_EXHAUSTED";
+      status = 503;
+      retryable = true;
+      retryAfter = failure.retryAfter ?? SERVICE_DEGRADED_RETRY_AFTER_S;
     } else if (failure.code === "NONCE_DO_UNAVAILABLE") {
       code = "NONCE_DO_UNAVAILABLE";
       status = 503;

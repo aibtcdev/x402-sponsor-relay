@@ -552,12 +552,13 @@ describe("NonceDO stale sender repair helpers", () => {
       log,
     }, "STSYNC");
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       dispatched: true,
       sponsorNonce: 44,
       walletIndex: 1,
       sponsorAddress: "",
     });
+    expect(typeof result.nonceExpiresAt).toBe("string");
     expect(log).toHaveBeenCalledWith(
       "warn",
       "payment_sync_after_assign_failed",

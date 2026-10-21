@@ -75,6 +75,10 @@ interface AssignNonceRequest {
    *  Map of walletIndex (as string key) → Stacks address.
    *  Required when walletCount > 1 so each wallet pool seeds from its own on-chain nonce. */
   addresses?: Record<string, string>;
+  /** Optional per-wallet STX balances in microSTX (string keys = wallet index). */
+  walletBalances?: Record<string, string>;
+  /** Minimum balance required to assign from a wallet (microSTX string). Defaults to MIN_SPONSOR_ASSIGN_BALANCE_USTX. */
+  minAssignBalanceUstx?: string;
 }
 
 interface AssignNonceResponse {
@@ -438,6 +442,11 @@ const GAP_FILL_AMOUNT = 1n;
  * are correct, so a low fee is sufficient.
  */
 const MIN_FLUSH_FEE = 30_000n;
+/**
+ * Minimum known STX balance (microSTX) for a wallet to receive new nonce assignments.
+ * Wallets below this cannot pay even a gap-fill fee and must not win headroom tie-breaks (#434).
+ */
+const MIN_SPONSOR_ASSIGN_BALANCE_USTX = MIN_FLUSH_FEE;
 /** Gap-fill fee: alias for MIN_FLUSH_FEE (backward compat with log references) */
 const GAP_FILL_FEE = MIN_FLUSH_FEE;
 /** Default recipient for gap-fill self-transfers, per network */
@@ -635,6 +644,17 @@ class LowHeadroomError extends Error {
     // Estimate: each confirmed tx frees one nonce slot. ~2 txs/s drain rate.
     // Backoff scales with pool pressure: more reserved nonces → longer wait.
     this.retryAfterSeconds = Math.ceil((CHAINING_LIMIT - maxHeadroom) / 2) + 5;
+  }
+}
+
+/**
+ * Thrown when every wallet is unfunded or otherwise ineligible for assignment.
+ * Callers should return 503 SPONSOR_EXHAUSTED.
+ */
+class SponsorPoolExhaustedError extends Error {
+  constructor() {
+    super("SPONSOR_POOL_EXHAUSTED");
+    this.name = "SponsorPoolExhaustedError";
   }
 }
 
@@ -4790,6 +4810,126 @@ export class NonceDO {
     return this.headroomFromChainGap(walletIndex) ?? (CHAINING_LIMIT - this.ledgerInFlightCount(walletIndex));
   }
 
+  private walletBalanceStorageKey(walletIndex: number): string {
+    return `wallet_balance_ustx:${walletIndex}`;
+  }
+
+  /** Persist wallet balances supplied by SponsorService (best-effort cache for selection). */
+  private recordWalletBalances(
+    walletBalances: Record<string, string> | undefined,
+    minAssignBalanceUstx?: string
+  ): void {
+    if (!walletBalances) return;
+    for (const [index, balance] of Object.entries(walletBalances)) {
+      const wi = Number(index);
+      if (!Number.isInteger(wi) || wi < 0) continue;
+      const asNumber = Number(balance);
+      if (Number.isFinite(asNumber) && asNumber >= 0) {
+        this.setStateValue(this.walletBalanceStorageKey(wi), asNumber);
+      }
+    }
+    if (minAssignBalanceUstx) {
+      this.setStateValue("min_assign_balance_ustx", Number(minAssignBalanceUstx));
+    }
+  }
+
+  private getMinAssignBalanceUstx(): bigint {
+    const stored = this.getStateValue("min_assign_balance_ustx");
+    if (stored !== null && stored >= 0) {
+      return BigInt(stored);
+    }
+    return MIN_SPONSOR_ASSIGN_BALANCE_USTX;
+  }
+
+  private getCachedWalletBalanceUstx(walletIndex: number): bigint | null {
+    const stored = this.getStateValue(this.walletBalanceStorageKey(walletIndex));
+    if (stored === null) return null;
+    try {
+      return BigInt(stored);
+    } catch {
+      return null;
+    }
+  }
+
+  /** False when a known balance is below the minimum sponsor assignment threshold. */
+  private isWalletFundedForAssignment(walletIndex: number): boolean {
+    const balance = this.getCachedWalletBalanceUstx(walletIndex);
+    if (balance === null) return true; // unknown — fail-open
+    return balance >= this.getMinAssignBalanceUstx();
+  }
+
+  /**
+   * First nonce in [chainStart, head) with no assigned/broadcasted/confirmed ledger row, or null if contiguous.
+   */
+  private findFirstLedgerGap(walletIndex: number, chainStart: number, head: number): number | null {
+    if (head <= chainStart) return null;
+    const occupiedRows = this.sql
+      .exec<{ nonce: number }>(
+        `SELECT nonce FROM nonce_intents
+         WHERE wallet_index = ? AND nonce >= ? AND nonce < ?
+           AND state IN ('assigned', 'broadcasted', 'confirmed')`,
+        walletIndex,
+        chainStart,
+        head
+      )
+      .toArray();
+    const occupied = new Set(occupiedRows.map((r) => r.nonce));
+    for (let n = chainStart; n < head; n++) {
+      if (!occupied.has(n)) return n;
+    }
+    return null;
+  }
+
+  private walletHasLedgerGap(walletIndex: number): boolean {
+    const frontier = this.getChainFrontier(walletIndex);
+    const head = this.ledgerGetWalletHead(walletIndex);
+    if (frontier === null || head === null || head <= frontier) return false;
+    return this.findFirstLedgerGap(walletIndex, frontier, head) !== null;
+  }
+
+  /**
+   * Next nonce to assign: fills ledger gaps at the chain frontier before advancing the head (#434).
+   */
+  private resolveNextAssignNonce(walletIndex: number, hiroNextNonce: number | null): number {
+    const head = this.ledgerGetWalletHead(walletIndex)!;
+    const frontier = this.getChainFrontier(walletIndex);
+    const chainStart = hiroNextNonce ?? frontier ?? head;
+    let assignmentHead = head;
+    if (hiroNextNonce !== null && assignmentHead < hiroNextNonce) {
+      assignmentHead = hiroNextNonce;
+    }
+    const gap = this.findFirstLedgerGap(walletIndex, chainStart, assignmentHead);
+    if (gap !== null) return gap;
+    return assignmentHead;
+  }
+
+  private advanceWalletHeadAfterAssign(walletIndex: number, assignedNonce: number): void {
+    const currentHead = this.ledgerGetWalletHead(walletIndex) ?? assignedNonce;
+    const nextHead = Math.max(currentHead, assignedNonce + 1);
+    this.ledgerAdvanceWalletHead(walletIndex, nextHead);
+  }
+
+  /**
+   * Pick the best wallet for assignment: headroom desc, prefer gap-free, then balance desc, then index asc.
+   */
+  private selectWalletForAssignment(
+    eligible: Array<{ walletIndex: number; headroom: number }>
+  ): { walletIndex: number; headroom: number } | null {
+    if (eligible.length === 0) return null;
+    const gapFree = eligible.filter((w) => !this.walletHasLedgerGap(w.walletIndex));
+    const pool = gapFree.length > 0 ? gapFree : eligible;
+    pool.sort((a, b) => {
+      if (b.headroom !== a.headroom) return b.headroom - a.headroom;
+      const balA = this.getCachedWalletBalanceUstx(a.walletIndex);
+      const balB = this.getCachedWalletBalanceUstx(b.walletIndex);
+      if (balA !== null && balB !== null && balA !== balB) {
+        return balA > balB ? -1 : 1;
+      }
+      return a.walletIndex - b.walletIndex;
+    });
+    return pool[0];
+  }
+
   /**
    * Effective headroom for gin rummy dispatch.
    * Returns walletHeadroom - WALLET_RESERVE_SLOTS, clamped to 0 minimum.
@@ -4834,17 +4974,19 @@ export class NonceDO {
     }
 
     // Step 2: Find wallet with most effectiveHeadroom that can fit the entire truncated run
-    let bestWalletIndex = -1;
-    let bestEffectiveHeadroom = 0;
+    const runEligible: Array<{ walletIndex: number; headroom: number }> = [];
     for (let wi = 0; wi < MAX_WALLET_COUNT; wi++) {
       const head = this.ledgerGetWalletHead(wi);
       if (head === null) break; // wallet not initialized — stop scanning
+      if (!this.isWalletFundedForAssignment(wi)) continue;
       const eff = this.effectiveHeadroom(wi);
-      if (eff > bestEffectiveHeadroom) {
-        bestEffectiveHeadroom = eff;
-        bestWalletIndex = wi;
+      if (eff > 0) {
+        runEligible.push({ walletIndex: wi, headroom: eff });
       }
     }
+    const bestRunWallet = this.selectWalletForAssignment(runEligible);
+    let bestWalletIndex = bestRunWallet?.walletIndex ?? -1;
+    let bestEffectiveHeadroom = bestRunWallet?.headroom ?? 0;
 
     // Determine how many txs we can actually dispatch
     let dispatchCount: number;
@@ -4865,14 +5007,42 @@ export class NonceDO {
       return { assigned: [], held };
     }
 
-    const dispatchBatch = truncatedRun.slice(0, dispatchCount);
+    let dispatchBatch = truncatedRun.slice(0, dispatchCount);
     const remainingTruncated = truncatedRun.slice(dispatchCount);
-    const held = [...remainingTruncated, ...excessRun].map((e) => ({ senderNonce: e.senderNonce }));
+    let held = [...remainingTruncated, ...excessRun].map((e) => ({ senderNonce: e.senderNonce }));
 
     // Step 3: Atomic hand→queue transition for dispatchBatch
     const walletIndex = bestWalletIndex;
-    const walletHead = this.ledgerGetWalletHead(walletIndex)!;
-    const firstSponsorNonce = walletHead;
+    const hiroCached = this.hiroNonceCache.get(walletIndex)?.value ?? null;
+    const firstSponsorNonce = this.resolveNextAssignNonce(walletIndex, hiroCached);
+
+    // Truncate the run at the first ledger-occupied sponsor nonce (non-contiguous gap).
+    let contiguousLen = dispatchBatch.length;
+    for (let i = 0; i < dispatchBatch.length; i++) {
+      const sponsorNonce = firstSponsorNonce + i;
+      const occupiedRows = this.sql
+        .exec<{ count: number }>(
+          `SELECT COUNT(*) as count FROM nonce_intents
+           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted', 'confirmed')`,
+          walletIndex,
+          sponsorNonce
+        )
+        .toArray();
+      if ((occupiedRows[0]?.count ?? 0) > 0) {
+        contiguousLen = i;
+        break;
+      }
+    }
+    if (contiguousLen < dispatchBatch.length) {
+      held = [
+        ...dispatchBatch.slice(contiguousLen).map((e) => ({ senderNonce: e.senderNonce })),
+        ...held,
+      ];
+      dispatchBatch = dispatchBatch.slice(0, contiguousLen);
+    }
+    if (dispatchBatch.length === 0) {
+      return { assigned: [], held };
+    }
 
     const assigned: RunDispatchResult["assigned"] = [];
 
@@ -4925,8 +5095,11 @@ export class NonceDO {
       assigned.push({ senderNonce: entry.senderNonce, walletIndex, sponsorNonce });
     }
 
-    // Advance wallet nonce head past the dispatched run
-    this.ledgerAdvanceWalletHead(walletIndex, walletHead + dispatchBatch.length);
+    // Advance wallet nonce head past the dispatched run (preserve head when filling gaps)
+    if (assigned.length > 0) {
+      const lastAssigned = assigned[assigned.length - 1].sponsorNonce;
+      this.advanceWalletHeadAfterAssign(walletIndex, lastAssigned);
+    }
 
     this.log("info", "assign_run_to_wallet", {
       senderAddress,
@@ -5062,7 +5235,9 @@ export class NonceDO {
   async assignNonce(
     sponsorAddress: string,
     walletCount: number = 1,
-    addresses?: Record<string, string>
+    addresses?: Record<string, string>,
+    walletBalances?: Record<string, string>,
+    minAssignBalanceUstx?: string
   ): Promise<{ nonce: number; walletIndex: number; totalReserved: number }> {
     if (!sponsorAddress) {
       throw new Error("Missing sponsor address");
@@ -5117,6 +5292,7 @@ export class NonceDO {
     // Phase 2 (inside lock): All state reads and mutations. No Hiro I/O.
     // -------------------------------------------------------------------------
     return this.state.blockConcurrencyWhile(async () => {
+      this.recordWalletBalances(walletBalances, minAssignBalanceUstx);
 
       // Use the larger of the caller-supplied count and the dynamically-scaled count
       // stored in nonce_state. This ensures scale-ups are reflected immediately
@@ -5170,13 +5346,17 @@ export class NonceDO {
       // Scan all wallets and select the one with the most available headroom.
       // No degradation flags — per-nonce occupied tracking handles conflicts.
       let totalMempoolDepth = 0;
+      let headroomButUnfunded = false;
       const eligibleWallets: Array<{ walletIndex: number; headroom: number }> = [];
 
       for (let i = 0; i < effectiveWalletCount; i++) {
         const headroom = this.walletHeadroom(i);
-        if (headroom > 0) {
+        if (headroom > 0 && this.isWalletFundedForAssignment(i)) {
           eligibleWallets.push({ walletIndex: i, headroom });
         } else {
+          if (headroom > 0 && !this.isWalletFundedForAssignment(i)) {
+            headroomButUnfunded = true;
+          }
           totalMempoolDepth += CHAINING_LIMIT - headroom;
         }
       }
@@ -5184,8 +5364,10 @@ export class NonceDO {
       // Select wallet with most available headroom (fewest in-flight nonces).
       let selectedWalletIndex: number | null = null;
       if (eligibleWallets.length > 0) {
-        eligibleWallets.sort((a, b) => b.headroom - a.headroom);
-        const best = eligibleWallets[0];
+        const best = this.selectWalletForAssignment(eligibleWallets);
+        if (!best) {
+          throw new SponsorPoolExhaustedError();
+        }
         // Soft-reject: if even the best wallet is nearly full, tell the caller to back off
         // rather than assigning into a pool that could hit TooMuchChaining in the next burst.
         if (best.headroom <= SOFT_REJECT_HEADROOM_THRESHOLD) {
@@ -5200,6 +5382,9 @@ export class NonceDO {
       }
 
       if (selectedWalletIndex === null) {
+        if (headroomButUnfunded && eligibleWallets.length === 0) {
+          throw new SponsorPoolExhaustedError();
+        }
         throw new ChainingLimitError(totalMempoolDepth);
       }
 
@@ -5214,16 +5399,21 @@ export class NonceDO {
       const walletAddr = resolveAddress(walletIndex);
       const hiroNextNonce = await this.fetchNextNonceForWallet(walletIndex, walletAddr);
 
-      // Compute the nonce to assign from the stored head.
-      let assignedNonce = this.ledgerGetWalletHead(walletIndex)!;
-
-      // Guard: if Hiro's possible_next_nonce is ahead of our stored head, advance head.
-      // This catches the case where txs were confirmed between alarm cycles and the
-      // relay's head is stale. Advance to hiroNextNonce to avoid re-using confirmed nonces.
-      if (hiroNextNonce !== null && assignedNonce < hiroNextNonce) {
+      // Compute the nonce to assign — prefer filling gaps at the chain frontier (#434).
+      let assignedNonce = this.resolveNextAssignNonce(walletIndex, hiroNextNonce);
+      const headBeforeAssign = this.ledgerGetWalletHead(walletIndex)!;
+      if (assignedNonce < headBeforeAssign) {
+        this.log("warn", "nonce_gap_fill_assignment", {
+          walletIndex,
+          assignedNonce,
+          headBeforeAssign,
+          hiroNextNonce,
+          chainFrontier: this.getChainFrontier(walletIndex),
+        });
+      } else if (hiroNextNonce !== null && assignedNonce < hiroNextNonce) {
         this.log("warn", "nonce_stale_head_advanced", {
           walletIndex,
-          oldHead: assignedNonce,
+          oldHead: headBeforeAssign,
           hiroNextNonce,
         });
         assignedNonce = hiroNextNonce;
@@ -5245,8 +5435,8 @@ export class NonceDO {
         throw new ChainingLimitError(inFlightCount);
       }
 
-      // Advance the stored head to assignedNonce + 1 (next wallet assignment)
-      this.ledgerAdvanceWalletHead(walletIndex, assignedNonce + 1);
+      // Advance the stored head (never shrink when filling an earlier gap).
+      this.advanceWalletHeadAfterAssign(walletIndex, assignedNonce);
 
       // Record the assignment in the intent ledger (authoritative nonce state)
       this.ledgerAssign(walletIndex, assignedNonce);
@@ -5258,7 +5448,7 @@ export class NonceDO {
         nonce: assignedNonce,
         ledgerReserved: this.ledgerReservedCount(walletIndex),
         chainGapHeadroom: this.headroomFromChainGap(walletIndex),
-        nextHead: assignedNonce + 1,
+        nextHead: Math.max(headBeforeAssign, assignedNonce + 1),
       });
 
       // Advance round-robin to next wallet
@@ -9613,7 +9803,13 @@ export class NonceDO {
         : 1;
 
       try {
-        const result = await this.assignNonce(body.sponsorAddress, walletCount, body.addresses);
+        const result = await this.assignNonce(
+          body.sponsorAddress,
+          walletCount,
+          body.addresses,
+          body.walletBalances,
+          body.minAssignBalanceUstx
+        );
         const response: AssignNonceResponse = {
           nonce: result.nonce,
           walletIndex: result.walletIndex,
@@ -9651,6 +9847,22 @@ export class NonceDO {
               estimatedDrainSeconds,
             },
             429
+          );
+        }
+        if (error instanceof SponsorPoolExhaustedError) {
+          return new Response(
+            JSON.stringify({
+              error:
+                "The relay's sponsor wallets are out of STX or ineligible for assignment. Retry later, or send without sponsorship (pay your own fee).",
+              code: "SPONSOR_EXHAUSTED",
+            }),
+            {
+              status: 503,
+              headers: {
+                "content-type": "application/json",
+                "Retry-After": "30",
+              },
+            }
           );
         }
         return this.internalError(error);
@@ -10264,6 +10476,8 @@ export class NonceDO {
         txHex: string;
         mode?: "hold" | "immediate";
         paymentId?: string;
+        walletBalances?: Record<string, string>;
+        minAssignBalanceUstx?: string;
       }>(request);
       if (errorResponse) return errorResponse;
       if (!body?.senderAddress || typeof body.senderNonce !== "number" || !body.txHex) {
@@ -10276,6 +10490,8 @@ export class NonceDO {
 
       return this.state.blockConcurrencyWhile(async () => {
         try {
+          this.recordWalletBalances(body.walletBalances, body.minAssignBalanceUstx);
+
           // 1. Seed sender state on first contact
           await this.seedSenderState(body.senderAddress, body.senderNonce);
 

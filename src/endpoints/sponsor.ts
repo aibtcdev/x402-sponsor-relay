@@ -21,7 +21,7 @@ import {
 } from "../schemas";
 import { checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import type { AppContext, Env, Logger, SponsorRequest } from "../types";
-import { buildQueueInfo } from "../types";
+import { buildQueueInfo, SERVICE_DEGRADED_RETRY_AFTER_S } from "../types";
 import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix, extractTransferDetails } from "../utils";
 import type { BroadcastTarget } from "../utils";
 
@@ -261,6 +261,27 @@ export class Sponsor extends BaseEndpoint {
       const preflight = await sponsorService.preflightSponsoredPayment(validation.transaction);
       if (preflight) {
         return this.preflightRejectionResponse(c, preflight);
+      }
+
+      const sponsorReadiness = await sponsorService.fetchSponsorReadiness();
+      if (sponsorReadiness && !sponsorReadiness.canSponsor) {
+        c.executionCtx.waitUntil(statsService.recordError("sponsoring").catch(() => {}));
+        c.executionCtx.waitUntil(
+          statsService.logFailure("sponsor", false, undefined, "sponsor_failure").catch(() => {})
+        );
+        const exhausted =
+          sponsorReadiness.reasons.includes("NO_AVAILABLE_NONCES") ||
+          sponsorReadiness.reasons.includes("ALL_WALLETS_DEGRADED");
+        return this.err(c, {
+          error: exhausted
+            ? "The relay's sponsor wallets cannot safely assign nonces right now. Retry later, or send without sponsorship (pay your own fee)."
+            : "Sponsor pool is degraded — back off and retry after the pool recovers",
+          code: exhausted ? "SPONSOR_EXHAUSTED" : "SERVICE_DEGRADED",
+          status: 503,
+          details: `Sponsor status: ${sponsorReadiness.status}; reasons: ${sponsorReadiness.reasons.join(", ") || "none"}`,
+          retryable: true,
+          retryAfter: SERVICE_DEGRADED_RETRY_AFTER_S,
+        });
       }
 
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
