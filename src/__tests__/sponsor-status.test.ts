@@ -63,6 +63,7 @@ describe("toSponsorStatusResult", () => {
 
     expect(result.status).toBe("degraded");
     expect(result.canSponsor).toBe(false);
+    expect(result.recommendation).toBe("fallback_to_direct");
     expect(result.reasons).toContain("SNAPSHOT_STALE");
     expect(result.snapshot.freshness).toBe("stale");
   });
@@ -75,6 +76,7 @@ describe("toSponsorStatusResult", () => {
 
     expect(result.status).toBe("unavailable");
     expect(result.canSponsor).toBe(false);
+    expect(result.recommendation).toBe("fallback_to_direct");
     expect(result.reasons).toContain("SNAPSHOT_STALE");
     expect(result.snapshot.freshness).toBe("expired");
   });
@@ -91,6 +93,7 @@ describe("toSponsorStatusResult", () => {
 
     expect(result.status).toBe("degraded");
     expect(result.canSponsor).toBe(false);
+    expect(result.recommendation).toBe("fallback_to_direct");
     expect(result.reconciliation.freshness).toBe("unavailable");
     expect(result.reasons).toContain("RECONCILIATION_STALE");
   });

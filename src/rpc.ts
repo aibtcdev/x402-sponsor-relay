@@ -163,11 +163,15 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     const sent = await sponsorService.sponsorAndBroadcast(validation.transaction);
     if (!sent.ok) {
       const senderFault = sent.responsible === "sender" || sent.clientRejection !== undefined;
+      const isSponsorExhausted =
+        sent.error === "Daily sponsor budget reached" ||
+        sent.error === "Sponsor wallet has insufficient funds" ||
+        (sent.responsible === "sponsor" && sent.details?.includes("NotEnoughFunds"));
       return {
         success: false,
         code: sent.senderNonceCode ? sent.senderNonceCode
           : sent.nonceConflict && senderFault ? "SENDER_NONCE_CONFLICT"
-          : sent.error === "Daily sponsor budget reached" ? "SPONSOR_EXHAUSTED"
+          : isSponsorExhausted ? "SPONSOR_EXHAUSTED"
           : "BROADCAST_FAILED",
         error: `${sent.error}: ${sent.details}`,
         retryable: sent.retryable,

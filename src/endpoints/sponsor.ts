@@ -21,7 +21,7 @@ import {
 } from "../schemas";
 import { checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
 import type { AppContext, Env, Logger, SponsorRequest } from "../types";
-import { buildQueueInfo } from "../types";
+import { buildQueueInfo, SERVICE_DEGRADED_RETRY_AFTER_S } from "../types";
 import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix, extractTransferDetails } from "../utils";
 import type { BroadcastTarget } from "../utils";
 
@@ -386,7 +386,9 @@ export class Sponsor extends BaseEndpoint {
 
       if (!broadcastResult.success) {
         const { errorMessage, errorDetails, httpStatus, isNonceConflict, clientRejection, nodeUrl } = broadcastResult;
-        const isClientError = clientRejection !== undefined;
+        const isRelaySideRejection =
+          clientRejection === "TooMuchChaining" || clientRejection === "NotEnoughFunds";
+        const isClientError = clientRejection !== undefined && !isRelaySideRejection;
 
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError, undefined, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {}));
@@ -441,7 +443,20 @@ export class Sponsor extends BaseEndpoint {
           });
         }
 
-        // Client rejections (NotEnoughFunds, FeeTooLow, etc.)
+        // NotEnoughFunds after preflightSponsoredPayment passed means the assigned
+        // sponsor wallet could not cover the sponsor fee — relay-side, not a client error.
+        if (clientRejection === "NotEnoughFunds") {
+          return this.err(c, {
+            error: "The relay's sponsor wallets are out of STX. Retry later, or send without sponsorship (pay your own fee).",
+            code: "SPONSOR_EXHAUSTED",
+            status: 503,
+            details: errorDetails,
+            retryable: true,
+            retryAfter: SERVICE_DEGRADED_RETRY_AFTER_S,
+          });
+        }
+
+        // Client rejections (FeeTooLow, BadNonce, etc.)
         if (clientRejection) {
           return this.clientRejectionResponse(c, clientRejection, errorDetails);
         }

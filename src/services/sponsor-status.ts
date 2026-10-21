@@ -101,11 +101,15 @@ export function toSponsorStatusResult(
     status = "degraded";
   }
 
+  const canSponsor = status === "healthy";
+
   return {
     status,
-    canSponsor: status === "healthy",
+    canSponsor,
     walletCount: snapshot.walletCount,
-    recommendation: snapshot.recommendation,
+    recommendation: canSponsor
+      ? snapshot.recommendation
+      : (snapshot.recommendation ?? "fallback_to_direct"),
     reasons,
     noncePool: {
       totalAvailable: snapshot.noncePool.totalAvailable,

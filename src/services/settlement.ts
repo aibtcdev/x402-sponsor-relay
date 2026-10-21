@@ -1022,6 +1022,43 @@ export class SettlementService {
               };
             }
 
+            if (
+              matchedReason === "NotEnoughFunds" &&
+              sponsorNonceForLog !== null &&
+              reasonData?.is_origin !== true
+            ) {
+              const rawBroadcastErr: RawBroadcastError = {
+                status: broadcastResponse.status,
+                reason: errorDetails,
+                body: responseText,
+                reasonData: reasonData as Record<string, unknown> | undefined,
+              };
+              const fundsOutcome = parseBroadcastOutcome(rawBroadcastErr);
+              const fundsDecision = decideBroadcastAction(fundsOutcome);
+              this.logger.error(
+                "Sponsor wallet has insufficient funds at broadcast, not retrying",
+                {
+                  status: broadcastResponse.status,
+                  error: errorMessage,
+                  details: errorDetails,
+                  sponsorNonce: sponsorNonceForLog,
+                  responsible: fundsDecision.responsible,
+                  principal: reasonData?.principal,
+                  expected: reasonData?.expected,
+                  actual: reasonData?.actual,
+                  nodeUrl: target.baseUrl,
+                }
+              );
+              return {
+                error: "Sponsor wallet has insufficient funds",
+                details: errorDetails,
+                retryable: true,
+                responsible: fundsDecision.responsible,
+                nodeUrl: target.baseUrl,
+                httpStatus: broadcastResponse.status,
+              };
+            }
+
             if (matchedReason) {
               this.logger.warn("Broadcast rejected by node (client error), not retrying", {
                 status: broadcastResponse.status,
