@@ -17,7 +17,12 @@ import { TIER_LIMITS } from "../types";
 export class DuplicateAddressError extends Error {
   constructor(
     public readonly addressType: "btc" | "stx",
-    public readonly address: string
+    public readonly address: string,
+    /**
+     * True when the existing key has expired and could be renewed, but the
+     * request didn't come in on the timestamped self-service path.
+     */
+    public readonly renewalRequiresTimestamp = false
   ) {
     const label = addressType === "btc" ? "Bitcoin" : "Stacks";
     super(`${label} address "${address}" already has a provisioned API key`);
@@ -659,26 +664,32 @@ export class AuthService {
    * Provision a new free-tier API key for a Bitcoin address
    * Used by POST /keys/provision after BTC signature verification
    *
+   * @param options.allowRenewal - replace an expired key for this address.
+   *   Only pass true for a signature over a fresh timestamped message; a bare
+   *   registration signature never expires and could be replayed.
    * @throws DuplicateAddressError if BTC address already has a key
    * @throws KVNotConfiguredError if KV not configured
    */
   async provisionKey(
-    btcAddress: string
+    btcAddress: string,
+    options: { allowRenewal?: boolean } = {}
   ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
-    return this.provisionKeyByAddress("btc", btcAddress);
+    return this.provisionKeyByAddress("btc", btcAddress, options);
   }
 
   /**
    * Provision a new free-tier API key for a Stacks address
    * Used by POST /keys/provision-stx after STX signature verification
    *
+   * @param options.allowRenewal - see provisionKey
    * @throws DuplicateAddressError if STX address already has a key
    * @throws KVNotConfiguredError if KV not configured
    */
   async provisionKeyByStx(
-    stxAddress: string
+    stxAddress: string,
+    options: { allowRenewal?: boolean } = {}
   ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
-    return this.provisionKeyByAddress("stx", stxAddress);
+    return this.provisionKeyByAddress("stx", stxAddress, options);
   }
 
   /**
@@ -686,7 +697,8 @@ export class AuthService {
    */
   private async provisionKeyByAddress(
     type: "btc" | "stx",
-    address: string
+    address: string,
+    { allowRenewal = false }: { allowRenewal?: boolean } = {}
   ): Promise<{ apiKey: string; metadata: ApiKeyMetadata }> {
     if (!this.kv) {
       throw new KVNotConfiguredError();
@@ -697,13 +709,31 @@ export class AuthService {
     const existingKeyId = await this.kv.get(indexKey);
     if (existingKeyId) {
       const existing = await this.getMetadataByKeyId(existingKeyId);
-      if (!existing || new Date(existing.metadata.expiresAt) > new Date()) {
+      if (!existing) {
+        // Index entry with no readable key record. Could be KV read lag right
+        // after a write, so it is not treated as reclaimable, but log it so a
+        // permanently dangling entry is findable.
+        this.logger.warn(`${type.toUpperCase()} address index points at a missing key record`, {
+          [type === "btc" ? "btcAddress" : "stxAddress"]: address,
+          keyId: existingKeyId,
+        });
         throw new DuplicateAddressError(type, address);
+      }
+      if (new Date(existing.metadata.expiresAt) > new Date()) {
+        throw new DuplicateAddressError(type, address);
+      }
+      if (!allowRenewal) {
+        // Expired, but the bare registration message carries no timestamp:
+        // a copied signature over it must not be able to mint a new key.
+        throw new DuplicateAddressError(type, address, true);
       }
 
       // The address's key has lapsed: deactivate it for hygiene and fall
       // through to provision a fresh one in its place, rather than 409ing
       // forever (the address's plaintext key isn't recoverable to renew).
+      // Two concurrent renewals can both get here; the last index write wins
+      // and the other fresh key is orphaned until it expires. Acceptable for
+      // free-tier keys, which grant nothing beyond the address's own quota.
       existing.metadata.active = false;
       await this.kv.put(`key:${existing.keyHash}`, JSON.stringify(existing.metadata));
       this.logger.info(`Expired ${type.toUpperCase()}-provisioned key replaced`, {
