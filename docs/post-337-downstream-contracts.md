@@ -29,6 +29,11 @@ The relay exposes a `WorkerEntrypoint` named `RelayRPC` for same-account Cloudfl
 ### Public methods
 
 ```ts
+env.X402_RELAY.sponsorPayment(
+  txHex: string,
+  settle: SettleOptions
+): Promise<SponsorPaymentResult>
+
 env.X402_RELAY.submitPayment(
   txHex: string,
   settle?: SettleOptions,
@@ -39,6 +44,8 @@ env.X402_RELAY.checkPayment(paymentId: string): Promise<RpcCheckPaymentResult>
 
 env.X402_RELAY.getSponsorStatus(): Promise<SponsorStatusResult>
 ```
+
+`sponsorPayment` is the only path that pays the STX fee for the payer: it co-signs a transaction built with `sponsored: true, fee: 0`, broadcasts it, and returns `{ success, txid, payer, fee }` or `{ success: false, code, error, retryable }`. The public HTTP `/settle` never sponsors. `SponsorPaymentResult` is defined in `src/rpc.ts`, and `SettleOptions` in `src/types.ts`. See [Pattern: advertise gasless payments in your 402](#pattern-advertise-gasless-payments-in-your-402) for what the resource server must put in its `payment-required` response so clients build that kind of transaction.
 
 The `RpcSubmitPaymentResult`, `RpcCheckPaymentResult`, and `SponsorStatusResult` types are the canonical contract. They are exported from `@aibtc/tx-schemas/rpc` and consumers should import from there to stay version-locked:
 
@@ -199,6 +206,41 @@ const checkPoll = async (): Promise<RpcCheckPaymentResult> => {
   throw new Error("timeout waiting for confirmation");
 };
 ```
+
+### Pattern: advertise gasless payments in your 402
+
+A resource server that settles through `sponsorPayment` has to tell clients to build a sponsored transaction. With `x402-stacks` (2.1.0, the client the aibtc MCP server and skills use), the only signal it reads is **`extra.feePayer` being a string**:
+
+```js
+// x402-stacks@2.1.0 dist/interceptor-v2.js, signPaymentV2
+const sponsored = typeof paymentRequirements.extra?.feePayer === 'string';
+const sponsorOpts = sponsored ? { sponsored: true, fee: 0n } : {};
+```
+
+So the 402 must carry `feePayer`. Any other key, e.g. `extra.sponsored: true`, is ignored. The client then signs a normal fee-paying transaction, `sponsorPayment` is never reached, and the payer pays gas the server said it would cover. That is what happened on `inference.aibtc.com` (aibtcdev/inference-marketplace#33).
+
+```ts
+const status = await env.X402_RELAY.getSponsorStatus();
+const requirements = {
+  scheme: "exact",
+  network: "stacks:1",
+  amount,
+  asset,
+  payTo,
+  maxTimeoutSeconds: 300,
+  extra: {
+    ...pricing,
+    // Only advertise sponsorship when the relay says it can sponsor.
+    ...(status.canSponsor ? { feePayer: env.X402_SPONSOR_FEE_PAYER } : {}),
+  },
+};
+```
+
+Notes:
+
+- **The value is informational for the client.** `x402-stacks` checks only that it is a string. The relay picks the sponsor wallet when it co-signs. `landing-page` advertises its configured sponsor (`X402_SPONSOR_FEE_PAYER` in its `wrangler.jsonc`, used by `lib/inbox/x402-config.ts`), and that is the pattern to copy.
+- **Gate it on `canSponsor`.** If you advertise `feePayer` while `getSponsorStatus()` returns `canSponsor: false` / `recommendation: "fallback_to_direct"`, clients send fee-0 transactions that `sponsorPayment` may refuse, and they cannot be broadcast on their own. Leaving `feePayer` out in that state makes clients pay their own gas, and the payment still goes through.
+- **Route on what was signed, not on what was advertised.** Check the transaction's auth type (`AuthType.Sponsored`) before choosing `sponsorPayment` or the self-paid path, because a client is free to ignore `feePayer`.
 
 ## 5. References
 
