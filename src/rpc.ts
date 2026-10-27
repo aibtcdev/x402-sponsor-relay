@@ -8,7 +8,7 @@
  * - sponsorPayment(txHex, settle) — sponsor + broadcast an x402 payment now, or fail with a reason
  * - submitPayment(txHex, settle) — validate tx, check sender nonce, enqueue, return paymentId
  * - checkPayment(paymentId)      — return current payment status from KV
- * - getSponsorStatus()           — return the cached relay-owned sponsor status snapshot
+ * - getSponsorStatus()           — return whether the x402 payment sponsor can take a payment now
  */
 
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -58,6 +58,7 @@ import {
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
 import { repairSenderWedgeDO, SettlementService, SponsorService } from "./services";
+import { getPaymentSponsorStatus } from "./services/payment-sponsor-status";
 
 export type { SubmitPaymentResult, CheckPaymentResult };
 
@@ -636,22 +637,14 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
   }
 
   /**
-   * Return the cached relay-owned sponsor status snapshot.
-   * Reads from NonceDO cached state only and never triggers live Hiro fan-out.
+   * Readiness of the x402 payment sponsor that sponsorPayment() uses (SponsorWalletDO):
+   * configured, funded and under today's budget. Balance is KV-cached for 60s.
    */
   async getSponsorStatus(): Promise<SponsorStatusResult> {
-    if (!this.env.NONCE_DO) {
-      throw new Error("Nonce coordinator unavailable");
-    }
-
-    const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
-    const response = await stub.fetch("https://nonce-do/sponsor-status");
-
-    if (!response.ok && response.status !== 503) {
-      const body = await response.text();
-      throw new Error(body || `NonceDO sponsor status failed with ${response.status}`);
-    }
-
-    return (await response.json()) as SponsorStatusResult;
+    const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
+      component: "rpc",
+      route: "rpc.getSponsorStatus",
+    });
+    return getPaymentSponsorStatus(this.env, logger);
   }
 }

@@ -229,7 +229,7 @@ Access a protected resource using a payment receipt. Validates the receipt (exis
 
 ### GET /health
 
-Service health summary. Use `GET /status/sponsor` for the canonical cached sponsor status contract.
+Service health summary. Use `GET /status/sponsor` to check whether the x402 payment sponsor can take a payment now.
 
 **Response:**
 ```json
@@ -323,7 +323,7 @@ if (receiptId) {
 |--------|------|------|-------------|
 | GET | `/` | None | Service info |
 | GET | `/health` | None | Service health summary |
-| GET | `/status/sponsor` | None | Canonical cached sponsor readiness snapshot |
+| GET | `/status/sponsor` | None | x402 payment sponsor readiness (configured, funded, under daily budget) |
 | GET | `/docs` | None | Swagger UI documentation |
 | GET | `/openapi.json` | None | OpenAPI specification |
 | POST | `/relay` | None | Submit transaction via x402 facilitator |

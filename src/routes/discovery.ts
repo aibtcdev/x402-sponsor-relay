@@ -212,7 +212,7 @@ Full V2 facilitator docs: https://x402-relay.aibtc.com/topics/x402-v2-facilitato
 ## Other Endpoints
 
 - GET  /health              — Service health summary
-- GET  /status/sponsor      — Cached sponsor readiness snapshot
+- GET  /status/sponsor      — Can the x402 payment sponsor take a payment now
 - GET  /fees                — Clamped fee estimates (no auth required)
 - GET  /payment/:id         — Poll queue-based payment status by relay-owned paymentId
 - GET  /verify/:receiptId   — Verify an existing payment receipt (no new receipts are issued)
@@ -742,36 +742,44 @@ This is not the canonical sponsor status contract and does not include sponsor r
   "version": "0.3.0"
 }
 
-## GET /status/sponsor — Cached Sponsor Status
+## GET /status/sponsor — Sponsor Status
 
-Returns the relay-owned cached sponsor readiness snapshot used by public and internal consumers.
-This is the canonical sponsor status surface. Reads do not trigger live Hiro fan-out.
+Whether the x402 payment sponsor can take a payment right now. Check canSponsor before a
+gasless payment; when it is false, follow recommendation ("fallback_to_direct": pay your own fee).
+
+canSponsor is false (HTTP 503, status "unavailable") when any of these reasons apply:
+- SPONSOR_NOT_CONFIGURED — the relay has no payment sponsor key
+- SPONSOR_BALANCE_LOW — the sponsor wallet holds less than 0.1 STX
+- DAILY_BUDGET_REACHED — today's sponsor fee budget is spent (resets at midnight UTC)
+
+The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor stays true and
+reconciliation.freshness is "unavailable". noncePool is kept for compatibility (one sponsor, nothing reserved).
 
 ### Response
 
 {
   "status": "healthy",
   "canSponsor": true,
-  "walletCount": 4,
+  "walletCount": 1,
   "recommendation": null,
   "reasons": [],
   "noncePool": {
-    "totalAvailable": 72,
-    "totalReserved": 8,
-    "totalCapacity": 80,
-    "poolAvailabilityRatio": 0.9,
+    "totalAvailable": 1,
+    "totalReserved": 0,
+    "totalCapacity": 1,
+    "poolAvailabilityRatio": 1,
     "conflictsDetected": 0,
     "lastConflictAt": null,
     "healInProgress": false
   },
   "reconciliation": {
     "source": "hiro",
-    "lastSuccessfulAt": "2026-03-30T18:20:00.000Z",
+    "lastSuccessfulAt": "2026-10-27T12:00:00.000Z",
     "freshness": "fresh"
   },
   "snapshot": {
-    "asOf": "2026-03-30T18:20:05.000Z",
-    "ageMs": 412,
+    "asOf": "2026-10-27T12:00:00.000Z",
+    "ageMs": 0,
     "freshness": "fresh"
   }
 }
@@ -2217,7 +2225,7 @@ discovery.get("/.well-known/agent.json", (c) => {
         name: "Service Health Check",
         description:
           "Check relay health and cached sponsor readiness. " +
-          "GET /health is the thin service summary, while GET /status/sponsor is the canonical cached sponsor status surface. " +
+          "GET /health is the thin service summary, while GET /status/sponsor reports whether the x402 payment sponsor can take a payment now. " +
           "Use before sending transactions to verify the relay is operational.",
         tags: ["health", "monitoring", "status"],
         examples: [
