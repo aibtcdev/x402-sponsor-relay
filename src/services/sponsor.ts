@@ -1120,7 +1120,7 @@ export class SponsorService {
 
   /** Balance thresholds in microSTX for classifying wallet health */
   private static readonly LOW_BALANCE_WARNING = "1000000";   // 1 STX
-  private static readonly DEPLETED_THRESHOLD = "100000";     // 0.1 STX
+  static readonly DEPLETED_THRESHOLD = "100000";     // 0.1 STX
 
   /**
    * Fetch the STX balance for a sponsor wallet address from Hiro.
@@ -1132,7 +1132,7 @@ export class SponsorService {
   }
 
   /** As fetchWalletBalance, but null when Hiro could not be read. */
-  private async fetchWalletBalanceOrNull(address: string): Promise<string | null> {
+  async fetchWalletBalanceOrNull(address: string): Promise<string | null> {
     const cacheKey = `wallet_balance:${address}`;
 
     // Try cache first
