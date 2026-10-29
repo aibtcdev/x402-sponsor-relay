@@ -280,7 +280,8 @@ export class Sponsor extends BaseEndpoint {
 
       // Sponsor with the single payment-sponsor wallet (SponsorWalletDO): it takes the
       // sponsor nonce from the chain at broadcast time, so a failed attempt leaves no gap.
-      const sent = await sponsorService.sponsorAndBroadcast(validation.transaction);
+      // /sponsor has its own daily budget so API-key traffic cannot use up the x402 payments' one.
+      const sent = await sponsorService.sponsorAndBroadcast(validation.transaction, "budget:sponsor");
 
       if (!sent.ok) {
         const isClientError = sent.responsible === "sender" || sent.clientRejection !== undefined;
@@ -301,6 +302,19 @@ export class Sponsor extends BaseEndpoint {
             details: sent.details,
             retryable: false,
           });
+        }
+        if (sent.tooMuchChaining && !sent.isOriginChaining) {
+          return this.err(c, {
+            error: "Sponsor wallet congested — too many pending transactions. Back off and retry",
+            code: "TOO_MUCH_CHAINING",
+            status: 429,
+            details: sent.details,
+            retryable: true,
+            retryAfter: 30,
+          });
+        }
+        if (sent.tooMuchChaining) {
+          return this.clientRejectionResponse(c, "TooMuchChaining", sent.details);
         }
         if (sent.clientRejection) {
           return this.clientRejectionResponse(c, sent.clientRejection, sent.details);
