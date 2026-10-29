@@ -1201,9 +1201,11 @@ export class SponsorService {
       };
     }
     const spend = this.paymentSpend(transaction);
-    const fee = await new FeeService(this.env, this.logger).getFeeForType(
+    const estimate = await new FeeService(this.env, this.logger).getFeeForType(
       spend && spend.asset !== "STX" ? "sip010_transfer" : this.payloadToFeeType(transaction.payload.payloadType)
     );
+    // Nodes reject a fee under 1 µSTX per byte (FeeTooLow); the token_transfer floor sits below that.
+    const fee = Math.max(estimate, transaction.serializeBytes().length);
     const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/sponsor", {
       method: "POST",
       body: JSON.stringify({
