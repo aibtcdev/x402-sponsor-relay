@@ -7,6 +7,15 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.34.1](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.34.0...x402-sponsor-relay-v1.34.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **nonce-do:** retire queued entries on the deserialize errors @stacks/transactions actually throws ([#443](https://github.com/aibtcdev/x402-sponsor-relay/issues/443)) ([1cd3fab](https://github.com/aibtcdev/x402-sponsor-relay/commit/1cd3fabfc6f3297beed0b1a0fb352f956e8a1c31))
+* **sponsor:** sponsor /sponsor with the single payment wallet ([#449](https://github.com/aibtcdev/x402-sponsor-relay/issues/449)) ([0329a76](https://github.com/aibtcdev/x402-sponsor-relay/commit/0329a761d55410c8b5829bc4266d50b47922e2e8))
+* **status:** report the x402 payment sponsor in /status/sponsor ([#435](https://github.com/aibtcdev/x402-sponsor-relay/issues/435)) ([#446](https://github.com/aibtcdev/x402-sponsor-relay/issues/446)) ([70dab4a](https://github.com/aibtcdev/x402-sponsor-relay/commit/70dab4a9ee3d9a39fb59fbb3eb7f2ac66b9fda56))
+
 ## [1.34.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.33.2...x402-sponsor-relay-v1.34.0) (2026-10-02)
 
 
