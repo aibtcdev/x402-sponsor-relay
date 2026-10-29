@@ -294,27 +294,26 @@ Content-Type: application/json
   "requestId": "uuid",
   "txid": "0x...",
   "explorerUrl": "https://explorer.hiro.so/txid/0x...",
-  "fee": "1000",                   // microSTX sponsored by relay
-  "nonceExpiresAt": "2026-05-18T12:10:00.000Z",  // ISO 8601 UTC — DO NOT retry same hex after this
-  "sponsorNonceValidForMs": 600000                // integer ms = STALE_THRESHOLD_MS (10 min)
+  "fee": "1000"                    // microSTX sponsored by relay
 }
 
-### Sponsor Nonce TTL
+### One Pending Transaction per Sender
 
-The relay reclaims sponsor nonces after STALE_THRESHOLD_MS (currently 10 minutes).
-Do NOT rebroadcast the same sponsored hex past nonceExpiresAt — the nonce will
-have been reassigned, causing a ConflictingNonceInMempool error with no recovery.
-
-If your retry loop reaches nonceExpiresAt, call /sponsor again with the same
-inner client-signed payload to obtain fresh sponsored hex and a new TTL.
-See docs/sponsor-nonce-ttl.md for the full consumer adoption checklist.
+The relay sponsors from a single wallet and takes the sponsor nonce from the chain
+at broadcast time. A sender may have one sponsored transaction pending at a time:
+while one is in the mempool, the next is refused with 409 CLIENT_NONCE_CONFLICT.
+Wait for it to confirm, then submit the next nonce. (This keeps a dropped
+transaction from blocking every later one behind it.)
 
 ### Error Responses
 
 - 400 INVALID_TRANSACTION / NOT_SPONSORED — tx validation failed
 - 401 MISSING_API_KEY / INVALID_API_KEY / EXPIRED_API_KEY — auth failed
 - 401 INVALID_AUTH_SIGNATURE / AUTH_EXPIRED — SIP-018 auth failed
+- 409 CLIENT_NONCE_CONFLICT — sender already has a pending transaction; wait for it to confirm
 - 429 RATE_LIMIT_EXCEEDED / DAILY_LIMIT_EXCEEDED / SPENDING_CAP_EXCEEDED
+- 429 TOO_MUCH_CHAINING — sponsor wallet congested; retry after 30s
+- 503 SPONSOR_EXHAUSTED — sponsor wallet out of STX or daily budget reached
 - 500 SPONSOR_CONFIG_ERROR / SPONSOR_FAILED — broadcast failed
 
 ---
@@ -1076,27 +1075,15 @@ Success (200):
   "success": true,
   "txid": "0x...",
   "explorerUrl": "https://explorer.hiro.so/txid/0x...",
-  "fee": "1000",
-  "nonceExpiresAt": "2026-05-18T12:10:00.000Z",
-  "sponsorNonceValidForMs": 600000
+  "fee": "1000"
 }
 
-## Sponsor Nonce TTL
+## One Pending Transaction per Sender
 
-/sponsor success responses include:
-
-- nonceExpiresAt: ISO 8601 UTC timestamp after which the relay may reclaim the sponsor nonce.
-  Do NOT retry the same sponsored hex after this timestamp — re-call /sponsor instead.
-- sponsorNonceValidForMs: integer ms equal to the relay's STALE_THRESHOLD_MS (currently 600000 = 10 min).
-
-Pattern for retry queues:
-  if (Date.now() < Date.parse(item.nonceExpiresAt)) {
-    // still valid — rebroadcast original hex
-  } else {
-    // expired — re-call /sponsor to get fresh hex and new nonceExpiresAt
-  }
-
-Full consumer guide: https://x402-relay.aibtc.com/docs/sponsor-nonce-ttl (or see docs/sponsor-nonce-ttl.md in repo).
+/sponsor signs with a single sponsor wallet and reads the sponsor nonce from the chain
+at broadcast time, so a failed attempt leaves no sponsor-side gap. A sender may have
+one sponsored transaction pending at a time; the next is refused with 409
+CLIENT_NONCE_CONFLICT until the first confirms. Submit sender nonces in order, one at a time.
 
 ## Notes
 
@@ -1371,13 +1358,13 @@ All errors return JSON with this shape:
 | SPENDING_CAP_EXCEEDED          | 429  | true      | key's daily fee cap reached |
 | SPONSOR_CONFIG_ERROR           | 500  | false     | relay not configured (missing mnemonic) |
 | SPONSOR_FAILED                 | 500  | true      | sponsoring the tx failed |
-| NONCE_CONFLICT                 | 409  | true      | Sponsor nonce conflict in mempool; resubmit with a new transaction |
 | SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but definitively aborted on-chain (abort_* status only) |
 | CLIENT_INSUFFICIENT_FUNDS      | 422  | false     | Sender had insufficient funds — top up wallet before re-signing and retrying |
 | CLIENT_BAD_NONCE               | 422  | true      | Sender nonce is invalid — verify via Stacks API, re-sign with correct nonce, and retry |
-| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender nonce conflicts in mempool — verify nonce state, wait for pending tx, re-sign and retry |
+| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender has a pending transaction (or a mempool nonce conflict) — wait for it to confirm, then retry |
+| TOO_MUCH_CHAINING              | 429  | true      | Sponsor wallet congested — retry after Retry-After (30s) |
+| SPONSOR_EXHAUSTED              | 503  | true      | Sponsor wallet out of STX or /sponsor daily budget reached — retry later |
 | SENDER_NONCE_GAP               | 400  | false     | Sender nonce has a gap — verify account nonce, submit missing nonces listed in response |
-| TRANSACTION_HELD               | 200  | true      | Transaction queued pending nonce gap fill — submit missing nonces or poll for dispatch |
 | SIGNATURE_VALIDATION_FAILED    | 422  | false     | Invalid signature — wrong network, mismatched key, or corrupted transaction bytes |
 | BROADCAST_REJECTED             | 422  | true      | Stacks node rejected the transaction for another client-caused reason |
 

@@ -32,7 +32,7 @@ import type {
   SponsorHeld,
 } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix, decodeClarityUint } from "../utils";
-import type { SponsorWalletResult } from "../durable-objects/sponsor-wallet-do";
+import type { BudgetName, SponsorWalletResult } from "../durable-objects/sponsor-wallet-do";
 import { FeeService } from "./fee";
 
 /**
@@ -1190,7 +1190,7 @@ export class SponsorService {
    * /sponsor wallets) is a single SponsorWalletDO that signs and broadcasts one transaction at a
    * time with a chain-derived nonce — nothing is reserved, queued or held.
    */
-  async sponsorAndBroadcast(transaction: StacksTransactionWire): Promise<SponsorWalletResult> {
+  async sponsorAndBroadcast(transaction: StacksTransactionWire, budget?: BudgetName): Promise<SponsorWalletResult> {
     const ns = this.env.SPONSOR_WALLET_DO;
     const sponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
     if (!ns || !sponsorKey) {
@@ -1201,14 +1201,17 @@ export class SponsorService {
       };
     }
     const spend = this.paymentSpend(transaction);
-    const fee = await new FeeService(this.env, this.logger).getFeeForType(
+    const estimate = await new FeeService(this.env, this.logger).getFeeForType(
       spend && spend.asset !== "STX" ? "sip010_transfer" : this.payloadToFeeType(transaction.payload.payloadType)
     );
+    // Nodes reject a fee under 1 µSTX per byte (FeeTooLow); the token_transfer floor sits below that.
+    const fee = Math.max(estimate, transaction.serializeBytes().length);
     const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/sponsor", {
       method: "POST",
       body: JSON.stringify({
         txHex: transaction.serialize(), sponsorKey, fee: String(fee),
         senderAddress: this.deriveSenderAddress(transaction),
+        budget,
       }),
     });
     return (await res.json()) as SponsorWalletResult;

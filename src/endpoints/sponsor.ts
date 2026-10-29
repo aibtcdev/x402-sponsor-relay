@@ -1,14 +1,9 @@
-import { deserializeTransaction } from "@stacks/transactions";
 import { BaseEndpoint } from "./BaseEndpoint";
 import {
   SponsorService,
   StatsService,
   AuthService,
   StxVerifyService,
-  extractSponsorNonce,
-  releaseNonceDO,
-  recordBroadcastOutcomeDO,
-  nonceLifecycleOnBroadcastSuccess,
 } from "../services";
 import {
   Error400Response,
@@ -20,36 +15,8 @@ import {
   Error503Response,
 } from "../schemas";
 import { checkAndRecordMalformed, MALFORMED_BLOCK_THRESHOLD } from "../middleware";
-import type { AppContext, Env, Logger, SponsorRequest } from "../types";
-import { buildQueueInfo } from "../types";
-import { buildExplorerUrl, CLIENT_REJECTION_REASONS, getBroadcastTargets, NONCE_CONFLICT_REASONS, stripHexPrefix, extractTransferDetails } from "../utils";
-import type { BroadcastTarget } from "../utils";
-
-const BROADCAST_MAX_ATTEMPTS = 3;
-const BROADCAST_RETRY_BASE_DELAY_MS = 1_000;
-const BROADCAST_RETRY_MAX_DELAY_MS = 2_000;
-const BROADCAST_TIMEOUT_MS = 12_000;
-
-/**
- * Duration in milliseconds that a sponsor nonce slot remains valid after assignment.
- * Must equal STALE_THRESHOLD_MS in src/durable-objects/nonce-do.ts (10 minutes).
- * Published on every /sponsor success response as `sponsorNonceValidForMs` so
- * consumers can derive a relative retry budget without parsing the ISO timestamp.
- * Update this constant if STALE_THRESHOLD_MS changes.
- */
-const SPONSOR_NONCE_VALID_FOR_MS = 10 * 60 * 1_000; // 600 000 ms = 10 min
-
-type BroadcastResult =
-  | { success: true; txid: string }
-  | {
-      success: false;
-      errorMessage: string;
-      errorDetails: string;
-      httpStatus: number;
-      isNonceConflict: boolean;
-      clientRejection?: string;
-      nodeUrl?: string;
-    };
+import type { AppContext, SponsorRequest } from "../types";
+import { buildExplorerUrl, extractTransferDetails, stripHexPrefix } from "../utils";
 
 /**
  * Sponsor endpoint - sponsors and broadcasts transactions directly
@@ -148,19 +115,6 @@ export class Sponsor extends BaseEndpoint {
                   description: "Fee paid by sponsor in microSTX",
                   example: "1000",
                 },
-                nonceExpiresAt: {
-                  type: "string" as const,
-                  format: "date-time",
-                  description:
-                    "ISO 8601 UTC timestamp after which the relay may reclaim this sponsor nonce. Callers MUST NOT retry the same sponsored hex past this timestamp — re-call /sponsor with the same inner client-signed payload to mint a fresh sponsorship instead.",
-                  example: "2026-05-18T12:10:00.000Z",
-                },
-                sponsorNonceValidForMs: {
-                  type: "integer" as const,
-                  description:
-                    "Duration in milliseconds for which this sponsor nonce is valid, equal to the relay's STALE_THRESHOLD_MS constant (600000 = 10 minutes). Use this to derive a relative retry budget without parsing the absolute timestamp.",
-                  example: 600000,
-                },
               },
             },
           },
@@ -168,20 +122,17 @@ export class Sponsor extends BaseEndpoint {
       },
       "400": Error400Response,
       "401": Error401Response,
-      "409": { ...Error409Response, description: "Nonce conflict — resubmit with a new transaction" },
+      "409": { ...Error409Response, description: "Sender has a pending transaction — wait for it to confirm, then retry" },
       "429": { ...Error429Response, description: "Spending cap exceeded" },
       "500": Error500Response,
       "502": { ...Error502Response, description: "Broadcast failed" },
-      "503": { ...Error503Response, description: "Nonce coordinator unavailable — retry after delay" },
+      "503": { ...Error503Response, description: "Sponsor wallet out of STX or daily budget reached — retry later" },
     },
   };
 
   async handle(c: AppContext) {
     const logger = this.getLogger(c);
     logger.info("Sponsor request received");
-
-    // Capture HTTP request arrival time for user-perceived settlement latency measurement.
-    const submittedAt = new Date().toISOString();
 
     const statsService = new StatsService(c.env, logger);
 
@@ -258,7 +209,11 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
-      const preflight = await sponsorService.preflightSponsoredPayment(validation.transaction);
+      const paymentSponsorKey = c.env.PAYMENT_SPONSOR_PRIVATE_KEY;
+      const preflight = await sponsorService.preflightSponsoredPayment(
+        validation.transaction,
+        paymentSponsorKey ? [paymentSponsorKey] : []
+      );
       if (preflight) {
         return this.preflightRejectionResponse(c, preflight);
       }
@@ -323,160 +278,77 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
-      // mode:"immediate" — reject without queuing if a gap exists.
-      // POST /sponsor must remain synchronous (200 with txid or error, NEVER 202).
-      // MCP server and skills expect either txid or a 4xx error; they cannot handle 202.
-      const sponsorResult = await sponsorService.sponsorTransaction(
-        validation.transaction,
-        body.transaction, // pass original hex for hand-submit sender nonce tracking
-        "immediate"
-      );
-      if (sponsorResult.success === false) {
-        // Gin rummy: nonce gap detected — reject immediately with actionable error.
-        // The tx was NOT added to sender_hand (mode:"immediate" prevents insertion on gap).
-        if ("held" in sponsorResult && sponsorResult.held) {
-          c.executionCtx.waitUntil(statsService.recordError("validation").catch(() => {}));
-          c.executionCtx.waitUntil(statsService.logFailure("sponsor", true, undefined, "sender_nonce_gap").catch(() => {}));
-          const senderNonce = Number(validation.transaction.auth.spendingCondition.nonce);
-          const queue = buildQueueInfo(sponsorResult, senderNonce);
-          logger.warn("Sender nonce gap — rejecting /sponsor request", {
-            senderNonce,
-            missingNonces: sponsorResult.missingNonces,
-            nextExpected: sponsorResult.nextExpected,
-          });
-          return c.json({
-            success: false,
-            requestId: crypto.randomUUID(),
-            code: "SENDER_NONCE_GAP",
-            error: `Sender nonce ${senderNonce} cannot be sponsored — verify your account nonce via the Stacks API, then submit nonces ${sponsorResult.missingNonces.join(", ")} to unblock dispatch`,
-            missingNonces: sponsorResult.missingNonces,
-            nextExpectedNonce: sponsorResult.nextExpected,
-            retryable: false,
-            queue,
-          }, 400);
-        }
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", false, undefined, "sponsor_failure").catch(() => {}));
-        return this.sponsorFailureResponse(
-          c,
-          sponsorResult as { error: string; details: string; code?: string; retryAfter?: number },
-          statsService.recordError("sponsoring").catch(() => {})
-        );
-      }
+      // Sponsor with the single payment-sponsor wallet (SponsorWalletDO): it takes the
+      // sponsor nonce from the chain at broadcast time, so a failed attempt leaves no gap.
+      // /sponsor has its own daily budget so API-key traffic cannot use up the x402 payments' one.
+      const sent = await sponsorService.sponsorAndBroadcast(validation.transaction, "budget:sponsor");
 
-      const cleanHex = stripHexPrefix(sponsorResult.sponsoredTxHex);
-      const sponsoredTx = deserializeTransaction(cleanHex);
-
-      // Extract token type and transfer amount from the sponsored transaction for accurate
-      // stats attribution. Falls back to { tokenType: "STX", amount: "0" } on any error.
-      const { tokenType: txTokenType, amount: txAmount } = extractTransferDetails(sponsoredTx, c.env.STACKS_NETWORK);
-
-      // Extract nonce before broadcast so it's available in all failure and success paths
-      const sponsorNonce = extractSponsorNonce(sponsoredTx);
-      // walletIndex from NonceDO assignment — routes release to the correct per-wallet pool
-      const sponsorWalletIndex = sponsorResult.walletIndex;
-
-      // Broadcast with retry: raw fetch to /v2/transactions instead of library
-      // broadcastTransaction() which swallows response bodies and has no retry.
-      // Retry on 5xx/network errors with backoff; fail fast on 4xx.
-      // Pass cleanHex directly — it's already stripped hex from sponsoredTxHex.
-      // Avoids a deserialize→re-serialize round-trip through sponsoredTx.serialize().
-      const broadcastResult = await this.broadcastWithRetry(
-        cleanHex, c.env, logger
-      );
-
-      if (!broadcastResult.success) {
-        const { errorMessage, errorDetails, httpStatus, isNonceConflict, clientRejection, nodeUrl } = broadcastResult;
-        const isClientError = clientRejection !== undefined;
-
+      if (!sent.ok) {
+        const isClientError = sent.responsible === "sender" || sent.clientRejection !== undefined;
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
         c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError, undefined, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {}));
 
-        // Record broadcast outcome in the intent ledger.
-        // httpStatus 0 = network/timeout exception (no HTTP response received).
-        if (sponsorNonce !== null) {
-          c.executionCtx.waitUntil(
-            recordBroadcastOutcomeDO(
-              c.env, logger, sponsorNonce, sponsorWalletIndex,
-              undefined, httpStatus, nodeUrl, errorDetails
-            ).catch((e) => {
-              logger.warn("Failed to record broadcast outcome", { error: String(e) });
-            })
-          );
-          c.executionCtx.waitUntil(
-            releaseNonceDO(c.env, logger, sponsorNonce, undefined, sponsorWalletIndex).catch((e) => {
-              logger.warn("Failed to release nonce after broadcast rejection", { error: String(e) });
-            })
-          );
+        if (sent.senderNonceCode === "SENDER_NONCE_DUPLICATE") {
+          return this.clientRejectionResponse(c, "ConflictingNonceInMempool", sent.details);
         }
-
-        // Nonce conflicts: trigger resync and return 409
-        if (isNonceConflict) {
-          logger.warn("Nonce conflict returned to agent", {
-            sponsorNonce,
-            walletIndex: sponsorWalletIndex,
-            broadcastDetails: errorDetails,
-          });
-          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
+        if (sent.senderNonceCode === "SENDER_NONCE_STALE") {
+          return this.clientRejectionResponse(c, "BadNonce", sent.details);
+        }
+        if (sent.senderNonceCode === "SENDER_NONCE_GAP") {
           return this.err(c, {
-            error: "Nonce conflict — back off and retry. Check GET /nonce/stats for nonce pool state",
-            code: "NONCE_CONFLICT",
-            status: 409,
-            details: errorDetails,
-            retryable: true,
-            retryAfter: 30,
+            error: sent.error,
+            code: "SENDER_NONCE_GAP",
+            status: 400,
+            details: sent.details,
+            retryable: false,
           });
         }
-
-        // TooMuchChaining: sponsor wallet congested — relay-side, not a client error.
-        // Trigger resync and return a dedicated 429 so stats don't misattribute.
-        if (clientRejection === "TooMuchChaining") {
-          this.scheduleNonceResync(c, sponsorService.resyncNonceDODelayed(), logger);
+        if (sent.tooMuchChaining && !sent.isOriginChaining) {
           return this.err(c, {
             error: "Sponsor wallet congested — too many pending transactions. Back off and retry",
             code: "TOO_MUCH_CHAINING",
             status: 429,
-            details: errorDetails,
+            details: sent.details,
             retryable: true,
             retryAfter: 30,
           });
         }
-
-        // Client rejections (NotEnoughFunds, FeeTooLow, etc.)
-        if (clientRejection) {
-          return this.clientRejectionResponse(c, clientRejection, errorDetails);
+        if (sent.tooMuchChaining) {
+          return this.clientRejectionResponse(c, "TooMuchChaining", sent.details);
         }
-
-        // Generic 4xx = non-retryable transaction rejection; 5xx/network = retryable
-        const is4xx = httpStatus >= 400 && httpStatus < 500;
+        if (sent.clientRejection) {
+          return this.clientRejectionResponse(c, sent.clientRejection, sent.details);
+        }
+        if (sent.error === "Daily sponsor budget reached") {
+          return this.err(c, {
+            error: sent.error,
+            code: "SPONSOR_EXHAUSTED",
+            status: 503,
+            details: sent.details,
+            retryable: true,
+            retryAfter: 3600,
+          });
+        }
+        if (sent.error === "Service not configured") {
+          return this.sponsorFailureResponse(c, sent, Promise.resolve());
+        }
         return this.err(c, {
-          error: errorMessage,
+          error: sent.error,
           code: "BROADCAST_FAILED",
-          status: is4xx ? 400 : 502,
-          details: errorDetails,
-          retryable: !is4xx,
-          retryAfter: is4xx ? undefined : 5,
+          status: sent.retryable ? 502 : 400,
+          details: sent.details,
+          retryable: sent.retryable,
+          retryAfter: sent.retryable ? 5 : undefined,
         });
       }
 
-      const txid = broadcastResult.txid;
+      const { txid, fee } = sent;
 
-      if (sponsorNonce !== null) {
-        c.executionCtx.waitUntil(
-          nonceLifecycleOnBroadcastSuccess(c.env, logger, {
-            sponsorNonce,
-            walletIndex: sponsorWalletIndex,
-            txid,
-            fee: sponsorResult.fee,
-            senderTxHex: body.transaction,
-            senderAddress: validation.senderAddress,
-            senderNonce: Number(validation.transaction.auth.spendingCondition.nonce),
-            submittedAt,
-          })
-        );
-      }
+      // Token type and transfer amount for stats attribution.
+      // Falls back to { tokenType: "STX", amount: "0" } on any error.
+      const { tokenType: txTokenType, amount: txAmount } = extractTransferDetails(validation.transaction, c.env.STACKS_NETWORK);
 
-      const actualFee = BigInt(sponsorResult.fee);
-      await authService.recordFeeSpent(metadata.keyId, actualFee);
+      await authService.recordFeeSpent(metadata.keyId, BigInt(fee));
 
       // Record successful transaction in global stats (fire-and-forget, never blocks response)
       c.executionCtx.waitUntil(
@@ -486,11 +358,10 @@ export class Sponsor extends BaseEndpoint {
           success: true,
           tokenType: txTokenType,
           amount: txAmount,
-          fee: sponsorResult.fee,
+          fee,
           txid,
           sender: validation.senderAddress,
           status: "pending",
-          walletIndex: sponsorWalletIndex,
         }).catch(() => {})
       );
 
@@ -499,22 +370,21 @@ export class Sponsor extends BaseEndpoint {
         success: true,
         tokenType: txTokenType,
         amount: txAmount,
-        fee: sponsorResult.fee,
+        fee,
       });
 
       logger.info("Transaction sponsored and broadcast", {
         txid,
         sender: validation.senderAddress,
-        fee: sponsorResult.fee,
+        fee,
+        sponsorNonce: sent.sponsorNonce,
         keyId: metadata.keyId,
       });
 
       return this.ok(c, {
         txid,
         explorerUrl: buildExplorerUrl(txid, c.env.STACKS_NETWORK),
-        fee: sponsorResult.fee,
-        nonceExpiresAt: sponsorResult.nonceExpiresAt,
-        sponsorNonceValidForMs: SPONSOR_NONCE_VALID_FOR_MS,
+        fee,
       });
     } catch (e) {
       logger.error("Unexpected error", {
@@ -532,238 +402,4 @@ export class Sponsor extends BaseEndpoint {
       });
     }
   }
-
-  /**
-   * Broadcast a serialized transaction with retry and node failover.
-   *
-   * Uses raw fetch to /v2/transactions instead of the library broadcastTransaction()
-   * to get full control over retry behaviour and to log raw response bodies when
-   * Hiro returns unparseable responses (fixes #211).
-   *
-   * Retry strategy (same as SettlementService):
-   * - Up to BROADCAST_MAX_ATTEMPTS per node with fixed backoff (1s then 2s)
-   * - Fail over to next node after exhausting attempts
-   * - Immediate return on 4xx (transaction-level rejection)
-   * - Retry on 5xx and network/timeout errors
-   */
-  private async broadcastWithRetry(
-    txHex: string,
-    env: Env,
-    logger: Logger
-  ): Promise<BroadcastResult> {
-    const txBytes = Buffer.from(stripHexPrefix(txHex), "hex");
-    if (txBytes.length === 0) {
-      return {
-        success: false,
-        errorMessage: "Failed to broadcast transaction",
-        errorDetails: "Serialized transaction hex could not be converted to bytes",
-        httpStatus: 0,
-        isNonceConflict: false,
-      };
-    }
-
-    const broadcastTargets: BroadcastTarget[] = getBroadcastTargets(
-      env.STACKS_NETWORK, env.HIRO_API_KEY, env.BROADCAST_NODE_URLS
-    );
-
-    let lastError: BroadcastResult & { success: false } | undefined;
-    let totalAttempt = 0;
-
-    for (let nodeIndex = 0; nodeIndex < broadcastTargets.length; nodeIndex++) {
-      const target = broadcastTargets[nodeIndex];
-      const broadcastUrl = `${target.baseUrl}/v2/transactions`;
-      const headers: Record<string, string> = {
-        "Content-Type": "application/octet-stream",
-        ...target.headers,
-      };
-
-      for (let attempt = 1; attempt <= BROADCAST_MAX_ATTEMPTS; attempt++) {
-        totalAttempt++;
-        try {
-          const response = await fetch(broadcastUrl, {
-            method: "POST",
-            headers,
-            body: txBytes,
-            signal: AbortSignal.timeout(BROADCAST_TIMEOUT_MS),
-          });
-
-          const responseText = await response.text();
-
-          if (response.ok) {
-            const parsedTxid = this.parseTxid(responseText);
-            if (!parsedTxid) {
-              logger.error("Broadcast returned OK but unparseable txid", {
-                responseText: responseText.slice(0, 500),
-                contentType: response.headers.get("content-type"),
-                nodeUrl: target.baseUrl,
-              });
-              throw new Error("Node returned OK but txid could not be parsed");
-            }
-            return { success: true, txid: parsedTxid };
-          }
-
-          const { errorMessage, errorDetails } = this.parseErrorBody(responseText, response.status);
-
-          if (!response.headers.get("content-type")?.includes("json")) {
-            logger.warn("Broadcast returned non-JSON error response", {
-              status: response.status,
-              contentType: response.headers.get("content-type"),
-              bodyPreview: responseText.slice(0, 500),
-              nodeUrl: target.baseUrl,
-            });
-          }
-
-          const conflictDetails = `${errorMessage}: ${errorDetails}`;
-
-          if (response.status >= 400 && response.status < 500) {
-            return this.handle4xxRejection(logger, response.status, errorMessage, errorDetails, conflictDetails, target.baseUrl);
-          }
-
-          if (response.status >= 500) {
-            this.logRetriableFailure(logger, totalAttempt, conflictDetails, attempt, nodeIndex, broadcastTargets.length, target.baseUrl);
-            lastError = {
-              success: false,
-              errorMessage: "Failed to broadcast transaction",
-              errorDetails: conflictDetails,
-              httpStatus: response.status,
-              isNonceConflict: false,
-              nodeUrl: target.baseUrl,
-            };
-            if (attempt < BROADCAST_MAX_ATTEMPTS) {
-              await this.retryDelay(attempt);
-            }
-            continue;
-          }
-
-          logger.error("Broadcast failed with unexpected status", {
-            status: response.status,
-            bodyPreview: responseText.slice(0, 500),
-            nodeUrl: target.baseUrl,
-          });
-          return {
-            success: false,
-            errorMessage: "Failed to broadcast transaction",
-            errorDetails,
-            httpStatus: response.status,
-            isNonceConflict: false,
-            nodeUrl: target.baseUrl,
-          };
-        } catch (e) {
-          const errMsg = e instanceof Error ? e.message : String(e);
-          this.logRetriableFailure(logger, totalAttempt, errMsg, attempt, nodeIndex, broadcastTargets.length, target.baseUrl);
-          lastError = {
-            success: false,
-            errorMessage: "Failed to broadcast transaction",
-            errorDetails: errMsg,
-            httpStatus: 0,
-            isNonceConflict: false,
-            nodeUrl: target.baseUrl,
-          };
-          if (attempt < BROADCAST_MAX_ATTEMPTS) {
-            await this.retryDelay(attempt);
-          }
-        }
-      }
-    }
-
-    logger.error("Broadcast failed after all nodes and attempts", {
-      totalAttempts: totalAttempt,
-    });
-
-    return lastError ?? {
-      success: false,
-      errorMessage: "Failed to broadcast transaction",
-      errorDetails: "All broadcast targets exhausted",
-      httpStatus: 0,
-      isNonceConflict: false,
-    };
-  }
-
-  private parseTxid(responseText: string): string | null {
-    try {
-      const parsed: unknown = JSON.parse(responseText);
-      if (typeof parsed === "string" && parsed) return parsed;
-    } catch {
-      const trimmed = responseText.trim().replace(/^"|"$/g, "");
-      if (trimmed) return trimmed;
-    }
-    return null;
-  }
-
-  private parseErrorBody(
-    responseText: string,
-    status: number
-  ): { errorMessage: string; errorDetails: string } {
-    let errorMessage = `HTTP ${status}`;
-    let errorDetails = responseText.slice(0, 500);
-    try {
-      const json = JSON.parse(responseText) as { error?: string; reason?: string; message?: string };
-      if (json.error || json.reason || json.message) {
-        errorMessage = json.error ?? json.message ?? errorMessage;
-        errorDetails = json.reason ?? errorDetails;
-      }
-    } catch {
-      // Not JSON — use raw text
-    }
-    return { errorMessage, errorDetails };
-  }
-
-  private handle4xxRejection(
-    logger: Logger,
-    status: number,
-    errorMessage: string,
-    errorDetails: string,
-    conflictDetails: string,
-    nodeUrl: string
-  ): BroadcastResult & { success: false } {
-    const isNonceConflict = NONCE_CONFLICT_REASONS.some((r) => conflictDetails.includes(r));
-    const clientRejection = CLIENT_REJECTION_REASONS.find((r) => conflictDetails.includes(r));
-
-    const logMethod = clientRejection ? "warn" : "error";
-    const logLabel = clientRejection ? "Broadcast rejected by node (client error)" : "Broadcast rejected by node";
-    logger[logMethod](logLabel, {
-      status,
-      error: errorMessage,
-      reason: errorDetails,
-      ...(clientRejection && { clientRejection }),
-      nodeUrl,
-    });
-
-    return { success: false, errorMessage, errorDetails, httpStatus: status, isNonceConflict, clientRejection, nodeUrl };
-  }
-
-  private logRetriableFailure(
-    logger: Logger,
-    totalAttempt: number,
-    details: string,
-    attempt: number,
-    nodeIndex: number,
-    nodeCount: number,
-    nodeUrl: string
-  ): void {
-    const hasMoreAttempts = attempt < BROADCAST_MAX_ATTEMPTS;
-    const hasMoreNodes = nodeIndex < nodeCount - 1;
-    const retryDelay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
-
-    let retryMsg: string;
-    if (hasMoreAttempts) {
-      retryMsg = `retrying same node in ${retryDelay}ms`;
-    } else if (hasMoreNodes) {
-      retryMsg = "moving to next node";
-    } else {
-      retryMsg = "no retries remaining";
-    }
-
-    logger.warn(`Broadcast attempt ${totalAttempt} failed: ${details}, ${retryMsg}`, {
-      attempt,
-      maxAttempts: BROADCAST_MAX_ATTEMPTS,
-      nodeUrl,
-    });
-  }
-
-  private retryDelay(attempt: number): Promise<void> {
-    const delay = attempt === 1 ? BROADCAST_RETRY_BASE_DELAY_MS : BROADCAST_RETRY_MAX_DELAY_MS;
-    return new Promise((r) => setTimeout(r, delay));
-  }
 }
-

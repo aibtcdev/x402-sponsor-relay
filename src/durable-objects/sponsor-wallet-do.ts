@@ -14,11 +14,14 @@ const HIRO_NONCE_TIMEOUT_MS = 10_000;
 /** Default cap on sponsor fees spent per UTC day (µSTX) — override with SPONSOR_DAILY_BUDGET_USTX */
 export const DEFAULT_DAILY_BUDGET_USTX = 10_000_000n;
 
-/** Persisted fee spend for the current UTC day. */
+/** Persisted fee spend for the current UTC day, one counter per budget name. */
 export interface BudgetStore {
-  get(): Promise<{ day: string; spent: string } | undefined>;
-  put(value: { day: string; spent: string }): Promise<void>;
+  get(name: string): Promise<{ day: string; spent: string } | undefined>;
+  put(name: string, value: { day: string; spent: string }): Promise<void>;
 }
+
+/** x402 payments spend "budget" (read by /status/sponsor and the alert cron); /sponsor spends its own. */
+export type BudgetName = "budget" | "budget:sponsor";
 
 export interface SponsorWalletRequest {
   txHex: string;
@@ -26,6 +29,8 @@ export interface SponsorWalletRequest {
   fee: string;
   /** Origin (payer) address — one sponsored payment per sender may be in flight */
   senderAddress: string;
+  /** Daily budget this fee counts against (default "budget") */
+  budget?: BudgetName;
 }
 
 /** Why a sender's payment was refused before signing (maps to the RPC SENDER_NONCE_* codes). */
@@ -81,7 +86,7 @@ export class SponsorWallet {
     return run;
   }
 
-  private async run({ txHex, sponsorKey, fee, senderAddress }: SponsorWalletRequest): Promise<SponsorWalletResult> {
+  private async run({ txHex, sponsorKey, fee, senderAddress, budget: budgetName = "budget" }: SponsorWalletRequest): Promise<SponsorWalletResult> {
     const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
     const address = getAddressFromPrivateKey(sponsorKey, network);
     const senderNonce = Number(deserializeTransaction(stripHexPrefix(txHex)).auth.spendingCondition.nonce);
@@ -91,11 +96,11 @@ export class SponsorWallet {
 
     // Daily budget: bounds what any caller — including a leaked binding or a bug — can burn.
     const day = new Date().toISOString().slice(0, 10);
-    const stored = await this.budget.get();
+    const stored = await this.budget.get(budgetName);
     const spent = stored?.day === day ? BigInt(stored.spent) : 0n;
     const limit = BigInt(this.env.SPONSOR_DAILY_BUDGET_USTX ?? DEFAULT_DAILY_BUDGET_USTX);
     if (spent + BigInt(fee) > limit) {
-      this.logger.error("sponsor_daily_budget_reached", { address, spent: spent.toString(), limit: limit.toString() });
+      this.logger.error("sponsor_daily_budget_reached", { address, budget: budgetName, spent: spent.toString(), limit: limit.toString() });
       return {
         ok: false,
         error: "Daily sponsor budget reached",
@@ -131,12 +136,15 @@ export class SponsorWallet {
       if ("txid" in result) {
         this.nextNonce = nonce + 1n;
         this.inFlight.set(senderAddress, { nonce: senderNonce, at: Date.now() });
-        await this.budget.put({ day, spent: (spent + BigInt(fee)).toString() });
+        await this.budget.put(budgetName, { day, spent: (spent + BigInt(fee)).toString() });
         this.logger.info("sponsor_broadcast_ok", { address, nonce: Number(nonce), txid: result.txid, fee });
         return { ok: true, txid: result.txid, sponsorNonce: Number(nonce), fee };
       }
 
-      this.nextNonce = null;
+      // A node rejection (4xx) other than a nonce conflict left this nonce unused: keep it,
+      // since Hiro may still lag our last broadcast. Otherwise re-read the chain next time.
+      const rejected = result.httpStatus !== undefined && result.httpStatus >= 400 && result.httpStatus < 500;
+      this.nextNonce = rejected && !result.nonceConflict ? nonce : null;
       this.logger.warn("sponsor_broadcast_failed", {
         address,
         nonce: Number(nonce),
@@ -231,8 +239,8 @@ export class SponsorWalletDO {
       (tx) => settlement.broadcastOnly(tx),
       (address) => fetchHiroNonces(env, address),
       {
-        get: () => state.storage.get<{ day: string; spent: string }>("budget"),
-        put: (value) => state.storage.put("budget", value),
+        get: (name) => state.storage.get<{ day: string; spent: string }>(name),
+        put: (name, value) => state.storage.put(name, value),
       }
     );
   }

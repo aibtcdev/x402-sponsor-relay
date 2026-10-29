@@ -47,13 +47,17 @@ async function sponsoredTxHex(key = senderKey, nonce = 0n): Promise<string> {
   return tx.serialize();
 }
 
-function memoryBudget(initial?: { day: string; spent: string }): BudgetStore & { value?: { day: string; spent: string } } {
-  const store: BudgetStore & { value?: { day: string; spent: string } } = {
-    value: initial,
-    get: async () => store.value,
-    put: async (v) => { store.value = v; },
+type Spend = { day: string; spent: string };
+
+/** In-memory budget store; `value` is the x402 payments' "budget" counter. */
+function memoryBudget(initial?: Spend): BudgetStore & { value?: Spend; all: Map<string, Spend> } {
+  const all = new Map<string, Spend>(initial ? [["budget", initial]] : []);
+  return {
+    all,
+    get value() { return all.get("budget"); },
+    get: async (name) => all.get(name),
+    put: async (name, v) => { all.set(name, v); },
   };
-  return store;
 }
 
 const sponsorNonceOf = (tx: unknown) =>
@@ -181,6 +185,55 @@ describe("SponsorWallet", () => {
     await wallet.sponsorAndBroadcast({ txHex: await sponsoredTxHex(), sponsorKey, fee: "3000", senderAddress });
 
     expect(budget.value).toEqual({ day: new Date().toISOString().slice(0, 10), spent: "3000" });
+  });
+
+  it("counts /sponsor fees against their own budget, not the x402 payments' one", async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    const budget = memoryBudget({ day, spent: "9000" });
+    const wallet = new SponsorWallet(
+      { ...env, SPONSOR_DAILY_BUDGET_USTX: "10000" } as Env,
+      logger, async () => ({ txid: "t" }), nonces({ possible_next_nonce: 0 }), budget
+    );
+
+    const result = await wallet.sponsorAndBroadcast({
+      txHex: await sponsoredTxHex(), sponsorKey, fee: "3000", senderAddress, budget: "budget:sponsor",
+    });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(budget.all.get("budget:sponsor")).toEqual({ day, spent: "3000" });
+    expect(budget.value).toEqual({ day, spent: "9000" });
+  });
+
+  it("keeps the sponsor nonce after a node rejection that is not a nonce conflict", async () => {
+    const fetchNonces = nonces({ possible_next_nonce: 7 });
+    const broadcast = vi.fn()
+      .mockResolvedValueOnce({ txid: "a" })
+      .mockResolvedValueOnce({ error: "Broadcast failed", details: "", retryable: false, clientRejection: "NotEnoughFunds", httpStatus: 400, responsible: "sender" })
+      .mockResolvedValueOnce({ txid: "b" });
+    const wallet = new SponsorWallet(env, logger, broadcast, fetchNonces, memoryBudget());
+    const other = makeRandomPrivKey();
+    const third = makeRandomPrivKey();
+
+    await wallet.sponsorAndBroadcast({ txHex: await sponsoredTxHex(), sponsorKey, fee: "3000", senderAddress });
+    await wallet.sponsorAndBroadcast({ txHex: await sponsoredTxHex(other), sponsorKey, fee: "3000", senderAddress: getAddressFromPrivateKey(other, "testnet") });
+    const result = await wallet.sponsorAndBroadcast({ txHex: await sponsoredTxHex(third), sponsorKey, fee: "3000", senderAddress: getAddressFromPrivateKey(third, "testnet") });
+
+    expect(result).toMatchObject({ ok: true, txid: "b", sponsorNonce: 8 });
+    expect(fetchNonces.mock.calls.filter(([a]) => a === sponsorAddress)).toHaveLength(1);
+  });
+
+  it("re-reads the chain after a broadcast with no node answer", async () => {
+    const fetchNonces = nonces({ possible_next_nonce: 7 });
+    const broadcast = vi.fn()
+      .mockResolvedValueOnce({ error: "Broadcast failed", details: "timeout", retryable: true })
+      .mockResolvedValueOnce({ txid: "b" });
+    const wallet = new SponsorWallet(env, logger, broadcast, fetchNonces, memoryBudget());
+    const other = makeRandomPrivKey();
+
+    await wallet.sponsorAndBroadcast({ txHex: await sponsoredTxHex(), sponsorKey, fee: "3000", senderAddress });
+    await wallet.sponsorAndBroadcast({ txHex: await sponsoredTxHex(other), sponsorKey, fee: "3000", senderAddress: getAddressFromPrivateKey(other, "testnet") });
+
+    expect(fetchNonces.mock.calls.filter(([a]) => a === sponsorAddress)).toHaveLength(2);
   });
 
   it("keeps the client's origin signature intact", async () => {
