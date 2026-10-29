@@ -716,9 +716,15 @@ No authentication required.
   ],
   "extensions": ["payment-identifier"],     // client-controlled idempotency keys
   "signers": {
-    "stacks:*": []                           // empty = any signer accepted
+    "stacks:*": []                           // empty: this relay advertises no signer
   }
 }
+
+signers (x402 V2 spec 7.3.1) lists the facilitator's own public signer addresses. This relay
+lists none because /settle does not co-sign: there is no fee payer to put in a 402's
+extra.feePayer. The x402-stacks README "Sponsored transactions" recipe
+(supported.signers['stacks:1'][0]) therefore finds nothing here (signers has no 'stacks:1'
+key, so that lookup throws) and must not be pointed at this relay. Clients sign self-paid.
 
 payment-identifier extension: include a stable id in paymentPayload.extensions to get
 idempotency that survives transaction rebuilds. Same id + same payload = cached response.
@@ -1662,9 +1668,14 @@ GET https://x402-relay.aibtc.com/supported
   ],
   "extensions": ["payment-identifier"],     // client-controlled idempotency extension
   "signers": {
-    "stacks:*": []                           // empty = any signer accepted
+    "stacks:*": []                           // empty: this relay advertises no signer
   }
 }
+
+signers lists the facilitator's own public signer addresses (x402 V2 spec 7.3.1). It is empty
+because /settle does not co-sign, so there is no fee payer for a 402's extra.feePayer. Do not
+use the x402-stacks README "Sponsored transactions" recipe (supported.signers['stacks:1'][0])
+with this relay: the 'stacks:1' key is absent and the lookup throws. Sign self-paid.
 
 ## Payment-Identifier Extension
 
