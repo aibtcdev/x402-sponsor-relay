@@ -45,7 +45,9 @@ env.X402_RELAY.checkPayment(paymentId: string): Promise<RpcCheckPaymentResult>
 env.X402_RELAY.getSponsorStatus(): Promise<SponsorStatusResult>
 ```
 
-`sponsorPayment` is the only path that pays the STX fee for the payer: it co-signs a transaction built with `sponsored: true, fee: 0`, broadcasts it, and returns `{ success, txid, payer, fee }` or `{ success: false, code, error, retryable }`. The public HTTP `/settle` never sponsors. `SponsorPaymentResult` is defined in `src/rpc.ts`, and `SettleOptions` in `src/types.ts`. See [Pattern: advertise gasless payments in your 402](#pattern-advertise-gasless-payments-in-your-402) for what the resource server must put in its `payment-required` response so clients build that kind of transaction.
+`sponsorPayment` is the only path that pays the STX fee for the payer: it co-signs a transaction built with `sponsored: true, fee: 0`, broadcasts it, and returns `{ success, txid, payer, fee }` or `{ success: false, code, error, retryable }`. The public HTTP `/settle` never sponsors.
+
+`sponsorPayment` is safe to retry with the same transaction hex. When a broadcast gets no clear answer from the node (timeout, 5xx, or a nonce conflict with its own earlier copy), the relay checks Hiro for the txid it signed and reports success if the node took it. If Hiro has not indexed it yet, the call fails with `retryable: true` and the payer is held (`SENDER_NONCE_DUPLICATE`) instead of being sponsored twice. Resubmitting the same hex within 24 hours returns the txid of the earlier sponsorship once Hiro shows it pending or mined, without broadcasting again or counting against the rate limit. `SponsorPaymentResult` is defined in `src/rpc.ts`, and `SettleOptions` in `src/types.ts`. See [Pattern: advertise gasless payments in your 402](#pattern-advertise-gasless-payments-in-your-402) for what the resource server must put in its `payment-required` response so clients build that kind of transaction.
 
 The `RpcSubmitPaymentResult`, `RpcCheckPaymentResult`, and `SponsorStatusResult` types are the canonical contract. They are exported from `@aibtc/tx-schemas/rpc` and consumers should import from there to stay version-locked:
 
