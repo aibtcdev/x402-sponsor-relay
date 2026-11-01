@@ -499,7 +499,7 @@ describe("payment polling runtime alignment", () => {
     expect(httpResult.terminalReason).toBe("unknown_payment_identity");
   });
 
-  it("surfaces held sender-wedge diagnostics consistently from RPC and HTTP polling", async () => {
+  it("surfaces held-payment details consistently from RPC and HTTP polling, without touching NonceDO", async () => {
     const kv = new MemoryKV();
     const heldRecord = transitionPayment(
       createPaymentRecord("pay_held", "testnet"),
@@ -515,32 +515,13 @@ describe("payment polling runtime alignment", () => {
     heldRecord.relayState = "held";
     await putPaymentRecord(kv, heldRecord);
 
+    // Held payments wait in the queue for SponsorWalletDO; NonceDO sender rows no longer gate them.
+    const nonceDoFetch = vi.fn();
     const env = {
       RELAY_KV: kv,
       STACKS_NETWORK: "testnet",
       RELAY_BASE_URL: "https://x402-relay.aibtc.dev",
-      NONCE_DO: {
-        idFromName: () => "sponsor",
-        get: () => ({
-          fetch: vi.fn(async () => new Response(JSON.stringify({
-            senderAddress: "STHOLD000000000000000000000000000000000",
-            blocked: true,
-            blockedOnFrontierMismatch: true,
-            adminRecoveryLikely: false,
-            nextExpectedNonce: 4,
-            lowestHeldNonce: 6,
-            missingNonces: [4, 5],
-            heldCount: 1,
-            oldestHeldAgeMs: 120000,
-            lastRepairAttemptAt: null,
-            lastRepairFailureAt: null,
-            repairEligible: false,
-            repairTriggered: true,
-            repairAdvanced: false,
-            activePaymentIds: ["pay_held"],
-          }))),
-        }),
-      },
+      NONCE_DO: { idFromName: () => "sponsor", get: () => ({ fetch: nonceDoFetch }) },
     } as unknown as Env;
 
     const rpc = new RelayRPC(executionContext, env);
@@ -554,24 +535,15 @@ describe("payment polling runtime alignment", () => {
     const httpBody = await response.json();
 
     expect(response.status).toBe(200);
-    expect(rpcResult.status).toBe("queued");
-    expect(httpBody.status).toBe("queued");
-    expect((rpcResult as Record<string, unknown>).relayState).toBe("held");
-    expect((rpcResult as Record<string, unknown>).holdReason).toBe("gap");
-    expect((rpcResult as Record<string, unknown>).nextExpectedNonce).toBe(4);
-    expect((rpcResult as Record<string, unknown>).missingNonces).toEqual([4, 5]);
-    expect((rpcResult as Record<string, unknown>).senderWedge).toEqual(
-      expect.objectContaining({
-        blockedOnFrontierMismatch: true,
-        repairTriggered: true,
-      })
-    );
-    expect(httpBody.senderWedge).toEqual(
-      expect.objectContaining({
-        senderAddress: "STHOLD000000000000000000000000000000000",
-        missingNonces: [4, 5],
-      })
-    );
+    for (const result of [rpcResult as Record<string, unknown>, httpBody as Record<string, unknown>]) {
+      expect(result.status).toBe("queued");
+      expect(result.relayState).toBe("held");
+      expect(result.holdReason).toBe("gap");
+      expect(result.nextExpectedNonce).toBe(4);
+      expect(result.missingNonces).toEqual([4, 5]);
+      expect(result.senderWedge).toBeUndefined();
+    }
+    expect(nonceDoFetch).not.toHaveBeenCalled();
   });
 });
 
