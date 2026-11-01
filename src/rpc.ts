@@ -57,7 +57,7 @@ import {
   markInFlight,
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
-import { repairSenderWedgeDO, SettlementService, SponsorService } from "./services";
+import { SettlementService, SponsorService } from "./services";
 import { getPaymentSponsorStatus } from "./services/payment-sponsor-status";
 
 export type { SubmitPaymentResult, CheckPaymentResult };
@@ -68,7 +68,6 @@ type RelayCheckPaymentResult = CheckPaymentResult & {
   nextExpectedNonce?: number;
   missingNonces?: number[];
   holdExpiresAt?: string;
-  senderWedge?: import("./types").SenderWedgeStatus;
 };
 
 type PublicRpcErrorCode = (typeof RPC_ERROR_CODES)[number];
@@ -200,7 +199,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
    * 1. Deserializes and validates the transaction
    * 2. Checks sender nonce health against KV cache
    * 3. Generates paymentId and writes initial status to KV
-   * 4. Enqueues to PAYMENT_QUEUE
+   * 4. Enqueues to PAYMENT_QUEUE — the consumer sponsors through the payment sponsor
+   *    (SponsorWalletDO), the same wallet as sponsorPayment()
    * 5. Returns immediately with paymentId + sender nonce info
    */
   async submitPayment(
@@ -311,7 +311,12 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
 
     // Balance preflight: refuse payments the sender can't cover, and stop accepting
     // when every sponsor wallet is out of STX, before any nonce or queue state is touched.
-    const preflight = await new SponsorService(this.env, logger).preflightSponsoredPayment(transaction);
+    // The queue consumer sponsors with the payment sponsor, so check that wallet's balance.
+    const paymentSponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
+    const preflight = await new SponsorService(this.env, logger).preflightSponsoredPayment(
+      transaction,
+      paymentSponsorKey ? [paymentSponsorKey] : []
+    );
     if (preflight) {
       return { accepted: false, error: preflight.error, code: preflight.code, retryable: preflight.retryable };
     }
@@ -602,16 +607,6 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     }
 
     let refreshedRecord = record;
-    let senderWedge;
-    if (
-      record.status === "queued" &&
-      record.relayState === "held" &&
-      record.holdReason === "gap" &&
-      record.senderAddress
-    ) {
-      senderWedge = await repairSenderWedgeDO(this.env, logger, record.senderAddress);
-      refreshedRecord = (await getPaymentRecord(kv, paymentId)) ?? record;
-    }
 
     // Self-healing: check on-chain status for payments stuck in mempool
     refreshedRecord = await selfHealMempoolRecord(
@@ -647,7 +642,6 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       }),
       ...(projected.missingNonces && { missingNonces: projected.missingNonces }),
       ...(projected.holdExpiresAt && { holdExpiresAt: projected.holdExpiresAt }),
-      ...(senderWedge && { senderWedge }),
       checkStatusUrl,
     };
   }
