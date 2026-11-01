@@ -27,15 +27,10 @@ import { MemoryKV } from "./helpers/memory-kv";
 
 const mocks = vi.hoisted(() => ({
   deserializeTransaction: vi.fn(),
-  sponsorTransaction: vi.fn(),
-  broadcastOnly: vi.fn(),
+  sponsorAndBroadcast: vi.fn(),
   verifyPaymentParams: vi.fn(),
   clearInFlight: vi.fn(),
   updateSenderNonceOnBroadcast: vi.fn(),
-  extractSponsorNonce: vi.fn(),
-  releaseNonceDO: vi.fn(),
-  nonceLifecycleOnBroadcastSuccess: vi.fn(),
-  repairSenderWedgeDO: vi.fn(),
   fetch: vi.fn(),
 }));
 
@@ -53,22 +48,15 @@ vi.mock("../services", async () => {
   return {
     ...actual,
     SponsorService: class {
-      async sponsorTransaction(transaction: unknown) {
-        return mocks.sponsorTransaction(transaction);
+      async sponsorAndBroadcast(transaction: unknown) {
+        return mocks.sponsorAndBroadcast(transaction);
       }
     },
     SettlementService: class {
-      async broadcastOnly(transaction: unknown) {
-        return mocks.broadcastOnly(transaction);
-      }
       verifyPaymentParams(txHex: unknown, settle: unknown) {
         return mocks.verifyPaymentParams(txHex, settle);
       }
     },
-    extractSponsorNonce: mocks.extractSponsorNonce,
-    releaseNonceDO: mocks.releaseNonceDO,
-    nonceLifecycleOnBroadcastSuccess: mocks.nonceLifecycleOnBroadcastSuccess,
-    repairSenderWedgeDO: mocks.repairSenderWedgeDO,
   };
 });
 
@@ -130,12 +118,8 @@ const DEFAULT_SETTLE = {
 describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.extractSponsorNonce.mockReturnValue(55);
     mocks.clearInFlight.mockResolvedValue(undefined);
     mocks.updateSenderNonceOnBroadcast.mockResolvedValue(undefined);
-    mocks.releaseNonceDO.mockResolvedValue(undefined);
-    mocks.nonceLifecycleOnBroadcastSuccess.mockResolvedValue(undefined);
-    mocks.repairSenderWedgeDO.mockResolvedValue(null);
     // Replace global fetch with the vitest mock
     vi.stubGlobal("fetch", mocks.fetch);
   });
@@ -166,13 +150,10 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_hex") return sponsoredTx;
       throw new Error(`unexpected hex: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_hex",
-      walletIndex: 0,
-      fee: "1000",
-    });
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sender",
       error: "ConflictingNonceInMempool",
       nonceConflict: true,
       retryable: false,
@@ -263,13 +244,10 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_mismatch") return sponsoredTx;
       throw new Error(`unexpected hex: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_mismatch",
-      walletIndex: 1,
-      fee: "1000",
-    });
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sender",
       error: "ConflictingNonceInMempool",
       nonceConflict: true,
       retryable: false,
@@ -341,13 +319,10 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_fail") return { id: "sponsored" };
       throw new Error(`unexpected: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_fail",
-      walletIndex: 0,
-      fee: "1000",
-    });
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sender",
       error: "ConflictingNonceInMempool",
       nonceConflict: true,
       retryable: false,
@@ -406,13 +381,10 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_notfound") return { id: "sponsored" };
       throw new Error(`unexpected: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_notfound",
-      walletIndex: 0,
-      fee: "1000",
-    });
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sender",
       error: "ConflictingNonceInMempool",
       nonceConflict: true,
       retryable: false,
@@ -471,13 +443,10 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_attr") return { id: "sponsored_attr" };
       throw new Error(`unexpected: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_attr",
-      walletIndex: 0,
-      fee: "1000",
-    });
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sender",
       error: "ConflictingNonceInMempool",
       nonceConflict: true,
       retryable: true,
@@ -536,14 +505,11 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_sponsor") return { id: "sponsored_sponsor" };
       throw new Error(`unexpected: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_sponsor",
-      walletIndex: 2,
-      fee: "2000",
-    });
     // TooMuchChaining is sponsor-side (isTooMuchChaining=true, isNonceConflict=false)
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sponsor",
       error: "TooMuchChaining",
       tooMuchChaining: true,
       isOriginChaining: false,
@@ -599,13 +565,10 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_p1_hex") return sponsoredTx;
       throw new Error(`unexpected hex: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_p1_hex",
-      walletIndex: 0,
-      fee: "1000",
-    });
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sender",
       error: "ConflictingNonceInMempool",
       nonceConflict: true,
       retryable: false,
@@ -692,13 +655,10 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_aborted") return { id: "sponsored_aborted" };
       throw new Error(`unexpected hex: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_aborted",
-      walletIndex: 0,
-      fee: "1000",
-    });
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sender",
       error: "ConflictingNonceInMempool",
       nonceConflict: true,
       retryable: false,
@@ -792,13 +752,10 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       if (hex === "sponsored_rawfail") return { id: "sponsored_rawfail" };
       throw new Error(`unexpected hex: ${hex}`);
     });
-    mocks.sponsorTransaction.mockResolvedValue({
-      success: true,
-      sponsoredTxHex: "sponsored_rawfail",
-      walletIndex: 0,
-      fee: "1000",
-    });
-    mocks.broadcastOnly.mockResolvedValue({
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false,
+      details: "",
+      responsible: "sender",
       error: "ConflictingNonceInMempool",
       nonceConflict: true,
       retryable: false,
