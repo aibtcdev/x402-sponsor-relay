@@ -38,7 +38,12 @@ export type SenderNonceCode = "SENDER_NONCE_DUPLICATE" | "SENDER_NONCE_STALE" | 
 
 export type SponsorWalletResult =
   | { ok: true; txid: string; sponsorNonce: number; fee: string; /** Already sponsored earlier; this call broadcast nothing */ replayed?: boolean }
-  | ({ ok: false; senderNonceCode?: SenderNonceCode } & Extract<BroadcastOnlyResult, { error: string }>);
+  | ({
+      ok: false;
+      senderNonceCode?: SenderNonceCode;
+      /** The sender's next nonce per Hiro, on a SENDER_NONCE_STALE / SENDER_NONCE_GAP refusal */
+      expectedNonce?: number;
+    } & Extract<BroadcastOnlyResult, { error: string }>);
 
 interface HiroNonces {
   possible_next_nonce: number;
@@ -264,9 +269,10 @@ export class SponsorWallet {
     sender: string,
     senderNonce: number
   ): Promise<Extract<SponsorWalletResult, { ok: false }> | null> {
-    const refuse = (code: SenderNonceCode, details: string) => ({
+    const refuse = (code: SenderNonceCode, details: string, expectedNonce?: number) => ({
       ok: false as const,
       senderNonceCode: code,
+      ...(expectedNonce !== undefined && { expectedNonce }),
       error: code === "SENDER_NONCE_DUPLICATE" ? "Previous payment from this sender is still pending" : "Sender nonce out of order",
       details,
       retryable: code !== "SENDER_NONCE_STALE",
@@ -291,10 +297,10 @@ export class SponsorWallet {
       return refuse("SENDER_NONCE_DUPLICATE", "Wait for your previous transaction to confirm, then re-sign and resend");
     }
     if (senderNonce < info.possible_next_nonce) {
-      return refuse("SENDER_NONCE_STALE", `Nonce ${senderNonce} is already used; next is ${info.possible_next_nonce}`);
+      return refuse("SENDER_NONCE_STALE", `Nonce ${senderNonce} is already used; next is ${info.possible_next_nonce}`, info.possible_next_nonce);
     }
     if (senderNonce > info.possible_next_nonce) {
-      return refuse("SENDER_NONCE_GAP", `Nonce ${senderNonce} skips ahead; next is ${info.possible_next_nonce}`);
+      return refuse("SENDER_NONCE_GAP", `Nonce ${senderNonce} skips ahead; next is ${info.possible_next_nonce}`, info.possible_next_nonce);
     }
     return null;
   }
