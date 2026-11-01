@@ -70,7 +70,7 @@ describe("RelayRPC.sponsorPayment", () => {
     });
 
     expect(result).toEqual({
-      success: true, txid: "abc123", payer: getAddressFromPrivateKey(key, "testnet"), fee: "3000",
+      success: true, txid: "abc123", payer: getAddressFromPrivateKey(key, "testnet"), fee: "3000", replayed: true,
     });
     expect(doFetch).toHaveBeenCalledTimes(1);
     expect(rateLimit).not.toHaveBeenCalled();
