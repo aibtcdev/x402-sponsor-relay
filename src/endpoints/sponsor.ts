@@ -344,6 +344,12 @@ export class Sponsor extends BaseEndpoint {
 
       const { txid, fee } = sent;
 
+      // Already sponsored by an earlier call (same tx): return it without charging or counting it again.
+      if (sent.replayed) {
+        logger.info("Transaction already sponsored, returning its txid", { txid, keyId: metadata.keyId });
+        return this.ok(c, { txid, explorerUrl: buildExplorerUrl(txid, c.env.STACKS_NETWORK), fee });
+      }
+
       // Token type and transfer amount for stats attribution.
       // Falls back to { tokenType: "STX", amount: "0" } on any error.
       const { tokenType: txTokenType, amount: txAmount } = extractTransferDetails(validation.transaction, c.env.STACKS_NETWORK);
