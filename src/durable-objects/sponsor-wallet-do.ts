@@ -52,8 +52,10 @@ const SENDER_IN_FLIGHT_MS = 10 * 60_000;
 
 /** How long a sponsored payment's txids are kept so a resubmit of the same tx finds them. */
 export const SENT_TTL_MS = 24 * 60 * 60_000;
-/** Waits before each Hiro lookup of a txid whose broadcast had no clear answer. */
-const UNCLEAR_BROADCAST_CHECK_DELAYS_MS = [1_000, 2_000, 3_000];
+/** Waits before each Hiro lookup of a txid whose broadcast got no answer (timeout, 5xx). */
+const NO_ANSWER_CHECK_DELAYS_MS = [1_000, 2_000, 3_000];
+/** A nonce conflict means the occupant is already at the node: one immediate lookup. */
+const NONCE_CONFLICT_CHECK_DELAYS_MS = [0];
 
 /** Txids this wallet may have put on the network for one client-signed tx. */
 export interface SentRecord {
@@ -210,12 +212,15 @@ export class SponsorWallet {
       const unclear = result.httpStatus === undefined || result.nonceConflict === true;
       if (unclear) {
         await this.recordSent(txHex, txid, Number(nonce), fee);
-        if (await this.awaitSeen(txid)) {
+        const delays = result.httpStatus === undefined ? NO_ANSWER_CHECK_DELAYS_MS : NONCE_CONFLICT_CHECK_DELAYS_MS;
+        if (await this.awaitSeen(txid, delays)) {
           this.logger.warn("sponsor_broadcast_unclear_but_landed", { address, nonce: Number(nonce), txid, fee, error: result.error });
           return accept(txid);
         }
         // The node may still hold it and Hiro not have indexed it yet: keep the sender in
-        // flight so a retry is refused (retryable) instead of sponsored a second time.
+        // flight so a later call is refused (retryable) instead of sponsored a second time.
+        // (A sponsor-nonce conflict below still retries once with a fresh sponsor nonce; both
+        // copies spend the same sender nonce, so at most one can mine.)
         this.inFlight.set(senderAddress, { nonce: senderNonce, at: Date.now() });
       }
 
@@ -247,9 +252,9 @@ export class SponsorWallet {
   }
 
   /** Whether Hiro shows the txid pending or mined within a few seconds (it lags a fresh broadcast). */
-  private async awaitSeen(txid: string): Promise<boolean> {
-    for (const delay of UNCLEAR_BROADCAST_CHECK_DELAYS_MS) {
-      await this.sleep(delay);
+  private async awaitSeen(txid: string, delays: number[]): Promise<boolean> {
+    for (const delay of delays) {
+      if (delay > 0) await this.sleep(delay);
       if (isLanded(await this.txStatus(txid))) return true;
     }
     return false;
