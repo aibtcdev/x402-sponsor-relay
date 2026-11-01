@@ -311,8 +311,13 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
 
     // Balance preflight: refuse payments the sender can't cover, and stop accepting
     // when every sponsor wallet is out of STX, before any nonce or queue state is touched.
-    // The queue consumer sponsors with the payment sponsor, so check that wallet's balance.
+    // The queue consumer sponsors with the payment sponsor: refuse now if it is not set up,
+    // rather than accept a payment that can only fail later, and check that wallet's balance.
     const paymentSponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
+    if (!paymentSponsorKey || !this.env.SPONSOR_WALLET_DO) {
+      logger.error("submitPayment refused: payment sponsor not configured");
+      return { accepted: false, error: "Payment sponsor not configured", code: "INTERNAL_ERROR", retryable: false };
+    }
     const preflight = await new SponsorService(this.env, logger).preflightSponsoredPayment(
       transaction,
       paymentSponsorKey ? [paymentSponsorKey] : []
