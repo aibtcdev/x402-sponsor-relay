@@ -37,7 +37,7 @@ export interface SponsorWalletRequest {
 export type SenderNonceCode = "SENDER_NONCE_DUPLICATE" | "SENDER_NONCE_STALE" | "SENDER_NONCE_GAP";
 
 export type SponsorWalletResult =
-  | { ok: true; txid: string; sponsorNonce: number; fee: string }
+  | { ok: true; txid: string; sponsorNonce: number; fee: string; /** Already sponsored earlier; this call broadcast nothing */ replayed?: boolean }
   | ({ ok: false; senderNonceCode?: SenderNonceCode } & Extract<BroadcastOnlyResult, { error: string }>);
 
 interface HiroNonces {
@@ -49,6 +49,37 @@ interface HiroNonces {
 
 /** How long a sponsored payment counts as in flight if Hiro has not yet seen it execute. */
 const SENDER_IN_FLIGHT_MS = 10 * 60_000;
+
+/** How long a sponsored payment's txids are kept so a resubmit of the same tx finds them. */
+export const SENT_TTL_MS = 24 * 60 * 60_000;
+/** Waits before each Hiro lookup of a txid whose broadcast had no clear answer. */
+const UNCLEAR_BROADCAST_CHECK_DELAYS_MS = [1_000, 2_000, 3_000];
+
+/** Txids this wallet may have put on the network for one client-signed tx. */
+export interface SentRecord {
+  sends: Array<{ txid: string; sponsorNonce: number }>;
+  fee: string;
+  at: number;
+}
+
+/** Persisted SentRecords, keyed by the hash of the client-signed tx. */
+export interface SentStore {
+  get(key: string): Promise<SentRecord | undefined>;
+  put(key: string, value: SentRecord): Promise<void>;
+}
+
+/** Hiro tx_status for a txid, or null when Hiro has not seen it (or could not be read). */
+export type TxStatusLookup = (txid: string) => Promise<string | null>;
+
+/** Key for a client-signed tx: SHA-256 of its hex, so the same bytes map to the same payment. */
+export async function sentKey(txHex: string): Promise<string> {
+  const bytes = new TextEncoder().encode(stripHexPrefix(txHex).toLowerCase());
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Pending or mined: the node took it. Abort or dropped: it will not settle the payment. */
+const isLanded = (status: string | null) => status === "pending" || status === "success";
 
 /**
  * Sponsors and broadcasts one transaction at a time for a single sponsor wallet.
@@ -77,8 +108,27 @@ export class SponsorWallet {
     private readonly logger: Logger,
     private readonly broadcast: (tx: StacksTransactionWire) => Promise<BroadcastOnlyResult>,
     private readonly fetchNonces: (address: string) => Promise<HiroNonces>,
-    private readonly budget: BudgetStore
+    private readonly budget: BudgetStore,
+    private readonly txStatus: TxStatusLookup = async () => null,
+    private readonly sent: SentStore = noSentStore(),
+    private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))
   ) {}
+
+  /**
+   * The txid of an earlier sponsorship of this exact client tx that the node took
+   * (pending or mined), or null. Lets a client that resubmits after a failure answer
+   * — while the first broadcast in fact landed — get the real txid back.
+   */
+  async findSent(txHex: string): Promise<Extract<SponsorWalletResult, { ok: true }> | null> {
+    const record = await this.sent.get(await sentKey(txHex));
+    if (!record || Date.now() - record.at > SENT_TTL_MS) return null;
+    for (const send of record.sends) {
+      if (isLanded(await this.txStatus(send.txid))) {
+        return { ok: true, txid: send.txid, sponsorNonce: send.sponsorNonce, fee: record.fee, replayed: true };
+      }
+    }
+    return null;
+  }
 
   sponsorAndBroadcast(req: SponsorWalletRequest): Promise<SponsorWalletResult> {
     const run = this.tail.then(() => this.run(req));
@@ -90,6 +140,12 @@ export class SponsorWallet {
     const network = this.env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
     const address = getAddressFromPrivateKey(sponsorKey, network);
     const senderNonce = Number(deserializeTransaction(stripHexPrefix(txHex)).auth.spendingCondition.nonce);
+
+    const prior = await this.findSent(txHex);
+    if (prior) {
+      this.logger.info("sponsor_resubmit_found", { address, txid: prior.txid, sponsorNonce: prior.sponsorNonce });
+      return prior;
+    }
 
     const senderRefusal = await this.checkSender(senderAddress, senderNonce);
     if (senderRefusal) return senderRefusal;
@@ -131,14 +187,36 @@ export class SponsorWallet {
         sponsorNonce: nonce,
         network,
       });
+      // Deterministic (RFC 6979 signatures): known before broadcast, so a lost answer can be checked.
+      const txid = sponsored.txid();
       const result = await this.broadcast(sponsored);
 
-      if ("txid" in result) {
+      const accept = async (landedTxid: string): Promise<SponsorWalletResult> => {
         this.nextNonce = nonce + 1n;
         this.inFlight.set(senderAddress, { nonce: senderNonce, at: Date.now() });
         await this.budget.put(budgetName, { day, spent: (spent + BigInt(fee)).toString() });
+        return { ok: true, txid: landedTxid, sponsorNonce: Number(nonce), fee };
+      };
+
+      if ("txid" in result) {
+        await this.recordSent(txHex, result.txid, Number(nonce), fee);
         this.logger.info("sponsor_broadcast_ok", { address, nonce: Number(nonce), txid: result.txid, fee });
-        return { ok: true, txid: result.txid, sponsorNonce: Number(nonce), fee };
+        return accept(result.txid);
+      }
+
+      // No node answer (timeout, 5xx), or a nonce conflict that may be with this very tx after
+      // a retried send: the node may hold it. Write the txid down first so a resubmit can find
+      // it, then ask Hiro whether it landed.
+      const unclear = result.httpStatus === undefined || result.nonceConflict === true;
+      if (unclear) {
+        await this.recordSent(txHex, txid, Number(nonce), fee);
+        if (await this.awaitSeen(txid)) {
+          this.logger.warn("sponsor_broadcast_unclear_but_landed", { address, nonce: Number(nonce), txid, fee, error: result.error });
+          return accept(txid);
+        }
+        // The node may still hold it and Hiro not have indexed it yet: keep the sender in
+        // flight so a retry is refused (retryable) instead of sponsored a second time.
+        this.inFlight.set(senderAddress, { nonce: senderNonce, at: Date.now() });
       }
 
       // A node rejection (4xx) other than a nonce conflict left this nonce unused: keep it,
@@ -149,6 +227,8 @@ export class SponsorWallet {
         address,
         nonce: Number(nonce),
         attempt,
+        txid,
+        unclear,
         error: result.error,
         responsible: result.responsible,
       });
@@ -156,6 +236,23 @@ export class SponsorWallet {
       const sponsorNonceRejected = result.nonceConflict === true && result.responsible !== "sender";
       if (!sponsorNonceRejected || attempt >= 2) return { ok: false, ...result };
     }
+  }
+
+  /** Add a txid to the record for this client tx (a retry with a new sponsor nonce adds a second). */
+  private async recordSent(txHex: string, txid: string, sponsorNonce: number, fee: string): Promise<void> {
+    const key = await sentKey(txHex);
+    const prev = await this.sent.get(key);
+    const sends = (prev?.sends ?? []).filter((s) => s.txid !== txid);
+    await this.sent.put(key, { sends: [...sends, { txid, sponsorNonce }], fee, at: Date.now() });
+  }
+
+  /** Whether Hiro shows the txid pending or mined within a few seconds (it lags a fresh broadcast). */
+  private async awaitSeen(txid: string): Promise<boolean> {
+    for (const delay of UNCLEAR_BROADCAST_CHECK_DELAYS_MS) {
+      await this.sleep(delay);
+      if (isLanded(await this.txStatus(txid))) return true;
+    }
+    return false;
   }
 
   private async checkSender(
@@ -204,6 +301,11 @@ export class SponsorWallet {
   }
 }
 
+function noSentStore(): SentStore {
+  const records = new Map<string, SentRecord>();
+  return { get: async (k) => records.get(k), put: async (k, v) => { records.set(k, v); } };
+}
+
 async function fetchHiroNonces(env: Env, address: string): Promise<HiroNonces> {
   const res = await fetch(`${getHiroBaseUrl(env.STACKS_NETWORK)}/extended/v1/address/${address}/nonces`, {
     headers: getHiroHeaders(env.HIRO_API_KEY),
@@ -241,8 +343,25 @@ export class SponsorWalletDO {
       {
         get: (name) => state.storage.get<{ day: string; spent: string }>(name),
         put: (name, value) => state.storage.put(name, value),
+      },
+      async (txid) => (await settlement.fetchHiroTxStatus(txid))?.txStatus ?? null,
+      {
+        get: (key) => state.storage.get<SentRecord>(`sent:${key}`),
+        put: async (key, value) => {
+          await state.storage.put(`sent:${key}`, value);
+          if ((await state.storage.getAlarm()) === null) await state.storage.setAlarm(Date.now() + SENT_TTL_MS);
+        },
       }
     );
+  }
+
+  /** Drop SentRecords older than SENT_TTL_MS; re-arm while any remain. */
+  async alarm(): Promise<void> {
+    const records = await this.state.storage.list<SentRecord>({ prefix: "sent:" });
+    const cutoff = Date.now() - SENT_TTL_MS;
+    const expired = [...records].filter(([, r]) => r.at < cutoff).map(([k]) => k);
+    for (let i = 0; i < expired.length; i += 128) await this.state.storage.delete(expired.slice(i, i + 128));
+    if (records.size > expired.length) await this.state.storage.setAlarm(Date.now() + SENT_TTL_MS);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -251,6 +370,11 @@ export class SponsorWalletDO {
       const day = new Date().toISOString().slice(0, 10);
       const stored = await this.state.storage.get<{ day: string; spent: string }>("budget");
       return Response.json({ day, spent: stored?.day === day ? stored.spent : "0" });
+    }
+    // POST /lookup: an earlier sponsorship of this client tx that landed, or null
+    if (new URL(request.url).pathname === "/lookup") {
+      const { txHex } = (await request.json()) as { txHex: string };
+      return Response.json(await this.wallet.findSent(txHex));
     }
     const req = (await request.json()) as SponsorWalletRequest;
     return Response.json(await this.wallet.sponsorAndBroadcast(req));
