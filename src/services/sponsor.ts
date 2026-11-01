@@ -1218,6 +1218,25 @@ export class SponsorService {
   }
 
   /**
+   * An earlier sponsorship of this exact client tx by the payment sponsor that the node took
+   * (pending or mined), or null. Fail-open: any error reads as "none found".
+   */
+  async findSponsored(transaction: StacksTransactionWire): Promise<Extract<SponsorWalletResult, { ok: true }> | null> {
+    const ns = this.env.SPONSOR_WALLET_DO;
+    if (!ns) return null;
+    try {
+      const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/lookup", {
+        method: "POST",
+        body: JSON.stringify({ txHex: transaction.serialize() }),
+      });
+      return res.ok ? ((await res.json()) as Extract<SponsorWalletResult, { ok: true }> | null) : null;
+    } catch (e) {
+      this.logger.warn("sponsor_lookup_failed", { error: e instanceof Error ? e.message : String(e) });
+      return null;
+    }
+  }
+
+  /**
    * Balance checks to run before sponsoring a payment, so neither side can make the
    * sponsor pay for a transaction that is bound to fail:
    *  - the sender must hold the transferred amount (STX, or the SIP-010 token it calls
