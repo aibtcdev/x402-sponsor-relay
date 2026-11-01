@@ -144,6 +144,15 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       return { success: false, code: "PAYMENT_MISMATCH", error: "Sender and recipient are the same address", retryable: false };
     }
 
+    // A resubmit of a tx already sponsored and landed (e.g. after a failure answer to a
+    // broadcast the node in fact took) gets that txid back. Checked before the rate limit and
+    // balance preflight: once the payment has landed, the sender may no longer pass either.
+    const prior = await sponsorService.findSponsored(validation.transaction);
+    if (prior) {
+      logger.info("Sponsored payment already broadcast, returning its txid", { txid: prior.txid, payer });
+      return { success: true, txid: prior.txid, payer, fee: prior.fee };
+    }
+
     if (this.env.SPONSOR_RATE_LIMIT) {
       const { success } = await this.env.SPONSOR_RATE_LIMIT.limit({ key: payer });
       if (!success) {
