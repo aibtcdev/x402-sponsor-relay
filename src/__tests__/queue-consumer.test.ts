@@ -129,7 +129,7 @@ describe("queue consumer (payment sponsor via SponsorWalletDO)", () => {
     const gap = await run(kv, "pay_gap");
     const next = await run(kv, "pay_next");
 
-    expect(gap.retry).toHaveBeenCalledWith({ delaySeconds: 10 });
+    expect(gap.retry).toHaveBeenCalledWith({ delaySeconds: 30 });
     expect(gap.ack).not.toHaveBeenCalled();
     expect(await getPaymentRecord(kv, "pay_gap")).toEqual(expect.objectContaining({
       status: "queued", relayState: "held", holdReason: "gap", nextExpectedNonce: 5,
@@ -147,7 +147,7 @@ describe("queue consumer (payment sponsor via SponsorWalletDO)", () => {
     }));
 
     const first = await run(kv, "pay_dup", 2);
-    expect(first.retry).toHaveBeenCalledWith({ delaySeconds: 20 });
+    expect(first.retry).toHaveBeenCalledWith({ delaySeconds: 60 });
     expect(await getPaymentRecord(kv, "pay_dup")).toEqual(expect.objectContaining({ status: "queued", relayState: "queued" }));
 
     const last = await run(kv, "pay_dup", 5);
@@ -226,13 +226,14 @@ describe("queue consumer (payment sponsor via SponsorWalletDO)", () => {
     warnSpy.mockRestore();
   });
 
-  it("terminalizes the daily sponsor budget as sponsor_exhausted once retries run out", async () => {
+  it("fails at once on the daily sponsor budget, which only resets at UTC midnight", async () => {
     const kv = new MemoryKV();
     await queued(kv, "pay_budget", { nonce: 1 });
     mocks.sponsorAndBroadcast.mockResolvedValue(refusal({ error: "Daily sponsor budget reached", responsible: "sponsor" }));
 
-    await run(kv, "pay_budget", 5);
+    const message = await run(kv, "pay_budget", 1);
 
+    expect(message.retry).not.toHaveBeenCalled();
     expect(await getPaymentRecord(kv, "pay_budget")).toEqual(expect.objectContaining({
       status: "failed", terminalReason: "sponsor_exhausted", errorCode: "SPONSOR_EXHAUSTED",
     }));
