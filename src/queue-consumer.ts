@@ -294,8 +294,9 @@ async function recordBroadcastBookkeeping(
 
 /** Queue backoff for a payment that may go through later (seconds). */
 function retryDelaySeconds(attempt: number, senderNotReady: boolean): number {
-  // A sender's next payment waits for the previous one to execute (a block or two).
-  return senderNotReady ? Math.min(60, 10 * attempt) : Math.min(30, Math.pow(2, attempt));
+  // A sender's next payment waits for the previous one to execute and Hiro to index it:
+  // 30s, 60s, 120s, 240s — about 7.5 minutes before the last attempt.
+  return senderNotReady ? Math.min(240, 30 * Math.pow(2, attempt - 1)) : Math.min(30, Math.pow(2, attempt));
 }
 
 /**
@@ -437,7 +438,8 @@ async function handleSponsorFailure(
     : sent.clientRejection ? "broadcast_failure"
     : sent.responsible === "sponsor" ? "sponsor_failure"
     : "broadcast_failure";
-  if (sent.retryable && sent.clientRejection === undefined && canRetry) {
+  // The daily budget only resets at UTC midnight — retrying in seconds cannot help.
+  if (sent.retryable && sent.clientRejection === undefined && !budget && canRetry) {
     await requeue({ error: `Sponsor contention: ${sent.error}` }, "queue_retry_sponsor_contention", "sponsor", false);
     return;
   }
