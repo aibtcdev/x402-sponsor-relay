@@ -96,7 +96,14 @@ function projectRpcErrorCode(errorCode?: string): PublicRpcErrorCode | undefined
  */
 /** Result of RelayRPC.sponsorPayment(). */
 export type SponsorPaymentResult =
-  | { success: true; txid: string; payer: string; fee: string }
+  | {
+      success: true;
+      txid: string;
+      payer: string;
+      fee: string;
+      /** This tx was already sponsored earlier; nothing new was broadcast. Dedupe on txid. */
+      replayed?: boolean;
+    }
   | {
       success: false;
       code:
@@ -150,7 +157,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     const prior = await sponsorService.findSponsored(validation.transaction);
     if (prior) {
       logger.info("Sponsored payment already broadcast, returning its txid", { txid: prior.txid, payer });
-      return { success: true, txid: prior.txid, payer, fee: prior.fee };
+      return { success: true, txid: prior.txid, payer, fee: prior.fee, replayed: true };
     }
 
     if (this.env.SPONSOR_RATE_LIMIT) {
@@ -184,7 +191,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
     logger.info("Sponsored payment broadcast", { txid: sent.txid, payer, fee: sent.fee, sponsorNonce: sent.sponsorNonce });
-    return { success: true, txid: sent.txid, payer, fee: sent.fee };
+    return { success: true, txid: sent.txid, payer, fee: sent.fee, ...(sent.replayed && { replayed: true }) };
   }
 
   /**
