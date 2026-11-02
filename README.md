@@ -323,7 +323,7 @@ if (receiptId) {
 |--------|------|------|-------------|
 | GET | `/` | None | Service info |
 | GET | `/health` | None | Service health summary |
-| GET | `/status/sponsor` | None | x402 payment sponsor readiness (configured, funded, under daily budget) |
+| GET | `/status/sponsor` | None | x402 payment sponsor readiness (configured, funded, under daily budget, Hiro readable) |
 | GET | `/docs` | None | Swagger UI documentation |
 | GET | `/openapi.json` | None | OpenAPI specification |
 | POST | `/relay` | None | Submit transaction via x402 facilitator |

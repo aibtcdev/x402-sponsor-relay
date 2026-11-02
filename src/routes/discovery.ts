@@ -756,9 +756,12 @@ canSponsor is false (HTTP 503, status "unavailable") when any of these reasons a
 - SPONSOR_NOT_CONFIGURED — the relay has no payment sponsor key
 - SPONSOR_BALANCE_LOW — the sponsor wallet holds less than 0.1 STX
 - DAILY_BUDGET_REACHED — today's sponsor fee budget is spent (resets at midnight UTC)
+- HIRO_UNAVAILABLE — the sponsor's Hiro account read failed; sponsored payments need Hiro for
+  the sender and sponsor nonces, so they are refused until it recovers
 
-The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor stays true and
-reconciliation.freshness is "unavailable". noncePool is kept for compatibility (one sponsor, nothing reserved).
+The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor is false with
+HIRO_UNAVAILABLE, reconciliation.freshness is "unavailable" and snapshot.freshness is "expired".
+noncePool is kept for compatibility (one sponsor, nothing reserved).
 
 ### Response
 

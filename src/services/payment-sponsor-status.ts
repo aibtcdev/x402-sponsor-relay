@@ -18,12 +18,15 @@ export interface PaymentSponsorState {
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * to go stale. So readiness is: configured, funded, under today's budget, and Hiro readable.
+ * An unreadable balance blocks with HIRO_UNAVAILABLE: SponsorWalletDO reads the sender and
+ * sponsor nonces from Hiro on every payment and refuses when it can't, so a status that stayed
+ * healthy would keep clients on a path that cannot succeed (#448).
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
   if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
+  else if (s.balance === null) reasons.push("HIRO_UNAVAILABLE");
   if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
@@ -31,6 +34,7 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
 
   const canSponsor = reasons.length === 0;
   const asOf = new Date(nowMs).toISOString();
+  const read = s.balance !== null;
   return {
     status: canSponsor ? "healthy" : "unavailable",
     canSponsor,
@@ -49,10 +53,11 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
     },
     reconciliation: {
       source: "hiro",
-      lastSuccessfulAt: s.balance !== null ? asOf : null,
-      freshness: s.balance !== null ? "fresh" : "unavailable",
+      lastSuccessfulAt: read ? asOf : null,
+      freshness: read ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    // Nothing was read from Hiro, so there is no usable snapshot behind this answer.
+    snapshot: { asOf, ageMs: 0, freshness: read ? "fresh" : "expired" },
   };
 }
 

@@ -54,10 +54,21 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
-    const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
-    expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+  it("is unavailable when the Hiro balance is unreadable, since the payment path refuses then (#448)", () => {
+    const result = toPaymentSponsorStatus(state({ balance: null }), Date.parse("2026-10-27T12:00:00.000Z"));
+    expect(result).toMatchObject({
+      status: "unavailable",
+      canSponsor: false,
+      recommendation: "fallback_to_direct",
+      reasons: ["HIRO_UNAVAILABLE"],
+      reconciliation: { lastSuccessfulAt: null, freshness: "unavailable" },
+      snapshot: { asOf: "2026-10-27T12:00:00.000Z", ageMs: 0, freshness: "expired" },
+    });
+  });
+
+  it("reports only SPONSOR_NOT_CONFIGURED when there is no key to read a balance for", () => {
+    const result = toPaymentSponsorStatus(state({ configured: false, balance: null }));
+    expect(result.reasons).not.toContain("HIRO_UNAVAILABLE");
   });
 });
 
@@ -91,6 +102,26 @@ describe("getPaymentSponsorStatus", () => {
     hiroBalance(1_000n);
     const result = await getPaymentSponsorStatus(env("10000000"), logger);
     expect(result.reasons).toEqual(["SPONSOR_BALANCE_LOW", "DAILY_BUDGET_REACHED"]);
+  });
+
+  it("is unavailable with HIRO_UNAVAILABLE when Hiro returns an error", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("upstream down", { status: 503 }));
+    const result = await getPaymentSponsorStatus(env("0"), logger);
+    expect(result).toMatchObject({
+      status: "unavailable",
+      canSponsor: false,
+      recommendation: "fallback_to_direct",
+      reasons: ["HIRO_UNAVAILABLE"],
+      reconciliation: { freshness: "unavailable" },
+      snapshot: { freshness: "expired" },
+    });
+  });
+
+  it("is unavailable with HIRO_UNAVAILABLE when Hiro cannot be reached", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("fetch failed"));
+    const result = await getPaymentSponsorStatus(env("0"), logger);
+    expect(result.canSponsor).toBe(false);
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
   });
 
   it("does not touch Hiro when the sponsor is not configured", async () => {
