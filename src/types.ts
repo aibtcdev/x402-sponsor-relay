@@ -686,7 +686,16 @@ export interface PoolHealthResponse {
 }
 
 export type SponsorStatusLevel = "healthy" | "degraded" | "unavailable";
-export type SponsorSnapshotFreshness = "fresh" | "stale" | "expired";
+/**
+ * Freshness of the snapshot the status was built from.
+ *
+ * `"unavailable"` is the case #448 made explicit: the read the snapshot would
+ * have come from failed, so there is no age to judge. Before it existed, a
+ * failed Hiro read reported `"fresh"` with `ageMs: 0`, which claimed a reading
+ * that never happened. Mirrors SponsorReconciliationFreshness, which has
+ * carried `"unavailable"` for the same reason.
+ */
+export type SponsorSnapshotFreshness = "fresh" | "stale" | "expired" | "unavailable";
 export type SponsorReconciliationFreshness = "fresh" | "stale" | "unavailable";
 export type SponsorStatusReason =
   | "NO_AVAILABLE_NONCES"
@@ -697,7 +706,8 @@ export type SponsorStatusReason =
   | "SNAPSHOT_STALE"
   | "SPONSOR_NOT_CONFIGURED"
   | "SPONSOR_BALANCE_LOW"
-  | "DAILY_BUDGET_REACHED";
+  | "DAILY_BUDGET_REACHED"
+  | "HIRO_UNAVAILABLE";
 
 export interface SponsorStatusResult {
   status: SponsorStatusLevel;

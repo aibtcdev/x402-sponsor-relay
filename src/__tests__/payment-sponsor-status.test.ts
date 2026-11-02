@@ -54,10 +54,32 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
+  // #448: an unreadable Hiro read blocks. SponsorWalletDO reads the sender and
+  // sponsor nonce from Hiro on every sponsored payment, so `canSponsor: true`
+  // here advertised a path that refuses every payment.
+  it("is unavailable when Hiro is unreadable (the balance read failed)", () => {
     const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
+    expect(result.canSponsor).toBe(false);
+    expect(result.status).toBe("unavailable");
+    expect(result.recommendation).toBe("fallback_to_direct");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
     expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+  });
+
+  it("reports snapshot freshness from the read that produced it", () => {
+    // A failed read is not a fresh snapshot: `freshness` used to be a constant
+    // "fresh" with ageMs 0 even when nothing was read.
+    const unreadable = toPaymentSponsorStatus(state({ balance: null }));
+    expect(unreadable.snapshot.freshness).toBe("unavailable");
+    const readable = toPaymentSponsorStatus(state());
+    expect(readable.snapshot.freshness).toBe("fresh");
+  });
+
+  it("does not stack HIRO_UNAVAILABLE onto an unconfigured sponsor", () => {
+    // No key means no Hiro read was ever attempted, so there is nothing to
+    // report as unavailable about. The single cause stays SPONSOR_NOT_CONFIGURED.
+    const result = toPaymentSponsorStatus(state({ configured: false, balance: null }));
+    expect(result.reasons).toEqual(["SPONSOR_NOT_CONFIGURED"]);
   });
 });
 

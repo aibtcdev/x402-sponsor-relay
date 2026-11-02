@@ -38,6 +38,9 @@ export function getSponsorSnapshotFreshness(
   nowMs = Date.now()
 ): SponsorSnapshotFreshness {
   const ageMs = Math.max(0, nowMs - new Date(asOf).getTime());
+  // `asOf` is the time the snapshot claims to describe. A snapshot whose source
+  // read failed has no such time; callers that know that report "unavailable"
+  // directly rather than routing through this age window (#448).
   if (ageMs <= SPONSOR_STATUS_SNAPSHOT_FRESH_MS) {
     return "fresh";
   }
