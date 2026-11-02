@@ -18,12 +18,17 @@ export interface PaymentSponsorState {
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * to go stale. So readiness is just: configured, funded, and under today's budget.
+ *
+ * An unreadable Hiro read is not readiness. SponsorWalletDO reads its nonce from Hiro for every
+ * sponsored payment, so when Hiro cannot be read the sponsor refuses the payment. Reporting
+ * canSponsor: true there keeps resource servers advertising extra.feePayer on a path that cannot
+ * succeed, so an unreadable balance is reported as HIRO_UNAVAILABLE.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
   if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
+  if (s.configured && s.balance === null) reasons.push("HIRO_UNAVAILABLE");
   if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
@@ -52,7 +57,8 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    // What was actually read: no Hiro read means there is nothing fresh to report.
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "unavailable" },
   };
 }
 
