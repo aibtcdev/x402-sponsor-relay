@@ -54,10 +54,20 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
-    const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
+  it("stops sponsoring when the Hiro balance is unreadable", () => {
+    const result = toPaymentSponsorStatus(state({ balance: null }), Date.parse("2026-11-03T00:00:00.000Z"));
+    expect(result.status).toBe("unavailable");
+    expect(result.canSponsor).toBe(false);
+    expect(result.recommendation).toBe("fallback_to_direct");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
     expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+    expect(result.snapshot).toMatchObject({ freshness: "unavailable" });
+  });
+
+  it("does not blame Hiro when the sponsor is simply not configured", () => {
+    expect(toPaymentSponsorStatus(state({ configured: false, balance: null })).reasons).toEqual([
+      "SPONSOR_NOT_CONFIGURED",
+    ]);
   });
 });
 
