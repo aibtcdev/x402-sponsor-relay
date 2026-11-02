@@ -19,11 +19,19 @@ export interface PaymentSponsorState {
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
  * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * unreadable balance DOES block: the DO reads sender and sponsor nonces from Hiro for
+ * every payment and refuses ("Could not read sender/sponsor nonce") when Hiro cannot be
+ * read, so reporting healthy in that state sends clients onto a path that cannot succeed.
+ * The status therefore fails closed with HIRO_UNAVAILABLE until Hiro reads succeed again.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
   if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
+  // A configured sponsor whose balance could not be read means Hiro is unreadable;
+  // the sponsor DO will refuse every payment in that state, so fail closed here too.
+  // (An unconfigured sponsor never attempted a Hiro read — it reports only
+  // SPONSOR_NOT_CONFIGURED.)
+  if (s.configured && s.balance === null) reasons.push("HIRO_UNAVAILABLE");
   if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
@@ -52,7 +60,9 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    // The snapshot is only as fresh as what was actually read: when the Hiro
+    // balance read failed there is no fresh snapshot to report.
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "unavailable" },
   };
 }
 
