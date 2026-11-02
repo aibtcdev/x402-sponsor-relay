@@ -194,6 +194,6 @@ describe("SponsorStatus schema", () => {
     expect(properties).toHaveProperty("canSponsor");
     expect(properties).toHaveProperty("noncePool");
     expect(properties).toHaveProperty("reconciliation");
-    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired"]);
+    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired", "unavailable"]);
   });
 });

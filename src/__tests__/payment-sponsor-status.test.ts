@@ -5,7 +5,8 @@ import {
   toPaymentSponsorStatus,
   type PaymentSponsorState,
 } from "../services/payment-sponsor-status";
-import type { Env, Logger } from "../types";
+import type { AppContext, Env, Logger } from "../types";
+import { SponsorStatus } from "../endpoints/sponsor-status";
 
 const logger: Logger = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
 
@@ -54,10 +55,20 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
-    const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
+  it("stops sponsoring when the Hiro balance is unreadable", () => {
+    const result = toPaymentSponsorStatus(state({ balance: null }), Date.parse("2026-11-03T00:00:00.000Z"));
+    expect(result.status).toBe("unavailable");
+    expect(result.canSponsor).toBe(false);
+    expect(result.recommendation).toBe("fallback_to_direct");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
     expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+    expect(result.snapshot).toMatchObject({ freshness: "unavailable" });
+  });
+
+  it("does not blame Hiro when the sponsor is simply not configured", () => {
+    expect(toPaymentSponsorStatus(state({ configured: false, balance: null })).reasons).toEqual([
+      "SPONSOR_NOT_CONFIGURED",
+    ]);
   });
 });
 
@@ -93,10 +104,43 @@ describe("getPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["SPONSOR_BALANCE_LOW", "DAILY_BUDGET_REACHED"]);
   });
 
+  it("reports HIRO_UNAVAILABLE when the Hiro read fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("hiro unreachable"));
+    const result = await getPaymentSponsorStatus(env("0"), logger);
+    expect(result.status).toBe("unavailable");
+    expect(result.canSponsor).toBe(false);
+    expect(result.recommendation).toBe("fallback_to_direct");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
+    expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+    expect(result.snapshot.freshness).toBe("unavailable");
+  });
+
   it("does not touch Hiro when the sponsor is not configured", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     const result = await getPaymentSponsorStatus(env("0", { PAYMENT_SPONSOR_PRIVATE_KEY: undefined }), logger);
     expect(result.reasons).toEqual(["SPONSOR_NOT_CONFIGURED"]);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("serves the HTTP route as 503 with HIRO_UNAVAILABLE when Hiro fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("hiro unreachable"));
+    const ctx = {
+      env: env("0"),
+      get: (key: string) => (key === "logger" ? logger : "test-request-id"),
+      header: () => {},
+      json: (body: unknown, status = 200) => new Response(JSON.stringify(body), { status }),
+    };
+    const res = await new SponsorStatus().handle(ctx as unknown as AppContext);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as {
+      canSponsor: boolean;
+      recommendation: string;
+      reasons: string[];
+      snapshot: { freshness: string };
+    };
+    expect(body.canSponsor).toBe(false);
+    expect(body.recommendation).toBe("fallback_to_direct");
+    expect(body.reasons).toEqual(["HIRO_UNAVAILABLE"]);
+    expect(body.snapshot.freshness).toBe("unavailable");
   });
 });
