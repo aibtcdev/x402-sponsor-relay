@@ -54,10 +54,22 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
+  it("is unavailable when the Hiro balance is unreadable (fail-closed)", () => {
+    // SponsorWalletDO reads nonces from Hiro per payment and refuses when Hiro
+    // cannot be read, so an unreadable balance must not report healthy.
     const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
+    expect(result.canSponsor).toBe(false);
+    expect(result.status).toBe("unavailable");
+    expect(result.recommendation).toBe("fallback_to_direct");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
     expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+    expect(result.snapshot.freshness).toBe("unavailable");
+  });
+
+  it("does not blame Hiro when the sponsor is not configured", () => {
+    const result = toPaymentSponsorStatus(state({ configured: false, balance: null }));
+    expect(result.reasons).toEqual(["SPONSOR_NOT_CONFIGURED"]);
+    expect(result.snapshot.freshness).toBe("unavailable");
   });
 });
 
@@ -91,6 +103,16 @@ describe("getPaymentSponsorStatus", () => {
     hiroBalance(1_000n);
     const result = await getPaymentSponsorStatus(env("10000000"), logger);
     expect(result.reasons).toEqual(["SPONSOR_BALANCE_LOW", "DAILY_BUDGET_REACHED"]);
+  });
+
+  it("reports HIRO_UNAVAILABLE when the Hiro balance read fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("hiro down"));
+    const result = await getPaymentSponsorStatus(env("0"), logger);
+    expect(result.canSponsor).toBe(false);
+    expect(result.status).toBe("unavailable");
+    expect(result.recommendation).toBe("fallback_to_direct");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
+    expect(result.snapshot.freshness).toBe("unavailable");
   });
 
   it("does not touch Hiro when the sponsor is not configured", async () => {

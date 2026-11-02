@@ -653,7 +653,9 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
 
   /**
    * Readiness of the x402 payment sponsor that sponsorPayment() uses (SponsorWalletDO):
-   * configured, funded and under today's budget. Balance is KV-cached for 60s.
+   * configured, funded, under today's budget, and Hiro readable — when Hiro cannot be
+   * read the sponsor refuses payments, so this fails closed with HIRO_UNAVAILABLE.
+   * Balance is KV-cached for 60s.
    */
   async getSponsorStatus(): Promise<SponsorStatusResult> {
     const logger = createWorkerLogger(this.env.LOGS, this.ctx, {

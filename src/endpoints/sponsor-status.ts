@@ -14,7 +14,7 @@ export class SponsorStatus extends BaseEndpoint {
     tags: ["Health"],
     summary: "x402 payment sponsor readiness",
     description:
-      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, and under today's fee budget. The balance read is cached for 60s.",
+      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, under today's fee budget, and Hiro readable. When Hiro cannot be read the sponsor refuses every payment, so the status fails closed (canSponsor: false, reason HIRO_UNAVAILABLE) and this route answers 503. The balance read is cached for 60s.",
     responses: {
       "200": {
         description: "Fresh or stale sponsor status snapshot",
@@ -54,6 +54,7 @@ export class SponsorStatus extends BaseEndpoint {
                       "SPONSOR_NOT_CONFIGURED",
                       "SPONSOR_BALANCE_LOW",
                       "DAILY_BUDGET_REACHED",
+                      "HIRO_UNAVAILABLE",
                     ],
                   },
                 },
@@ -131,6 +132,7 @@ export class SponsorStatus extends BaseEndpoint {
                       "SPONSOR_NOT_CONFIGURED",
                       "SPONSOR_BALANCE_LOW",
                       "DAILY_BUDGET_REACHED",
+                      "HIRO_UNAVAILABLE",
                     ],
                   },
                 },
