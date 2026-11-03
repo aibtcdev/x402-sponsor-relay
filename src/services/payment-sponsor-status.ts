@@ -19,13 +19,21 @@ export interface PaymentSponsorState {
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
  * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * unreadable balance DOES block (#448): the DO reads the sender and sponsor nonces from
+ * Hiro on every payment and refuses when Hiro cannot be read, so a status that claimed
+ * readiness during a Hiro outage would steer clients onto a path that cannot succeed.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
   if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
   if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
+  }
+  if (s.configured && s.balance === null) {
+    // Hiro could not be read. SponsorWalletDO refuses every sponsored payment in
+    // this state ("Could not read sender/sponsor nonce"), so the status reports
+    // the payment path's real readiness instead of failing open (#448).
+    reasons.push("HIRO_UNAVAILABLE");
   }
   if (s.spentToday >= s.dailyBudget) reasons.push("DAILY_BUDGET_REACHED");
 
@@ -52,7 +60,10 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    // The snapshot describes the read that just happened: "fresh" only when the
+    // balance actually came back from Hiro. When nothing was read (balance null)
+    // it is "expired", matching reconciliation's "unavailable" (#448).
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "expired" },
   };
 }
 
