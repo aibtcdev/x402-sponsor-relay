@@ -18,12 +18,19 @@ export interface PaymentSponsorState {
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * to go stale. So readiness is just: configured, funded, and under today's budget.
+ *
+ * An unreadable balance blocks. The sponsor cannot read its nonce from Hiro either, so every
+ * sponsored payment fails with "Could not read sender nonce" / "Could not read sponsor nonce";
+ * reporting `canSponsor: true` here would keep resource servers advertising `extra.feePayer`
+ * on a path that cannot succeed (see issue #448). Both the HTTP route and the RPC method read
+ * this one function, so the reason and the recommendation are the same on both surfaces.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
   if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
+  // Only a configured sponsor reads Hiro; when it is not configured there was no read to fail.
+  if (s.configured && s.balance === null) reasons.push("HIRO_UNAVAILABLE");
   if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
@@ -52,7 +59,9 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    // The snapshot describes the Hiro read behind this answer: when that read failed, nothing
+    // was read, so the snapshot is unavailable rather than fresh at age 0.
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "unavailable" },
   };
 }
 

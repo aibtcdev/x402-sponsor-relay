@@ -194,6 +194,23 @@ describe("SponsorStatus schema", () => {
     expect(properties).toHaveProperty("canSponsor");
     expect(properties).toHaveProperty("noncePool");
     expect(properties).toHaveProperty("reconciliation");
-    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired"]);
+    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired", "unavailable"]);
+  });
+
+  it("publishes every reason the service can return (#448)", () => {
+    const endpoint = new SponsorStatus();
+    // Mirrors SponsorStatusReason in src/types.ts; a new reason must reach both schemas.
+    const expected = [
+      "SPONSOR_NOT_CONFIGURED",
+      "HIRO_UNAVAILABLE",
+      "SPONSOR_BALANCE_LOW",
+      "DAILY_BUDGET_REACHED",
+    ];
+    for (const code of ["200", "503"] as const) {
+      const reasons =
+        endpoint.schema.responses[code].content["application/json"].schema.properties.reasons.items.enum;
+      // The schema must not reject a response the service can actually produce.
+      expect(reasons).toEqual(expect.arrayContaining(expected));
+    }
   });
 });
