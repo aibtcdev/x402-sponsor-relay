@@ -194,6 +194,15 @@ describe("SponsorStatus schema", () => {
     expect(properties).toHaveProperty("canSponsor");
     expect(properties).toHaveProperty("noncePool");
     expect(properties).toHaveProperty("reconciliation");
-    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired"]);
+    // The 503 shape can carry every freshness value: a sponsor that is out of
+    // budget or low on balance has status "unavailable" with a *fresh* Hiro
+    // snapshot, and an unreadable read gives "unavailable". The old ["expired"]
+    // described neither (#448).
+    expect(properties.snapshot.properties.freshness.enum).toEqual([
+      "fresh",
+      "stale",
+      "expired",
+      "unavailable",
+    ]);
   });
 });

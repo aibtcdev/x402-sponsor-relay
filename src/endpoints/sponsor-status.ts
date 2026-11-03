@@ -88,7 +88,7 @@ export class SponsorStatus extends BaseEndpoint {
                     ageMs: { type: "number" as const },
                     freshness: {
                       type: "string" as const,
-                      enum: ["fresh", "stale", "expired"],
+                      enum: ["fresh", "stale", "expired", "unavailable"],
                     },
                   },
                 },
@@ -166,7 +166,10 @@ export class SponsorStatus extends BaseEndpoint {
                     ageMs: { type: "number" as const },
                     freshness: {
                       type: "string" as const,
-                      enum: ["expired"],
+                      // This 503 shape listed only "expired" and had already
+                      // drifted from what the mapping emits; align it with the
+                      // 200 shape (#448).
+                      enum: ["fresh", "stale", "expired", "unavailable"],
                     },
                   },
                 },
