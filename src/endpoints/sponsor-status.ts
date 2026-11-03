@@ -14,7 +14,7 @@ export class SponsorStatus extends BaseEndpoint {
     tags: ["Health"],
     summary: "x402 payment sponsor readiness",
     description:
-      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, and under today's fee budget. The balance read is cached for 60s.",
+      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, readable on Hiro, and under today's fee budget. The balance read is cached for 60s.",
     responses: {
       "200": {
         description: "Fresh or stale sponsor status snapshot",
@@ -51,6 +51,7 @@ export class SponsorStatus extends BaseEndpoint {
                       "HEAL_IN_PROGRESS",
                       "RECONCILIATION_STALE",
                       "SNAPSHOT_STALE",
+                      "HIRO_UNAVAILABLE",
                       "SPONSOR_NOT_CONFIGURED",
                       "SPONSOR_BALANCE_LOW",
                       "DAILY_BUDGET_REACHED",
@@ -87,7 +88,7 @@ export class SponsorStatus extends BaseEndpoint {
                     ageMs: { type: "number" as const },
                     freshness: {
                       type: "string" as const,
-                      enum: ["fresh", "stale", "expired"],
+                      enum: ["fresh", "stale", "expired", "unavailable"],
                     },
                   },
                 },
@@ -128,6 +129,7 @@ export class SponsorStatus extends BaseEndpoint {
                       "HEAL_IN_PROGRESS",
                       "RECONCILIATION_STALE",
                       "SNAPSHOT_STALE",
+                      "HIRO_UNAVAILABLE",
                       "SPONSOR_NOT_CONFIGURED",
                       "SPONSOR_BALANCE_LOW",
                       "DAILY_BUDGET_REACHED",
@@ -164,7 +166,7 @@ export class SponsorStatus extends BaseEndpoint {
                     ageMs: { type: "number" as const },
                     freshness: {
                       type: "string" as const,
-                      enum: ["expired"],
+                      enum: ["expired", "unavailable"],
                     },
                   },
                 },
