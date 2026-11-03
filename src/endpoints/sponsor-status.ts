@@ -14,7 +14,7 @@ export class SponsorStatus extends BaseEndpoint {
     tags: ["Health"],
     summary: "x402 payment sponsor readiness",
     description:
-      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, and under today's fee budget. The balance read is cached for 60s.",
+      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, under today's fee budget, and able to read Hiro. The balance read is cached for 60s; when Hiro cannot be read the sponsor cannot read the nonces it needs, so canSponsor is false with reason HIRO_UNAVAILABLE.",
     responses: {
       "200": {
         description: "Fresh or stale sponsor status snapshot",
@@ -54,6 +54,7 @@ export class SponsorStatus extends BaseEndpoint {
                       "SPONSOR_NOT_CONFIGURED",
                       "SPONSOR_BALANCE_LOW",
                       "DAILY_BUDGET_REACHED",
+                      "HIRO_UNAVAILABLE",
                     ],
                   },
                 },
@@ -87,7 +88,7 @@ export class SponsorStatus extends BaseEndpoint {
                     ageMs: { type: "number" as const },
                     freshness: {
                       type: "string" as const,
-                      enum: ["fresh", "stale", "expired"],
+                      enum: ["fresh", "stale", "expired", "unavailable"],
                     },
                   },
                 },
@@ -97,7 +98,8 @@ export class SponsorStatus extends BaseEndpoint {
         },
       },
       "503": {
-        description: "Expired sponsor status snapshot",
+        description:
+          "Sponsor cannot take a payment now: expired snapshot, unreadable Hiro read, or unconfigured sponsor. Follow recommendation.",
         content: {
           "application/json": {
             schema: {
@@ -131,6 +133,7 @@ export class SponsorStatus extends BaseEndpoint {
                       "SPONSOR_NOT_CONFIGURED",
                       "SPONSOR_BALANCE_LOW",
                       "DAILY_BUDGET_REACHED",
+                      "HIRO_UNAVAILABLE",
                     ],
                   },
                 },
@@ -164,7 +167,7 @@ export class SponsorStatus extends BaseEndpoint {
                     ageMs: { type: "number" as const },
                     freshness: {
                       type: "string" as const,
-                      enum: ["expired"],
+                      enum: ["expired", "unavailable"],
                     },
                   },
                 },
