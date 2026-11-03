@@ -6,6 +6,7 @@ import {
   type StoredSponsorStatusSnapshot,
 } from "../services/sponsor-status";
 import { SponsorStatus } from "../endpoints/sponsor-status";
+import { toPaymentSponsorStatus } from "../services/payment-sponsor-status";
 
 function makeSnapshot(overrides: Partial<StoredSponsorStatusSnapshot> = {}): StoredSponsorStatusSnapshot {
   return {
@@ -194,6 +195,18 @@ describe("SponsorStatus schema", () => {
     expect(properties).toHaveProperty("canSponsor");
     expect(properties).toHaveProperty("noncePool");
     expect(properties).toHaveProperty("reconciliation");
-    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired"]);
+    const cases = [
+      { configured: false, balance: null, spentToday: 0n },
+      { configured: true, balance: null, spentToday: 0n },
+      { configured: true, balance: 0n, spentToday: 0n },
+      { configured: true, balance: 5_000_000n, spentToday: 10_000_000n },
+    ];
+    for (const input of cases) {
+      const result = toPaymentSponsorStatus({ ...input, dailyBudget: 10_000_000n });
+      expect(properties.status.enum).toContain(result.status);
+      expect(properties.snapshot.properties.freshness.enum).toContain(result.snapshot.freshness);
+      expect(properties.reconciliation.properties.freshness.enum).toContain(result.reconciliation.freshness);
+      for (const reason of result.reasons) expect(properties.reasons.items.enum).toContain(reason);
+    }
   });
 });

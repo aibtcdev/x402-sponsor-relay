@@ -653,7 +653,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
 
   /**
    * Readiness of the x402 payment sponsor that sponsorPayment() uses (SponsorWalletDO):
-   * configured, funded and under today's budget. Balance is KV-cached for 60s.
+   * configured, readable funded balance and under today's budget. Balance is KV-cached for 60s.
+   * Failed balance reads return unavailable with SPONSOR_STATE_UNREADABLE and fallback_to_direct.
    */
   async getSponsorStatus(): Promise<SponsorStatusResult> {
     const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
