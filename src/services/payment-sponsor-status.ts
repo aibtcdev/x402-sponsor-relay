@@ -18,12 +18,22 @@ export interface PaymentSponsorState {
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * to go stale. So readiness is just: configured, funded, and under today's budget.
+ *
+ * The status fails closed on an unreadable balance: when Hiro cannot be read, the payment
+ * path itself refuses every sponsored payment (it cannot read the sponsor or sender nonce),
+ * so reporting canSponsor: true would steer clients onto a path that cannot succeed. A
+ * configured sponsor whose balance read returned null therefore reports HIRO_UNAVAILABLE,
+ * which flips canSponsor to false and the recommendation to "fallback_to_direct". Only the
+ * status changes — the payment preflight keeps its existing behaviour. An unconfigured
+ * sponsor reports only SPONSOR_NOT_CONFIGURED: nothing was read, so nothing was unreadable.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
   if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
+  if (s.configured && s.balance === null) {
+    reasons.push("HIRO_UNAVAILABLE");
+  }
   if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
@@ -52,7 +62,9 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    // The snapshot is built from the balance read above, so its freshness reports that
+    // read: "unavailable" when no balance came back rather than claiming a fresh reading.
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "unavailable" },
   };
 }
 

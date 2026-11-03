@@ -194,6 +194,16 @@ describe("SponsorStatus schema", () => {
     expect(properties).toHaveProperty("canSponsor");
     expect(properties).toHaveProperty("noncePool");
     expect(properties).toHaveProperty("reconciliation");
-    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired"]);
+    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired", "unavailable"]);
+  });
+
+  it("documents HIRO_UNAVAILABLE in the reason enums of both responses", () => {
+    const endpoint = new SponsorStatus();
+    for (const code of ["200", "503"] as const) {
+      const properties =
+        endpoint.schema.responses[code].content["application/json"].schema.properties;
+      expect(properties.reasons.items.enum).toContain("HIRO_UNAVAILABLE");
+      expect(properties.snapshot.properties.freshness.enum).toContain("unavailable");
+    }
   });
 });
