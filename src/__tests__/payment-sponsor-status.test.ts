@@ -54,10 +54,22 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
+  it("cannot establish readiness when Hiro balance is unreadable", () => {
     const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
+    expect(result).toMatchObject({
+      status: "unavailable",
+      canSponsor: false,
+      recommendation: "fallback_to_direct",
+      reasons: ["SPONSOR_STATE_UNREADABLE"],
+      noncePool: { totalAvailable: 0, poolAvailabilityRatio: 0 },
+      snapshot: { freshness: "unavailable" },
+    });
     expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+  });
+
+  it("retains the budget reason when the balance is also unreadable", () => {
+    expect(toPaymentSponsorStatus(state({ balance: null, spentToday: 10_000_000n })).reasons)
+      .toEqual(["SPONSOR_STATE_UNREADABLE", "DAILY_BUDGET_REACHED"]);
   });
 });
 
@@ -98,5 +110,41 @@ describe("getPaymentSponsorStatus", () => {
     const result = await getPaymentSponsorStatus(env("0", { PAYMENT_SPONSOR_PRIVATE_KEY: undefined }), logger);
     expect(result.reasons).toEqual(["SPONSOR_NOT_CONFIGURED"]);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("uses a successful cached balance without an extra Hiro probe", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const get = vi.fn().mockResolvedValue("5000000");
+    const result = await getPaymentSponsorStatus(env("0", {
+      RELAY_KV: { get } as unknown as KVNamespace,
+    }), logger);
+    expect(result.canSponsor).toBe(true);
+    expect(result.snapshot.freshness).toBe("fresh");
+    expect(get).toHaveBeenCalledWith(expect.stringMatching(/^wallet_balance:/));
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not cache a failed read and recovers on the next successful read", async () => {
+    const get = vi.fn().mockResolvedValue(null);
+    const put = vi.fn().mockResolvedValue(undefined);
+    const bindings = env("0", { RELAY_KV: { get, put } as unknown as KVNamespace });
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new Error("Hiro unreachable"))
+      .mockResolvedValueOnce(Response.json({ balance: "0x4c4b40" }));
+
+    const failed = await getPaymentSponsorStatus(bindings, logger);
+    expect(failed.canSponsor).toBe(false);
+    expect(failed.reasons).toEqual(["SPONSOR_STATE_UNREADABLE"]);
+    expect(put).not.toHaveBeenCalled();
+
+    const recovered = await getPaymentSponsorStatus(bindings, logger);
+    expect(recovered).toMatchObject({
+      status: "healthy", canSponsor: true, reasons: [], recommendation: null,
+      snapshot: { freshness: "fresh" },
+    });
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(put).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/^wallet_balance:/), "5000000", { expirationTtl: 60 }
+    );
   });
 });

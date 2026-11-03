@@ -753,12 +753,23 @@ Whether the x402 payment sponsor can take a payment right now. Check canSponsor 
 gasless payment; when it is false, follow recommendation ("fallback_to_direct": pay your own fee).
 
 canSponsor is false (HTTP 503, status "unavailable") when any of these reasons apply:
-- SPONSOR_NOT_CONFIGURED — the relay has no payment sponsor key
+- SPONSOR_NOT_CONFIGURED — the relay has no payment sponsor key or SponsorWalletDO binding
+- SPONSOR_STATE_UNREADABLE — the configured sponsor's balance could not be read from Hiro
 - SPONSOR_BALANCE_LOW — the sponsor wallet holds less than 0.1 STX
 - DAILY_BUDGET_REACHED — today's sponsor fee budget is spent (resets at midnight UTC)
 
-The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor stays true and
-reconciliation.freshness is "unavailable". noncePool is kept for compatibility (one sponsor, nothing reserved).
+Successful sponsor balance reads are cached for 60s. A cached balance can still report readiness
+during that window; this is not a live probe of Hiro on every request. When there is no cached
+balance and the Hiro read fails, canSponsor is false, recommendation is "fallback_to_direct",
+reconciliation.lastSuccessfulAt is null, and both reconciliation.freshness and snapshot.freshness
+are "unavailable". Direct payment may also require Hiro, depending on the client's node.
+
+A successful balance read (including a cache hit) keeps both freshness fields "fresh", even if
+low balance or a spent budget makes sponsorship unavailable. An unconfigured sponsor has
+unavailable freshness. snapshot.asOf and ageMs describe response generation, not the age of the
+underlying cached balance; reconciliation.lastSuccessfulAt is the time this response obtained
+a readable balance. RelayRPC.getSponsorStatus() uses the same readiness contract.
+noncePool is kept for compatibility (one sponsor, nothing reserved).
 
 ### Response
 
