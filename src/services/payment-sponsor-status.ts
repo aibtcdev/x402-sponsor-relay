@@ -18,13 +18,21 @@ export interface PaymentSponsorState {
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * to go stale. So readiness is just: configured, readable, funded, and under today's budget.
+ *
+ * An unreadable balance blocks. The payment path fails closed on the same Hiro read:
+ * SponsorWalletDO answers "Could not read sender nonce" / "Could not read sponsor nonce"
+ * and broadcasts nothing, so a status that stays healthy here would keep steering clients
+ * (via extra.feePayer) onto a path that cannot succeed. SPONSOR_STATE_UNREADABLE is the
+ * honest answer until the read recovers.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
-  if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
-  if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
+  if (!s.configured) {
+    reasons.push("SPONSOR_NOT_CONFIGURED");
+  } else if (s.balance === null) {
+    reasons.push("SPONSOR_STATE_UNREADABLE");
+  } else if (s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
   if (s.spentToday >= s.dailyBudget) reasons.push("DAILY_BUDGET_REACHED");
@@ -52,7 +60,8 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    // There is no cached snapshot to age out; when Hiro cannot be read there is none at all.
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "unavailable" },
   };
 }
 
