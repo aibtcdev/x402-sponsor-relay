@@ -17,13 +17,18 @@ export interface PaymentSponsorState {
  * Map the payment sponsor's state onto the SponsorStatusResult contract.
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
- * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * which reads its nonce from Hiro per payment. Readiness is: configured, funded (balance
+ * readable and above the depleted threshold), and under today's budget.
+ *
+ * When Hiro cannot be read (balance === null) the sponsor cannot confirm funding and every
+ * sponsored payment would be refused ("Could not read sender nonce" / "Could not read
+ * sponsor nonce"), so the status fails closed with HIRO_UNAVAILABLE and recommends
+ * fallback_to_direct instead of advertising a path that cannot succeed.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
   if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
+  if (s.configured && s.balance === null) reasons.push("HIRO_UNAVAILABLE");
   if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
@@ -31,6 +36,7 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
 
   const canSponsor = reasons.length === 0;
   const asOf = new Date(nowMs).toISOString();
+  const freshness = s.balance === null ? "expired" : "fresh";
   return {
     status: canSponsor ? "healthy" : "unavailable",
     canSponsor,
@@ -52,7 +58,7 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    snapshot: { asOf, ageMs: 0, freshness },
   };
 }
 
