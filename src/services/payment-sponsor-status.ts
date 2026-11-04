@@ -19,17 +19,22 @@ export interface PaymentSponsorState {
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
  * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * unreadable balance means Hiro could not be read, so the sponsor reports unavailable
+ * (HIRO_UNAVAILABLE) rather than failing open — a resource server gating `extra.feePayer`
+ * on `canSponsor` would otherwise steer clients onto a path that cannot succeed.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
   if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
-  if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
+  if (s.configured && s.balance === null) {
+    reasons.push("HIRO_UNAVAILABLE");
+  } else if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
   if (s.spentToday >= s.dailyBudget) reasons.push("DAILY_BUDGET_REACHED");
 
   const canSponsor = reasons.length === 0;
+  const balanceReadable = s.balance !== null;
   const asOf = new Date(nowMs).toISOString();
   return {
     status: canSponsor ? "healthy" : "unavailable",
@@ -49,10 +54,10 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
     },
     reconciliation: {
       source: "hiro",
-      lastSuccessfulAt: s.balance !== null ? asOf : null,
-      freshness: s.balance !== null ? "fresh" : "unavailable",
+      lastSuccessfulAt: balanceReadable ? asOf : null,
+      freshness: balanceReadable ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    snapshot: { asOf, ageMs: 0, freshness: balanceReadable ? "fresh" : "stale" },
   };
 }
 
