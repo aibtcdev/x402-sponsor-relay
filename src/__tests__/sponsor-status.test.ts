@@ -181,6 +181,8 @@ describe("SponsorStatus schema", () => {
     expect(properties).toHaveProperty("reconciliation");
     expect(properties).toHaveProperty("snapshot");
     expect(properties.noncePool.properties).toHaveProperty("poolAvailabilityRatio");
+    expect(properties.reasons.items.enum).toContain("HIRO_UNAVAILABLE");
+    expect(properties.snapshot.properties.freshness.enum).toContain("unavailable");
   });
 
   it("documents unavailable responses with the full cached status shape", () => {
@@ -194,6 +196,7 @@ describe("SponsorStatus schema", () => {
     expect(properties).toHaveProperty("canSponsor");
     expect(properties).toHaveProperty("noncePool");
     expect(properties).toHaveProperty("reconciliation");
-    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired"]);
+    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired", "unavailable"]);
+    expect(properties.reasons.items.enum).toContain("HIRO_UNAVAILABLE");
   });
 });
