@@ -18,8 +18,10 @@ export interface PaymentSponsorState {
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * to go stale. So readiness is just: configured, funded, under today's budget, and able to
+ * read Hiro. The wallet refuses every payment when it cannot read the sender or sponsor
+ * nonce from Hiro, so an unreadable balance fails closed here too: the status must report
+ * the payment path's real readiness, not the preflight's fail-open view of it.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
@@ -27,6 +29,9 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
   if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
+  // A configured sponsor whose balance could not be read cannot take a payment either:
+  // SponsorWalletDO reads both nonces from Hiro per payment and refuses when it cannot.
+  if (s.configured && s.balance === null) reasons.push("HIRO_UNAVAILABLE");
   if (s.spentToday >= s.dailyBudget) reasons.push("DAILY_BUDGET_REACHED");
 
   const canSponsor = reasons.length === 0;
@@ -52,7 +57,9 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    // The snapshot is only as fresh as the balance read behind it: with no successful
+    // Hiro read it is stale, not fresh, however recently it was computed.
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "stale" },
   };
 }
 
