@@ -686,7 +686,7 @@ export interface PoolHealthResponse {
 }
 
 export type SponsorStatusLevel = "healthy" | "degraded" | "unavailable";
-export type SponsorSnapshotFreshness = "fresh" | "stale" | "expired";
+export type SponsorSnapshotFreshness = "fresh" | "stale" | "expired" | "unavailable";
 export type SponsorReconciliationFreshness = "fresh" | "stale" | "unavailable";
 export type SponsorStatusReason =
   | "NO_AVAILABLE_NONCES"
@@ -696,6 +696,7 @@ export type SponsorStatusReason =
   | "RECONCILIATION_STALE"
   | "SNAPSHOT_STALE"
   | "SPONSOR_NOT_CONFIGURED"
+  | "HIRO_UNAVAILABLE"
   | "SPONSOR_BALANCE_LOW"
   | "DAILY_BUDGET_REACHED";
 

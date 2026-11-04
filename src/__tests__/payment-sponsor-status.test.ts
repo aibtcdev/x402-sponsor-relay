@@ -54,10 +54,26 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
+  it("falls back to direct payment when the configured sponsor's Hiro balance is unreadable", () => {
     const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
+    expect(result.canSponsor).toBe(false);
+    expect(result.status).toBe("unavailable");
+    expect(result.recommendation).toBe("fallback_to_direct");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
     expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+    expect(result.snapshot.freshness).toBe("unavailable");
+  });
+
+  it("keeps independent budget and unreadable-state reasons", () => {
+    const result = toPaymentSponsorStatus(state({ balance: null, spentToday: 10_000_000n }));
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE", "DAILY_BUDGET_REACHED"]);
+    expect(result.canSponsor).toBe(false);
+  });
+
+  it("does not invent a Hiro failure when no sponsor is configured", () => {
+    const result = toPaymentSponsorStatus(state({ configured: false, balance: null }));
+    expect(result.reasons).toEqual(["SPONSOR_NOT_CONFIGURED"]);
+    expect(result.snapshot.freshness).toBe("unavailable");
   });
 });
 
@@ -98,5 +114,17 @@ describe("getPaymentSponsorStatus", () => {
     const result = await getPaymentSponsorStatus(env("0", { PAYMENT_SPONSOR_PRIVATE_KEY: undefined }), logger);
     expect(result.reasons).toEqual(["SPONSOR_NOT_CONFIGURED"]);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("reports unavailable when the actual Hiro balance request rejects", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Hiro unavailable"));
+    const result = await getPaymentSponsorStatus(env("0"), logger);
+    expect(result).toMatchObject({
+      status: "unavailable",
+      canSponsor: false,
+      recommendation: "fallback_to_direct",
+      reasons: ["HIRO_UNAVAILABLE"],
+      snapshot: { freshness: "unavailable" },
+    });
   });
 });
