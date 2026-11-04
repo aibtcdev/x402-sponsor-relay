@@ -303,7 +303,7 @@ If `settlement.status === "failed"` (only for `abort_*` on-chain rejections), po
 | `RATE_LIMIT_EXCEEDED` | 429 | true | 10 req/min per sender on free tier; wait for `retryAfter` seconds (check `Retry-After` header) |
 | `DAILY_LIMIT_EXCEEDED` | 429 | true | Daily request quota reached for your API key; wait until the quota resets at midnight UTC |
 | `SPENDING_CAP_EXCEEDED` | 429 | true | Daily sponsor fee cap reached for your API key tier; wait until midnight UTC |
-| `BROADCAST_FAILED` | 400 / 502 | true | Emitted by `POST /sponsor` when broadcast fails (400 = client/tx error, 502 = node/network issue); `POST /relay` uses `SETTLEMENT_BROADCAST_FAILED` instead. Inspect `details` and retry with backoff. |
+| `BROADCAST_FAILED` | 400 / 502 | true | Emitted by `POST /sponsor` when broadcast fails (400 = client/tx error, 502 = node/network issue); `POST /relay` uses `SETTLEMENT_BROADCAST_FAILED` instead. On a 502 the node may still hold the tx: retry with backoff by resending the **same signed hex** (the relay returns the earlier txid if it landed). Do not re-sign the same payment at a new nonce, or both can confirm. |
 | `SPONSOR_CONFIG_ERROR` | 500 | false | Relay misconfigured (no mnemonic); contact relay operator |
 | `SPONSOR_FAILED` | 500 | true | Sponsor step failed transiently; retry after 5s |
 | `SETTLEMENT_BROADCAST_FAILED` | 502 | true | Stacks node rejected broadcast; wait `retryAfter` seconds (default 5s) and retry |
