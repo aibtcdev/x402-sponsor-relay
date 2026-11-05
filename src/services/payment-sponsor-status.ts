@@ -18,13 +18,18 @@ export interface PaymentSponsorState {
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * to go stale. So readiness is: configured, funded (Hiro readable), and under today's budget.
+ * An unreadable balance is reported as HIRO_UNAVAILABLE, because the payment path fails
+ * closed on the same outage (SponsorWalletDO needs Hiro per payment): the status must not
+ * advertise a sponsored path that cannot succeed.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
-  if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
-  if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
+  if (!s.configured) {
+    reasons.push("SPONSOR_NOT_CONFIGURED");
+  } else if (s.balance === null) {
+    reasons.push("HIRO_UNAVAILABLE");
+  } else if (s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
   if (s.spentToday >= s.dailyBudget) reasons.push("DAILY_BUDGET_REACHED");
@@ -52,7 +57,7 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "stale" },
   };
 }
 
