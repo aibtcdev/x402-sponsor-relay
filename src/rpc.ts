@@ -8,7 +8,7 @@
  * - sponsorPayment(txHex, settle) — sponsor + broadcast an x402 payment now, or fail with a reason
  * - submitPayment(txHex, settle) — validate tx, check sender nonce, enqueue, return paymentId
  * - checkPayment(paymentId)      — return current payment status from KV
- * - getSponsorStatus()           — return the cached relay-owned sponsor status snapshot
+ * - getSponsorStatus()           — return whether the x402 payment sponsor can take a payment now
  */
 
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -57,7 +57,8 @@ import {
   markInFlight,
   seedSenderNonceFromHiro,
 } from "./services/sender-nonce";
-import { repairSenderWedgeDO, SettlementService, SponsorService } from "./services";
+import { SettlementService, SponsorService } from "./services";
+import { getPaymentSponsorStatus } from "./services/payment-sponsor-status";
 
 export type { SubmitPaymentResult, CheckPaymentResult };
 
@@ -67,7 +68,6 @@ type RelayCheckPaymentResult = CheckPaymentResult & {
   nextExpectedNonce?: number;
   missingNonces?: number[];
   holdExpiresAt?: string;
-  senderWedge?: import("./types").SenderWedgeStatus;
 };
 
 type PublicRpcErrorCode = (typeof RPC_ERROR_CODES)[number];
@@ -95,7 +95,14 @@ function projectRpcErrorCode(errorCode?: string): PublicRpcErrorCode | undefined
  */
 /** Result of RelayRPC.sponsorPayment(). */
 export type SponsorPaymentResult =
-  | { success: true; txid: string; payer: string; fee: string }
+  | {
+      success: true;
+      txid: string;
+      payer: string;
+      fee: string;
+      /** This tx was already sponsored earlier; nothing new was broadcast. Dedupe on txid. */
+      replayed?: boolean;
+    }
   | {
       success: false;
       code:
@@ -143,6 +150,15 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       return { success: false, code: "PAYMENT_MISMATCH", error: "Sender and recipient are the same address", retryable: false };
     }
 
+    // A resubmit of a tx already sponsored and landed (e.g. after a failure answer to a
+    // broadcast the node in fact took) gets that txid back. Checked before the rate limit and
+    // balance preflight: once the payment has landed, the sender may no longer pass either.
+    const prior = await sponsorService.findSponsored(validation.transaction);
+    if (prior) {
+      logger.info("Sponsored payment already broadcast, returning its txid", { txid: prior.txid, payer });
+      return { success: true, txid: prior.txid, payer, fee: prior.fee, replayed: true };
+    }
+
     if (this.env.SPONSOR_RATE_LIMIT) {
       const { success } = await this.env.SPONSOR_RATE_LIMIT.limit({ key: payer });
       if (!success) {
@@ -174,7 +190,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       };
     }
     logger.info("Sponsored payment broadcast", { txid: sent.txid, payer, fee: sent.fee, sponsorNonce: sent.sponsorNonce });
-    return { success: true, txid: sent.txid, payer, fee: sent.fee };
+    return { success: true, txid: sent.txid, payer, fee: sent.fee, ...(sent.replayed && { replayed: true }) };
   }
 
   /**
@@ -183,7 +199,8 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
    * 1. Deserializes and validates the transaction
    * 2. Checks sender nonce health against KV cache
    * 3. Generates paymentId and writes initial status to KV
-   * 4. Enqueues to PAYMENT_QUEUE
+   * 4. Enqueues to PAYMENT_QUEUE — the consumer sponsors through the payment sponsor
+   *    (SponsorWalletDO), the same wallet as sponsorPayment()
    * 5. Returns immediately with paymentId + sender nonce info
    */
   async submitPayment(
@@ -294,7 +311,17 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
 
     // Balance preflight: refuse payments the sender can't cover, and stop accepting
     // when every sponsor wallet is out of STX, before any nonce or queue state is touched.
-    const preflight = await new SponsorService(this.env, logger).preflightSponsoredPayment(transaction);
+    // The queue consumer sponsors with the payment sponsor: refuse now if it is not set up,
+    // rather than accept a payment that can only fail later, and check that wallet's balance.
+    const paymentSponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
+    if (!paymentSponsorKey || !this.env.SPONSOR_WALLET_DO) {
+      logger.error("submitPayment refused: payment sponsor not configured");
+      return { accepted: false, error: "Payment sponsor not configured", code: "INTERNAL_ERROR", retryable: false };
+    }
+    const preflight = await new SponsorService(this.env, logger).preflightSponsoredPayment(
+      transaction,
+      paymentSponsorKey ? [paymentSponsorKey] : []
+    );
     if (preflight) {
       return { accepted: false, error: preflight.error, code: preflight.code, retryable: preflight.retryable };
     }
@@ -585,16 +612,6 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     }
 
     let refreshedRecord = record;
-    let senderWedge;
-    if (
-      record.status === "queued" &&
-      record.relayState === "held" &&
-      record.holdReason === "gap" &&
-      record.senderAddress
-    ) {
-      senderWedge = await repairSenderWedgeDO(this.env, logger, record.senderAddress);
-      refreshedRecord = (await getPaymentRecord(kv, paymentId)) ?? record;
-    }
 
     // Self-healing: check on-chain status for payments stuck in mempool
     refreshedRecord = await selfHealMempoolRecord(
@@ -630,28 +647,19 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       }),
       ...(projected.missingNonces && { missingNonces: projected.missingNonces }),
       ...(projected.holdExpiresAt && { holdExpiresAt: projected.holdExpiresAt }),
-      ...(senderWedge && { senderWedge }),
       checkStatusUrl,
     };
   }
 
   /**
-   * Return the cached relay-owned sponsor status snapshot.
-   * Reads from NonceDO cached state only and never triggers live Hiro fan-out.
+   * Readiness of the x402 payment sponsor that sponsorPayment() uses (SponsorWalletDO):
+   * configured, funded and under today's budget. Balance is KV-cached for 60s.
    */
   async getSponsorStatus(): Promise<SponsorStatusResult> {
-    if (!this.env.NONCE_DO) {
-      throw new Error("Nonce coordinator unavailable");
-    }
-
-    const stub = this.env.NONCE_DO.get(this.env.NONCE_DO.idFromName("sponsor"));
-    const response = await stub.fetch("https://nonce-do/sponsor-status");
-
-    if (!response.ok && response.status !== 503) {
-      const body = await response.text();
-      throw new Error(body || `NonceDO sponsor status failed with ${response.status}`);
-    }
-
-    return (await response.json()) as SponsorStatusResult;
+    const logger = createWorkerLogger(this.env.LOGS, this.ctx, {
+      component: "rpc",
+      route: "rpc.getSponsorStatus",
+    });
+    return getPaymentSponsorStatus(this.env, logger);
   }
 }

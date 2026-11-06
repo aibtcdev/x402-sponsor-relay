@@ -324,6 +324,9 @@ describe("submitPayment duplicate reuse", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) =>
       String(input).includes("/balances")
         ? new Response(JSON.stringify({ stx: { balance: "1000000", locked: "0" } }), { status: 200 })
+        : String(input).includes("/v2/accounts/")
+        // payment sponsor balance (Clarity-encoded): 1,000 STX
+        ? new Response(JSON.stringify({ balance: "0x0000000000000000000000003b9aca00", locked: "0x0", nonce: 0 }), { status: 200 })
         : new Response(JSON.stringify({
             last_executed_tx_nonce: 25,
             possible_next_nonce: 26,
@@ -347,6 +350,9 @@ describe("submitPayment duplicate reuse", () => {
       PAYMENT_QUEUE: {
         send: queueSend,
       },
+      // The queue consumer sponsors with the payment sponsor; balances above are mocked.
+      PAYMENT_SPONSOR_PRIVATE_KEY: "753b7cc01a1a2e86221266a154af739463fce51219d97e4f856cd7200c3bd2a601",
+      SPONSOR_WALLET_DO: {},
     } as unknown as Env;
 
     const rpc = new RelayRPC(executionContext, env);
@@ -354,8 +360,8 @@ describe("submitPayment duplicate reuse", () => {
       await rpc.submitPayment(txHex)
     );
 
-    // one sender-balance preflight read + one nonce reseed
-    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).includes("/balances"))).toHaveLength(1);
+    // balance preflight reads (sender + payment sponsor) aside, one nonce reseed
+    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).includes("/balances") && !String(u).includes("/v2/accounts/"))).toHaveLength(1);
     expect(result).toEqual({
       accepted: true,
       paymentId: expect.stringMatching(/^pay_/),
@@ -499,7 +505,7 @@ describe("payment polling runtime alignment", () => {
     expect(httpResult.terminalReason).toBe("unknown_payment_identity");
   });
 
-  it("surfaces held sender-wedge diagnostics consistently from RPC and HTTP polling", async () => {
+  it("surfaces held-payment details consistently from RPC and HTTP polling, without touching NonceDO", async () => {
     const kv = new MemoryKV();
     const heldRecord = transitionPayment(
       createPaymentRecord("pay_held", "testnet"),
@@ -515,32 +521,13 @@ describe("payment polling runtime alignment", () => {
     heldRecord.relayState = "held";
     await putPaymentRecord(kv, heldRecord);
 
+    // Held payments wait in the queue for SponsorWalletDO; NonceDO sender rows no longer gate them.
+    const nonceDoFetch = vi.fn();
     const env = {
       RELAY_KV: kv,
       STACKS_NETWORK: "testnet",
       RELAY_BASE_URL: "https://x402-relay.aibtc.dev",
-      NONCE_DO: {
-        idFromName: () => "sponsor",
-        get: () => ({
-          fetch: vi.fn(async () => new Response(JSON.stringify({
-            senderAddress: "STHOLD000000000000000000000000000000000",
-            blocked: true,
-            blockedOnFrontierMismatch: true,
-            adminRecoveryLikely: false,
-            nextExpectedNonce: 4,
-            lowestHeldNonce: 6,
-            missingNonces: [4, 5],
-            heldCount: 1,
-            oldestHeldAgeMs: 120000,
-            lastRepairAttemptAt: null,
-            lastRepairFailureAt: null,
-            repairEligible: false,
-            repairTriggered: true,
-            repairAdvanced: false,
-            activePaymentIds: ["pay_held"],
-          }))),
-        }),
-      },
+      NONCE_DO: { idFromName: () => "sponsor", get: () => ({ fetch: nonceDoFetch }) },
     } as unknown as Env;
 
     const rpc = new RelayRPC(executionContext, env);
@@ -554,24 +541,15 @@ describe("payment polling runtime alignment", () => {
     const httpBody = await response.json();
 
     expect(response.status).toBe(200);
-    expect(rpcResult.status).toBe("queued");
-    expect(httpBody.status).toBe("queued");
-    expect((rpcResult as Record<string, unknown>).relayState).toBe("held");
-    expect((rpcResult as Record<string, unknown>).holdReason).toBe("gap");
-    expect((rpcResult as Record<string, unknown>).nextExpectedNonce).toBe(4);
-    expect((rpcResult as Record<string, unknown>).missingNonces).toEqual([4, 5]);
-    expect((rpcResult as Record<string, unknown>).senderWedge).toEqual(
-      expect.objectContaining({
-        blockedOnFrontierMismatch: true,
-        repairTriggered: true,
-      })
-    );
-    expect(httpBody.senderWedge).toEqual(
-      expect.objectContaining({
-        senderAddress: "STHOLD000000000000000000000000000000000",
-        missingNonces: [4, 5],
-      })
-    );
+    for (const result of [rpcResult as Record<string, unknown>, httpBody as Record<string, unknown>]) {
+      expect(result.status).toBe("queued");
+      expect(result.relayState).toBe("held");
+      expect(result.holdReason).toBe("gap");
+      expect(result.nextExpectedNonce).toBe(4);
+      expect(result.missingNonces).toEqual([4, 5]);
+      expect(result.senderWedge).toBeUndefined();
+    }
+    expect(nonceDoFetch).not.toHaveBeenCalled();
   });
 });
 

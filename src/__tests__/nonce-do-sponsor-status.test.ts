@@ -557,6 +557,8 @@ describe("NonceDO stale sender repair helpers", () => {
       sponsorNonce: 44,
       walletIndex: 1,
       sponsorAddress: "",
+      // Added to the assignment result with tx-schemas 1.1.0: now + STALE_THRESHOLD_MS.
+      nonceExpiresAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
     });
     expect(log).toHaveBeenCalledWith(
       "warn",

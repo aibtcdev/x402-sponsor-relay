@@ -32,7 +32,7 @@ import type {
   SponsorHeld,
 } from "../types";
 import { getHiroBaseUrl, getHiroHeaders, stripHexPrefix, decodeClarityUint } from "../utils";
-import type { SponsorWalletResult } from "../durable-objects/sponsor-wallet-do";
+import type { BudgetName, SponsorWalletResult } from "../durable-objects/sponsor-wallet-do";
 import { FeeService } from "./fee";
 
 /**
@@ -1120,7 +1120,7 @@ export class SponsorService {
 
   /** Balance thresholds in microSTX for classifying wallet health */
   private static readonly LOW_BALANCE_WARNING = "1000000";   // 1 STX
-  private static readonly DEPLETED_THRESHOLD = "100000";     // 0.1 STX
+  static readonly DEPLETED_THRESHOLD = "100000";     // 0.1 STX
 
   /**
    * Fetch the STX balance for a sponsor wallet address from Hiro.
@@ -1132,7 +1132,7 @@ export class SponsorService {
   }
 
   /** As fetchWalletBalance, but null when Hiro could not be read. */
-  private async fetchWalletBalanceOrNull(address: string): Promise<string | null> {
+  async fetchWalletBalanceOrNull(address: string): Promise<string | null> {
     const cacheKey = `wallet_balance:${address}`;
 
     // Try cache first
@@ -1190,7 +1190,7 @@ export class SponsorService {
    * /sponsor wallets) is a single SponsorWalletDO that signs and broadcasts one transaction at a
    * time with a chain-derived nonce — nothing is reserved, queued or held.
    */
-  async sponsorAndBroadcast(transaction: StacksTransactionWire): Promise<SponsorWalletResult> {
+  async sponsorAndBroadcast(transaction: StacksTransactionWire, budget?: BudgetName): Promise<SponsorWalletResult> {
     const ns = this.env.SPONSOR_WALLET_DO;
     const sponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
     if (!ns || !sponsorKey) {
@@ -1201,17 +1201,39 @@ export class SponsorService {
       };
     }
     const spend = this.paymentSpend(transaction);
-    const fee = await new FeeService(this.env, this.logger).getFeeForType(
+    const estimate = await new FeeService(this.env, this.logger).getFeeForType(
       spend && spend.asset !== "STX" ? "sip010_transfer" : this.payloadToFeeType(transaction.payload.payloadType)
     );
+    // Nodes reject a fee under 1 µSTX per byte (FeeTooLow); the token_transfer floor sits below that.
+    const fee = Math.max(estimate, transaction.serializeBytes().length);
     const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/sponsor", {
       method: "POST",
       body: JSON.stringify({
         txHex: transaction.serialize(), sponsorKey, fee: String(fee),
         senderAddress: this.deriveSenderAddress(transaction),
+        budget,
       }),
     });
     return (await res.json()) as SponsorWalletResult;
+  }
+
+  /**
+   * An earlier sponsorship of this exact client tx by the payment sponsor that the node took
+   * (pending or mined), or null. Fail-open: any error reads as "none found".
+   */
+  async findSponsored(transaction: StacksTransactionWire): Promise<Extract<SponsorWalletResult, { ok: true }> | null> {
+    const ns = this.env.SPONSOR_WALLET_DO;
+    if (!ns) return null;
+    try {
+      const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/lookup", {
+        method: "POST",
+        body: JSON.stringify({ txHex: transaction.serialize() }),
+      });
+      return res.ok ? ((await res.json()) as Extract<SponsorWalletResult, { ok: true }> | null) : null;
+    } catch (e) {
+      this.logger.warn("sponsor_lookup_failed", { error: e instanceof Error ? e.message : String(e) });
+      return null;
+    }
   }
 
   /**

@@ -11,7 +11,6 @@ import {
   emitPaymentLifecycleEvent,
   emitProjectedPaymentPollEvents,
 } from "../utils";
-import { repairSenderWedgeDO } from "../services";
 
 /**
  * GET /payment/:id — Public payment status endpoint.
@@ -67,7 +66,6 @@ export class PaymentStatus extends BaseEndpoint {
                 nextExpectedNonce: { type: "number" as const },
                 missingNonces: { type: "array" as const, items: { type: "number" as const } },
                 holdExpiresAt: { type: "string" as const },
-                senderWedge: { type: "object" as const },
               },
             },
           },
@@ -166,16 +164,6 @@ export class PaymentStatus extends BaseEndpoint {
     }
 
     let refreshedRecord = record;
-    let senderWedge;
-    if (
-      record.status === "queued" &&
-      record.relayState === "held" &&
-      record.holdReason === "gap" &&
-      record.senderAddress
-    ) {
-      senderWedge = await repairSenderWedgeDO(c.env, logger, record.senderAddress);
-      refreshedRecord = (await getPaymentRecord(kv, paymentId)) ?? record;
-    }
 
     // Self-healing: check on-chain status for payments stuck in mempool
     refreshedRecord = await selfHealMempoolRecord(
@@ -222,7 +210,6 @@ export class PaymentStatus extends BaseEndpoint {
       }),
       ...(projected.missingNonces && { missingNonces: projected.missingNonces }),
       ...(projected.holdExpiresAt && { holdExpiresAt: projected.holdExpiresAt }),
-      ...(senderWedge && { senderWedge }),
       submittedAt: projected.submittedAt,
       ...(projected.queuedAt && { queuedAt: projected.queuedAt }),
       ...(projected.mempoolAt && { mempoolAt: projected.mempoolAt }),

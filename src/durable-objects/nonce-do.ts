@@ -31,7 +31,7 @@ import {
   toSponsorStatusResult,
   type StoredSponsorStatusSnapshot,
 } from "../services/sponsor-status";
-import { parseBroadcastOutcome, decideBroadcastAction } from "../utils/broadcast-outcome";
+import { parseBroadcastOutcome, decideBroadcastAction, isStructuralBroadcastFailure } from "../utils/broadcast-outcome";
 import type {
   WalletCapacity,
   OccupiedNonce,
@@ -8545,15 +8545,13 @@ export class NonceDO {
         //
         // Patterns we treat as structural / non-retryable:
         //   - "Cannot sponsor sign a non-sponsored transaction" (auth.authType !== Sponsored)
-        //   - "Failed to deserialize" / deserializeTransaction throws (malformed hex)
+        //   - deserializeTransaction throws on malformed hex: DeserializationError,
+        //     "Could not parse ... as ...", "Invalid byte sequence" (see isStructuralBroadcastFailure)
         //
         // tx-schemas follow-up: extend NodeBroadcastOutcomeSchema with a local pre-broadcast
         // outcome variant so decideBroadcastAction owns this classification instead of a
         // string-match here. Tracked in REGRESSION-NOTES for #373.
-        const isStructuralFailure =
-          /non-sponsored transaction/i.test(errMsg) ||
-          /failed to deserialize/i.test(errMsg) ||
-          /malformed/i.test(errMsg);
+        const isStructuralFailure = isStructuralBroadcastFailure(e);
 
         if (isStructuralFailure) {
           this.retireQueuedEntry(

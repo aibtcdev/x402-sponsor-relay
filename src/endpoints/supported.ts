@@ -42,7 +42,7 @@ export class Supported extends BaseEndpoint {
                 },
                 signers: {
                   type: "object" as const,
-                  description: "Map of network to supported signer addresses (empty = any signer accepted)",
+                  description: "Map of CAIP-2 pattern to the facilitator's own signer addresses (x402 V2 spec 7.3.1). Empty: this relay advertises no signer and does not co-sign on /settle",
                   additionalProperties: {
                     type: "array" as const,
                     items: { type: "string" as const },

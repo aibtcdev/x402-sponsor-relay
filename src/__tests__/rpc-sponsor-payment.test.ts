@@ -46,4 +46,34 @@ describe("RelayRPC.sponsorPayment", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(rateLimit).not.toHaveBeenCalled();
   });
+
+  it("returns the txid of an earlier sponsorship of the same tx before the rate limit or balance preflight", async () => {
+    const key = makeRandomPrivKey();
+    const recipient = getAddressFromPrivateKey(makeRandomPrivKey(), "testnet");
+    const tx = await makeSTXTokenTransfer({
+      recipient, amount: 100n, senderKey: key, network: "testnet", nonce: 0n, fee: 0n, sponsored: true,
+    });
+    const doFetch = vi.fn(async (url: string) => {
+      expect(url).toBe("https://sponsor-wallet/lookup");
+      return Response.json({ ok: true, txid: "abc123", sponsorNonce: 4, fee: "3000", replayed: true });
+    });
+    const rateLimit = vi.fn();
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const env = {
+      STACKS_NETWORK: "testnet",
+      SPONSOR_RATE_LIMIT: { limit: rateLimit },
+      SPONSOR_WALLET_DO: { idFromName: () => "id", get: () => ({ fetch: doFetch }) },
+    } as unknown as Env;
+
+    const result = await new RelayRPC(executionContext, env).sponsorPayment(tx.serialize(), {
+      expectedRecipient: recipient, minAmount: "100", tokenType: "STX",
+    });
+
+    expect(result).toEqual({
+      success: true, txid: "abc123", payer: getAddressFromPrivateKey(key, "testnet"), fee: "3000", replayed: true,
+    });
+    expect(doFetch).toHaveBeenCalledTimes(1);
+    expect(rateLimit).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
 });

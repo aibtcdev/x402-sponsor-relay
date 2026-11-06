@@ -151,3 +151,26 @@ export function decideBroadcastAction(outcome: NodeBroadcastOutcome): BroadcastR
     }
   }
 }
+
+/**
+ * True when a throw from building/sponsoring a queued tx means the hex itself is
+ * broken, so retrying can never succeed and the entry should be retired.
+ *
+ * Messages measured against @stacks/transactions@7.3.1:
+ *   sponsorTransaction on a standard tx  -> SigningError "Cannot sponsor sign a non-sponsored transaction"
+ *   deserializeTransaction("00")         -> DeserializationError "Could not parse undefined as AuthType"
+ *   deserializeTransaction("")           -> Error "Could not parse undefined as TransactionVersion"
+ *   deserializeTransaction("zz")         -> Error "Invalid byte sequence"
+ * "failed to deserialize" / "malformed" are the original patterns, kept for compatibility.
+ */
+export function isStructuralBroadcastFailure(err: unknown): boolean {
+  if (err instanceof Error && err.name === "DeserializationError") return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    /non-sponsored transaction/i.test(msg) ||
+    /^Could not parse .+ as /.test(msg) ||
+    /invalid byte sequence/i.test(msg) ||
+    /failed to deserialize/i.test(msg) ||
+    /malformed/i.test(msg)
+  );
+}

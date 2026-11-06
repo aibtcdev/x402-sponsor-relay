@@ -694,7 +694,10 @@ export type SponsorStatusReason =
   | "RECENT_CONFLICT"
   | "HEAL_IN_PROGRESS"
   | "RECONCILIATION_STALE"
-  | "SNAPSHOT_STALE";
+  | "SNAPSHOT_STALE"
+  | "SPONSOR_NOT_CONFIGURED"
+  | "SPONSOR_BALANCE_LOW"
+  | "DAILY_BUDGET_REACHED";
 
 export interface SponsorStatusResult {
   status: SponsorStatusLevel;

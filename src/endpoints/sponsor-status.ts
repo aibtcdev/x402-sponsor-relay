@@ -1,9 +1,10 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import type { AppContext } from "../types";
 import { Error500Response } from "../schemas";
+import { getPaymentSponsorStatus } from "../services/payment-sponsor-status";
 
 /**
- * Public cached sponsor status endpoint.
+ * Public sponsor status endpoint — readiness of the x402 payment sponsor (SponsorWalletDO).
  * Returns the same SponsorStatusResult contract used by RelayRPC.getSponsorStatus().
  *
  * GET /status/sponsor
@@ -11,9 +12,9 @@ import { Error500Response } from "../schemas";
 export class SponsorStatus extends BaseEndpoint {
   schema = {
     tags: ["Health"],
-    summary: "Cached sponsor readiness snapshot",
+    summary: "x402 payment sponsor readiness",
     description:
-      "Returns the relay-owned cached sponsor readiness snapshot. Reads never fan out to Hiro on the request path.",
+      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, and under today's fee budget. The balance read is cached for 60s.",
     responses: {
       "200": {
         description: "Fresh or stale sponsor status snapshot",
@@ -50,6 +51,9 @@ export class SponsorStatus extends BaseEndpoint {
                       "HEAL_IN_PROGRESS",
                       "RECONCILIATION_STALE",
                       "SNAPSHOT_STALE",
+                      "SPONSOR_NOT_CONFIGURED",
+                      "SPONSOR_BALANCE_LOW",
+                      "DAILY_BUDGET_REACHED",
                     ],
                   },
                 },
@@ -124,6 +128,9 @@ export class SponsorStatus extends BaseEndpoint {
                       "HEAL_IN_PROGRESS",
                       "RECONCILIATION_STALE",
                       "SNAPSHOT_STALE",
+                      "SPONSOR_NOT_CONFIGURED",
+                      "SPONSOR_BALANCE_LOW",
+                      "DAILY_BUDGET_REACHED",
                     ],
                   },
                 },
@@ -173,42 +180,13 @@ export class SponsorStatus extends BaseEndpoint {
   async handle(c: AppContext) {
     const logger = this.getLogger(c);
 
-    if (!c.env.NONCE_DO) {
-      return this.err(c, {
-        error: "Nonce coordinator unavailable",
-        code: "INTERNAL_ERROR",
-        status: 500,
-        details: "NONCE_DO binding not configured",
-        retryable: true,
-        retryAfter: 5,
-      });
-    }
-
     try {
-      const stub = c.env.NONCE_DO.get(c.env.NONCE_DO.idFromName("sponsor"));
-      const response = await stub.fetch("https://nonce-do/sponsor-status");
-
-      const body = await response.text();
-      if (!response.ok && response.status !== 503) {
-        logger.warn("Nonce DO sponsor-status request failed", {
-          status: response.status,
-          body,
-        });
-        return this.err(c, {
-          error: "Failed to fetch sponsor status",
-          code: "INTERNAL_ERROR",
-          status: 500,
-          details: body || "Nonce DO responded with error",
-          retryable: true,
-          retryAfter: 5,
-        });
-      }
-
+      const status = await getPaymentSponsorStatus(c.env, logger);
       return this.ok(
         c,
-        JSON.parse(body) as Record<string, unknown>,
+        status as unknown as Record<string, unknown>,
         undefined,
-        response.status as 200 | 503
+        status.status === "unavailable" ? 503 : 200
       );
     } catch (e) {
       logger.error("Sponsor status request failed", {
