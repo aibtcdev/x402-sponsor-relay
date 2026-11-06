@@ -373,7 +373,7 @@ Content-Type: application/json
 - 400 INVALID_MESSAGE_FORMAT — message absent or malformed
 - 400 INVALID_SIGNATURE — BIP-137/BIP-322 signature verification failed
 - 400 STALE_TIMESTAMP — timestamp older than 5 minutes
-- 409 ALREADY_PROVISIONED — this BTC address already has a key
+- 409 ALREADY_PROVISIONED — this BTC address already has a key (an expired key is renewed only via the timestamped message)
 - 500 INTERNAL_ERROR — storage error, retryable: true
 
 ---
@@ -1205,7 +1205,7 @@ Required for:
 - 400 INVALID_MESSAGE_FORMAT
 - 400 INVALID_SIGNATURE / INVALID_STX_SIGNATURE
 - 400 STALE_TIMESTAMP — timestamp > 5 minutes old
-- 409 ALREADY_PROVISIONED — this address already has a key
+- 409 ALREADY_PROVISIONED — this address already has a key (an expired key is renewed only via the timestamped message)
 - 500 INTERNAL_ERROR — storage error, retry
 
 When using an expired/invalid key:
