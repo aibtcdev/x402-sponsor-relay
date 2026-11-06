@@ -697,6 +697,7 @@ export type SponsorStatusReason =
   | "SNAPSHOT_STALE"
   | "SPONSOR_NOT_CONFIGURED"
   | "SPONSOR_BALANCE_LOW"
+  | "HIRO_UNAVAILABLE"
   | "DAILY_BUDGET_REACHED";
 
 export interface SponsorStatusResult {
