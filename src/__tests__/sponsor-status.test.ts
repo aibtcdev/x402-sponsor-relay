@@ -194,6 +194,7 @@ describe("SponsorStatus schema", () => {
     expect(properties).toHaveProperty("canSponsor");
     expect(properties).toHaveProperty("noncePool");
     expect(properties).toHaveProperty("reconciliation");
-    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired"]);
+    // "expired" for a stale cached snapshot, "unavailable" when Hiro could not be read (#448).
+    expect(properties.snapshot.properties.freshness.enum).toEqual(["expired", "unavailable"]);
   });
 });
