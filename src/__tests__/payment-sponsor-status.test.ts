@@ -54,10 +54,19 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
+  it("fails closed when Hiro balance is unreadable (the payment path refuses on the same outage)", () => {
     const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
+    expect(result.canSponsor).toBe(false);
+    expect(result.status).toBe("unavailable");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
+    expect(result.recommendation).toBe("fallback_to_direct");
     expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+    expect(result.snapshot).toMatchObject({ freshness: "unavailable" });
+  });
+
+  it("reports only SPONSOR_NOT_CONFIGURED when unconfigured, even with an unreadable balance", () => {
+    const result = toPaymentSponsorStatus(state({ configured: false, balance: null }));
+    expect(result.reasons).toEqual(["SPONSOR_NOT_CONFIGURED"]);
   });
 });
 
@@ -85,6 +94,17 @@ describe("getPaymentSponsorStatus", () => {
     const result = await getPaymentSponsorStatus(env("0"), logger);
     expect(result.canSponsor).toBe(true);
     expect(result.reasons).toEqual([]);
+  });
+
+  it("reports HIRO_UNAVAILABLE with fallback_to_direct when the Hiro balance read fails", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Hiro unreachable"));
+    const result = await getPaymentSponsorStatus(env("0"), logger);
+    expect(result.canSponsor).toBe(false);
+    expect(result.status).toBe("unavailable");
+    expect(result.reasons).toEqual(["HIRO_UNAVAILABLE"]);
+    expect(result.recommendation).toBe("fallback_to_direct");
+    expect(result.snapshot).toMatchObject({ freshness: "unavailable" });
+    expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
   });
 
   it("reports low balance and a spent budget together", async () => {
