@@ -69,7 +69,7 @@ Content-Type: application/json
 | `INVALID_TRANSACTION` | 400 | Transaction is malformed |
 | `NOT_SPONSORED` | 400 | Transaction must be built with `sponsored: true` |
 | `SPENDING_CAP_EXCEEDED` | 429 | Daily fee cap exceeded for this API key tier |
-| `BROADCAST_FAILED` | 502 | Broadcast rejected, or its outcome unclear (the node may still hold the tx). Resend the same signed hex; do not re-sign the same payment at a new nonce. See [docs/post-337-downstream-contracts.md](docs/post-337-downstream-contracts.md) |
+| `BROADCAST_FAILED` | 400 / 502 | 400: the node rejected the tx for a client reason (not retryable). 502: broadcast rejected, or its outcome unclear (the node may still hold the tx). Resend the same signed hex; do not re-sign the same payment at a new nonce. See [docs/post-337-downstream-contracts.md](docs/post-337-downstream-contracts.md) |
 
 ### POST /relay
 

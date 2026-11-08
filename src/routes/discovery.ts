@@ -1361,7 +1361,7 @@ All errors return JSON with this shape:
 | SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but definitively aborted on-chain (abort_* status only) |
 | CLIENT_INSUFFICIENT_FUNDS      | 422  | false     | Sender had insufficient funds — top up wallet before re-signing and retrying |
 | CLIENT_BAD_NONCE               | 422  | true      | Sender nonce is invalid — verify via Stacks API, re-sign with correct nonce, and retry |
-| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender has a pending transaction (or a mempool nonce conflict) — wait for it to confirm, then retry |
+| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender has a pending transaction (or a mempool nonce conflict) — wait for it to confirm, then retry; when retrying the same payment, resend the same signed hex (do not re-sign at a new nonce) |
 | TOO_MUCH_CHAINING              | 429  | true      | Sponsor wallet congested — retry after Retry-After (30s) |
 | SPONSOR_EXHAUSTED              | 503  | true      | Sponsor wallet out of STX or /sponsor daily budget reached — retry later |
 | SENDER_NONCE_GAP               | 400  | false     | Sender nonce has a gap — verify account nonce, submit missing nonces listed in response |
@@ -1440,7 +1440,7 @@ Do retry (after verifying nonces):
 - 422 BROADCAST_REJECTED — inspect the details field, correct the transaction, and resubmit
 - 422 CLIENT_BAD_NONCE — verify your account nonce via the Stacks API (GET /extended/v1/address/{addr}/nonces), re-sign with the correct nonce, and resubmit
 - 400 SENDER_NONCE_GAP — verify your account nonce, then submit the missing nonces listed in the response to unblock dispatch
-- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; verify your account nonce, wait for any pending mempool tx, re-sign and retry
+- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; wait for any pending mempool tx. Retrying the same payment: resend the same signed hex. A different payment: re-sign at the next nonce
 - 409 NONCE_CONFLICT — relay sponsor nonce conflict; rebuild and resubmit a new transaction
 
 Do retry (after retryAfter):
