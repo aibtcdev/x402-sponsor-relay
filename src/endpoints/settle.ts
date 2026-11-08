@@ -41,7 +41,8 @@ interface BroadcastSuccessParams {
  * POST /settle (spec section 7.2)
  *
  * Verifies payment parameters locally and broadcasts the transaction.
- * Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer).
+ * Does not sponsor: a transaction with an empty sponsor slot (fee=0 / all-zeros signer)
+ * is refused with invalid_transaction_state. Sponsorship is service-binding only.
  * Returns x402 V2 spec-compliant settlement response.
  */
 export class Settle extends BaseEndpoint {
@@ -49,7 +50,7 @@ export class Settle extends BaseEndpoint {
     tags: ["x402 V2"],
     summary: "Settle an x402 V2 payment",
     description:
-      "x402 V2 facilitator settle endpoint (spec section 7.2). Verifies payment parameters locally and broadcasts the transaction to the Stacks network. Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer) — standard x402 clients that build transactions with sponsored:true and fee:0 are handled transparently. Returns HTTP 200 for settlement results (success or failure); HTTP 400 for invalid request schema; HTTP 409 when a payment-identifier conflicts with a prior request.",
+      "x402 V2 facilitator settle endpoint (spec section 7.2). Verifies payment parameters locally and broadcasts the transaction to the Stacks network. Accepts self-paid transactions (standard auth, sender pays the fee) and transactions that already carry a sponsor signature. It does not sponsor: a transaction with an empty sponsor slot (sponsored:true, fee 0) is refused with errorReason invalid_transaction_state. Returns HTTP 200 for settlement results (success or failure); HTTP 400 for invalid request schema; HTTP 409 when a payment-identifier conflicts with a prior request.",
     request: {
       body: {
         content: {

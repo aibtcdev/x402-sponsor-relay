@@ -84,7 +84,7 @@ export class BaseEndpoint extends OpenAPIRoute {
 
   /**
    * Map a sponsor failure to a structured error response.
-   * Shared by /relay and /sponsor to avoid duplicated nested ternary logic.
+   * Used by /sponsor (formerly shared with the removed POST /relay).
    */
   protected sponsorFailureResponse(
     c: AppContext,
@@ -159,8 +159,7 @@ export class BaseEndpoint extends OpenAPIRoute {
    * and falls through to a generic BROADCAST_REJECTED response for any other
    * client rejection.
    *
-   * Shared by /relay (sponsored + self-pay) and /sponsor to avoid duplicating
-   * the same if/else chain across three call sites.
+   * Used by /sponsor (formerly shared with the removed POST /relay).
    */
   protected clientRejectionResponse(
     c: AppContext,

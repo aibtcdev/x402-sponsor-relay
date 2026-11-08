@@ -1,17 +1,16 @@
 # x402 Stacks Sponsor Relay
 
-A Cloudflare Worker that enables gasless transactions for AI agents on the Stacks blockchain by sponsoring transactions and verifying payment settlement.
+A Cloudflare Worker that verifies and settles x402 payments on the Stacks blockchain, and sponsors transactions for API-key holders and aibtc.com's own worker.
 
 ## Overview
 
-The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard that uses the HTTP 402 "Payment Required" status code to enable instant, autonomous stablecoin payments. This relay service brings gasless transactions to Stacks by:
+The [x402 protocol](https://www.x402.org/) is an HTTP-native payment standard that uses the HTTP 402 "Payment Required" status code to enable instant, autonomous payments. This relay is an x402 V2 facilitator for Stacks:
 
-1. Accepting pre-signed sponsored transactions from agents
-2. Validating the transaction format (must be sponsored type)
-3. Sponsoring the transaction (covers gas fees)
-4. Calling the x402 facilitator for settlement verification
-5. Storing payment receipts for verification and resource access
-6. Returning the settlement status, sponsored tx hex, and receipt token to the agent
+1. Agents build and sign a normal **self-paid** transaction (standard auth, non-zero fee) paying the resource server
+2. `POST /settle` verifies recipient, amount and asset locally, then broadcasts the transaction (`POST /verify` checks without broadcasting)
+3. The relay returns the txid, which the agent presents as proof of payment
+
+Public fee sponsorship has been removed: the former `POST /relay` endpoint no longer exists, and `/settle` refuses a transaction with an empty sponsor slot (`invalid_transaction_state`). Relay-paid fees are available only to aibtc.com's own worker over the Cloudflare service binding (`RelayRPC.sponsorPayment` / `submitPayment`), and to API-key holders via `POST /sponsor`. Agent guide: [docs/agent-payment-guide.md](./docs/agent-payment-guide.md).
 
 ## For downstream consumers
 
@@ -71,96 +70,13 @@ Content-Type: application/json
 | `SPENDING_CAP_EXCEEDED` | 429 | Daily fee cap exceeded for this API key tier |
 | `BROADCAST_FAILED` | 400 / 502 | 400: the node rejected the tx for a client reason (not retryable). 502: broadcast rejected, or its outcome unclear (the node may still hold the tx). Resend the same signed hex; do not re-sign the same payment at a new nonce. See [docs/post-337-downstream-contracts.md](docs/post-337-downstream-contracts.md) |
 
-### POST /relay
+### POST /settle, POST /verify, GET /supported
 
-Submit a sponsored transaction for relay and settlement.
-
-**Request:**
-```json
-{
-  "transaction": "<hex-encoded-sponsored-stacks-transaction>",
-  "settle": {
-    "expectedRecipient": "SP...",
-    "minAmount": "1000000",
-    "tokenType": "STX",
-    "expectedSender": "SP...",
-    "resource": "/api/endpoint",
-    "method": "GET"
-  }
-}
-```
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `transaction` | Yes | Hex-encoded sponsored Stacks transaction |
-| `settle.expectedRecipient` | Yes | Expected payment recipient address |
-| `settle.minAmount` | Yes | Minimum payment amount (in smallest unit) |
-| `settle.tokenType` | No | Token type: `STX`, `sBTC`, `USDCx` (default: `STX`) |
-| `settle.expectedSender` | No | Expected sender address for validation |
-| `settle.resource` | No | API resource being accessed (for tracking) |
-| `settle.method` | No | HTTP method being used (for tracking) |
-
-**Response (success):**
-```json
-{
-  "success": true,
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "txid": "0x...",
-  "explorerUrl": "https://explorer.hiro.so/txid/0x...?chain=testnet",
-  "settlement": {
-    "success": true,
-    "status": "confirmed",
-    "sender": "SP...",
-    "recipient": "SP...",
-    "amount": "1000000",
-    "blockHeight": 12345
-  },
-  "sponsoredTx": "0x00000001...",
-  "receiptId": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
-
-**Response (held / sender nonce gap):**
-```json
-{
-  "success": true,
-  "status": "held",
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "queue": {
-    "senderNonce": 8,
-    "nextExpectedNonce": 5,
-    "missingNonces": [5, 6, 7],
-    "handSize": 1,
-    "estimatedDispatchMs": null,
-    "expiresAt": "2026-03-31T20:25:00.000Z",
-    "help": "Verify your account nonce at /fees or via the Stacks API, then submit transactions with nonces 5, 6, 7 to unblock dispatch"
-  }
-}
-```
-
-Held queue behavior:
-- `POST /relay` returns HTTP `202` when the sender has a nonce gap.
-- Held entries remain queued for up to 15 minutes.
-- The alarm may conservatively repair stale-low sender frontiers after 5 minutes, with at most one Hiro refresh per sender every 10 minutes.
-- If the missing nonces arrive first, dispatch proceeds immediately without waiting for repair.
-
-> **Note:** `sponsoredTx` contains the fully-sponsored transaction hex (usable as `X-PAYMENT` header). `receiptId` is only returned when receipt storage succeeds (requires `RELAY_KV` binding).
-
-**Response (error):**
-```json
-{
-  "success": false,
-  "requestId": "550e8400-e29b-41d4-a716-446655440000",
-  "error": "Transaction must be sponsored",
-  "code": "NOT_SPONSORED",
-  "details": "Build transaction with sponsored: true",
-  "retryable": false
-}
-```
+x402 V2 facilitator endpoints ([spec](https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md) sections 7.1–7.3). Request shapes, `errorReason` codes and idempotency rules are in [docs/agent-payment-guide.md](./docs/agent-payment-guide.md) and at `/topics/x402-v2-facilitator`.
 
 ### GET /verify/:receiptId
 
-Look up a payment receipt by ID and return its status.
+Look up a payment receipt by ID and return its status. Receipts were issued by the former `POST /relay`; existing ones stay readable, no new ones are created.
 
 **Response (success):**
 ```json
@@ -205,7 +121,7 @@ Access a protected resource using a payment receipt. Validates the receipt (exis
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `receiptId` | Yes | Receipt ID from a successful relay transaction |
+| `receiptId` | Yes | Receipt ID issued by the former `POST /relay` (existing receipts only) |
 | `resource` | No | Resource path (validated against receipt) |
 | `targetUrl` | No | Downstream URL for proxying (HTTPS only, no internal hosts) |
 
@@ -259,56 +175,58 @@ OpenAPI 3.1 specification for programmatic access.
 
 ## Usage
 
-### Building a Sponsored Transaction
+### Paying via POST /settle
 
-Transactions must be built with `sponsored: true` and `fee: 0n`:
+Build a standard self-paid transaction (do not set `sponsored: true`; see `GET /fees` for a fee) and settle it:
 
 ```typescript
-import { makeSTXTokenTransfer, getAddressFromPrivateKey, TransactionVersion } from "@stacks/transactions";
-
-const senderAddress = getAddressFromPrivateKey(privateKey, TransactionVersion.Testnet);
-const recipient = "SP..."; // Payment recipient
+import { makeSTXTokenTransfer } from "@stacks/transactions";
 
 const transaction = await makeSTXTokenTransfer({
-  recipient,
+  recipient: "SP...",  // paymentRequirements.payTo
   amount: 1000000n,
   senderKey: privateKey,
   network: "testnet",
-  sponsored: true,  // Required
-  fee: 0n,          // Sponsor pays
+  fee: 3000n,          // sender pays the network fee
 });
 
-const txHex = Buffer.from(transaction.serialize()).toString("hex");
-```
-
-### Submitting to the Relay
-
-```typescript
-const response = await fetch("https://x402-relay.aibtc.dev/relay", {
+const response = await fetch("https://x402-relay.aibtc.dev/settle", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
-    transaction: txHex,
-    settle: {
-      expectedRecipient: recipient,
-      minAmount: "1000000",
-      tokenType: "STX",
-      expectedSender: senderAddress,
+    paymentPayload: { x402Version: 2, payload: { transaction: transaction.serialize() } },
+    paymentRequirements: {
+      scheme: "exact",
+      network: "stacks:2147483648",
+      amount: "1000000",
+      asset: "STX",
+      payTo: "SP...",
     },
   }),
 });
 
-const { txid, settlement, sponsoredTx, receiptId } = await response.json();
-console.log(`Transaction: https://explorer.hiro.so/txid/${txid}?chain=testnet`);
-console.log(`Settlement status: ${settlement.status}`);
-
-// Use receiptId to verify payment or access protected resources
-if (receiptId) {
-  const verifyResponse = await fetch(`https://x402-relay.aibtc.dev/verify/${receiptId}`);
-  const { receipt } = await verifyResponse.json();
-  console.log(`Receipt status: ${receipt.status}`);
-}
+// HTTP 200 for both outcomes; check `success`
+const { success, transaction: txid, errorReason } = await response.json();
 ```
+
+### Building a Sponsored Transaction (POST /sponsor only)
+
+`POST /sponsor` takes a transaction built with `sponsored: true` and `fee: 0n`; the relay adds the sponsor signature and fee.
+
+```typescript
+const transaction = await makeSTXTokenTransfer({
+  recipient: "SP...",
+  amount: 1000000n,
+  senderKey: privateKey,
+  network: "testnet",
+  sponsored: true,  // Required for /sponsor
+  fee: 0n,          // Sponsor pays
+});
+
+const txHex = transaction.serialize();
+```
+
+See [API Key Authentication](#api-key-authentication) for the request.
 
 ## Deployments
 
@@ -326,7 +244,9 @@ if (receiptId) {
 | GET | `/status/sponsor` | None | x402 payment sponsor readiness (configured, funded, under daily budget) |
 | GET | `/docs` | None | Swagger UI documentation |
 | GET | `/openapi.json` | None | OpenAPI specification |
-| POST | `/relay` | None | Submit transaction via x402 facilitator |
+| POST | `/settle` | None | x402 V2 settle: verify payment + broadcast a self-paid tx |
+| POST | `/verify` | None | x402 V2 verify: local validation only |
+| GET | `/supported` | None | x402 V2 supported payment kinds |
 | POST | `/sponsor` | API Key | Sponsor and broadcast transaction directly |
 | GET | `/verify/:receiptId` | None | Verify a payment receipt |
 | POST | `/access` | None | Access protected resource with receipt |
@@ -334,10 +254,6 @@ if (receiptId) {
 | GET | `/dashboard` | None | Public dashboard (HTML) |
 
 ## Rate Limits
-
-### /relay Endpoint
-- 10 requests per minute per sender address
-- Rate limiting is based on the transaction sender, not IP
 
 ### /sponsor Endpoint (API Key)
 
@@ -420,10 +336,6 @@ npm install
 
 # Start local dev server
 npm run dev
-
-# Test /relay endpoint (no auth required)
-npm run test:relay                              # Uses RELAY_URL from .env or localhost
-npm run test:relay -- http://localhost:8787    # Override relay URL
 
 # Test /sponsor endpoint (requires API key)
 npm run test:sponsor                            # Uses TEST_API_KEY from .env

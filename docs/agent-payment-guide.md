@@ -1,556 +1,302 @@
 # Agent Payment Guide — x402 on Stacks
 
-> Canonical reference for AI agents making x402 payments via the aibtc relay.
+> Canonical reference for AI agents making x402 payments through the aibtc relay.
 > Testnet: https://x402-relay.aibtc.dev
 > Production: https://x402-relay.aibtc.com
 
 Related docs:
 - Quick-start: https://x402-relay.aibtc.com/llms.txt
 - Full reference: https://x402-relay.aibtc.com/llms-full.txt
+- x402 V2 facilitator: https://x402-relay.aibtc.com/topics/x402-v2-facilitator
 - Error codes: https://x402-relay.aibtc.com/topics/errors
-- Sponsored transactions: https://x402-relay.aibtc.com/topics/sponsored-transactions
 
 ---
 
 ## Mental Model
 
-**You sign. The relay pays the fee. The recipient gets paid.**
+**You sign and pay your own STX fee. The relay verifies and broadcasts. The recipient gets paid.**
 
 ```
-Agent                    Relay                    Stacks Network
-  |                        |                           |
-  | 1. Build tx            |                           |
-  |    sponsored: true     |                           |
-  |    sign with your key  |                           |
-  |                        |                           |
-  | 2. POST /relay ──────► |                           |
-  |    { transaction,      | 3. Validates payment      |
-  |      settle: {...} }   |    params locally         |
-  |                        | 4. Adds sponsor sig       |
-  |                        |    (pays network fee)     |
-  |                        | 5. Broadcasts ──────────► |
-  |                        | 6. Polls up to 60s ◄───── |
-  |                        |                           |
-  | ◄── 7a. 200 OK ─────── |                           |
-  |    { txid,             |                           |
-  |      settlement,       |                           |
-  |      receiptId? }      |                           |
-  |                        |                           |
-  | ◄── 7b. 202 Held ──── |  (if sender nonce gap)    |
-  |    { status: "held",   |                           |
-  |      queue }           |                           |
+Agent                         Relay                       Stacks Network
+  |                             |                              |
+  | 1. Build a self-paid tx     |                              |
+  |    (standard auth, fee > 0) |                              |
+  |                             |                              |
+  | 2. POST /settle ──────────► | 3. Verify payTo / amount /   |
+  |    { paymentPayload,        |    asset locally             |
+  |      paymentRequirements }  | 4. Broadcast ──────────────► |
+  |                             |                              |
+  | ◄── 5. 200 { success,       |    (confirmation is tracked  |
+  |       transaction: txid }   |     in the background)       |
 ```
 
 Key facts:
-- You never hold STX for fees. The relay wallet sponsors every transaction.
-- Your transaction must be built with `sponsored: true`. The relay fills the sponsor slot.
-- You pay the *service* (the recipient) in STX, sBTC, or USDCx. The relay pays the *network fee*.
-- The `settle` field tells the relay what to verify: who gets paid, how much, which token.
-- `receiptId` is your proof of payment. Store it to gate downstream resources. Note: `receiptId` is best-effort — it may be absent if relay KV storage fails. If missing, use `txid` as your reference.
+- Your wallet pays the network fee. Build a **standard** transaction (do not set `sponsored: true`) with a non-zero fee. See `GET /fees` for estimates.
+- **Public sponsorship has been removed.** `POST /relay` no longer exists (404), and `POST /settle` does not sponsor: a transaction with an empty sponsor slot (`sponsored: true`, fee 0) is refused with `errorReason: "invalid_transaction_state"`.
+- Relay-paid fees exist only for aibtc.com's own worker over a Cloudflare service binding (`RelayRPC.sponsorPayment` / `submitPayment`). They are not reachable over HTTP.
+- You pay the *service* (the recipient) in STX, sBTC, or USDCx. `paymentRequirements` tells the relay what to verify: who gets paid, how much, which token.
+- `POST /settle` returns once the node accepts the broadcast. A `success: true` response means "broadcast", not "confirmed".
 
----
-
-## Per-Service Payment Flows
-
-| Service | Endpoint | Token | Typical Amount | What You Get Back |
-|---------|----------|-------|----------------|-------------------|
-| aibtc.com inbox | `POST /relay` with `expectedRecipient: SP_INBOX` | STX | 1,000,000 µSTX (1 STX) | `receiptId` proving message delivery |
-| aibtc.news briefs | `POST /relay` with `expectedRecipient: SP_NEWS` | STX | 500,000 µSTX (0.5 STX) | `receiptId` + brief content access via `POST /access` |
-| aibtc.news classifieds | `POST /relay` with `expectedRecipient: SP_NEWS` | STX | 2,000,000 µSTX (2 STX) | `receiptId` + classified listing confirmation |
-| MCP tools (per-call) | `POST /settle` (x402 V2) | STX | varies by tool | `success: true` + `transaction` (txid) |
-| Skills (per-execution) | `POST /settle` (x402 V2) | STX | varies by skill | `success: true` + `transaction` (txid) |
-
-> Recipient addresses and exact amounts are published at each service's `GET /supported` endpoint or in its `402 Payment Required` response headers. Always read `payTo` and `amount` from the server's requirements — do not hardcode them.
+Always read `payTo`, `amount`, `asset` and `network` from the resource server's `402 Payment Required` response. Do not hardcode them.
 
 ---
 
 ## Step-by-Step Payment Flow
 
-### Step 1: Build a sponsored transaction
-
-Use `@stacks/transactions` to build a transfer or contract call with `sponsored: true`.
+### Step 1: Build a self-paid transaction
 
 ```typescript
-import { makeSTXTokenTransfer, AnchorMode, PostConditionMode } from "@stacks/transactions";
-import { bytesToHex } from "@stacks/common";
+import { makeSTXTokenTransfer } from "@stacks/transactions";
 
 const tx = await makeSTXTokenTransfer({
-  recipient: "SP_RECIPIENT_ADDRESS",
-  amount: BigInt(1_000_000),           // 1 STX in microSTX
-  senderKey: agentPrivateKey,          // agent signs the tx
-  network: "testnet",                   // or "mainnet" for production
-  sponsored: true,                      // REQUIRED: leaves sponsor slot open
-  anchorMode: AnchorMode.Any,
-  postConditionMode: PostConditionMode.Allow,
-  fee: BigInt(0),                       // relay sets the fee; agent fee must be 0
-  nonce: BigInt(agentNonce),            // use GET /extended/v1/address/{addr}/nonces
+  recipient: paymentRequirements.payTo,
+  amount: BigInt(paymentRequirements.amount), // smallest unit (microSTX for STX)
+  senderKey: agentPrivateKey,
+  network: "testnet",                          // "mainnet" for production
+  fee: BigInt(feeMicroStx),                    // non-zero; see GET /fees
+  nonce: BigInt(agentNonce),                   // see "Account nonce" below
+  // do NOT set sponsored: true
 });
 
-const txHex = bytesToHex(tx.serialize());
+const txHex = tx.serialize(); // hex string
 ```
 
-Important constraints:
-- `sponsored: true` is required. Relay rejects `NOT_SPONSORED` (HTTP 400) if absent.
-- Agent fee must be 0 in the pre-signed tx. The relay calculates and sets the sponsor fee.
-- Use the correct `nonce` for your account. Stale nonces cause `CLIENT_BAD_NONCE` (HTTP 422).
+For sBTC or USDCx, build a SIP-010 `transfer` contract call to `payTo` instead; the same self-paid rules apply.
 
-### Step 2: Submit to the relay (POST /relay)
+### Step 2 (optional): POST /verify
+
+Local validation only, nothing is broadcast. Same request body as `/settle`.
+
+```json
+{ "isValid": true, "payer": "SP..." }
+{ "isValid": false, "invalidReason": "recipient_mismatch" }
+```
+
+`/verify` checks recipient, amount and asset. It does **not** check the sponsor slot, so a transaction with an empty sponsor slot can pass `/verify` and still be refused by `/settle`.
+
+### Step 3: POST /settle
 
 ```typescript
-const response = await fetch("https://x402-relay.aibtc.dev/relay", {
+const RELAY = "https://x402-relay.aibtc.dev";
+
+const res = await fetch(`${RELAY}/settle`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
-    transaction: txHex,
-    settle: {
-      expectedRecipient: "SP_RECIPIENT_ADDRESS",
-      minAmount: "1000000",              // minimum acceptable amount in smallest unit
-      tokenType: "STX",                  // "STX" | "sBTC" | "USDCx"
-    },
-  }),
-});
-
-const result = await response.json();
-```
-
-Optional: add `auth` for SIP-018 structured data authentication (domain-bound, replay-protected):
-
-```typescript
-body: JSON.stringify({
-  transaction: txHex,
-  settle: { ... },
-  auth: {
-    signature: "0x...",                 // RSV sig of SIP-018 structured data
-    message: {
-      action: "relay",                  // "relay" or "sponsor"
-      nonce: Date.now().toString(),     // unix ms — unique per request
-      expiry: (Date.now() + 300_000).toString()  // 5 min from now
-    }
-  }
-})
-```
-
-Alternative path — x402 V2 facilitator (POST /settle):
-
-```typescript
-const response = await fetch("https://x402-relay.aibtc.dev/settle", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
+    x402Version: 2, // optional
     paymentPayload: {
       x402Version: 2,
       payload: { transaction: txHex },
-      extensions: {
-        "payment-identifier": { info: { id: "pay_" + crypto.randomUUID() } }
-      }
+      // optional, see "Idempotency" below
+      extensions: { "payment-identifier": { info: { id: "pay_" + crypto.randomUUID() } } },
     },
     paymentRequirements: {
       scheme: "exact",
-      network: "stacks:2147483648",     // testnet CAIP-2; mainnet = "stacks:1"
+      network: "stacks:2147483648", // testnet; mainnet = "stacks:1"
       amount: "1000000",
-      asset: "STX",
+      asset: "STX",                 // "STX" | "sBTC" | CAIP-19 contract id
       payTo: "SP_RECIPIENT_ADDRESS",
       maxTimeoutSeconds: 60,
     },
   }),
 });
+const result = await res.json();
 ```
 
-### Step 3: Handle the response
+### Step 4: Handle the response
 
-```typescript
-if (!response.ok && response.status !== 202) {
-  // HTTP 4xx/5xx — check result.code and result.retryable
-  const { code, error, retryable, retryAfter } = result;
-  // See error table below for exact action per code
-  return handleError(code, retryable, retryAfter);
-}
+Per the x402 V2 spec, settlement outcomes come back as **HTTP 200** — check `success`, not the status code.
 
-// HTTP 202 — transaction held due to sender nonce gap (no txid, no receiptId)
-if (response.status === 202) {
-  const { status, queue } = result;  // status === "held"
-  // queue contains: { senderNonce, nextExpectedNonce, missingNonces, handSize, estimatedDispatchMs, expiresAt, help }
-  // Submit the missing nonces to unblock dispatch. Held entries remain queued for up to 15 minutes.
-  // After 5 minutes, the alarm may conservatively repair a stale-low sender frontier.
-  return handleHeld(queue, response.headers.get("Retry-After"));
-}
-
-// HTTP 200 — POST /relay success shape:
-const {
-  success,          // true
-  txid,             // "0x..."
-  explorerUrl,      // "https://explorer.hiro.so/txid/0x..."
-  settlement,       // { success, status, sender, recipient, amount, blockHeight? }
-  sponsoredTx,      // fully-sponsored tx hex (keep for dedup retries)
-  receiptId,        // "uuid" — proof of payment (may be absent if KV storage failed; use txid as fallback)
-} = result;
-
-// POST /settle success shape (HTTP 200 for both success and failure per V2 spec):
-const {
-  success,          // true | false
-  payer,            // agent's Stacks address
-  transaction,      // txid (empty string on pre-broadcast failure)
-  network,          // "stacks:2147483648"
-  errorReason,      // set only when success: false
-} = result;
-```
-
-### Step 4: Interpret settlement status
-
-```typescript
-const { status } = settlement;
-
-switch (status) {
-  case "confirmed":
-    // Transaction is on-chain. blockHeight is set.
-    // Store receiptId — it's valid for 30 days.
-    break;
-
-  case "pending":
-    // Broadcast succeeded but relay timed out polling (60s limit).
-    // The transaction IS in flight — do NOT treat this as failure.
-    // Hiro's "dropped_replace_by_fee" reports are ~93% false positives.
-    // Poll GET /verify/:receiptId until status becomes "confirmed".
-    schedulePoll(receiptId);
-    break;
-
-  case "failed":
-    // abort_* on-chain rejection. Definitive terminal state.
-    // Do not retry with the same transaction.
-    // Re-sign with corrected parameters and re-submit.
-    break;
-}
-```
-
----
-
-## Status Checking
-
-### Poll for pending transactions
-
-When `settlement.status === "pending"`, poll this endpoint:
-
-```
-GET https://x402-relay.aibtc.dev/verify/:receiptId
-```
-
-Response:
 ```json
-{
-  "success": true,
-  "receipt": {
-    "receiptId": "uuid",
-    "status": "valid",
-    "senderAddress": "SP...",
-    "txid": "0x...",
-    "settlement": {
-      "success": true,
-      "status": "confirmed",
-      "recipient": "SP...",
-      "amount": "1000000",
-      "blockHeight": 12345
-    }
-  }
-}
+// Success
+{ "success": true, "payer": "SP...", "transaction": "0x<txid>", "network": "stacks:2147483648" }
+
+// Failure (transaction is "" when nothing was broadcast)
+{ "success": false, "errorReason": "recipient_mismatch", "transaction": "", "network": "stacks:2147483648" }
 ```
 
-Polling strategy:
-```typescript
-async function pollReceipt(receiptId: string, maxAttempts = 12): Promise<Receipt> {
-  for (let i = 0; i < maxAttempts; i++) {
-    const r = await fetch(`https://x402-relay.aibtc.dev/verify/${receiptId}`);
-    const { receipt } = await r.json();
-    if (receipt.settlement.status === "confirmed") return receipt;
-    if (receipt.settlement.status === "failed") throw new Error("tx_failed");
-    await sleep(5_000 * Math.pow(1.5, i));  // exponential backoff, ~5s to ~2.5min
-  }
-  throw new Error("poll_timeout");
-}
+Other HTTP statuses:
+- `400` — malformed request (`invalid_payload`, `invalid_payment_requirements`, `invalid_scheme`, `invalid_network`, `unrecognized_asset`).
+- `409` — `payment_identifier_conflict` (same id, different payload).
+- `500` — `unexpected_settle_error`; retry with backoff.
+
+Present the txid (`transaction`) to the resource server as proof of payment.
+
+### Step 5 (optional): Track confirmation
+
+```
+GET /settle/status/:txid          # relay's record: broadcast | pending | confirmed | failed
+GET /settle/status/:txid?live=true # also fetches the live Hiro status
 ```
 
-### When NOT to poll
-
-If `settlement.status === "confirmed"`, no polling needed. The transaction is already on-chain.
-
-If `settlement.status === "failed"` (only for `abort_*` on-chain rejections), polling will not help. Re-sign and re-submit.
+You can also query the Stacks API directly. Hiro's `dropped_replace_by_fee` status is usually transient (most such transactions confirm); only `abort_*` is a definitive on-chain rejection.
 
 ---
 
-## Complete Error-to-Action Table
+## Idempotency and Retries
 
-### Transaction Errors (POST /relay, POST /sponsor)
+- **Same tx hex within 5 minutes** returns the cached result (same txid), so resending the identical signed hex after a network error is safe.
+- **payment-identifier** (`paymentPayload.extensions["payment-identifier"].info.id`, 16–128 chars, `[a-zA-Z0-9_-]+`, `pay_` prefix recommended):
+  - same id + same payload → cached `200` response, no re-broadcast;
+  - same id + different payload (rebuilt tx) → `409 payment_identifier_conflict`. This blocks an accidental double payment. If you really mean to send a different transaction, use a new id;
+  - only successful settles are cached (5 minutes).
+- **Retrying the same payment means resending the same signed hex.** Never re-sign the same payment at a new nonce: if the first transaction is still in the mempool, both can confirm and you pay twice. If you must rebuild (for example a higher fee), keep the **same nonce** so only one of the two can confirm.
 
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `MISSING_TRANSACTION` | 400 | false | Add `transaction` field to request body |
-| `MISSING_SETTLE_OPTIONS` | 400 | false | Add `settle` field with `expectedRecipient` and `minAmount` |
-| `INVALID_SETTLE_OPTIONS` | 400 | false | Fix `expectedRecipient` (must be valid SP/ST address) or `minAmount` (must be numeric string) |
-| `INVALID_TRANSACTION` | 400 | false | Transaction hex is malformed — rebuild the transaction |
-| `NOT_SPONSORED` | 400 | false | Set `sponsored: true` when building the transaction |
-| `SETTLEMENT_VERIFICATION_FAILED` | 400 | false | Tx recipient or amount does not match `settle` options — fix the transaction or the settle params |
-| `INVALID_PAYLOAD` | 400 | false | Request body is structurally invalid — check JSON shape against the schema |
-| `MALFORMED_PAYLOAD` | 400 | false | Payload cannot be parsed — check encoding and content-type |
-| `SENDER_NONCE_GAP` | 400 | false | Your account nonce has a gap; check `details` for missing nonces and submit them to unblock dispatch |
-| `SIGNATURE_VALIDATION_FAILED` | 422 | false | Invalid tx signature — wrong network, mismatched key, or corrupted bytes; rebuild and re-sign |
-| `SETTLEMENT_FAILED` | 422 | false | Transaction received `abort_*` status on-chain (definitive rejection); rebuild with corrected parameters |
-| `CLIENT_INSUFFICIENT_FUNDS` | 422 | false | Agent wallet has insufficient funds for the transfer; top up the wallet, then re-sign and retry |
-| `CLIENT_BAD_NONCE` | 422 | true | Agent nonce is stale; fetch correct nonce from `GET /extended/v1/address/{addr}/nonces`, re-sign, and resubmit |
-| `BROADCAST_REJECTED` | 422 | true | Stacks node rejected the tx for a client reason; inspect `details`, correct the transaction, and resubmit |
-| `NONCE_CONFLICT` | 409 | true | Relay sponsor nonce conflict in mempool; rebuild and resubmit a new transaction (different serialized bytes) |
-| `CLIENT_NONCE_CONFLICT` | 409 | true | Agent already has a pending tx in the mempool; wait for it to confirm or drop. If this request retries that same payment (e.g. after a `BROADCAST_FAILED` 502), resend the same signed hex; do not re-sign it at a new nonce, or both can confirm. Sign at the next nonce only for a different payment |
-| `TRANSACTION_HELD` | 202 | true | Transaction accepted but queued due to a sender nonce gap. Returned as HTTP 202 with `status: "held"` and `queue` info (no `receiptId`). `POST /sponsor` returns `SENDER_NONCE_GAP` (400) instead. Submit the missing nonces listed in `queue.missingNonces`. Held entries remain queued for up to 15 minutes, and the alarm can conservatively repair stale-low sender frontiers after 5 minutes. |
-| `TOO_MUCH_CHAINING` | 429 | true | Relay sponsor wallet has too many in-flight transactions; wait for `retryAfter` seconds (check `Retry-After` header); relay will recover automatically |
-| `RATE_LIMIT_EXCEEDED` | 429 | true | 10 req/min per sender on free tier; wait for `retryAfter` seconds (check `Retry-After` header) |
-| `DAILY_LIMIT_EXCEEDED` | 429 | true | Daily request quota reached for your API key; wait until the quota resets at midnight UTC |
-| `SPENDING_CAP_EXCEEDED` | 429 | true | Daily sponsor fee cap reached for your API key tier; wait until midnight UTC |
-| `BROADCAST_FAILED` | 400 / 502 | 400: false, 502: true | Emitted by `POST /sponsor` when broadcast fails (400 = client/tx error, not retryable; 502 = node/network issue); `POST /relay` uses `SETTLEMENT_BROADCAST_FAILED` instead. On a 502 the node may still hold the tx: retry with backoff by resending the **same signed hex** (the relay returns the earlier txid if it landed). Do not re-sign the same payment at a new nonce, or both can confirm. |
-| `SPONSOR_CONFIG_ERROR` | 500 | false | Relay misconfigured (no mnemonic); contact relay operator |
-| `SPONSOR_FAILED` | 500 | true | Sponsor step failed transiently; retry after 5s |
-| `SETTLEMENT_BROADCAST_FAILED` | 502 | true | Stacks node rejected broadcast; wait `retryAfter` seconds (default 5s) and retry |
-| `SERVICE_DEGRADED` | 503 | true | All sponsor wallets are circuit-broken; retry after `retryAfter` seconds (~30s); relay recovers automatically |
-| `LOW_HEADROOM` | 503 | true | Sponsor nonce pool near capacity; retry after `retryAfter` seconds |
-| `NONCE_DO_UNAVAILABLE` | 503 | true | Nonce coordinator unavailable transiently; retry after backoff |
-
-### API Key Errors (POST /sponsor, POST /fees/config)
-
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `MISSING_API_KEY` | 401 | false | Add `Authorization: Bearer x402_sk_...` header |
-| `INVALID_API_KEY` | 401 | false | Key format is wrong or not found; verify key was stored correctly |
-| `EXPIRED_API_KEY` | 401 | false | Key is past `expiresAt`; provision a new key via `POST /keys/provision` or `POST /keys/provision-stx` |
-| `REVOKED_API_KEY` | 401 | false | Key was deactivated; provision a new key |
-
-### SIP-018 Auth Errors (POST /relay, POST /sponsor with `auth` field)
-
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `INVALID_AUTH_SIGNATURE` | 401 | false | Signature is invalid or `action` does not match the endpoint; rebuild the SIP-018 message and re-sign |
-| `AUTH_EXPIRED` | 401 | false | `expiry` timestamp is in the past; rebuild the message with a future expiry and re-sign |
-
-### Key Provisioning Errors (POST /keys/provision, POST /keys/provision-stx)
-
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `MISSING_BTC_ADDRESS` | 400 | false | Add `btcAddress` field |
-| `MISSING_STX_ADDRESS` | 400 | false | Add `stxAddress` field |
-| `MISSING_SIGNATURE` | 400 | false | Add `signature` field |
-| `INVALID_MESSAGE_FORMAT` | 400 | false | `message` field must match the required format including timestamp |
-| `INVALID_SIGNATURE` | 400 | false | BIP-137/BIP-322 signature verification failed; verify message and signing method |
-| `INVALID_STX_SIGNATURE` | 400 | false | Stacks RSV signature verification failed; verify message and key |
-| `STALE_TIMESTAMP` | 400 | false | Timestamp in message is more than 5 minutes old; re-sign with a fresh timestamp |
-| `ALREADY_PROVISIONED` | 409 | false | This address already has an active key; use your existing key or wait for it to expire |
-| `UNSUPPORTED_ADDRESS_TYPE` | 400 | false | Address type not supported for this endpoint |
-| `INVALID_BTC_ADDRESS` | 400 | false | BTC address format is invalid |
-
-### Receipt and Access Errors (GET /verify/:receiptId, POST /access)
-
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `MISSING_RECEIPT_ID` | 400 | false | Provide `receiptId` in the request |
-| `INVALID_RECEIPT` | 404 | false | Receipt not found; check the `receiptId` value |
-| `RECEIPT_EXPIRED` | 404 | false | Receipt is past its 30-day TTL; re-submit a new payment |
-| `RECEIPT_CONSUMED` | 409 | false | Receipt was one-time-use and already consumed; pay again to get a new receipt |
-| `RESOURCE_MISMATCH` | 400 | false | `resource` param does not match what is stored in the receipt |
-| `PROXY_FAILED` | 502 | true | Downstream `targetUrl` was unreachable; retry after backoff |
-
-### Fee Errors (GET /fees, POST /fees/config)
-
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `FEE_FETCH_FAILED` | 500 | true | Hiro API unreachable; relay uses cached values — retry after backoff |
-| `INVALID_FEE_CONFIG` | 400 | false | Fee floor > ceiling or invalid shape; fix the config request |
-
-### Nonce Management Errors (POST /nonce/reset)
-
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `NONCE_RESET_FAILED` | 500 | true | Nonce resync failed; retry after backoff |
-
-### Queue Errors
-
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `QUEUE_NOT_FOUND` | 404 | false | Queue entry does not exist |
-| `QUEUE_ACCESS_DENIED` | 403 | false | Not authorized to access this queue entry |
-
-### General Errors
-
-| Code | HTTP | Retryable | Agent Action |
-|------|------|-----------|--------------|
-| `NOT_FOUND` | 404 | false | Route or resource not found; check the URL |
-| `INTERNAL_ERROR` | 500 | true | Unexpected server error; retry with exponential backoff |
-
----
-
-## x402 V2 Error Codes
-
-These appear in the `errorReason` (POST /settle) or `invalidReason` (POST /verify) field. The HTTP status is always 200 per the V2 spec — check the `success` or `isValid` field.
-
-| V2 Code | Agent Action |
-|---------|--------------|
-| `invalid_payload` | Required fields missing from request; check paymentPayload and paymentRequirements structure |
-| `invalid_payment_requirements` | `network`, `payTo`, or `amount` missing from paymentRequirements |
-| `invalid_network` | `network` does not match relay's chain (testnet: `stacks:2147483648`, mainnet: `stacks:1`) |
-| `unrecognized_asset` | Asset not recognized; use `"STX"`, `"sBTC"`, or a valid CAIP-19 contract address |
-| `invalid_scheme` | Scheme is not `"exact"` |
-| `unsupported_scheme` | Scheme is syntactically valid but not supported by this relay |
-| `invalid_x402_version` | `x402Version` must be `2` |
-| `invalid_transaction_state` | Tx cannot be deserialized or fails local verification |
-| `recipient_mismatch` | Tx recipient does not match `paymentRequirements.payTo` |
-| `amount_insufficient` | Tx transfer amount is less than `paymentRequirements.amount` |
-| `sender_mismatch` | Tx token type does not match the declared asset |
-| `insufficient_funds` | Sender wallet has insufficient balance |
-| `broadcast_failed` | Stacks node rejected broadcast; rebuild and resubmit |
-| `conflicting_nonce` | Nonce conflict (agent or sponsor); rebuild and resubmit |
-| `transaction_not_found` | Broadcast succeeded but tx not found during confirmation polling |
-| `transaction_pending` | Broadcast succeeded; tx is in flight but not yet confirmed |
-| `transaction_failed` | On-chain `abort_*` rejection; rebuild with corrected parameters |
-| `client_insufficient_funds` | Sender lacks funds for the transfer; top up the wallet |
-| `client_bad_nonce` | Agent nonce is stale; fetch correct nonce and re-sign |
-| `signature_validation_failed` | Tx signature is invalid; rebuild and re-sign |
-| `transaction_held` | Tx queued pending agent nonce gap fill; submit missing nonces. Held entries expire after 15 minutes unless dispatched earlier. |
-| `payment_identifier_conflict` | Same payment-identifier `id` was used with a different transaction payload (HTTP 409) |
-| `payment_identifier_required` | Service requires a `payment-identifier` extension but none was provided |
-| `unexpected_verify_error` | Internal error during local verification; retry |
-| `unexpected_settle_error` | Internal error during settlement; retry |
-
----
-
-## Integration Quick-Start
-
-Full end-to-end example for an agent making an STX payment via POST /relay:
+### Account nonce
 
 ```typescript
-import {
-  makeSTXTokenTransfer,
-  AnchorMode,
-  PostConditionMode,
-} from "@stacks/transactions";
-import { bytesToHex } from "@stacks/common";
-
-const RELAY = "https://x402-relay.aibtc.dev";
-
-async function payAndSettle(opts: {
-  agentPrivateKey: string;
-  agentNonce: bigint;
-  recipientAddress: string;
-  amountMicroSTX: bigint;
-  resource: string;
-}): Promise<{ receiptId: string; txid: string; status: string }> {
-  // 1. Build pre-signed sponsored transaction
-  const tx = await makeSTXTokenTransfer({
-    recipient: opts.recipientAddress,
-    amount: opts.amountMicroSTX,
-    senderKey: opts.agentPrivateKey,
-    network: "testnet",
-    sponsored: true,
-    anchorMode: AnchorMode.Any,
-    postConditionMode: PostConditionMode.Allow,
-    fee: BigInt(0),
-    nonce: opts.agentNonce,
-  });
-  const txHex = bytesToHex(tx.serialize());
-
-  // 2. Submit to relay
-  const res = await fetch(`${RELAY}/relay`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      transaction: txHex,
-      settle: {
-        expectedRecipient: opts.recipientAddress,
-        minAmount: opts.amountMicroSTX.toString(),
-        tokenType: "STX",
-        resource: opts.resource,
-      },
-    }),
-  });
-
-  const body = await res.json();
-
-  // 3. Handle errors and 202/held
-  if (!res.ok && res.status !== 202) {
-    const { code, retryable, retryAfter, error } = body;
-    throw Object.assign(new Error(error ?? "relay_error"), { code, retryable, retryAfter });
-  }
-
-  if (res.status === 202) {
-    // Sender nonce gap — tx is queued but not yet dispatched (no txid, no receiptId).
-    // The queue entry expires after 15 minutes. After 5 minutes the alarm may
-    // conservatively repair a stale-low sender frontier if Hiro confirms the sender advanced.
-    const retryAfter = Number(res.headers.get("Retry-After") ?? 30);
-    throw Object.assign(new Error("transaction_held"), {
-      code: "TRANSACTION_HELD",
-      retryable: true,
-      retryAfter,
-      queue: body.queue,
-    });
-  }
-
-  // 4. Handle settlement status
-  const { txid, receiptId, settlement } = body;
-
-  if (settlement.status === "confirmed") {
-    return { receiptId, txid, status: "confirmed" };
-  }
-
-  if (settlement.status === "pending") {
-    // Poll until confirmed (relay timed out its own polling window)
-    const confirmed = await pollReceipt(receiptId);
-    return { receiptId, txid: confirmed.txid, status: "confirmed" };
-  }
-
-  // status === "failed" — on-chain abort
-  throw new Error(`transaction_aborted: ${txid}`);
-}
-
-async function pollReceipt(
-  receiptId: string,
-  maxAttempts = 12
-): Promise<{ txid: string }> {
-  for (let i = 0; i < maxAttempts; i++) {
-    const r = await fetch(`${RELAY}/verify/${receiptId}`);
-    if (!r.ok) throw new Error("poll_fetch_failed");
-    const { receipt } = await r.json();
-    const status = receipt?.settlement?.status;
-    if (status === "confirmed") return receipt;
-    if (status === "failed") throw new Error("tx_failed_on_chain");
-    // Exponential backoff: 5s, 7.5s, 11.25s, ...
-    await new Promise((resolve) => setTimeout(resolve, 5000 * Math.pow(1.5, i)));
-  }
-  throw new Error("poll_timeout");
-}
-```
-
-### Checking your account nonce before signing
-
-```typescript
-const addr = "SP...";
 const r = await fetch(`https://api.testnet.hiro.so/extended/v1/address/${addr}/nonces`);
 const { possible_next_nonce } = await r.json();
-const nonce = BigInt(possible_next_nonce);
 ```
 
-### Getting an API key for POST /sponsor
+---
+
+## x402 V2 Error Codes (POST /settle, POST /verify)
+
+`/settle` returns these in `errorReason`, `/verify` in `invalidReason`.
+
+| Code | Endpoint | Agent Action |
+|------|----------|--------------|
+| `invalid_payload` | both | Body is not JSON, `paymentPayload`/`paymentRequirements` or `payload.transaction` is missing, or the payment-identifier is malformed. `/settle` returns HTTP 400; `/verify` returns 200 |
+| `invalid_payment_requirements` | both | `network`, `payTo`, `amount` or `asset` missing |
+| `invalid_scheme` | both | `scheme` is set and is not `"exact"` |
+| `invalid_network` | both | `network` does not match the relay (testnet `stacks:2147483648`, mainnet `stacks:1`) |
+| `unrecognized_asset` | both | Use `"STX"`, `"sBTC"`, or a supported CAIP-19 contract id |
+| `invalid_transaction_state` | both | Tx hex is malformed or cannot be verified. On `/settle` it also means the tx has an **empty sponsor slot** — build a self-paid tx |
+| `recipient_mismatch` | both | Tx recipient must exactly match `payTo` |
+| `amount_insufficient` | both | Tx amount is below `amount` |
+| `unsupported_scheme` | both | Tx token does not match `asset` (e.g. an STX transfer against `asset: "sBTC"`) |
+| `payment_identifier_conflict` | both | HTTP 409: same payment-identifier used with a different payload |
+| `unexpected_verify_error` | `/verify` | Internal error; retry |
+| `client_insufficient_funds` | `/settle` | Wallet cannot cover the transfer plus fee; top up, then re-sign |
+| `client_bad_nonce` | `/settle` | Nonce is stale; fetch `possible_next_nonce` and re-sign |
+| `signature_validation_failed` | `/settle` | Wrong network, wrong key, or corrupted bytes; rebuild and re-sign |
+| `conflicting_nonce` | `/settle` | A transaction with this nonce is already in the mempool. If it is this same payment, wait — do not re-sign at a new nonce |
+| `sender_nonce_conflict` | `/settle` | Nonce conflict caused by the sender's own nonce; check your nonce before re-signing |
+| `broadcast_failed` | `/settle` | Transient node/network failure (or too many pending txs from the sender); retry with backoff by resending the **same signed hex** |
+| `transaction_failed` | `/settle` | The node rejected the tx for a non-retryable reason; inspect and rebuild |
+| `unexpected_settle_error` | `/settle` | HTTP 500 internal error; retry with backoff |
+
+---
+
+## POST /sponsor (API key)
+
+`POST /sponsor` still sponsors and broadcasts a transaction directly, with **no payment verification**. It requires an API key (`Authorization: Bearer x402_sk_...`). Use it only when you hold a key and want the relay to pay the fee for a non-payment transaction.
+
+Build the transaction with `sponsored: true` and `fee: 0` (the relay sets the sponsor fee):
 
 ```typescript
-import { signWithKey } from "@stacks/encryption";
+const tx = await makeSTXTokenTransfer({
+  recipient: "SP...",
+  amount: 1_000_000n,
+  senderKey: agentPrivateKey,
+  network: "testnet",
+  sponsored: true,
+  fee: 0n,
+  nonce: BigInt(agentNonce),
+});
+
+const res = await fetch(`${RELAY}/sponsor`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+  body: JSON.stringify({ transaction: tx.serialize() }),
+});
+// 200: { success: true, requestId, txid, explorerUrl, fee }
+```
+
+Optional SIP-018 `auth` field (`action: "sponsor"`): see https://x402-relay.aibtc.com/topics/authentication.
+
+`GET /status/sponsor` reports whether the payment sponsor wallet behind `/sponsor` can take a transaction now (`canSponsor`, `reasons`). Check it if you get `SPONSOR_EXHAUSTED`.
+
+### /sponsor error codes
+
+Errors use the shape `{ success: false, requestId, error, code, details?, retryable, retryAfter? }`; `retryAfter` is also sent as a `Retry-After` header.
+
+| Code | HTTP | Retryable | Agent Action |
+|------|------|-----------|--------------|
+| `MISSING_API_KEY` / `INVALID_API_KEY` | 401 | false | Send a valid `Authorization: Bearer x402_sk_...` header |
+| `EXPIRED_API_KEY` / `REVOKED_API_KEY` | 401 | false | Provision a new key |
+| `INVALID_AUTH_SIGNATURE` | 401 | false | SIP-018 signature invalid or `action` is not `"sponsor"`; re-sign |
+| `AUTH_EXPIRED` | 401 | false | SIP-018 `expiry` is in the past; re-sign with a future expiry |
+| `MISSING_TRANSACTION` | 400 | false | Add the `transaction` field |
+| `MALFORMED_PAYLOAD` | 400 | false | Tx hex cannot be parsed (repeated malformed payloads get the IP blocked with `RATE_LIMIT_EXCEEDED`, `retryAfter: 600`) |
+| `INVALID_TRANSACTION` | 400 | false | Tx is invalid; rebuild it |
+| `NOT_SPONSORED` | 400 | false | `/sponsor` needs `sponsored: true` |
+| `SENDER_NONCE_GAP` | 400 | false | Your nonce is ahead of the chain; submit the missing nonces first |
+| `CLIENT_BAD_NONCE` | 422 | true | Nonce already used; fetch `possible_next_nonce`, re-sign, resubmit |
+| `CLIENT_INSUFFICIENT_FUNDS` | 422 | false | Wallet cannot cover the transfer; top up, then re-sign |
+| `SIGNATURE_VALIDATION_FAILED` | 422 | false | Wrong network, wrong key, or corrupted bytes; rebuild and re-sign |
+| `BROADCAST_REJECTED` | 422 | true | Node rejected the tx for another client reason; inspect `details`, correct, resubmit |
+| `CLIENT_NONCE_CONFLICT` | 409 | true | You already have a pending tx at this nonce; wait for it to confirm or drop. If this request retries that same payment (e.g. after a `BROADCAST_FAILED` 502), resend the **same signed hex**; do not re-sign it at a new nonce, or both can confirm. Sign at the next nonce only for a different payment |
+| `RATE_LIMIT_EXCEEDED` | 429 | true | Per-key request rate exceeded; wait `retryAfter` |
+| `DAILY_LIMIT_EXCEEDED` | 429 | true | Daily request quota reached; resets at midnight UTC |
+| `SPENDING_CAP_EXCEEDED` | 429 | true | Daily sponsor-fee cap for your tier reached; resets at midnight UTC |
+| `TOO_MUCH_CHAINING` | 429 | true | Sponsor wallet congested, or too many pending txs from your address; wait `retryAfter` (30s) |
+| `BROADCAST_FAILED` | 400 / 502 | 400: false, 502: true | 400 = the node rejected the tx for a client reason. 502 = node/network issue or unclear outcome; the node may still hold the tx. Retry with backoff by resending the **same signed hex** (the relay returns the earlier txid if it landed). Do not re-sign the same payment at a new nonce, or both can confirm |
+| `SPONSOR_EXHAUSTED` | 503 | true | Sponsor wallet low on STX or its daily budget is spent; wait `retryAfter`, check `GET /status/sponsor` |
+| `SPONSOR_CONFIG_ERROR` | 500 | false | Relay misconfigured; contact the operator |
+| `INTERNAL_ERROR` | 500 | true | Unexpected error; retry with backoff |
+
+Rate limits by tier: free 10/min, 100/day, 100 STX/day fee cap; standard 60/min, 10,000/day, 1,000 STX/day; unlimited has no limits.
+
+---
+
+## API Keys
+
+Provision a free-tier key (30-day expiry) by signing a message with your own key. One key per address.
+
+```typescript
+import { hashMessage, signMessageHashRsv } from "@stacks/encryption";
+import { bytesToHex } from "@stacks/common";
 
 const message = `Bitcoin will be the currency of AIs | ${new Date().toISOString()}`;
-const signature = await signWithKey(agentPrivateKey, message);
+const signature = signMessageHashRsv({
+  messageHash: bytesToHex(hashMessage(message)),
+  privateKey: agentPrivateKey,
+}).data;
 
 const r = await fetch(`${RELAY}/keys/provision-stx`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    stxAddress: agentAddress,
-    signature: "0x" + signature,
-    message,
-  }),
+  body: JSON.stringify({ stxAddress: agentAddress, signature, message }),
 });
-const { apiKey } = await r.json();
-// Store apiKey securely — it is shown only once.
+const { apiKey } = await r.json(); // shown only once — store it securely
 ```
+
+`POST /keys/provision` does the same with a Bitcoin address and a BIP-137/BIP-322 signature (`btcAddress`, `signature`, `message`). Details: https://x402-relay.aibtc.com/topics/api-keys.
+
+| Code | HTTP | Agent Action |
+|------|------|--------------|
+| `MISSING_BTC_ADDRESS` / `MISSING_STX_ADDRESS` / `MISSING_SIGNATURE` | 400 | Add the missing field |
+| `INVALID_MESSAGE_FORMAT` | 400 | `message` must match the required format |
+| `INVALID_SIGNATURE` / `INVALID_STX_SIGNATURE` | 400 | Signature does not verify; check message and signing method |
+| `STALE_TIMESTAMP` | 400 | Timestamp older than 5 minutes; re-sign with a fresh one |
+| `INVALID_BTC_ADDRESS` / `UNSUPPORTED_ADDRESS_TYPE` | 400 | Use a supported, valid address |
+| `ALREADY_PROVISIONED` | 409 | This address already has a key; use it |
+
+---
+
+## Receipts (legacy, read-only)
+
+Receipts were issued by the former `POST /relay`. Existing receipts (30-day TTL) remain readable; **no new receipts are created**, and `/settle` does not issue them.
+
+- `GET /verify/:receiptId` — receipt status. `404 NOT_FOUND` if unknown or expired.
+- `POST /access` `{ receiptId, resource?, targetUrl? }` — one-time use of a receipt to reach a resource.
+
+| Code | HTTP | Agent Action |
+|------|------|--------------|
+| `MISSING_RECEIPT_ID` | 400 | Provide `receiptId` |
+| `NOT_FOUND` | 404 | Receipt unknown or expired |
+| `RECEIPT_CONSUMED` | 400 | Receipt already used |
+| `RESOURCE_MISMATCH` | 400 | `resource` does not match the receipt |
+| `INVALID_RECEIPT` | 400 | `targetUrl` invalid, not HTTPS, or points at an internal host |
+| `PROXY_FAILED` | 502 | Downstream unreachable or non-2xx; retry after backoff |
+
+---
+
+## Fees
+
+`GET /fees` (no auth) returns clamped fee estimates in microSTX for `token_transfer`, `contract_call` and `smart_contract`, each with `low_priority` / `medium_priority` / `high_priority`. Use them to pick the fee for a self-paid transaction. `source` is `hiro`, `cache` or `default` (fallback when Hiro is unreachable). `FEE_FETCH_FAILED` (500) is an unexpected error; retry after backoff.
 
 ---
 
@@ -561,21 +307,20 @@ const { apiKey } = await r.json();
 | Testnet (staging) | https://x402-relay.aibtc.dev | `stacks:2147483648` | testnet |
 | Mainnet (production) | https://x402-relay.aibtc.com | `stacks:1` | mainnet |
 
-SIP-018 domain constants (for structured data signatures):
-- Both networks: `name="x402-sponsor-relay"`, `version="1"`
-- Mainnet: `chainId=1`
-- Testnet: `chainId=2147483648`
+`GET /supported` returns `{ kinds: [{ x402Version: 2, scheme: "exact", network }], extensions: ["payment-identifier"], signers: { "stacks:*": [] } }`. `signers` is empty because `/settle` does not co-sign: there is no fee payer to put in a 402's `extra.feePayer`.
+
+SIP-018 domain (for the optional `/sponsor` auth): `name="x402-sponsor-relay"`, `version="1"`, `chainId=1` (mainnet) or `2147483648` (testnet).
 
 ---
 
 ## Common Pitfalls
 
-| Symptom | Root Cause | Fix |
-|---------|-----------|-----|
-| `NOT_SPONSORED` | Built tx without `sponsored: true` | Set `sponsored: true` in transaction builder |
-| `SETTLEMENT_VERIFICATION_FAILED` | `expectedRecipient` in `settle` does not match the tx recipient | Make sure the address in `settle.expectedRecipient` exactly matches the transfer recipient in the tx |
-| `CLIENT_BAD_NONCE` | Stale nonce (another tx already consumed it) | Fetch `possible_next_nonce` from Hiro API and re-sign |
-| `SETTLEMENT_FAILED` | On-chain `abort_*` (insufficient funds, bad post-conditions, etc.) | Check tx parameters; ensure agent wallet has enough tokens for the transfer |
-| `settlement.status: "pending"` treated as failure | Misread pending as failed | Pending means in-flight — poll `/verify/:receiptId` |
-| `ALREADY_PROVISIONED` on key provisioning | Same address used twice | Use your existing API key; provision a new one after the existing key expires |
-| `AUTH_EXPIRED` on SIP-018 auth | `expiry` in the past | Set `expiry` to at least 60 seconds in the future from `Date.now()` |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `404` on `POST /relay` | Endpoint removed | Build a self-paid tx and use `POST /settle` |
+| `invalid_transaction_state` on `/settle` with a tx that passed `/verify` | Tx built with `sponsored: true`, fee 0 | Build a standard tx with a non-zero fee |
+| `recipient_mismatch` | Tx recipient differs from `payTo` | Use `payTo` exactly as given in the 402 response |
+| `unsupported_scheme` | Token in tx differs from `asset` | Transfer the asset the server asked for |
+| `client_bad_nonce` / `CLIENT_BAD_NONCE` | Stale nonce | Fetch `possible_next_nonce` and re-sign |
+| Paid twice | Re-signed the same payment at a new nonce after a timeout or error | Resend the same signed hex; if you must rebuild, keep the same nonce |
+| `payment_identifier_conflict` | Reused an id with a rebuilt tx | Resend the original hex, or use a new id for a genuinely new payment |

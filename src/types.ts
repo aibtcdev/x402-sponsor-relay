@@ -511,7 +511,7 @@ export const SIP018_DOMAIN = {
 } as const;
 
 /**
- * Request body for /relay endpoint
+ * Request body for the former POST /relay endpoint (removed; type kept for reference)
  */
 export interface RelayRequest {
   /** Hex-encoded signed sponsored transaction */
@@ -567,7 +567,7 @@ export interface PaymentReceipt {
 }
 
 /**
- * Response from /relay endpoint
+ * Response from the former POST /relay endpoint (removed; type kept for reference)
  */
 export interface RelayResponse {
   /** Transaction ID if successful */
@@ -1657,7 +1657,7 @@ export interface SponsorHeld {
 
 /**
  * Queue position info returned to agents when a transaction is held pending a nonce gap fill.
- * Included in 202 responses from POST /relay and in POST /settle held responses.
+ * Was included in 202 responses from the former POST /relay. No current HTTP endpoint returns it.
  */
 export interface QueueInfo {
   /** Always "held" — indicates the tx is waiting in the sender's hand */
@@ -1696,7 +1696,7 @@ const ALARM_CADENCE_ESTIMATE_MS = 10_000;
 
 /**
  * Build a QueueInfo object from a SponsorHeld result and the submitted sender nonce.
- * Suitable for inclusion in 202 responses (POST /relay) and V2 held responses (POST /settle).
+ * Built for the 202 responses of the former POST /relay. No current HTTP endpoint returns it.
  *
  * @param held - The SponsorHeld result from the sponsoring service
  * @param senderNonce - The nonce of the submitted transaction
