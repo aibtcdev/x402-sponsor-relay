@@ -536,6 +536,11 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
   - `SPONSOR_ACCOUNT_INDEX` - Account index to derive (default: 0, optional)
   - `SPONSOR_PRIVATE_KEY` - Hex private key (fallback, not recommended)
   - `HIRO_API_KEY` - Optional API key for Hiro fee estimation endpoint (higher rate limits)
+  - `PAYMENT_SPONSOR_PRIVATE_KEY` - **Required** hex private key of the single payment-sponsor wallet
+    (`SponsorWalletDO`). It sponsors `POST /sponsor`, `RelayRPC.sponsorPayment` and `RelayRPC.submitPayment`.
+    It is a separate wallet from the `SPONSOR_MNEMONIC` pool. Without it, all three return
+    `SPONSOR_CONFIG_ERROR` ("Service not configured"). It must be funded on the environment's network.
+  - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` - Optional; both are needed for payment-sponsor low-balance alerts
 - Vars set in `wrangler.jsonc` (not secrets):
   - `SPONSOR_WALLET_COUNT` - Number of sponsor wallets for round-robin nonce rotation (configured as `"10"` in `wrangler.jsonc`; if unset at runtime, the code defaults to `1`)
     - All environments (local dev, staging, production) currently set `"10"` in `wrangler.jsonc`
@@ -557,12 +562,15 @@ npx wrangler login
 npx wrangler secret put SPONSOR_MNEMONIC --env staging
 # Optional: set account index if not using default (0)
 npx wrangler secret put SPONSOR_ACCOUNT_INDEX --env staging
+# Required: payment-sponsor wallet for /sponsor and the sponsorPayment/submitPayment RPCs
+npx wrangler secret put PAYMENT_SPONSOR_PRIVATE_KEY --env staging
 
 # Deploy to staging (testnet)
 npx wrangler deploy --env staging
 
 # Deploy to production (mainnet)
 npx wrangler secret put SPONSOR_MNEMONIC --env production
+npx wrangler secret put PAYMENT_SPONSOR_PRIVATE_KEY --env production
 npx wrangler deploy --env production
 ```
 
