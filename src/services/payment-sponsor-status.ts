@@ -18,13 +18,19 @@ export interface PaymentSponsorState {
  *
  * x402 payments are sponsored by the single SponsorWalletDO (PAYMENT_SPONSOR_PRIVATE_KEY),
  * which reads its nonce from Hiro per payment — there is no pool, reconciliation or snapshot
- * to go stale. So readiness is just: configured, funded, and under today's budget. An
- * unreadable balance does not block (the sponsor preflight fails open the same way).
+ * to go stale. So readiness is: configured, readable, funded, and under today's budget.
+ *
+ * An unreadable balance blocks (SPONSOR_STATE_UNREADABLE). The payment path needs the same
+ * Hiro read: SponsorWalletDO refuses with "Could not read sender/sponsor nonce" and broadcasts
+ * nothing, so reporting healthy here would steer clients onto a path that cannot succeed.
  */
 export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now()): SponsorStatusResult {
   const reasons: SponsorStatusReason[] = [];
-  if (!s.configured) reasons.push("SPONSOR_NOT_CONFIGURED");
-  if (s.balance !== null && s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
+  if (!s.configured) {
+    reasons.push("SPONSOR_NOT_CONFIGURED");
+  } else if (s.balance === null) {
+    reasons.push("SPONSOR_STATE_UNREADABLE");
+  } else if (s.balance < BigInt(SponsorService.DEPLETED_THRESHOLD)) {
     reasons.push("SPONSOR_BALANCE_LOW");
   }
   if (s.spentToday >= s.dailyBudget) reasons.push("DAILY_BUDGET_REACHED");
@@ -52,7 +58,7 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       lastSuccessfulAt: s.balance !== null ? asOf : null,
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
-    snapshot: { asOf, ageMs: 0, freshness: "fresh" },
+    snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "unavailable" },
   };
 }
 

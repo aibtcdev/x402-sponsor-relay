@@ -754,11 +754,12 @@ gasless payment; when it is false, follow recommendation ("fallback_to_direct": 
 
 canSponsor is false (HTTP 503, status "unavailable") when any of these reasons apply:
 - SPONSOR_NOT_CONFIGURED — the relay has no payment sponsor key
+- SPONSOR_STATE_UNREADABLE — Hiro could not be read, so payments would be refused too
 - SPONSOR_BALANCE_LOW — the sponsor wallet holds less than 0.1 STX
 - DAILY_BUDGET_REACHED — today's sponsor fee budget is spent (resets at midnight UTC)
 
-The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor stays true and
-reconciliation.freshness is "unavailable". noncePool is kept for compatibility (one sponsor, nothing reserved).
+The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor is false with
+reason SPONSOR_STATE_UNREADABLE, and reconciliation.freshness and snapshot.freshness are "unavailable". noncePool is kept for compatibility (one sponsor, nothing reserved).
 
 ### Response
 

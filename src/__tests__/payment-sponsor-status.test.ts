@@ -54,10 +54,22 @@ describe("toPaymentSponsorStatus", () => {
     expect(result.reasons).toEqual(["DAILY_BUDGET_REACHED"]);
   });
 
-  it("stays sponsorable when Hiro balance is unreadable (fail-open like the preflight)", () => {
+  it("is unavailable when Hiro balance is unreadable (matches the payment path)", () => {
     const result = toPaymentSponsorStatus(state({ balance: null }));
-    expect(result.canSponsor).toBe(true);
-    expect(result.reconciliation).toMatchObject({ lastSuccessfulAt: null, freshness: "unavailable" });
+    expect(result).toMatchObject({
+      status: "unavailable",
+      canSponsor: false,
+      recommendation: "fallback_to_direct",
+      reasons: ["SPONSOR_STATE_UNREADABLE"],
+      reconciliation: { lastSuccessfulAt: null, freshness: "unavailable" },
+      snapshot: { freshness: "unavailable" },
+    });
+  });
+
+  it("reports only SPONSOR_NOT_CONFIGURED when there is no sponsor key", () => {
+    expect(toPaymentSponsorStatus(state({ configured: false, balance: null })).reasons).toEqual([
+      "SPONSOR_NOT_CONFIGURED",
+    ]);
   });
 });
 
@@ -91,6 +103,25 @@ describe("getPaymentSponsorStatus", () => {
     hiroBalance(1_000n);
     const result = await getPaymentSponsorStatus(env("10000000"), logger);
     expect(result.reasons).toEqual(["SPONSOR_BALANCE_LOW", "DAILY_BUDGET_REACHED"]);
+  });
+
+  it("fails closed when Hiro returns an error", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("upstream down", { status: 502 }));
+    const result = await getPaymentSponsorStatus(env("0"), logger);
+    expect(result).toMatchObject({
+      status: "unavailable",
+      canSponsor: false,
+      recommendation: "fallback_to_direct",
+      reasons: ["SPONSOR_STATE_UNREADABLE"],
+      snapshot: { freshness: "unavailable" },
+    });
+  });
+
+  it("fails closed when the Hiro request throws", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("connect timeout"));
+    const result = await getPaymentSponsorStatus(env("0"), logger);
+    expect(result.canSponsor).toBe(false);
+    expect(result.reasons).toEqual(["SPONSOR_STATE_UNREADABLE"]);
   });
 
   it("does not touch Hiro when the sponsor is not configured", async () => {
