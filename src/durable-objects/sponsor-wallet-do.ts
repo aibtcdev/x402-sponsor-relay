@@ -294,7 +294,7 @@ export class SponsorWallet {
       this.inFlight.delete(sender);
     }
     if (info.last_mempool_tx_nonce != null || this.inFlight.has(sender)) {
-      return refuse("SENDER_NONCE_DUPLICATE", "Wait for your previous transaction to confirm, then re-sign and resend");
+      return refuse("SENDER_NONCE_DUPLICATE", "Wait for your previous transaction to confirm or drop. If this retries that same payment, resend the same signed hex; re-signing it at a new nonce lets both confirm");
     }
     if (senderNonce < info.possible_next_nonce) {
       return refuse("SENDER_NONCE_STALE", `Nonce ${senderNonce} is already used; next is ${info.possible_next_nonce}`, info.possible_next_nonce);
