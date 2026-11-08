@@ -53,6 +53,7 @@ export class SponsorStatus extends BaseEndpoint {
                       "SNAPSHOT_STALE",
                       "SPONSOR_NOT_CONFIGURED",
                       "SPONSOR_BALANCE_LOW",
+                      "SPONSOR_STATE_UNREADABLE",
                       "DAILY_BUDGET_REACHED",
                     ],
                   },
@@ -87,7 +88,7 @@ export class SponsorStatus extends BaseEndpoint {
                     ageMs: { type: "number" as const },
                     freshness: {
                       type: "string" as const,
-                      enum: ["fresh", "stale", "expired"],
+                      enum: ["fresh", "stale", "expired", "unavailable"],
                     },
                   },
                 },
@@ -97,7 +98,7 @@ export class SponsorStatus extends BaseEndpoint {
         },
       },
       "503": {
-        description: "Expired sponsor status snapshot",
+        description: "Sponsor unavailable (canSponsor: false; see reasons)",
         content: {
           "application/json": {
             schema: {
@@ -130,6 +131,7 @@ export class SponsorStatus extends BaseEndpoint {
                       "SNAPSHOT_STALE",
                       "SPONSOR_NOT_CONFIGURED",
                       "SPONSOR_BALANCE_LOW",
+                      "SPONSOR_STATE_UNREADABLE",
                       "DAILY_BUDGET_REACHED",
                     ],
                   },
@@ -164,7 +166,7 @@ export class SponsorStatus extends BaseEndpoint {
                     ageMs: { type: "number" as const },
                     freshness: {
                       type: "string" as const,
-                      enum: ["expired"],
+                      enum: ["fresh", "expired", "unavailable"],
                     },
                   },
                 },
