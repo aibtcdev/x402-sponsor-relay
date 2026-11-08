@@ -131,7 +131,7 @@ The full enumeration is exported from `@aibtc/tx-schemas/rpc` as `RPC_ERROR_CODE
 | `INVALID_TRANSACTION` | validation | no | Malformed hex or deserialization failure |
 | `NOT_SPONSORED` | validation | no | Tx is not a sponsored transaction |
 | `SENDER_NONCE_STALE` | sender | yes (rebuild) | Sender's nonce already confirmed/in-mempool — re-acquire and rebuild |
-| `SENDER_NONCE_DUPLICATE` | sender | yes (wait) | This sender already has a tx in flight (at any nonce; the relay takes one pending tx per sender). Wait for it to confirm or drop. If this call retries that same payment, resend the same hex; re-signing it at a new nonce lets both confirm. A different payment also has to wait, then sign at the next nonce. Note: `submitPayment` returns this code with `retryable: false` |
+| `SENDER_NONCE_DUPLICATE` | sender | yes (wait) | This sender already has a tx in flight (at any nonce; the relay takes one pending tx per sender). Wait for it to confirm or drop. If this call retries that same payment, resend the same hex; re-signing it at a new nonce lets both confirm. A different payment also has to wait, then sign at the next nonce. From `submitPayment` it means something narrower and is `retryable: false`: a *different* tx at this nonce is already in flight (an identical hex is deduped earlier and returns the existing `paymentId`). Do not retry this tx; poll the in-flight payment, and sign the next payment at the next nonce only after it settles. |
 | `SENDER_NONCE_GAP` | sender | yes (later) | Hold/wait for sender to catch up |
 | `NONCE_CONFLICT` | relay | yes (resubmit) | Sponsor nonce collision — resubmit same serialized tx |
 | `SPONSOR_NONCE_STALE` | relay | yes (resubmit) | Internal sponsor nonce drift — resubmit |
