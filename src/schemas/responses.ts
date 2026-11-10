@@ -167,3 +167,25 @@ export const Error504Response = {
   },
   headers: RetryAfterHeader,
 };
+
+/** OpenAPI shape of PaymentSponsorWalletInfo (GET /status/sponsor `wallet`, GET /wallets `paymentSponsor`). */
+export const PaymentSponsorWalletSchema = {
+  type: "object" as const,
+  description:
+    "The x402 payment-sponsor wallet (PAYMENT_SPONSOR_PRIVATE_KEY), which sponsors POST /sponsor and the RelayRPC payment binding. " +
+    "Amounts in microSTX. It has two daily fee budgets (x402 payments and POST /sponsor), each capped at dailyBudgetPerPath.",
+  properties: {
+    address: { type: "string" as const },
+    balance: { type: "string" as const, nullable: true, description: "STX balance; null when Hiro is unreadable" },
+    spentToday: {
+      type: "object" as const,
+      nullable: true,
+      description: "Fees sponsored today (UTC) per budget; null when the sponsor wallet DO is unreadable",
+      properties: {
+        payments: { type: "string" as const },
+        sponsor: { type: "string" as const },
+      },
+    },
+    dailyBudgetPerPath: { type: "string" as const },
+  },
+};

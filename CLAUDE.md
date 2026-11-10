@@ -488,8 +488,10 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
     It is a separate wallet from the `SPONSOR_MNEMONIC` pool. Without it, all three return
     `SPONSOR_CONFIG_ERROR` ("Service not configured"). It must be funded on the environment's network.
     Its address, balance and today's spend are public at `GET /status/sponsor` (`wallet`) and
-    `GET /wallets` (`paymentSponsor`). The `/wallets` `wallets` array is the legacy `SPONSOR_MNEMONIC`
-    pool, which no live path sponsors from; do not fund it.
+    `GET /wallets` (`paymentSponsor`). It has two daily fee budgets, x402 payments (`"budget"`) and
+    `POST /sponsor` (`"budget:sponsor"`), each capped at `SPONSOR_DAILY_BUDGET_USTX`, so it can spend up to
+    twice that per UTC day. The `/wallets` `wallets` array is the legacy `SPONSOR_MNEMONIC` pool, which no
+    live path sponsors from; do not fund it.
   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` - Optional; both are needed for payment-sponsor low-balance alerts
 - Vars set in `wrangler.jsonc` (not secrets):
   - `SPONSOR_WALLET_COUNT` - Number of sponsor wallets for round-robin nonce rotation (configured as `"10"` in `wrangler.jsonc`; if unset at runtime, the code defaults to `1`)

@@ -376,11 +376,20 @@ export class SponsorWalletDO {
   }
 
   async fetch(request: Request): Promise<Response> {
-    // GET: today's fee spend (read by the alert cron)
+    // GET: today's fee spend per budget. `spent` is the x402 "budget" (read by the alert cron);
+    // `sponsorSpent` is POST /sponsor's separate "budget:sponsor". Each has its own daily cap.
     if (request.method === "GET") {
       const day = new Date().toISOString().slice(0, 10);
-      const stored = await this.state.storage.get<{ day: string; spent: string }>("budget");
-      return Response.json({ day, spent: stored?.day === day ? stored.spent : "0" });
+      const [payments, sponsor] = await Promise.all(
+        (["budget", "budget:sponsor"] as const).map((name) =>
+          this.state.storage.get<{ day: string; spent: string }>(name)
+        )
+      );
+      return Response.json({
+        day,
+        spent: payments?.day === day ? payments.spent : "0",
+        sponsorSpent: sponsor?.day === day ? sponsor.spent : "0",
+      });
     }
     // POST /lookup: an earlier sponsorship of this client tx that landed, or null
     if (new URL(request.url).pathname === "/lookup") {

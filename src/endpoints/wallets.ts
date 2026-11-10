@@ -2,7 +2,7 @@ import { BaseEndpoint } from "./BaseEndpoint";
 import { SponsorService } from "../services";
 import { getPaymentSponsorWallet } from "../services/payment-sponsor-status";
 import type { AppContext } from "../types";
-import { Error500Response } from "../schemas";
+import { Error500Response, PaymentSponsorWalletSchema } from "../schemas";
 
 /**
  * Wallet monitoring endpoint
@@ -34,16 +34,9 @@ export class Wallets extends BaseEndpoint {
                   description: "Unique request identifier for tracking",
                 },
                 paymentSponsor: {
-                  type: "object" as const,
+                  ...PaymentSponsorWalletSchema,
                   nullable: true,
-                  description:
-                    "The x402 payment-sponsor wallet (PAYMENT_SPONSOR_PRIVATE_KEY). null when not configured or unreadable.",
-                  properties: {
-                    address: { type: "string" as const },
-                    balance: { type: "string" as const, nullable: true, description: "STX balance in microSTX; null when Hiro is unreadable" },
-                    spentToday: { type: "string" as const, description: "Sponsored fees spent today (UTC) in microSTX" },
-                    dailyBudget: { type: "string" as const, description: "Daily sponsored-fee budget in microSTX" },
-                  },
+                  description: "The wallet to fund (null when not configured). " + PaymentSponsorWalletSchema.description,
                 },
                 legacyPool: {
                   type: "boolean" as const,
