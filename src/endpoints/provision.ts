@@ -211,7 +211,11 @@ export class Provision extends BaseEndpoint {
       let metadata: ApiKeyMetadata;
 
       try {
-        const result = await authService.provisionKey(body.btcAddress);
+        const result = await authService.provisionKey(body.btcAddress, {
+          // Only a fresh timestamped signature may replace an expired key;
+          // the bare registration signature has no freshness and could be replayed.
+          allowRenewal: verifyResult.path === "self-service",
+        });
         apiKey = result.apiKey;
         metadata = result.metadata;
       } catch (e) {
@@ -222,6 +226,11 @@ export class Provision extends BaseEndpoint {
             code: "ALREADY_PROVISIONED",
             status: 409,
             retryable: false,
+            ...(e.renewalRequiresTimestamp && {
+              details:
+                "The existing key has expired. To renew it, sign the timestamped message " +
+                "'Bitcoin will be the currency of AIs | {ISO-timestamp}' (within 5 minutes).",
+            }),
           });
         }
 
