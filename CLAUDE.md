@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-x402 Stacks Sponsor Relay - A Cloudflare Worker enabling gasless transactions for AI agents on the Stacks blockchain. Accepts pre-signed sponsored transactions, sponsors them, verifies payment parameters locally, and broadcasts directly to the Stacks network. Supports confirmed (immediate) and pending (60s timeout) settlement states with idempotent retry via KV dedup.
+x402 Stacks Sponsor Relay - A Cloudflare Worker that verifies and settles x402 payments on the Stacks blockchain. Agents submit a self-paid transaction to POST /settle; the relay verifies payment parameters locally and broadcasts directly to the Stacks network, with idempotent retry via KV dedup. Public sponsorship (the former POST /relay) has been removed: relay-paid fees exist only for aibtc.com's own worker over the service binding (RelayRPC.sponsorPayment / submitPayment) and for API-key holders via POST /sponsor.
 
 Also implements the x402 V2 facilitator API (spec sections 7.1–7.3) for compatibility with standard x402 client libraries: POST /settle, POST /verify, GET /supported.
 Spec reference: https://github.com/coinbase/x402/blob/main/specs/x402-specification-v2.md
@@ -26,10 +26,6 @@ npm run check
 # Dry-run deploy (verify build)
 npm run deploy:dry-run
 
-# Test relay endpoint (requires .env with AGENT_MNEMONIC or AGENT_PRIVATE_KEY)
-npm run test:relay
-npm run test:relay -- [relay-url]
-
 # Test sponsor endpoint (requires .env with TEST_API_KEY)
 npm run test:sponsor
 npm run test:sponsor -- [relay-url]
@@ -42,7 +38,7 @@ npm run test:provision -- [relay-url]
 npm run test:provision-stx
 npm run test:provision-stx -- [relay-url]
 
-# Test SIP-018 structured data auth (requires .env with AGENT_MNEMONIC and TEST_API_KEY)
+# Test SIP-018 structured data auth on /sponsor (requires .env with AGENT_MNEMONIC and TEST_API_KEY)
 npm run test:sip018-auth
 npm run test:sip018-auth -- [relay-url]
 
@@ -77,7 +73,6 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /health` - Health check with network info
 - `GET /docs` - Swagger UI API documentation (Chanfana)
 - `GET /openapi.json` - OpenAPI specification
-- `POST /relay` - Submit sponsored transaction for native settlement (verify locally + broadcast + poll, optional SIP-018 auth)
 - `POST /sponsor` - Sponsor and broadcast transaction directly (requires API key, optional SIP-018 auth)
 - `POST /keys/provision` - Provision API key via Bitcoin signature (BIP-137/BIP-322)
 - `POST /keys/provision-stx` - Provision API key via Stacks signature
@@ -88,12 +83,12 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /nonce/state` - Observable nonce state for client diagnostics (pending txs, gaps, health)
 - `GET /stats` - Relay statistics (JSON API): transactions (total/success/failed/clientErrors, rawSuccessRate, effectiveSuccessRate, previousTotal, trend), tokens (STX/sBTC/USDCx volume), settlement health, settlementTimes (p50/p95 excluding gap-fills), terminalReasons (6-category breakdown), walletThroughput, previous24h comparison window
 - `GET /dashboard` - Public dashboard (HTML)
-- `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast; auto-sponsors transactions with empty sponsor slot)
+- `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast; self-paid txs only, an empty sponsor slot is rejected with `invalid_transaction_state`)
 - `POST /verify` - x402 V2 facilitator verify (local validation only, no broadcast)
 - `GET /supported` - x402 V2 supported payment kinds (static config)
 
 **Nonce queue semantics:**
-- `POST /relay` can return HTTP `202` with `status: "held"` when the sender has a nonce gap.
+- The sender hand (NonceDO) holds a relay-sponsored tx when the sender has a nonce gap or no wallet has headroom. Only the RPC payment queue holds (`sponsorTransaction` mode `"hold"`); `POST /sponsor` uses `"immediate"` and rejects instead. No HTTP endpoint returns a `202 held` response.
 - Held sender-hand entries live for 15 minutes.
 - The alarm may conservatively repair stale-low sender frontiers after 5 minutes, with a 10 minute per-sender Hiro refresh cooldown.
 - Repair only bumps to the lowest held nonce when Hiro reports `possible_next_nonce >= lowestHeldNonce`; it must never speculate past locally held work.
@@ -105,7 +100,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - Gap-fill transactions carry `is_gap_fill: true` and are excluded from `settlementTimes` percentiles in `/stats` to prevent artificial inflation of reported settlement latency.
 
 **Agent Discovery (AX) — `src/routes/discovery.ts`:**
-- `GET /llms.txt` - Quick-start guide: what the relay does, key provisioning, /relay and /sponsor examples
+- `GET /llms.txt` - Quick-start guide: what the relay does, key provisioning, /settle and /sponsor examples
 - `GET /llms-full.txt` - Full reference: all endpoints with schemas, SIP-018 auth, receipt system, error codes
 - `GET /topics` - Topic index: JSON array of available topic docs with descriptions and URLs
 - `GET /topics/:topic` - Topic sub-docs (plaintext). Available topics:
@@ -118,52 +113,6 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 
 **Request/Response:**
 ```typescript
-// POST /relay
-Request: {
-  transaction: "hex-encoded-sponsored-tx",
-  settle: {
-    expectedRecipient: "SP...",
-    minAmount: "1000000",
-    tokenType?: "STX" | "sBTC" | "USDCx",
-    expectedSender?: "SP...",
-    resource?: "/api/endpoint",
-    method?: "GET"
-  },
-  auth?: {
-    signature: "0x1234...",  // RSV signature of SIP-018 structured data
-    message: {
-      action: "relay",
-      nonce: "1708099200000",  // Unix timestamp ms for replay protection
-      expiry: "1708185600000"  // Expiry timestamp (unix ms)
-    }
-  }
-}
-
-Response (success): {
-  success: true,
-  requestId: "uuid",
-  txid: "0x...",
-  explorerUrl: "https://explorer.hiro.so/txid/...",
-  settlement: {
-    success: true,
-    status: "pending" | "confirmed" | "failed",
-    sender: "SP...",
-    recipient: "SP...",
-    amount: "1000000",
-    blockHeight?: 12345
-  },
-  sponsoredTx: "0x00000001...",  // fully-sponsored tx hex
-  receiptId?: "uuid"  // only when KV storage succeeds
-}
-
-Response (error): {
-  error: "...",
-  code: "SETTLEMENT_BROADCAST_FAILED" | "SETTLEMENT_VERIFICATION_FAILED" | "RATE_LIMIT_EXCEEDED" | ...,
-  details: "...",
-  retryable: true | false,
-  retryAfter?: 5  // seconds, also sent as Retry-After header
-}
-
 // POST /sponsor (requires API key)
 Request: {
   transaction: "hex-encoded-sponsored-tx",
@@ -320,7 +269,7 @@ Response (error - stale timestamp): {
   retryable: false
 }
 
-// POST /settle (x402 V2 facilitator — verify + broadcast; auto-sponsors empty sponsor slots)
+// POST /settle (x402 V2 facilitator — verify + broadcast; self-paid txs only, empty sponsor slot is rejected)
 // CAIP-2 networks: "stacks:1" (mainnet), "stacks:2147483648" (testnet)
 // Assets: "STX", "sBTC", or CAIP-19 contract address
 Request: {
@@ -444,7 +393,7 @@ Response: {
 
 **SIP-018 Authentication:**
 
-The relay supports optional SIP-018 structured data signature verification for enhanced security on `/relay` and `/sponsor` endpoints. This provides:
+The relay supports optional SIP-018 structured data signature verification for enhanced security on the `/sponsor` endpoint. This provides:
 - Domain-bound signatures (specific to x402-sponsor-relay)
 - Replay protection via nonce (unix timestamp ms)
 - Time-bound authorization via expiry timestamp
@@ -457,7 +406,7 @@ Domain constants:
 Message schema (ClarityValue tuple):
 ```clarity
 {
-  action: (string-ascii 10),     ;; "relay" or "sponsor"
+  action: (string-ascii 10),     ;; "sponsor" ("relay" was for the removed /relay)
   nonce: uint,                    ;; Unix timestamp ms for replay protection
   expiry: uint                    ;; Expiry timestamp (unix ms), must be in future
 }
@@ -471,7 +420,7 @@ The signature is created by:
 
 If the auth field is provided, the relay verifies:
 - Signature is valid for the recovered Stacks address
-- Action matches the endpoint ("relay" or "sponsor") — prevents cross-endpoint replay
+- Action matches the endpoint (`"sponsor"` for /sponsor) — prevents cross-endpoint replay
 - Nonce is a valid integer (used as unique identifier in the signed tuple)
 - Expiry is in the future (not expired)
 - Domain matches the relay's network
@@ -484,7 +433,6 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
 - `src/version.ts` - Single source of truth for VERSION constant
 - `src/types.ts` - Centralized type definitions (includes SIP-018 domain constants)
 - `src/endpoints/BaseEndpoint.ts` - Base class with ok/okWithTx/err helpers
-- `src/endpoints/relay.ts` - Relay endpoint (sponsor + settle + receipt, optional SIP-018 auth)
 - `src/endpoints/sponsor.ts` - Sponsor endpoint (direct broadcast, API key + optional SIP-018 auth)
 - `src/endpoints/settle.ts` - x402 V2 settle endpoint (verify + broadcast, spec section 7.2)
 - `src/endpoints/verify-v2.ts` - x402 V2 verify endpoint (local validation only, spec section 7.1)
@@ -511,12 +459,11 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
 - `src/dashboard/index.ts` - Dashboard router (GET /dashboard, /dashboard/api/stats, /dashboard/api/health)
 - `src/dashboard/pages/overview.ts` - Dashboard HTML page generation
 - `src/dashboard/components/` - Reusable dashboard UI components (cards, charts, layout)
-- `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
 - `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
 - `scripts/test-settle.ts` - Test script for x402 V2 facilitator endpoints (/settle, /verify, /supported)
 - `scripts/test-provision.ts` - Test script for /keys/provision endpoint (BTC sig)
 - `scripts/test-provision-stx.ts` - Test script for /keys/provision-stx endpoint (STX sig)
-- `scripts/test-sip018-auth.ts` - Test script for SIP-018 auth on /relay and /sponsor
+- `scripts/test-sip018-auth.ts` - Test script for SIP-018 auth on /sponsor
 - `scripts/test-fees.ts` - Test script for /fees endpoint (no auth)
 - `scripts/manage-api-keys.ts` - CLI for API key management
 - `docs/` - State machine diagram and feature roadmap
@@ -614,67 +561,20 @@ See [worker-logs integration guide](~/dev/whoabuddy/worker-logs/docs/integration
 1. Copy `.env.example` to `.env` and fill in credentials
 2. Set `SPONSOR_MNEMONIC` in `.env` (preferred) or `SPONSOR_PRIVATE_KEY` (fallback)
 3. Start dev server: `npm run dev`
-4. Test with: `npm run test:relay -- http://localhost:8787`
+4. Test with: `npm run test:settle -- http://localhost:8787`
 5. Check logs at logs.wbd.host
 
-## Sponsored Transaction Flow
+## Settlement Flow
 
-```
-Agent                    Relay                              Stacks
-  │                        │                                  │
-  │ 1. Build tx with       │                                  │
-  │    sponsored: true     │                                  │
-  │                        │                                  │
-  │ 2. POST /relay         │                                  │
-  │    { transaction,      │                                  │
-  │      settle: {...} }   │                                  │
-  │───────────────────────▶│                                  │
-  │                        │ 3. Validate settle options       │
-  │                        │ 4. Validate tx                   │
-  │                        │ 5. Check dedup (KV)              │
-  │                        │ 6. Sponsor (add fee sig)         │
-  │                        │ 7. Verify payment params         │
-  │                        │    (recipient/amount/token)      │
-  │                        │ 8. Broadcast                     │
-  │                        │─────────────────────────────────▶│
-  │                        │◀─────────────────────────────────│
-  │                        │ 9. Poll confirm (≤60s)           │
-  │                        │10. Store receipt (KV)            │
-  │                        │11. Record dedup (KV)             │
-  │◀───────────────────────│ 12. Return {                     │
-  │                        │     txid,                        │
-  │                        │     settlement: {                │
-  │                        │       status: confirmed|pending, │
-  │                        │       blockHeight? },            │
-  │                        │     sponsoredTx,                 │
-  │                        │     receiptId }                  │
-  │                        │                                  │
-  │ 13. GET /verify/:id    │                                  │
-  │───────────────────────▶│ 14. Check KV receipt            │
-  │◀───────────────────────│ 15. Return receipt status       │
-  │                        │                                  │
-  │ 16. POST /access       │                                  │
-  │     { receiptId }      │                                  │
-  │───────────────────────▶│ 17. Validate receipt            │
-  │                        │ 18. Grant access /              │
-  │                        │     proxy request                │
-  │◀───────────────────────│ 19. Return data                 │
-```
-
-**Settlement states:**
-- `confirmed`: tx confirmed on-chain within 60s — includes `blockHeight`
-- `pending`: broadcast succeeded but confirmation timed out — safe state, poll `/verify/:receiptId`
-- `failed`: tx broadcast OK but definitively aborted on-chain (`abort_*` status) — returns `SETTLEMENT_FAILED` (422, not retryable)
+Agents build a self-paid transaction (standard auth, non-zero fee) and call POST /settle. The relay
+verifies recipient/amount/asset locally, refuses an empty sponsor slot (`invalid_transaction_state`),
+broadcasts, and returns `{ success, payer, transaction: txid, network }` as soon as the node accepts
+the broadcast. Confirmation is tracked in the background (`GET /settle/status/:txid`).
+Agent-facing details: `docs/agent-payment-guide.md`.
 
 Note: `/stats` `settlementTimes` percentiles (p50/p95) exclude gap-fill transactions (`is_gap_fill: true` in NonceDO). Gap-fills are relay-internal nonce repair transactions, not agent-submitted payments; including them would inflate reported settlement latency by 3-5x.
 
-**Drop vs abort semantics:**
-- `dropped_*` from Hiro is TRANSIENT — 93% of `dropped_replace_by_fee` reports actually confirm on-chain.
-  The relay polls through dropped statuses until the 60s timeout, then returns `status: "pending"`.
-- `abort_*` is TERMINAL (on-chain rejection). Only `abort_*` triggers `SETTLEMENT_FAILED` (422, not retryable).
-- Agents should treat `status: "pending"` as "in flight" and poll `/verify/:receiptId` for final status.
-
-**Idempotency:** Submitting the same sponsored tx hex within 5 minutes returns the cached result from KV (dedup). Safe for agents to retry on network failure.
+**Idempotency:** Submitting the same tx hex to POST /settle within 5 minutes returns the cached result from KV (dedup). Safe for agents to retry on network failure.
 
 **Sponsor nonce conflict log vocabulary (NonceDO):**
 

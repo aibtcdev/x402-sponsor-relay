@@ -10,7 +10,6 @@
     "check": "tsc --noEmit",
     "wrangler": "set -a && . ./.env && set +a && npx wrangler",
     "cf-typegen": "npm run wrangler -- types",
-    "test:relay": "set -a && . ./.env && set +a && tsx scripts/test-relay.ts",
     "test:sponsor": "set -a && . ./.env && set +a && tsx scripts/test-sponsor.ts",
     "test:provision": "set -a && . ./.env && set +a && tsx scripts/test-provision.ts",
     "test:provision-stx": "set -a && . ./.env && set +a && tsx scripts/test-provision-stx.ts",
