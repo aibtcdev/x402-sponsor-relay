@@ -135,7 +135,7 @@ You can also query the Stacks API directly. Hiro's `dropped_replace_by_fee` stat
 
 ## Idempotency and Retries
 
-- **Same tx hex within 5 minutes** returns the cached result (same txid), so resending the identical signed hex after a network error is safe.
+- **Same tx hex within 5 minutes** returns the cached result (same txid), so resending the identical signed hex after a network error is safe. Note that this cache hit is returned *before* `paymentRequirements` are checked, so it only tells you that this hex was settled — not that it satisfies a different `payTo`/`amount`.
 - **payment-identifier** (`paymentPayload.extensions["payment-identifier"].info.id`, 16–128 chars, `[a-zA-Z0-9_-]+`, `pay_` prefix recommended):
   - same id + same payload → cached `200` response, no re-broadcast;
   - same id + different payload (rebuilt tx) → `409 payment_identifier_conflict`. This blocks an accidental double payment. If you really mean to send a different transaction, use a new id;
@@ -155,9 +155,11 @@ const { possible_next_nonce } = await r.json();
 
 `/settle` returns these in `errorReason`, `/verify` in `invalidReason`.
 
+HTTP status: `/verify` always answers HTTP 200. `/settle` answers HTTP 200 for every code except the request-validation codes (`invalid_payload`, `invalid_payment_requirements`, `invalid_scheme`, `invalid_network`, `unrecognized_asset`), which come back as HTTP 400, plus `payment_identifier_conflict` (409) and `unexpected_settle_error` (500). Always check `success` / `isValid` rather than the status code alone.
+
 | Code | Endpoint | Agent Action |
 |------|----------|--------------|
-| `invalid_payload` | both | Body is not JSON, `paymentPayload`/`paymentRequirements` or `payload.transaction` is missing, or the payment-identifier is malformed. `/settle` returns HTTP 400; `/verify` returns 200 |
+| `invalid_payload` | both | Body is not JSON, `paymentPayload`/`paymentRequirements` or `payload.transaction` is missing, or the payment-identifier is malformed |
 | `invalid_payment_requirements` | both | `network`, `payTo`, `amount` or `asset` missing |
 | `invalid_scheme` | both | `scheme` is set and is not `"exact"` |
 | `invalid_network` | both | `network` does not match the relay (testnet `stacks:2147483648`, mainnet `stacks:1`) |
@@ -172,9 +174,8 @@ const { possible_next_nonce } = await r.json();
 | `client_bad_nonce` | `/settle` | Nonce is stale; fetch `possible_next_nonce` and re-sign |
 | `signature_validation_failed` | `/settle` | Wrong network, wrong key, or corrupted bytes; rebuild and re-sign |
 | `conflicting_nonce` | `/settle` | A transaction with this nonce is already in the mempool. If it is this same payment, wait — do not re-sign at a new nonce |
-| `sender_nonce_conflict` | `/settle` | Nonce conflict caused by the sender's own nonce; check your nonce before re-signing |
-| `broadcast_failed` | `/settle` | Transient node/network failure (or too many pending txs from the sender); retry with backoff by resending the **same signed hex** |
-| `transaction_failed` | `/settle` | The node rejected the tx for a non-retryable reason; inspect and rebuild |
+| `broadcast_failed` | `/settle` | Transient node/network failure; retry with backoff by resending the **same signed hex** |
+| `transaction_failed` | `/settle` | The node rejected the tx for a non-retryable reason (e.g. `FeeTooLow`). This also covers **too many pending txs from your address** (`TooMuchChaining`): wait for your earlier txs to confirm, then resend the same hex — do not re-sign at a new nonce |
 | `unexpected_settle_error` | `/settle` | HTTP 500 internal error; retry with backoff |
 
 ---

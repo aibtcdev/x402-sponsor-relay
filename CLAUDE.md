@@ -38,7 +38,7 @@ npm run test:provision -- [relay-url]
 npm run test:provision-stx
 npm run test:provision-stx -- [relay-url]
 
-# Test SIP-018 structured data auth (requires .env with AGENT_MNEMONIC and TEST_API_KEY; its /relay half now 404s)
+# Test SIP-018 structured data auth on /sponsor (requires .env with AGENT_MNEMONIC and TEST_API_KEY)
 npm run test:sip018-auth
 npm run test:sip018-auth -- [relay-url]
 
@@ -83,12 +83,12 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - `GET /nonce/state` - Observable nonce state for client diagnostics (pending txs, gaps, health)
 - `GET /stats` - Relay statistics (JSON API): transactions (total/success/failed/clientErrors, rawSuccessRate, effectiveSuccessRate, previousTotal, trend), tokens (STX/sBTC/USDCx volume), settlement health, settlementTimes (p50/p95 excluding gap-fills), terminalReasons (6-category breakdown), walletThroughput, previous24h comparison window
 - `GET /dashboard` - Public dashboard (HTML)
-- `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast; auto-sponsors transactions with empty sponsor slot)
+- `POST /settle` - x402 V2 facilitator settle (verify payment + broadcast; self-paid txs only, an empty sponsor slot is rejected with `invalid_transaction_state`)
 - `POST /verify` - x402 V2 facilitator verify (local validation only, no broadcast)
 - `GET /supported` - x402 V2 supported payment kinds (static config)
 
 **Nonce queue semantics:**
-- `POST /relay` can return HTTP `202` with `status: "held"` when the sender has a nonce gap.
+- The sender hand (NonceDO) holds a relay-sponsored tx when the sender has a nonce gap or no wallet has headroom. Only the RPC payment queue holds (`sponsorTransaction` mode `"hold"`); `POST /sponsor` uses `"immediate"` and rejects instead. No HTTP endpoint returns a `202 held` response.
 - Held sender-hand entries live for 15 minutes.
 - The alarm may conservatively repair stale-low sender frontiers after 5 minutes, with a 10 minute per-sender Hiro refresh cooldown.
 - Repair only bumps to the lowest held nonce when Hiro reports `possible_next_nonce >= lowestHeldNonce`; it must never speculate past locally held work.
@@ -100,7 +100,7 @@ npm run keys -- create --app "App" --email "x@y.com"  # Create key
 - Gap-fill transactions carry `is_gap_fill: true` and are excluded from `settlementTimes` percentiles in `/stats` to prevent artificial inflation of reported settlement latency.
 
 **Agent Discovery (AX) — `src/routes/discovery.ts`:**
-- `GET /llms.txt` - Quick-start guide: what the relay does, key provisioning, /relay and /sponsor examples
+- `GET /llms.txt` - Quick-start guide: what the relay does, key provisioning, /settle and /sponsor examples
 - `GET /llms-full.txt` - Full reference: all endpoints with schemas, SIP-018 auth, receipt system, error codes
 - `GET /topics` - Topic index: JSON array of available topic docs with descriptions and URLs
 - `GET /topics/:topic` - Topic sub-docs (plaintext). Available topics:
@@ -269,7 +269,7 @@ Response (error - stale timestamp): {
   retryable: false
 }
 
-// POST /settle (x402 V2 facilitator — verify + broadcast; auto-sponsors empty sponsor slots)
+// POST /settle (x402 V2 facilitator — verify + broadcast; self-paid txs only, empty sponsor slot is rejected)
 // CAIP-2 networks: "stacks:1" (mainnet), "stacks:2147483648" (testnet)
 // Assets: "STX", "sBTC", or CAIP-19 contract address
 Request: {
@@ -393,7 +393,7 @@ Response: {
 
 **SIP-018 Authentication:**
 
-The relay supports optional SIP-018 structured data signature verification for enhanced security on `/relay` and `/sponsor` endpoints. This provides:
+The relay supports optional SIP-018 structured data signature verification for enhanced security on the `/sponsor` endpoint. This provides:
 - Domain-bound signatures (specific to x402-sponsor-relay)
 - Replay protection via nonce (unix timestamp ms)
 - Time-bound authorization via expiry timestamp
@@ -406,7 +406,7 @@ Domain constants:
 Message schema (ClarityValue tuple):
 ```clarity
 {
-  action: (string-ascii 10),     ;; "relay" or "sponsor"
+  action: (string-ascii 10),     ;; "sponsor" ("relay" was for the removed /relay)
   nonce: uint,                    ;; Unix timestamp ms for replay protection
   expiry: uint                    ;; Expiry timestamp (unix ms), must be in future
 }
@@ -420,7 +420,7 @@ The signature is created by:
 
 If the auth field is provided, the relay verifies:
 - Signature is valid for the recovered Stacks address
-- Action matches the endpoint ("relay" or "sponsor") — prevents cross-endpoint replay
+- Action matches the endpoint (`"sponsor"` for /sponsor) — prevents cross-endpoint replay
 - Nonce is a valid integer (used as unique identifier in the signed tuple)
 - Expiry is in the future (not expired)
 - Domain matches the relay's network
@@ -459,12 +459,11 @@ If verification fails, the request is rejected with HTTP 401. If the auth field 
 - `src/dashboard/index.ts` - Dashboard router (GET /dashboard, /dashboard/api/stats, /dashboard/api/health)
 - `src/dashboard/pages/overview.ts` - Dashboard HTML page generation
 - `src/dashboard/components/` - Reusable dashboard UI components (cards, charts, layout)
-- `scripts/test-relay.ts` - Test script for /relay endpoint (no auth)
 - `scripts/test-sponsor.ts` - Test script for /sponsor endpoint (API key auth)
 - `scripts/test-settle.ts` - Test script for x402 V2 facilitator endpoints (/settle, /verify, /supported)
 - `scripts/test-provision.ts` - Test script for /keys/provision endpoint (BTC sig)
 - `scripts/test-provision-stx.ts` - Test script for /keys/provision-stx endpoint (STX sig)
-- `scripts/test-sip018-auth.ts` - Test script for SIP-018 auth on /relay and /sponsor
+- `scripts/test-sip018-auth.ts` - Test script for SIP-018 auth on /sponsor
 - `scripts/test-fees.ts` - Test script for /fees endpoint (no auth)
 - `scripts/manage-api-keys.ts` - CLI for API key management
 - `docs/` - State machine diagram and feature roadmap

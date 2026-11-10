@@ -511,18 +511,6 @@ export const SIP018_DOMAIN = {
 } as const;
 
 /**
- * Request body for the former POST /relay endpoint (removed; type kept for reference)
- */
-export interface RelayRequest {
-  /** Hex-encoded signed sponsored transaction */
-  transaction: string;
-  /** Settlement options for x402 payment verification */
-  settle: SettleOptions;
-  /** Optional SIP-018 authentication */
-  auth?: Sip018Auth;
-}
-
-/**
  * Settlement result in API response format
  */
 export interface SettlementResult {
@@ -565,23 +553,6 @@ export interface PaymentReceipt {
   /** Number of times this receipt has been used for access */
   accessCount: number;
 }
-
-/**
- * Response from the former POST /relay endpoint (removed; type kept for reference)
- */
-export interface RelayResponse {
-  /** Transaction ID if successful */
-  txid?: string;
-  /** Settlement status */
-  settlement?: SettlementResult;
-  /** Error message if failed */
-  error?: string;
-  /** Additional details */
-  details?: string;
-  /** Whether the client can retry the request */
-  retryable?: boolean;
-}
-
 /**
  * Error codes for structured error responses
  */
@@ -1452,7 +1423,7 @@ export interface TxStatusRecord {
 
 /**
  * Info about recently expired hand entries for a sender.
- * Included in HandSubmitResult (held branch) and QueueInfo to help agents
+ * Included in HandSubmitResult (held branch) to help agents
  * understand why previously-submitted nonces disappeared from the queue
  * after the 15-minute hold timeout expired.
  */
@@ -1653,80 +1624,4 @@ export interface SponsorHeld {
    * Helps agents understand why previously-submitted nonces are missing from the queue.
    */
   recentlyExpired?: RecentExpiryInfo;
-}
-
-/**
- * Queue position info returned to agents when a transaction is held pending a nonce gap fill.
- * Was included in 202 responses from the former POST /relay. No current HTTP endpoint returns it.
- */
-export interface QueueInfo {
-  /** Always "held" — indicates the tx is waiting in the sender's hand */
-  status: "held";
-  /** The nonce of the submitted transaction */
-  senderNonce: number;
-  /** The next sequential nonce the relay needs before it can dispatch */
-  nextExpectedNonce: number;
-  /** The specific nonces that must be submitted to fill the gap */
-  missingNonces: number[];
-  /** Total number of transactions in the sender's hand (including this one) */
-  handSize: number;
-  /**
-   * Estimated milliseconds until dispatch after gaps are filled.
-   * null when missingNonces.length > 0 — the agent controls dispatch timing
-   * by submitting the missing nonces.
-   */
-  estimatedDispatchMs: number | null;
-  /** ISO timestamp when the held tx expires from the hand */
-  expiresAt: string;
-  /** Actionable instruction for the agent */
-  help: string;
-  /**
-   * Recently expired nonces for this sender, if any expired before this submission.
-   * Helps agents understand why previously-submitted nonces are missing from the queue.
-   * Format: "Your nonces N, M expired after 15 minutes waiting for the gap to be filled."
-   */
-  recentlyExpired?: RecentExpiryInfo;
-}
-
-/**
- * Alarm cadence estimate used for estimatedDispatchMs when there are no gaps.
- * 10s is a conservative lower bound on the DO alarm tick interval.
- */
-const ALARM_CADENCE_ESTIMATE_MS = 10_000;
-
-/**
- * Build a QueueInfo object from a SponsorHeld result and the submitted sender nonce.
- * Built for the 202 responses of the former POST /relay. No current HTTP endpoint returns it.
- *
- * @param held - The SponsorHeld result from the sponsoring service
- * @param senderNonce - The nonce of the submitted transaction
- * @param recentlyExpired - Optional expiry info to surface to the agent
- */
-export function buildQueueInfo(
-  held: SponsorHeld,
-  senderNonce: number,
-  recentlyExpired?: RecentExpiryInfo
-): QueueInfo {
-  const reason = held.holdReason ?? (held.missingNonces.length > 0 ? "gap" : "capacity");
-
-  const queueInfo: QueueInfo = {
-    status: "held",
-    senderNonce,
-    nextExpectedNonce: held.nextExpected,
-    missingNonces: held.missingNonces,
-    handSize: held.handSize,
-    estimatedDispatchMs: reason === "gap" ? null : ALARM_CADENCE_ESTIMATE_MS,
-    expiresAt: held.expiresAt,
-    help: reason === "gap"
-      ? `Verify your account nonce at /fees or via the Stacks API, then submit transactions with nonces ${held.missingNonces.join(", ")} to unblock dispatch`
-      : "All wallet slots are at capacity — tx will be dispatched when headroom opens",
-  };
-
-  // Prefer explicitly passed recentlyExpired; fall back to value on the held object itself
-  const expiry = recentlyExpired ?? held.recentlyExpired;
-  if (expiry) {
-    queueInfo.recentlyExpired = expiry;
-  }
-
-  return queueInfo;
 }

@@ -1,5 +1,5 @@
 /**
- * Test script for SIP-018 authentication on /sponsor and /relay endpoints
+ * Test script for SIP-018 authentication on the /sponsor endpoint
  *
  * Usage (recommended - use .env file):
  *   npm run test:sip018-auth [relay-url]
@@ -96,13 +96,13 @@ async function deriveChildAccount(mnemonic: string, index: number) {
 /**
  * Create a SIP-018 structured data signature
  *
- * @param action - Action being performed ("relay" or "sponsor")
+ * @param action - Action being performed ("sponsor")
  * @param privateKey - Stacks private key (hex string)
  * @param network - Network ("mainnet" or "testnet")
  * @returns Signature and message for SIP-018 auth
  */
 function createSip018Auth(
-  action: "relay" | "sponsor",
+  action: "sponsor",
   privateKey: string,
   network: "mainnet" | "testnet" = "testnet"
 ) {
@@ -249,107 +249,6 @@ async function testSponsorWithAuth(
   }
 }
 
-/**
- * Test /relay endpoint with SIP-018 authentication
- */
-async function testRelayWithAuth(
-  relayUrl: string,
-  senderAddress: string,
-  privateKey: string
-) {
-  console.log("\n=== Testing /relay with SIP-018 Auth ===");
-  console.log(`Sender address: ${senderAddress}`);
-
-  // Use AIBTC server as recipient for testing
-  const recipient = process.env.TEST_RECIPIENT || AIBTC_TESTNET;
-  console.log(`Recipient address: ${recipient}`);
-
-  // Build a sponsored STX transfer
-  console.log("\nBuilding sponsored transaction...");
-  const transaction = await makeSTXTokenTransfer({
-    recipient,
-    amount: 1000n, // 0.001 STX in microSTX
-    senderKey: privateKey,
-    network: "testnet",
-    memo: "test-sip018-relay",
-    anchorMode: AnchorMode.Any,
-    sponsored: true,
-    fee: 0n, // Sponsor will pay
-  });
-
-  // Serialize to hex
-  const txHex = transaction.serialize();
-  console.log(`Transaction hex: ${txHex.slice(0, 50)}...`);
-
-  // Create SIP-018 auth
-  console.log("\nCreating SIP-018 authentication...");
-  const auth = createSip018Auth("relay", privateKey, "testnet");
-  console.log(`Action: ${auth.message.action}`);
-  console.log(`Nonce: ${auth.message.nonce}`);
-  console.log(`Expiry: ${auth.message.expiry}`);
-  console.log(`Signature: ${auth.signature.slice(0, 50)}...`);
-
-  // Build request with settle options and SIP-018 auth
-  const requestBody = {
-    transaction: txHex,
-    settle: {
-      expectedRecipient: recipient,
-      minAmount: "1000", // Same as amount we're sending
-      tokenType: "STX" as const,
-      expectedSender: senderAddress,
-      resource: "/test",
-      method: "POST",
-    },
-    auth,
-  };
-
-  // Send to relay endpoint
-  console.log(`\nSending to relay endpoint: ${relayUrl}/relay`);
-  console.log(`Settlement options:`, JSON.stringify(requestBody.settle, null, 2));
-
-  try {
-    const response = await fetch(`${relayUrl}/relay`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    const result = await response.json();
-
-    if (response.ok) {
-      console.log("\n=== SUCCESS ===");
-      console.log(`Transaction ID: ${result.txid}`);
-      console.log(`Explorer: https://explorer.hiro.so/txid/${result.txid}?chain=testnet`);
-      console.log("\nSIP-018 auth verified successfully!");
-      if (result.settlement) {
-        console.log("\n=== SETTLEMENT ===");
-        console.log(`Status: ${result.settlement.status}`);
-        console.log(`Success: ${result.settlement.success}`);
-        console.log(`Sender: ${result.settlement.sender}`);
-        console.log(`Recipient: ${result.settlement.recipient}`);
-        console.log(`Amount: ${result.settlement.amount}`);
-        if (result.settlement.blockHeight) {
-          console.log(`Block Height: ${result.settlement.blockHeight}`);
-        }
-      }
-    } else {
-      console.error("\n=== ERROR ===");
-      console.error(`Status: ${response.status}`);
-      console.error(`Error: ${result.error}`);
-      if (result.details) {
-        console.error(`Details: ${result.details}`);
-      }
-      process.exit(1);
-    }
-  } catch (e) {
-    console.error("\n=== NETWORK ERROR ===");
-    console.error(e instanceof Error ? e.message : e);
-    process.exit(1);
-  }
-}
-
 async function main() {
   const args = process.argv.slice(2);
 
@@ -416,11 +315,6 @@ async function main() {
 
   // Test /sponsor endpoint with SIP-018 auth
   await testSponsorWithAuth(relayUrl, apiKey, senderAddress, privateKey);
-
-  console.log("\n" + "=".repeat(60));
-
-  // Test /relay endpoint with SIP-018 auth
-  await testRelayWithAuth(relayUrl, senderAddress, privateKey);
 
   console.log("\n" + "=".repeat(60));
   console.log("Test completed successfully!");
