@@ -338,21 +338,6 @@ export class Settle extends BaseEndpoint {
         }
       }
 
-      const dedupResult = await settlementService.checkDedup(txHex);
-      if (dedupResult) {
-        logger.info("Dedup hit, returning cached settle result", {
-          txid: dedupResult.txid,
-          status: dedupResult.status,
-        });
-        const response: X402SettlementResponseV2 = {
-          success: true,
-          payer: dedupResult.sender,
-          transaction: dedupResult.txid,
-          network,
-        };
-        return c.json(response, 200);
-      }
-
       const clientIp = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? null;
 
       // Fast hex pre-validation before expensive deserialization (mirrors SponsorService.preValidateTxHex)
@@ -412,6 +397,23 @@ export class Settle extends BaseEndpoint {
           ]).catch(() => {})
         );
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
+      }
+
+      // Tx-hex dedup runs only after verifyPaymentParams: the cache is keyed on the
+      // hex alone, so a hit must not vouch for a different payTo/amount/asset.
+      const dedupResult = await settlementService.checkDedup(txHex);
+      if (dedupResult) {
+        logger.info("Dedup hit, returning cached settle result", {
+          txid: dedupResult.txid,
+          status: dedupResult.status,
+        });
+        const response: X402SettlementResponseV2 = {
+          success: true,
+          payer: dedupResult.sender,
+          transaction: dedupResult.txid,
+          network,
+        };
+        return c.json(response, 200);
       }
 
       // Public /settle only broadcasts self-paid (or already-sponsored) transactions.
