@@ -696,6 +696,19 @@ export interface SponsorStatusResult {
     ageMs: number;
     freshness: SponsorSnapshotFreshness;
   };
+  /**
+   * The x402 payment-sponsor wallet (SponsorWalletDO) behind this status, when configured.
+   * Amounts are microSTX strings; balance is null when Hiro could not be read.
+   */
+  wallet?: PaymentSponsorWalletInfo;
+}
+
+/** Public identity and funding of the single x402 payment-sponsor wallet. */
+export interface PaymentSponsorWalletInfo {
+  address: string;
+  balance: string | null;
+  spentToday: string;
+  dailyBudget: string;
 }
 
 /**

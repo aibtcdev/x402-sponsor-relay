@@ -14,7 +14,7 @@ export class SponsorStatus extends BaseEndpoint {
     tags: ["Health"],
     summary: "x402 payment sponsor readiness",
     description:
-      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, and under today's fee budget. The balance read is cached for 60s.",
+      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, and under today's fee budget. `wallet` gives the sponsor's address, balance and today's spend. The balance read is cached for 60s.",
     responses: {
       "200": {
         description: "Fresh or stale sponsor status snapshot",
@@ -79,6 +79,17 @@ export class SponsorStatus extends BaseEndpoint {
                       type: "string" as const,
                       enum: ["fresh", "stale", "unavailable"],
                     },
+                  },
+                },
+                wallet: {
+                  type: "object" as const,
+                  description:
+                    "The x402 payment-sponsor wallet (separate from the legacy /wallets pool). Amounts in microSTX; balance is null when Hiro is unreadable.",
+                  properties: {
+                    address: { type: "string" as const },
+                    balance: { type: "string" as const, nullable: true },
+                    spentToday: { type: "string" as const },
+                    dailyBudget: { type: "string" as const },
                   },
                 },
                 snapshot: {
@@ -157,6 +168,17 @@ export class SponsorStatus extends BaseEndpoint {
                       type: "string" as const,
                       enum: ["fresh", "stale", "unavailable"],
                     },
+                  },
+                },
+                wallet: {
+                  type: "object" as const,
+                  description:
+                    "The x402 payment-sponsor wallet (separate from the legacy /wallets pool). Amounts in microSTX; balance is null when Hiro is unreadable.",
+                  properties: {
+                    address: { type: "string" as const },
+                    balance: { type: "string" as const, nullable: true },
+                    spentToday: { type: "string" as const },
+                    dailyBudget: { type: "string" as const },
                   },
                 },
                 snapshot: {

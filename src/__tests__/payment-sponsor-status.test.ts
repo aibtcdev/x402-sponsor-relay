@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { makeRandomPrivKey } from "@stacks/transactions";
+import { getAddressFromPrivateKey, makeRandomPrivKey } from "@stacks/transactions";
 import {
   getPaymentSponsorStatus,
+  getPaymentSponsorWallet,
   toPaymentSponsorStatus,
   type PaymentSponsorState,
 } from "../services/payment-sponsor-status";
@@ -66,6 +67,26 @@ describe("toPaymentSponsorStatus", () => {
     });
   });
 
+  it("exposes the sponsor wallet's address, balance and budget", () => {
+    const result = toPaymentSponsorStatus(state({ address: "SP123", spentToday: 250n }));
+    expect(result.wallet).toEqual({
+      address: "SP123",
+      balance: "50000000",
+      spentToday: "250",
+      dailyBudget: "10000000",
+    });
+  });
+
+  it("keeps the wallet block with a null balance when Hiro is unreadable", () => {
+    const result = toPaymentSponsorStatus(state({ address: "SP123", balance: null }));
+    expect(result.wallet?.balance).toBeNull();
+    expect(result.wallet?.address).toBe("SP123");
+  });
+
+  it("omits the wallet block when the sponsor is not configured", () => {
+    expect(toPaymentSponsorStatus(state({ configured: false, balance: null })).wallet).toBeUndefined();
+  });
+
   it("reports only SPONSOR_NOT_CONFIGURED when there is no sponsor key", () => {
     expect(toPaymentSponsorStatus(state({ configured: false, balance: null })).reasons).toEqual([
       "SPONSOR_NOT_CONFIGURED",
@@ -94,9 +115,26 @@ describe("getPaymentSponsorStatus", () => {
 
   it("reads balance from Hiro and spend from the SponsorWalletDO", async () => {
     hiroBalance(5_000_000n);
-    const result = await getPaymentSponsorStatus(env("0"), logger);
+    const e = env("1234");
+    const result = await getPaymentSponsorStatus(e, logger);
     expect(result.canSponsor).toBe(true);
     expect(result.reasons).toEqual([]);
+    expect(result.wallet).toEqual({
+      address: getAddressFromPrivateKey(e.PAYMENT_SPONSOR_PRIVATE_KEY!, "mainnet"),
+      balance: "5000000",
+      spentToday: "1234",
+      dailyBudget: result.wallet!.dailyBudget,
+    });
+  });
+
+  it("getPaymentSponsorWallet returns the wallet, or null when not configured", async () => {
+    hiroBalance(7_000_000n);
+    const wallet = await getPaymentSponsorWallet(env("0"), logger);
+    expect(wallet?.balance).toBe("7000000");
+    expect(wallet?.address).toMatch(/^SP/);
+    expect(
+      await getPaymentSponsorWallet(env("0", { PAYMENT_SPONSOR_PRIVATE_KEY: undefined }), logger)
+    ).toBeNull();
   });
 
   it("reports low balance and a spent budget together", async () => {

@@ -1,6 +1,6 @@
 import { getAddressFromPrivateKey } from "@stacks/transactions";
 import { STACKS_MAINNET, STACKS_TESTNET } from "@stacks/network";
-import type { Env, Logger, SponsorStatusReason, SponsorStatusResult } from "../types";
+import type { Env, Logger, PaymentSponsorWalletInfo, SponsorStatusReason, SponsorStatusResult } from "../types";
 import { DEFAULT_DAILY_BUDGET_USTX } from "../durable-objects/sponsor-wallet-do";
 import { SponsorService } from "./sponsor";
 
@@ -11,6 +11,8 @@ export interface PaymentSponsorState {
   balance: bigint | null;
   spentToday: bigint;
   dailyBudget: bigint;
+  /** Sponsor wallet address, when configured */
+  address?: string;
 }
 
 /**
@@ -59,16 +61,26 @@ export function toPaymentSponsorStatus(s: PaymentSponsorState, nowMs = Date.now(
       freshness: s.balance !== null ? "fresh" : "unavailable",
     },
     snapshot: { asOf, ageMs: 0, freshness: s.balance !== null ? "fresh" : "unavailable" },
+    ...(s.configured && s.address
+      ? {
+          wallet: {
+            address: s.address,
+            balance: s.balance === null ? null : s.balance.toString(),
+            spentToday: s.spentToday.toString(),
+            dailyBudget: s.dailyBudget.toString(),
+          },
+        }
+      : {}),
   };
 }
 
 /** Read the payment sponsor's live state (balance is KV-cached for 60s by SponsorService). */
-export async function getPaymentSponsorStatus(env: Env, logger: Logger): Promise<SponsorStatusResult> {
+export async function readPaymentSponsorState(env: Env, logger: Logger): Promise<PaymentSponsorState> {
   const key = env.PAYMENT_SPONSOR_PRIVATE_KEY;
   const ns = env.SPONSOR_WALLET_DO;
   const dailyBudget = BigInt(env.SPONSOR_DAILY_BUDGET_USTX ?? DEFAULT_DAILY_BUDGET_USTX);
   if (!key || !ns) {
-    return toPaymentSponsorStatus({ configured: false, balance: null, spentToday: 0n, dailyBudget });
+    return { configured: false, balance: null, spentToday: 0n, dailyBudget };
   }
 
   const network = env.STACKS_NETWORK === "mainnet" ? STACKS_MAINNET : STACKS_TESTNET;
@@ -81,10 +93,23 @@ export async function getPaymentSponsorStatus(env: Env, logger: Logger): Promise
       .then(async (res) => BigInt(((await res.json()) as { spent: string }).spent)),
   ]);
 
-  return toPaymentSponsorStatus({
+  return {
     configured: true,
+    address,
     balance: balance === null ? null : BigInt(balance),
     spentToday,
     dailyBudget,
-  });
+  };
+}
+
+export async function getPaymentSponsorStatus(env: Env, logger: Logger): Promise<SponsorStatusResult> {
+  return toPaymentSponsorStatus(await readPaymentSponsorState(env, logger));
+}
+
+/** Wallet info for GET /wallets; null when the payment sponsor is not configured. */
+export async function getPaymentSponsorWallet(
+  env: Env,
+  logger: Logger
+): Promise<PaymentSponsorWalletInfo | null> {
+  return toPaymentSponsorStatus(await readPaymentSponsorState(env, logger)).wallet ?? null;
 }
