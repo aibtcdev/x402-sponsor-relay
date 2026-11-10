@@ -135,7 +135,7 @@ You can also query the Stacks API directly. Hiro's `dropped_replace_by_fee` stat
 
 ## Idempotency and Retries
 
-- **Same tx hex within 5 minutes** returns the cached result (same txid), so resending the identical signed hex after a network error is safe. Note that this cache hit is returned *before* `paymentRequirements` are checked, so it only tells you that this hex was settled — not that it satisfies a different `payTo`/`amount`.
+- **Same tx hex within 5 minutes** returns the cached result (same txid), so resending the identical signed hex after a network error is safe. The cached result is only returned when the tx still satisfies the request's `paymentRequirements`; the same hex sent with a different `payTo`/`amount` gets the normal mismatch error.
 - **payment-identifier** (`paymentPayload.extensions["payment-identifier"].info.id`, 16–128 chars, `[a-zA-Z0-9_-]+`, `pay_` prefix recommended):
   - same id + same payload → cached `200` response, no re-broadcast;
   - same id + different payload (rebuilt tx) → `409 payment_identifier_conflict`. This blocks an accidental double payment. If you really mean to send a different transaction, use a new id;
