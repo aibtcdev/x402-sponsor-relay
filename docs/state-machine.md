@@ -2,6 +2,8 @@
 
 This document describes the state machine for transactions processed by the x402 Sponsor Relay.
 
+> **Historical:** this diagram was drawn for the former `POST /relay` endpoint, which has been removed. Today agents settle self-paid payments via `POST /settle` (no sponsoring step), and sponsored transactions enter via `POST /sponsor` (API key) or the `RelayRPC` service binding. See [`agent-payment-guide.md`](./agent-payment-guide.md) for the current flow.
+
 ## State Diagram
 
 ```mermaid
