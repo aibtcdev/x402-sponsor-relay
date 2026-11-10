@@ -761,6 +761,13 @@ canSponsor is false (HTTP 503, status "unavailable") when any of these reasons a
 The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor is false with
 reason SPONSOR_STATE_UNREADABLE, and reconciliation.freshness and snapshot.freshness are "unavailable". noncePool is kept for compatibility (one sponsor, nothing reserved).
 
+wallet (present when the sponsor is configured) identifies the sponsor wallet: address, balance
+(µSTX; null when Hiro is unreadable), spentToday per budget ({ payments, sponsor } µSTX; null when
+unreadable) and dailyBudgetPerPath. x402 payments and POST /sponsor each have their own daily budget of
+dailyBudgetPerPath; canSponsor / DAILY_BUDGET_REACHED reflect the x402 payments budget only.
+GET /wallets returns the same block as paymentSponsor; its wallets array is a legacy pool that no
+longer sponsors anything.
+
 ### Response
 
 {
@@ -787,6 +794,12 @@ reason SPONSOR_STATE_UNREADABLE, and reconciliation.freshness and snapshot.fresh
     "asOf": "2026-10-27T12:00:00.000Z",
     "ageMs": 0,
     "freshness": "fresh"
+  },
+  "wallet": {
+    "address": "SP3F6ZPHAR5D0YT0CTPJST7H3NBZ43A5FW226FMYP",
+    "balance": "52454516",
+    "spentToday": { "payments": "40000", "sponsor": "0" },
+    "dailyBudgetPerPath": "10000000"
   }
 }
 

@@ -1,6 +1,6 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import type { AppContext } from "../types";
-import { Error500Response } from "../schemas";
+import { Error500Response, PaymentSponsorWalletSchema } from "../schemas";
 import { getPaymentSponsorStatus } from "../services/payment-sponsor-status";
 
 /**
@@ -14,7 +14,7 @@ export class SponsorStatus extends BaseEndpoint {
     tags: ["Health"],
     summary: "x402 payment sponsor readiness",
     description:
-      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, and under today's fee budget. The balance read is cached for 60s.",
+      "Returns whether the x402 payment sponsor can take a payment now: configured, funded above 0.1 STX, and under today's fee budget. `wallet` gives the sponsor's address, balance and today's spend per budget. The balance read is cached for 60s.",
     responses: {
       "200": {
         description: "Fresh or stale sponsor status snapshot",
@@ -81,6 +81,7 @@ export class SponsorStatus extends BaseEndpoint {
                     },
                   },
                 },
+                wallet: PaymentSponsorWalletSchema,
                 snapshot: {
                   type: "object" as const,
                   properties: {
@@ -159,6 +160,7 @@ export class SponsorStatus extends BaseEndpoint {
                     },
                   },
                 },
+                wallet: PaymentSponsorWalletSchema,
                 snapshot: {
                   type: "object" as const,
                   properties: {

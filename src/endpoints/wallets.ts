@@ -1,7 +1,8 @@
 import { BaseEndpoint } from "./BaseEndpoint";
 import { SponsorService } from "../services";
+import { getPaymentSponsorWallet } from "../services/payment-sponsor-status";
 import type { AppContext } from "../types";
-import { Error500Response } from "../schemas";
+import { Error500Response, PaymentSponsorWalletSchema } from "../schemas";
 
 /**
  * Wallet monitoring endpoint
@@ -10,12 +11,13 @@ import { Error500Response } from "../schemas";
 export class Wallets extends BaseEndpoint {
   schema = {
     tags: ["Wallets"],
-    summary: "Get per-wallet sponsor status",
+    summary: "Get sponsor wallet status (payment sponsor + legacy pool)",
     description:
-      "Returns current STX balance, cumulative fees spent, transaction counts, live nonce pool state, " +
-      "and health status for each configured sponsor wallet. " +
+      "`paymentSponsor` is the wallet that sponsors every live path (POST /sponsor and the RelayRPC " +
+      "sponsorPayment/submitPayment binding); fund this one. " +
+      "`wallets` is the legacy SPONSOR_MNEMONIC nonce pool, which no live path sponsors from any more: " +
+      "per-wallet STX balance, cumulative fees spent, transaction counts, live nonce pool state, and health status. " +
       "Balances are cached for 60 seconds. " +
-      "Use this endpoint to identify wallets that need funding. " +
       "This is the detailed operator/debugging path; use GET /status/sponsor for the canonical cached sponsor readiness surface.",
     responses: {
       "200": {
@@ -31,9 +33,19 @@ export class Wallets extends BaseEndpoint {
                   format: "uuid",
                   description: "Unique request identifier for tracking",
                 },
+                paymentSponsor: {
+                  ...PaymentSponsorWalletSchema,
+                  nullable: true,
+                  description: "The wallet to fund (null when not configured). " + PaymentSponsorWalletSchema.description,
+                },
+                legacyPool: {
+                  type: "boolean" as const,
+                  example: true,
+                  description: "Always true: `wallets` is the legacy pool, not used for live sponsoring",
+                },
                 wallets: {
                   type: "array" as const,
-                  description: "Per-wallet status array ordered by wallet index",
+                  description: "Legacy nonce-pool wallets, ordered by wallet index",
                   items: {
                     type: "object" as const,
                     properties: {
@@ -95,9 +107,18 @@ export class Wallets extends BaseEndpoint {
 
     try {
       const sponsorService = new SponsorService(c.env, logger);
-      const result = await sponsorService.getWalletStatuses();
+      const [result, paymentSponsor] = await Promise.all([
+        sponsorService.getWalletStatuses(),
+        // Never let the payment-sponsor read break the pool report.
+        getPaymentSponsorWallet(c.env, logger).catch((e) => {
+          logger.warn("Payment sponsor wallet read failed", {
+            error: e instanceof Error ? e.message : String(e),
+          });
+          return null;
+        }),
+      ]);
 
-      return this.ok(c, result, {
+      return this.ok(c, { paymentSponsor, legacyPool: true, ...result }, {
         "Cache-Control": "public, max-age=30",
       });
     } catch (e) {

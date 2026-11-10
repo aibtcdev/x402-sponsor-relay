@@ -696,6 +696,25 @@ export interface SponsorStatusResult {
     ageMs: number;
     freshness: SponsorSnapshotFreshness;
   };
+  /**
+   * The x402 payment-sponsor wallet (SponsorWalletDO) behind this status, when configured.
+   * Amounts are microSTX strings; balance is null when Hiro could not be read.
+   */
+  wallet?: PaymentSponsorWalletInfo;
+}
+
+/**
+ * Public identity and funding of the single x402 payment-sponsor wallet (microSTX strings).
+ * The wallet has two daily fee budgets, each capped at `dailyBudgetPerPath`: x402 payments
+ * (RelayRPC) and POST /sponsor. So it can spend up to 2 × dailyBudgetPerPath per UTC day.
+ */
+export interface PaymentSponsorWalletInfo {
+  address: string;
+  /** null when Hiro could not be read */
+  balance: string | null;
+  /** Fees sponsored today (UTC) per budget; null when the SponsorWalletDO could not be read */
+  spentToday: { payments: string; sponsor: string } | null;
+  dailyBudgetPerPath: string;
 }
 
 /**
