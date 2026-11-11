@@ -4858,8 +4858,16 @@ export class NonceDO {
     return balance >= this.getMinAssignBalanceUstx();
   }
 
+  /** Hiro cache entry when still within TTL; null if missing or stale. */
+  private getFreshHiroNonceCacheValue(walletIndex: number): number | null {
+    const cached = this.hiroNonceCache.get(walletIndex);
+    if (!cached || Date.now() >= cached.expiresAt) return null;
+    return cached.value;
+  }
+
   /**
-   * First nonce in [chainStart, head) with no assigned/broadcasted/confirmed ledger row, or null if contiguous.
+   * First nonce in [chainStart, head) with no occupied ledger row, or null if contiguous.
+   * Counts conflict / failed / expired rows so we do not gap-fill into a live mempool nonce (#434 review).
    */
   private findFirstLedgerGap(walletIndex: number, chainStart: number, head: number): number | null {
     if (head <= chainStart) return null;
@@ -4867,7 +4875,7 @@ export class NonceDO {
       .exec<{ nonce: number }>(
         `SELECT nonce FROM nonce_intents
          WHERE wallet_index = ? AND nonce >= ? AND nonce < ?
-           AND state IN ('assigned', 'broadcasted', 'confirmed')`,
+           AND state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed', 'expired')`,
         walletIndex,
         chainStart,
         head
@@ -4893,7 +4901,10 @@ export class NonceDO {
   private resolveNextAssignNonce(walletIndex: number, hiroNextNonce: number | null): number {
     const head = this.ledgerGetWalletHead(walletIndex)!;
     const frontier = this.getChainFrontier(walletIndex);
-    const chainStart = hiroNextNonce ?? frontier ?? head;
+    let chainStart = hiroNextNonce ?? frontier ?? head;
+    if (hiroNextNonce !== null && frontier !== null) {
+      chainStart = Math.max(hiroNextNonce, frontier);
+    }
     let assignmentHead = head;
     if (hiroNextNonce !== null && assignmentHead < hiroNextNonce) {
       assignmentHead = hiroNextNonce;
@@ -5013,7 +5024,7 @@ export class NonceDO {
 
     // Step 3: Atomic hand→queue transition for dispatchBatch
     const walletIndex = bestWalletIndex;
-    const hiroCached = this.hiroNonceCache.get(walletIndex)?.value ?? null;
+    const hiroCached = this.getFreshHiroNonceCacheValue(walletIndex);
     const firstSponsorNonce = this.resolveNextAssignNonce(walletIndex, hiroCached);
 
     // Truncate the run at the first ledger-occupied sponsor nonce (non-contiguous gap).
@@ -5023,7 +5034,7 @@ export class NonceDO {
       const occupiedRows = this.sql
         .exec<{ count: number }>(
           `SELECT COUNT(*) as count FROM nonce_intents
-           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted', 'confirmed')`,
+           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed', 'expired')`,
           walletIndex,
           sponsorNonce
         )
