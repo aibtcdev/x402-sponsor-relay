@@ -69,16 +69,13 @@ describe("NonceDO assign frontier gap (#434)", () => {
 
   it("skips a nonce that has a conflict ledger row when filling gaps", () => {
     const harness = makeNonceDoHarness();
-    setWalletState(harness, 0, { frontier: 24, head: 28, hiroNext: 24 });
     harness.sql.exec = vi.fn().mockReturnValue({
-      toArray: () => [{ nonce: 25 }],
+      toArray: () => [{ nonce: 24 }],
     });
 
-    const assigned = (harness as any).resolveNextAssignNonce(0, 24);
-    expect(assigned).toBe(24);
-
     const gap = (harness as any).findFirstLedgerGap(0, 24, 28);
-    expect(gap).toBe(24);
+    expect(gap).toBe(25);
+    expect(harness.sql.exec.mock.calls[0][0]).toMatch(/'conflict', 'failed', 'expired'/);
   });
 
   it("does not assign below the chain frontier when Hiro is stale", () => {
