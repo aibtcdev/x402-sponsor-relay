@@ -75,7 +75,9 @@ describe("NonceDO assign frontier gap (#434)", () => {
 
     const gap = (harness as any).findFirstLedgerGap(0, 24, 28);
     expect(gap).toBe(25);
-    expect(harness.sql.exec.mock.calls[0][0]).toMatch(/'conflict', 'failed', 'expired'/);
+    const sql = harness.sql.exec.mock.calls[0][0] as string;
+    expect(sql).toMatch(/'conflict', 'failed'/);
+    expect(sql).not.toMatch(/'expired'/);
   });
 
   it("does not assign below the chain frontier when Hiro is stale", () => {
@@ -85,6 +87,29 @@ describe("NonceDO assign frontier gap (#434)", () => {
     const assigned = (harness as any).resolveNextAssignNonce(0, 26);
     expect(assigned).toBe(30);
     expect(assigned).toBeGreaterThanOrEqual(30);
+  });
+
+  it("does not assign below frontier when head lags frontier and Hiro cache is empty", () => {
+    const harness = makeNonceDoHarness();
+    harness.setStateValue("chain_frontier:0", 30);
+    (harness as any).chainFrontierCache.set(0, 30);
+    (harness as any).ledgerAdvanceWalletHead(0, 28);
+
+    const assigned = (harness as any).resolveNextAssignNonce(0, null);
+    expect(assigned).toBe(30);
+  });
+
+  it("prefers higher headroom over gap-free when headroom differs", () => {
+    const harness = makeNonceDoHarness();
+    setWalletState(harness, 0, { frontier: 10, head: 12, hiroNext: 12 });
+    setWalletState(harness, 1, { frontier: 10, head: 10, hiroNext: 10 });
+
+    const chosen = (harness as any).selectWalletForAssignment([
+      { walletIndex: 0, headroom: 18 },
+      { walletIndex: 1, headroom: 2 },
+    ]);
+
+    expect(chosen?.walletIndex).toBe(0);
   });
 });
 

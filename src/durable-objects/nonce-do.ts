@@ -4867,7 +4867,8 @@ export class NonceDO {
 
   /**
    * First nonce in [chainStart, head) with no occupied ledger row, or null if contiguous.
-   * Counts conflict / failed / expired rows so we do not gap-fill into a live mempool nonce (#434 review).
+   * Counts conflict / failed rows so we do not gap-fill into a live mempool nonce (#434 review).
+   * Excludes expired: reserved but never broadcast — the chain nonce is still free.
    */
   private findFirstLedgerGap(walletIndex: number, chainStart: number, head: number): number | null {
     if (head <= chainStart) return null;
@@ -4875,7 +4876,7 @@ export class NonceDO {
       .exec<{ nonce: number }>(
         `SELECT nonce FROM nonce_intents
          WHERE wallet_index = ? AND nonce >= ? AND nonce < ?
-           AND state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed', 'expired')`,
+           AND state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed')`,
         walletIndex,
         chainStart,
         head
@@ -4906,8 +4907,11 @@ export class NonceDO {
       chainStart = Math.max(hiroNextNonce, frontier);
     }
     let assignmentHead = head;
-    if (hiroNextNonce !== null && assignmentHead < hiroNextNonce) {
-      assignmentHead = hiroNextNonce;
+    if (hiroNextNonce !== null) {
+      assignmentHead = Math.max(assignmentHead, hiroNextNonce);
+    }
+    if (frontier !== null) {
+      assignmentHead = Math.max(assignmentHead, frontier);
     }
     const gap = this.findFirstLedgerGap(walletIndex, chainStart, assignmentHead);
     if (gap !== null) return gap;
@@ -4927,10 +4931,11 @@ export class NonceDO {
     eligible: Array<{ walletIndex: number; headroom: number }>
   ): { walletIndex: number; headroom: number } | null {
     if (eligible.length === 0) return null;
-    const gapFree = eligible.filter((w) => !this.walletHasLedgerGap(w.walletIndex));
-    const pool = gapFree.length > 0 ? gapFree : eligible;
-    pool.sort((a, b) => {
+    eligible.sort((a, b) => {
       if (b.headroom !== a.headroom) return b.headroom - a.headroom;
+      const gapA = this.walletHasLedgerGap(a.walletIndex);
+      const gapB = this.walletHasLedgerGap(b.walletIndex);
+      if (gapA !== gapB) return gapA ? 1 : -1;
       const balA = this.getCachedWalletBalanceUstx(a.walletIndex);
       const balB = this.getCachedWalletBalanceUstx(b.walletIndex);
       if (balA !== null && balB !== null && balA !== balB) {
@@ -4938,7 +4943,7 @@ export class NonceDO {
       }
       return a.walletIndex - b.walletIndex;
     });
-    return pool[0];
+    return eligible[0];
   }
 
   /**
@@ -5034,7 +5039,7 @@ export class NonceDO {
       const occupiedRows = this.sql
         .exec<{ count: number }>(
           `SELECT COUNT(*) as count FROM nonce_intents
-           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed', 'expired')`,
+           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed')`,
           walletIndex,
           sponsorNonce
         )
