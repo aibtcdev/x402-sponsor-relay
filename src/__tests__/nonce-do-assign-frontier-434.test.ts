@@ -1,0 +1,127 @@
+import { describe, expect, it, vi, afterEach } from "vitest";
+import { NonceDO } from "../durable-objects/nonce-do";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+function makeNonceDoHarness() {
+  const state = new Map<string, number>();
+  const setStateValue = (key: string, value: number) => state.set(key, value);
+  const getStateValue = (key: string) => (state.has(key) ? state.get(key)! : null);
+
+  const harness = Object.create(NonceDO.prototype) as InstanceType<typeof NonceDO> & {
+    setStateValue: typeof setStateValue;
+    getStateValue: typeof getStateValue;
+  };
+
+  harness.sql = {
+    exec: vi.fn().mockReturnValue({ toArray: () => [] }),
+  } as unknown as InstanceType<typeof NonceDO>["sql"];
+  harness.hiroNonceCache = new Map();
+  (harness as any).chainFrontierCache = new Map();
+  harness.setStateValue = setStateValue;
+  harness.getStateValue = getStateValue;
+
+  return harness;
+}
+
+describe("NonceDO assign frontier gap (#434)", () => {
+  it("assigns the chain frontier when head is ahead with an empty ledger gap", () => {
+    const harness = makeNonceDoHarness();
+    setWalletState(harness, 0, { frontier: 24, head: 28, hiroNext: 24 });
+
+    const assigned = (harness as any).resolveNextAssignNonce(0, 24);
+    expect(assigned).toBe(24);
+  });
+
+  it("does not shrink the wallet head when filling an earlier gap", () => {
+    const harness = makeNonceDoHarness();
+    setWalletState(harness, 0, { frontier: 24, head: 28, hiroNext: 24 });
+
+    (harness as any).advanceWalletHeadAfterAssign(0, 24);
+    expect((harness as any).ledgerGetWalletHead(0)).toBe(28);
+  });
+
+  it("prefers a funded wallet over a low-balance wallet on headroom ties", () => {
+    const harness = makeNonceDoHarness();
+    setWalletState(harness, 0, { frontier: 10, head: 10, hiroNext: 10 });
+    setWalletState(harness, 4, { frontier: 10, head: 10, hiroNext: 10 });
+    harness.setStateValue("wallet_balance_ustx:0", 900);
+    harness.setStateValue("wallet_balance_ustx:4", 5_000_000);
+
+    const chosen = (harness as any).selectWalletForAssignment([
+      { walletIndex: 0, headroom: 20 },
+      { walletIndex: 4, headroom: 20 },
+    ]);
+
+    expect(chosen?.walletIndex).toBe(4);
+  });
+
+  it("excludes wallets below the minimum sponsor assignment balance", () => {
+    const harness = makeNonceDoHarness();
+    harness.setStateValue("wallet_balance_ustx:0", 900);
+    harness.setStateValue("min_assign_balance_ustx", 30_000);
+
+    expect((harness as any).isWalletFundedForAssignment(0)).toBe(false);
+    expect((harness as any).isWalletFundedForAssignment(1)).toBe(true);
+  });
+
+  it("skips a nonce that has a conflict ledger row when filling gaps", () => {
+    const harness = makeNonceDoHarness();
+    harness.sql.exec = vi.fn().mockReturnValue({
+      toArray: () => [{ nonce: 24 }],
+    });
+
+    const gap = (harness as any).findFirstLedgerGap(0, 24, 28);
+    expect(gap).toBe(25);
+    const sql = harness.sql.exec.mock.calls[0][0] as string;
+    expect(sql).toMatch(/'conflict', 'failed'/);
+    expect(sql).toMatch(/'gap_fill'/);
+    expect(sql).toMatch(/state = 'expired'/);
+    expect(sql).toMatch(/broadcast_failed/);
+  });
+
+  it("does not assign below the chain frontier when Hiro is stale", () => {
+    const harness = makeNonceDoHarness();
+    setWalletState(harness, 0, { frontier: 30, head: 32, hiroNext: 26 });
+
+    const assigned = (harness as any).resolveNextAssignNonce(0, 26);
+    expect(assigned).toBe(30);
+    expect(assigned).toBeGreaterThanOrEqual(30);
+  });
+
+  it("does not assign below frontier when head lags frontier and Hiro cache is empty", () => {
+    const harness = makeNonceDoHarness();
+    harness.setStateValue("chain_frontier:0", 30);
+    (harness as any).chainFrontierCache.set(0, 30);
+    (harness as any).ledgerAdvanceWalletHead(0, 28);
+
+    const assigned = (harness as any).resolveNextAssignNonce(0, null);
+    expect(assigned).toBe(30);
+  });
+
+  it("prefers higher headroom over gap-free when headroom differs", () => {
+    const harness = makeNonceDoHarness();
+    setWalletState(harness, 0, { frontier: 10, head: 12, hiroNext: 12 });
+    setWalletState(harness, 1, { frontier: 10, head: 10, hiroNext: 10 });
+
+    const chosen = (harness as any).selectWalletForAssignment([
+      { walletIndex: 0, headroom: 18 },
+      { walletIndex: 1, headroom: 2 },
+    ]);
+
+    expect(chosen?.walletIndex).toBe(0);
+  });
+});
+
+function setWalletState(
+  harness: ReturnType<typeof makeNonceDoHarness>,
+  walletIndex: number,
+  opts: { frontier: number; head: number; hiroNext: number }
+) {
+  harness.setStateValue(`chain_frontier:${walletIndex}`, opts.frontier);
+  (harness as any).chainFrontierCache.set(walletIndex, opts.frontier);
+  (harness as any).ledgerAdvanceWalletHead(walletIndex, opts.head);
+  harness.hiroNonceCache.set(walletIndex, { value: opts.hiroNext, expiresAt: Date.now() + 60_000 });
+}

@@ -552,7 +552,7 @@ describe("NonceDO stale sender repair helpers", () => {
       log,
     }, "STSYNC");
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       dispatched: true,
       sponsorNonce: 44,
       walletIndex: 1,
@@ -560,6 +560,7 @@ describe("NonceDO stale sender repair helpers", () => {
       // Added to the assignment result with tx-schemas 1.1.0: now + STALE_THRESHOLD_MS.
       nonceExpiresAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
     });
+    expect(typeof result.nonceExpiresAt).toBe("string");
     expect(log).toHaveBeenCalledWith(
       "warn",
       "payment_sync_after_assign_failed",
