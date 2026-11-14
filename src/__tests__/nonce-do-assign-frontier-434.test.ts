@@ -77,7 +77,9 @@ describe("NonceDO assign frontier gap (#434)", () => {
     expect(gap).toBe(25);
     const sql = harness.sql.exec.mock.calls[0][0] as string;
     expect(sql).toMatch(/'conflict', 'failed'/);
-    expect(sql).not.toMatch(/'expired'/);
+    expect(sql).toMatch(/'gap_fill'/);
+    expect(sql).toMatch(/state = 'expired'/);
+    expect(sql).toMatch(/broadcast_failed/);
   });
 
   it("does not assign below the chain frontier when Hiro is stale", () => {

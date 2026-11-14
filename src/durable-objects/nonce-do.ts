@@ -4865,10 +4865,16 @@ export class NonceDO {
     return cached.value;
   }
 
+  /** Ledger rows that block assigning or gap-filling at a nonce (#434, Mars review). */
+  private static readonly LEDGER_OCCUPIED_NONCE_SQL = `(
+    state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed', 'gap_fill')
+    OR (state = 'expired' AND COALESCE(status, '') != 'broadcast_failed')
+  )`;
+
   /**
    * First nonce in [chainStart, head) with no occupied ledger row, or null if contiguous.
-   * Counts conflict / failed rows so we do not gap-fill into a live mempool nonce (#434 review).
-   * Excludes expired: reserved but never broadcast — the chain nonce is still free.
+   * Release-path expired (status broadcast_failed, never dispatched) is not occupied.
+   * Reconcile-path expired may still have an unrecorded mempool tx — stays occupied.
    */
   private findFirstLedgerGap(walletIndex: number, chainStart: number, head: number): number | null {
     if (head <= chainStart) return null;
@@ -4876,7 +4882,7 @@ export class NonceDO {
       .exec<{ nonce: number }>(
         `SELECT nonce FROM nonce_intents
          WHERE wallet_index = ? AND nonce >= ? AND nonce < ?
-           AND state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed')`,
+           AND ${NonceDO.LEDGER_OCCUPIED_NONCE_SQL}`,
         walletIndex,
         chainStart,
         head
@@ -5039,7 +5045,7 @@ export class NonceDO {
       const occupiedRows = this.sql
         .exec<{ count: number }>(
           `SELECT COUNT(*) as count FROM nonce_intents
-           WHERE wallet_index = ? AND nonce = ? AND state IN ('assigned', 'broadcasted', 'confirmed', 'conflict', 'failed')`,
+           WHERE wallet_index = ? AND nonce = ? AND ${NonceDO.LEDGER_OCCUPIED_NONCE_SQL}`,
           walletIndex,
           sponsorNonce
         )
