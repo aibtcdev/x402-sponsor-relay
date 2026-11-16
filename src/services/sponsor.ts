@@ -581,7 +581,7 @@ export class SponsorService {
    * The DO adds it to the sender's hand and checks for a gapless run.
    * Returns the HandSubmitResult, or null if the DO is unavailable (fall back to legacy path).
    *
-   * @param mode - "hold" (default): insert into hand even if held (async callers like /relay).
+   * @param mode - "hold" (default): insert into hand even if held (async callers such as the payment queue).
    *               "immediate": reject without inserting if a gap exists (sync callers like /sponsor).
    */
   private async submitToHand(
@@ -792,7 +792,7 @@ export class SponsorService {
    *
    * @param transaction - The deserialized sponsored transaction to sign
    * @param originalTxHex - Original hex for hand-submit (defaults to re-serialized)
-   * @param mode - "hold" (default): queue tx even if held (for /relay and /settle async paths).
+   * @param mode - "hold" (default): queue tx even if held (for async paths such as the payment queue).
    *               "immediate": reject without queuing if a gap exists (for /sponsor sync path).
    */
   async sponsorTransaction(

@@ -54,6 +54,15 @@ interface HiroNonces {
 
 /** How long a sponsored payment counts as in flight if Hiro has not yet seen it execute. */
 const SENDER_IN_FLIGHT_MS = 10 * 60_000;
+/** How old the locally counted sponsor nonce may get before it is checked against Hiro again. */
+export const NONCE_REVALIDATE_MS = 60_000;
+/** A missing nonce we broadcast this recently may just be one Hiro has not indexed yet. */
+export const HIRO_INDEX_GRACE_MS = 30_000;
+/**
+ * How long a sponsor nonce the node rejected as taken is skipped when Hiro calls it missing.
+ * Hiro can miss a tx the node holds (a ghost); it is not a hole, and later nonces still mine.
+ */
+export const OCCUPIED_NONCE_TTL_MS = 10 * 60_000;
 
 /** How long a sponsored payment's txids are kept so a resubmit of the same tx finds them. */
 export const SENT_TTL_MS = 24 * 60 * 60_000;
@@ -98,6 +107,11 @@ const isLanded = (status: string | null) => status === "pending" || status === "
  * the next call re-reads the chain. A sponsor-side nonce rejection is retried once with
  * a fresh nonce. This is the pattern used by Xverse's and Tony's x402 sponsor services.
  *
+ * The node accepts a nonce above a hole, so a tx it took and later dropped (e.g. replaced by
+ * the sender at the same sender nonce) would leave every later tx chained behind an empty
+ * nonce, and no failure would ever clear the cache (#434). So a cached nonce older than
+ * NONCE_REVALIDATE_MS is checked against Hiro, and a hole below it is filled first.
+ *
  * One sponsored payment per sender may be in flight. A sponsored tx needs both its sender
  * nonce and its sponsor nonce to be next in line; if one sender's payments reach this lock
  * out of sender-nonce order, sender order and sponsor order cross and every one of them
@@ -106,6 +120,12 @@ const isLanded = (status: string | null) => status === "pending" || status === "
  */
 export class SponsorWallet {
   private nextNonce: bigint | null = null;
+  /** When the cached nonce was last checked against Hiro. */
+  private nonceCheckedAt = 0;
+  /** Sponsor nonce → when we broadcast it, for HIRO_INDEX_GRACE_MS. */
+  private readonly recentSends = new Map<bigint, number>();
+  /** Sponsor nonce → when the node rejected it as taken, for OCCUPIED_NONCE_TTL_MS. */
+  private readonly occupiedNonces = new Map<bigint, number>();
   private tail: Promise<unknown> = Promise.resolve();
   /** Sender → nonce + time of the last payment sponsored here (covers Hiro mempool lag). */
   private readonly inFlight = new Map<string, { nonce: number; at: number }>();
@@ -175,8 +195,9 @@ export class SponsorWallet {
 
     for (let attempt = 1; ; attempt++) {
       let nonce: bigint;
+      let filledHole = false;
       try {
-        nonce = this.nextNonce ?? (await this.chainNextNonce(address));
+        ({ nonce, filledHole } = await this.resolveNonce(address));
       } catch (e) {
         return {
           ok: false,
@@ -199,7 +220,9 @@ export class SponsorWallet {
       const result = await this.broadcast(sponsored);
 
       const accept = async (landedTxid: string): Promise<SponsorWalletResult> => {
-        this.nextNonce = nonce + 1n;
+        // Above a filled hole our own pending txs already hold the next nonces: re-read the chain.
+        this.nextNonce = filledHole ? null : nonce + 1n;
+        this.recentSends.set(nonce, Date.now());
         this.inFlight.set(senderAddress, { nonce: senderNonce, at: Date.now() });
         await this.budget.put(budgetName, { day, spent: (spent + BigInt(fee)).toString() });
         return { ok: true, txid: landedTxid, sponsorNonce: Number(nonce), fee };
@@ -232,7 +255,8 @@ export class SponsorWallet {
       // A node rejection (4xx) other than a nonce conflict left this nonce unused: keep it,
       // since Hiro may still lag our last broadcast. Otherwise re-read the chain next time.
       const rejected = result.httpStatus !== undefined && result.httpStatus >= 400 && result.httpStatus < 500;
-      this.nextNonce = rejected && !result.nonceConflict ? nonce : null;
+      // A hole fill that hit a nonce conflict left the cache (still in nextNonce) right: keep it.
+      if (!(filledHole && result.nonceConflict)) this.nextNonce = rejected && !result.nonceConflict ? nonce : null;
       this.logger.warn("sponsor_broadcast_failed", {
         address,
         nonce: Number(nonce),
@@ -244,6 +268,7 @@ export class SponsorWallet {
       });
       // Our nonce was stale (lagging cache or another writer): re-read the chain once.
       const sponsorNonceRejected = result.nonceConflict === true && result.responsible !== "sender";
+      if (sponsorNonceRejected) this.occupiedNonces.set(nonce, Date.now());
       if (!sponsorNonceRejected || attempt >= 2) return { ok: false, ...result };
     }
   }
@@ -294,7 +319,7 @@ export class SponsorWallet {
       this.inFlight.delete(sender);
     }
     if (info.last_mempool_tx_nonce != null || this.inFlight.has(sender)) {
-      return refuse("SENDER_NONCE_DUPLICATE", "Wait for your previous transaction to confirm, then re-sign and resend");
+      return refuse("SENDER_NONCE_DUPLICATE", "Wait for your previous transaction to confirm or drop. If this retries that same payment, resend the same signed hex; re-signing it at a new nonce lets both confirm");
     }
     if (senderNonce < info.possible_next_nonce) {
       return refuse("SENDER_NONCE_STALE", `Nonce ${senderNonce} is already used; next is ${info.possible_next_nonce}`, info.possible_next_nonce);
@@ -305,10 +330,63 @@ export class SponsorWallet {
     return null;
   }
 
+  /**
+   * The sponsor nonce to use: the cached one while it is fresh, else the chain's. A cache older
+   * than NONCE_REVALIDATE_MS is checked against Hiro: a missing nonce below it (one we did not
+   * broadcast in the last HIRO_INDEX_GRACE_MS) is used first, and a chain that moved past it wins.
+   * If that check cannot reach Hiro, the cache is used and the check is tried again next call.
+   */
+  private async resolveNonce(address: string): Promise<{ nonce: bigint; filledHole: boolean }> {
+    const cached = this.nextNonce;
+    if (cached === null) return { nonce: await this.chainNextNonce(address), filledHole: false };
+    const now = Date.now();
+    if (now - this.nonceCheckedAt < NONCE_REVALIDATE_MS) return { nonce: cached, filledHole: false };
+
+    let info: HiroNonces;
+    try {
+      info = await this.fetchNonces(address);
+    } catch (e) {
+      this.logger.warn("sponsor_nonce_revalidate_failed", { address, cached: Number(cached), error: e instanceof Error ? e.message : String(e) });
+      return { nonce: cached, filledHole: false };
+    }
+    this.nonceCheckedAt = now;
+
+    const hole = this.lowestHole(info.detected_missing_nonces);
+    if (hole !== null && hole < cached) {
+      this.logger.warn("sponsor_nonce_hole_refilled", { address, cached: Number(cached), hole: Number(hole) });
+      return { nonce: hole, filledHole: true };
+    }
+    const chain = BigInt(info.possible_next_nonce);
+    if (chain > cached) {
+      this.logger.warn("sponsor_nonce_cache_behind_chain", { address, cached: Number(cached), chain: Number(chain) });
+      this.nextNonce = chain;
+      return { nonce: chain, filledHole: false };
+    }
+    return { nonce: cached, filledHole: false };
+  }
+
   private async chainNextNonce(address: string): Promise<bigint> {
     const info = await this.fetchNonces(address);
-    const missing = info.detected_missing_nonces ?? [];
-    return BigInt(missing.length > 0 ? Math.min(...missing) : info.possible_next_nonce);
+    this.nonceCheckedAt = Date.now();
+    return this.lowestHole(info.detected_missing_nonces) ?? BigInt(info.possible_next_nonce);
+  }
+
+  /**
+   * The lowest nonce Hiro reports missing that is really free: not one we broadcast in the last
+   * HIRO_INDEX_GRACE_MS (Hiro may not have indexed it), nor one the node rejected as taken in
+   * the last OCCUPIED_NONCE_TTL_MS (a tx Hiro cannot see holds it).
+   */
+  private lowestHole(missing: number[] | undefined): bigint | null {
+    const now = Date.now();
+    for (const [n, at] of this.recentSends) if (now - at > HIRO_INDEX_GRACE_MS) this.recentSends.delete(n);
+    for (const [n, at] of this.occupiedNonces) if (now - at > OCCUPIED_NONCE_TTL_MS) this.occupiedNonces.delete(n);
+    let lowest: bigint | null = null;
+    for (const m of missing ?? []) {
+      const n = BigInt(m);
+      if (this.recentSends.has(n) || this.occupiedNonces.has(n)) continue;
+      if (lowest === null || n < lowest) lowest = n;
+    }
+    return lowest;
   }
 }
 
@@ -376,11 +454,20 @@ export class SponsorWalletDO {
   }
 
   async fetch(request: Request): Promise<Response> {
-    // GET: today's fee spend (read by the alert cron)
+    // GET: today's fee spend per budget. `spent` is the x402 "budget" (read by the alert cron);
+    // `sponsorSpent` is POST /sponsor's separate "budget:sponsor". Each has its own daily cap.
     if (request.method === "GET") {
       const day = new Date().toISOString().slice(0, 10);
-      const stored = await this.state.storage.get<{ day: string; spent: string }>("budget");
-      return Response.json({ day, spent: stored?.day === day ? stored.spent : "0" });
+      const [payments, sponsor] = await Promise.all(
+        (["budget", "budget:sponsor"] as const).map((name) =>
+          this.state.storage.get<{ day: string; spent: string }>(name)
+        )
+      );
+      return Response.json({
+        day,
+        spent: payments?.day === day ? payments.spent : "0",
+        sponsorSpent: sponsor?.day === day ? sponsor.spent : "0",
+      });
     }
     // POST /lookup: an earlier sponsorship of this client tx that landed, or null
     if (new URL(request.url).pathname === "/lookup") {

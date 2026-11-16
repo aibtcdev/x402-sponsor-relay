@@ -22,7 +22,7 @@ import { buildExplorerUrl, extractTransferDetails, stripHexPrefix } from "../uti
  * Sponsor endpoint - sponsors and broadcasts transactions directly
  * POST /sponsor
  *
- * Unlike /relay, this endpoint:
+ * Unlike /settle, this endpoint:
  * - Does NOT perform settlement verification
  * - Broadcasts directly to the Stacks node
  * - Requires API key authentication

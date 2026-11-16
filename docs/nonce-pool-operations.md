@@ -39,7 +39,7 @@ The relay uses a pool of sponsor wallets to sign and broadcast Stacks transactio
                     ┌──────────────────────────────────────────┐
                     │              NonceDO Ledger               │
                     │                                           │
-  /relay request    │  assign ──► broadcasted ──► confirmed     │
+  sponsor request   │  assign ──► broadcasted ──► confirmed     │
   ──────────────►   │    │                                      │
                     │    ├──► conflict  (ConflictingNonceInMempool)
                     │    ├──► failed    (other broadcast error)  │
@@ -67,71 +67,27 @@ The relay uses a pool of sponsor wallets to sign and broadcast Stacks transactio
 
 ## Caller Retry Contract
 
-### POST /relay — Response Codes
+`POST /relay` was removed, so its old response-code table and "re-sign and retry" advice no longer apply.
+The sponsor nonce pool now serves only `POST /sponsor` (API key) and the `RelayRPC.sponsorPayment` /
+`submitPayment` service binding. Caller-facing error codes and retry rules live in
+[`agent-payment-guide.md`](./agent-payment-guide.md). The rule that matters for the pool:
 
-| HTTP | Error Code | `retryable` | `retryAfter` | Action |
-|------|-----------|-------------|-------------|--------|
-| 200 | — | — | — | Success. Check `settlement.status` |
-| 409 | `NONCE_CONFLICT` | `true` | 30s | Wait, re-sign, retry (see below) |
-| 422 | `SETTLEMENT_FAILED` | `false` | — | Surface to user; tx rejected on-chain |
-| 422 | `SETTLEMENT_VERIFICATION_FAILED` | `false` | — | Payment params invalid; fix request |
-| 422 | `CLIENT_BAD_NONCE` | `false` | — | Agent tx has wrong nonce; re-sign |
-| 422 | `CLIENT_INSUFFICIENT_FUNDS` | `false` | — | Agent wallet has insufficient funds |
-| 429 | `CHAINING_LIMIT_EXCEEDED` | `true` | dynamic | Pool at capacity; wait and retry |
-| 429 | `RATE_LIMIT_EXCEEDED` | `true` | dynamic | Per-sender rate limit hit; back off |
-| 503 | `INTERNAL_ERROR` | `true` | 5s | Relay unavailable; retry shortly |
+- **Retrying the same payment means resending the same signed hex.** Never re-sign the same payment at a
+  new nonce: if the first tx is still in the mempool, both can confirm and the sender pays twice.
 
-### Handling 409 NONCE_CONFLICT
+### Held transactions (RPC payment queue)
 
-The relay returned a conflict because the sponsor nonce it used was already in the mempool. The relay has already scheduled a resync — the pool self-heals within 30–60 seconds.
+The RPC payment queue can hold a sponsored tx in the sender hand when the sender nonce sequence has a gap
+(`POST /sponsor` rejects instead of holding). No HTTP endpoint returns a `202 held` response.
 
-**Required caller steps:**
-1. Wait at least `retryAfter` seconds (always 30 for `NONCE_CONFLICT`)
-2. Re-sign the transaction — do NOT reuse the old signed hex
-   - The agent's own nonce may also need to be updated if time has passed
-3. Retry `POST /relay` with the newly signed transaction
-
-**Why re-signing is required:** The sponsor wallet picks a new nonce on the next request. The old signed transaction contains the stale sponsor nonce and will be rejected. The agent-side nonce may also have advanced during the wait.
-
-**Recovery timeline:** ~30–60s in normal conditions. During heavy conflict periods (multiple wallets simultaneously conflicted), recovery may take up to 90s. Check `GET /nonce/stats` if conflicts persist beyond 2 minutes.
-
-### Handling 200 with `settlement.status: "pending"`
-
-The transaction was broadcast but did not confirm within the 60-second polling window. This is not an error.
-
-**Required caller steps:**
-1. Store the `receiptId` from the response
-2. Poll `GET /verify/:receiptId` every 15–30 seconds
-3. Consider confirmed when `receipt.settlement.status === "confirmed"`
-4. Consider failed only when `receipt.settlement.status === "failed"`
-
-**Do not retry** `POST /relay` for a pending settlement — this creates duplicate transactions.
-
-### Handling 422 Errors
-
-All 422 responses have `retryable: false`. Do not retry automatically.
-
-- `SETTLEMENT_FAILED`: The transaction reached the chain and was aborted (`abort_*` status). This is a terminal state — surface the error to the user.
-- `CLIENT_BAD_NONCE` / `CLIENT_NONCE_CONFLICT`: The agent's own transaction nonce is wrong. Fetch the agent's current nonce from Hiro, re-build the transaction, and retry.
-- `SETTLEMENT_VERIFICATION_FAILED`: The transaction's payment parameters do not match the `settle` requirements sent with the request. Fix the transaction construction.
-
-### Handling 202 TRANSACTION_HELD
-
-The relay accepted the tx but could not dispatch it yet because the sender nonce sequence has a gap.
-
-**Required caller steps:**
-1. Read `queue.missingNonces` and submit those sender nonces first.
-2. Treat `queue.expiresAt` as the held-entry deadline.
-3. If the sender advanced outside the relay, allow the alarm to self-repair the stale-low frontier after 5 minutes.
-
-**Timing model:**
 - Held entries remain in `sender_hand` for up to 15 minutes.
 - Conservative stale-low repair becomes eligible after 5 minutes.
 - After a refresh attempt, the same sender waits 10 minutes before another Hiro refresh.
 
 ### Drop vs Abort — Dropped Is Not Failed
 
-The relay correctly treats `dropped_replace_by_fee` and other `dropped_*` statuses as **transient**, not terminal. If Hiro reports a drop, the relay continues polling until the 60s timeout, then returns `status: "pending"`. Production data shows 93% of RBF-drop reports eventually confirm on-chain. Only `abort_*` is treated as terminal.
+`dropped_replace_by_fee` and other `dropped_*` statuses are **transient**, not terminal. Production data
+showed 93% of RBF-drop reports eventually confirm on-chain. Only `abort_*` is treated as terminal.
 
 ---
 
@@ -292,7 +248,7 @@ With `SPONSOR_WALLET_COUNT=10` and `CHAINING_LIMIT=20`:
 
 ### Signs of capacity pressure
 
-1. Frequent 409 `NONCE_CONFLICT` in production logs
+1. Frequent sponsor nonce conflicts (`rbf_occupant_*`, `ConflictingNonceInMempool`) in production logs
 2. `surge_started` events with `peak_pressure_pct > 85`
 3. `nonce/stats` showing `wallets[*].reserved >= 16` on multiple wallets simultaneously
 4. Reconciler log `nonce_reconcile_stale` firing frequently (> 2x per hour per wallet)

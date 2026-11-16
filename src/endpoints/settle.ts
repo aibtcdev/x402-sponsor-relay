@@ -41,7 +41,8 @@ interface BroadcastSuccessParams {
  * POST /settle (spec section 7.2)
  *
  * Verifies payment parameters locally and broadcasts the transaction.
- * Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer).
+ * Does not sponsor: a transaction with an empty sponsor slot (fee=0 / all-zeros signer)
+ * is refused with invalid_transaction_state. Sponsorship is service-binding only.
  * Returns x402 V2 spec-compliant settlement response.
  */
 export class Settle extends BaseEndpoint {
@@ -49,7 +50,7 @@ export class Settle extends BaseEndpoint {
     tags: ["x402 V2"],
     summary: "Settle an x402 V2 payment",
     description:
-      "x402 V2 facilitator settle endpoint (spec section 7.2). Verifies payment parameters locally and broadcasts the transaction to the Stacks network. Auto-sponsors transactions with an empty sponsor slot (fee=0 / all-zeros signer) — standard x402 clients that build transactions with sponsored:true and fee:0 are handled transparently. Returns HTTP 200 for settlement results (success or failure); HTTP 400 for invalid request schema; HTTP 409 when a payment-identifier conflicts with a prior request.",
+      "x402 V2 facilitator settle endpoint (spec section 7.2). Verifies payment parameters locally and broadcasts the transaction to the Stacks network. Accepts self-paid transactions (standard auth, sender pays the fee) and transactions that already carry a sponsor signature. It does not sponsor: a transaction with an empty sponsor slot (sponsored:true, fee 0) is refused with errorReason invalid_transaction_state. Returns HTTP 200 for settlement results (success or failure); HTTP 400 for invalid request schema; HTTP 409 when a payment-identifier conflicts with a prior request.",
     request: {
       body: {
         content: {
@@ -338,21 +339,6 @@ export class Settle extends BaseEndpoint {
         }
       }
 
-      const dedupResult = await settlementService.checkDedup(txHex);
-      if (dedupResult) {
-        logger.info("Dedup hit, returning cached settle result", {
-          txid: dedupResult.txid,
-          status: dedupResult.status,
-        });
-        const response: X402SettlementResponseV2 = {
-          success: true,
-          payer: dedupResult.sender,
-          transaction: dedupResult.txid,
-          network,
-        };
-        return c.json(response, 200);
-      }
-
       const clientIp = c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for") ?? null;
 
       // Fast hex pre-validation before expensive deserialization (mirrors SponsorService.preValidateTxHex)
@@ -412,6 +398,23 @@ export class Settle extends BaseEndpoint {
           ]).catch(() => {})
         );
         return v2Error(mapVerifyErrorToV2Code(verifyResult.error), 200);
+      }
+
+      // Tx-hex dedup runs only after verifyPaymentParams: the cache is keyed on the
+      // hex alone, so a hit must not vouch for a different payTo/amount/asset.
+      const dedupResult = await settlementService.checkDedup(txHex);
+      if (dedupResult) {
+        logger.info("Dedup hit, returning cached settle result", {
+          txid: dedupResult.txid,
+          status: dedupResult.status,
+        });
+        const response: X402SettlementResponseV2 = {
+          success: true,
+          payer: dedupResult.sender,
+          transaction: dedupResult.txid,
+          network,
+        };
+        return c.json(response, 200);
       }
 
       // Public /settle only broadcasts self-paid (or already-sponsored) transactions.

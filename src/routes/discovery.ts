@@ -754,11 +754,19 @@ gasless payment; when it is false, follow recommendation ("fallback_to_direct": 
 
 canSponsor is false (HTTP 503, status "unavailable") when any of these reasons apply:
 - SPONSOR_NOT_CONFIGURED — the relay has no payment sponsor key
+- SPONSOR_STATE_UNREADABLE — Hiro could not be read, so payments would be refused too
 - SPONSOR_BALANCE_LOW — the sponsor wallet holds less than 0.1 STX
 - DAILY_BUDGET_REACHED — today's sponsor fee budget is spent (resets at midnight UTC)
 
-The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor stays true and
-reconciliation.freshness is "unavailable". noncePool is kept for compatibility (one sponsor, nothing reserved).
+The sponsor balance read is cached for 60s. If Hiro cannot be read, canSponsor is false with
+reason SPONSOR_STATE_UNREADABLE, and reconciliation.freshness and snapshot.freshness are "unavailable". noncePool is kept for compatibility (one sponsor, nothing reserved).
+
+wallet (present when the sponsor is configured) identifies the sponsor wallet: address, balance
+(µSTX; null when Hiro is unreadable), spentToday per budget ({ payments, sponsor } µSTX; null when
+unreadable) and dailyBudgetPerPath. x402 payments and POST /sponsor each have their own daily budget of
+dailyBudgetPerPath; canSponsor / DAILY_BUDGET_REACHED reflect the x402 payments budget only.
+GET /wallets returns the same block as paymentSponsor; its wallets array is a legacy pool that no
+longer sponsors anything.
 
 ### Response
 
@@ -786,6 +794,12 @@ reconciliation.freshness is "unavailable". noncePool is kept for compatibility (
     "asOf": "2026-10-27T12:00:00.000Z",
     "ageMs": 0,
     "freshness": "fresh"
+  },
+  "wallet": {
+    "address": "SP3F6ZPHAR5D0YT0CTPJST7H3NBZ43A5FW226FMYP",
+    "balance": "52454516",
+    "spentToday": { "payments": "40000", "sponsor": "0" },
+    "dailyBudgetPerPath": "10000000"
   }
 }
 
@@ -1361,7 +1375,7 @@ All errors return JSON with this shape:
 | SETTLEMENT_FAILED              | 422  | false     | Transaction broadcast OK but definitively aborted on-chain (abort_* status only) |
 | CLIENT_INSUFFICIENT_FUNDS      | 422  | false     | Sender had insufficient funds — top up wallet before re-signing and retrying |
 | CLIENT_BAD_NONCE               | 422  | true      | Sender nonce is invalid — verify via Stacks API, re-sign with correct nonce, and retry |
-| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender has a pending transaction (or a mempool nonce conflict) — wait for it to confirm, then retry |
+| CLIENT_NONCE_CONFLICT          | 409  | true      | Sender has a pending transaction (or a mempool nonce conflict) — wait for it to confirm, then retry; when retrying the same payment, resend the same signed hex (do not re-sign at a new nonce) |
 | TOO_MUCH_CHAINING              | 429  | true      | Sponsor wallet congested — retry after Retry-After (30s) |
 | SPONSOR_EXHAUSTED              | 503  | true      | Sponsor wallet out of STX or /sponsor daily budget reached — retry later |
 | SENDER_NONCE_GAP               | 400  | false     | Sender nonce has a gap — verify account nonce, submit missing nonces listed in response |
@@ -1440,7 +1454,7 @@ Do retry (after verifying nonces):
 - 422 BROADCAST_REJECTED — inspect the details field, correct the transaction, and resubmit
 - 422 CLIENT_BAD_NONCE — verify your account nonce via the Stacks API (GET /extended/v1/address/{addr}/nonces), re-sign with the correct nonce, and resubmit
 - 400 SENDER_NONCE_GAP — verify your account nonce, then submit the missing nonces listed in the response to unblock dispatch
-- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; verify your account nonce, wait for any pending mempool tx, re-sign and retry
+- 409 CLIENT_NONCE_CONFLICT — sender nonce conflict; wait for any pending mempool tx. Retrying the same payment: resend the same signed hex. A different payment: re-sign at the next nonce
 - 409 NONCE_CONFLICT — relay sponsor nonce conflict; rebuild and resubmit a new transaction
 
 Do retry (after retryAfter):

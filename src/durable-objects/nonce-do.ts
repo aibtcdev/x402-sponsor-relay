@@ -85,7 +85,7 @@ interface AssignNonceResponse {
   sponsorAddress: string;
   /** Total reserved nonces across all wallets at time of assignment (pool pressure signal) */
   totalReserved: number;
-  /** ISO 8601 timestamp after which the relay may reclaim this sponsor nonce. Callers MUST NOT retry the same sponsored hex past this timestamp — re-call /relay to mint a fresh sponsorship instead. */
+  /** ISO 8601 timestamp after which the relay may reclaim this sponsor nonce. Callers MUST NOT retry the same sponsored hex past this timestamp — request a fresh sponsorship instead. */
   nonceExpiresAt: string;
 }
 

@@ -100,7 +100,7 @@ function endpointBreakdownCards(breakdown: EndpointBreakdown): string {
 
   return `
 <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-  ${endpointCard("/relay", breakdown.relay.total, breakdown.relay.success, breakdown.relay.failed)}
+  ${breakdown.relay.total > 0 ? endpointCard("/relay (removed)", breakdown.relay.total, breakdown.relay.success, breakdown.relay.failed) : ""}
   ${endpointCard("/sponsor", breakdown.sponsor.total, breakdown.sponsor.success, breakdown.sponsor.failed)}
   ${endpointCard("/settle", breakdown.settle.total, breakdown.settle.success, breakdown.settle.failed, breakdown.settle.clientErrors)}
   ${endpointCard("/verify", breakdown.verify.total)}

@@ -902,7 +902,7 @@ export class SettlementService {
           // Match against CLIENT_REJECTION_REASONS first — this is a superset of
           // NONCE_CONFLICT_REASONS, so nonce errors get clientRejection set too.
           // We also set nonceConflict for nonce errors so that endpoints with a
-          // sponsor nonce pool (e.g. /relay sponsored path) can trigger resync.
+          // sponsor nonce pool (e.g. relay-sponsored payments) can trigger resync.
           if (broadcastResponse.status >= 400 && broadcastResponse.status < 500) {
             const matchedReason = CLIENT_REJECTION_REASONS.find(
               (reason) => conflictDetails.includes(reason)
@@ -955,7 +955,7 @@ export class SettlementService {
               // Nonce conflicts are retriable after resync/backoff — the nonce pool
               // needs time to reconcile before the client retries with a fresh nonce.
               // clientRejection is ALSO set so endpoints without a sponsor nonce pool
-              // (e.g. /settle, self-pay /relay) can map it to a client error code.
+              // (e.g. /settle) can map it to a client error code.
               return {
                 error: "Nonce conflict",
                 details: conflictDetails,
@@ -1391,7 +1391,7 @@ export class SettlementService {
 
     try {
       // Note: dedup keys are SHA-256 of the original unsigned agent tx hex
-      // (body.transaction in /relay, txHex in /settle). This means the same
+      // (txHex in /settle; formerly body.transaction in POST /relay). This means the same
       // agent payload will match even across different sponsoring attempts,
       // enabling true idempotency for retried submissions.
       const txHash = await this.computeTxHash(sponsoredTxHex);

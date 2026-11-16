@@ -282,7 +282,7 @@ export class StxVerifyService {
   /**
    * Verify a SIP-018 auth payload from a request body.
    * Validates structure, expiry, nonce, builds domain/message tuples, and verifies signature.
-   * Used by /relay and /sponsor endpoints for optional SIP-018 authentication.
+   * Used by /sponsor (and formerly POST /relay) for optional SIP-018 authentication.
    *
    * Returns null if auth is valid, or an error object if validation fails.
    */

@@ -151,7 +151,7 @@ export interface PaymentQueueMessage {
   paymentId: string;
   /** Hex-encoded signed sponsored transaction */
   txHex: string;
-  /** Settlement options (optional, for /relay path) */
+  /** Settlement options (optional) */
   settle?: SettleOptions;
   /** Network at time of submission */
   network: "mainnet" | "testnet";
