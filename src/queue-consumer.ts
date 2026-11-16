@@ -48,40 +48,32 @@ const TRANSIENT_ERROR_FIELDS: Partial<PaymentRecord> = {
   retryable: undefined,
 };
 
-/**
- * Resolve the on-chain transaction for a sender address at a specific nonce.
- *
- * Queries Hiro GET /extended/v1/address/{sender}/transactions?limit=50 and finds
- * the entry whose nonce matches senderNonce. Used to recover the real txid when a
- * payment is terminated due to a sender-origin ConflictingNonceInMempool — the
- * sender's own in-flight tx occupied the nonce before the relay could sponsor a new one.
- *
- * Never throws — returns null on any error or when no match is found.
- *
- * @param env - Worker env (for STACKS_NETWORK and optional HIRO_API_KEY)
- * @param senderAddress - Stacks sender address (SP... / ST...)
- * @param senderNonce - The nonce to look up
- * @returns { txId, txStatus } if a matching tx is found, null otherwise
- */
-async function lookupTxByAddressNonce(
+/** Hiro tx fields the sender-nonce lookup reads (mined list and mempool list share them). */
+interface HiroTxSummary {
+  tx_id: string;
+  tx_status: string;
+  nonce: number;
+  sender_address: string;
+}
+
+/** GET a Hiro tx list and return the entry sent by `senderAddress` at `senderNonce`, or null. */
+async function findSenderTx(
   env: Env,
+  path: string,
   senderAddress: string,
   senderNonce: number
-): Promise<{ txId: string; txStatus: string } | null> {
+): Promise<HiroTxSummary | null> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), HIRO_LOOKUP_TIMEOUT_MS);
   try {
     const base = getHiroBaseUrl(env.STACKS_NETWORK ?? "testnet");
-    const headers = getHiroHeaders(env.HIRO_API_KEY);
-    const url = `${base}/extended/v1/address/${senderAddress}/transactions?limit=50`;
-    const response = await fetch(url, { headers, signal: controller.signal });
+    const response = await fetch(`${base}${path}`, { headers: getHiroHeaders(env.HIRO_API_KEY), signal: controller.signal });
     if (!response.ok) return null;
-    const json = await response.json() as { results?: Array<{ tx_id: string; tx_status: string; nonce: number }> };
-    const results = json?.results;
-    if (!Array.isArray(results)) return null;
-    const match = results.find((tx) => tx.nonce === senderNonce);
-    if (!match) return null;
-    return { txId: match.tx_id, txStatus: match.tx_status };
+    const json = await response.json() as { results?: HiroTxSummary[] };
+    if (!Array.isArray(json?.results)) return null;
+    // Check the sender as well as the nonce: an incoming tx from another account can carry
+    // the same nonce, and matching it would wrongly terminalize this payment.
+    return json.results.find((tx) => tx.sender_address === senderAddress && tx.nonce === senderNonce) ?? null;
   } catch {
     return null;
   } finally {
@@ -90,12 +82,40 @@ async function lookupTxByAddressNonce(
 }
 
 /**
+ * Resolve the transaction a sender broadcast at a specific nonce. Used to recover the real
+ * txid when a payment is terminated on a sender-origin ConflictingNonceInMempool: a tx of
+ * the sender's already occupies the nonce.
+ *
+ * 1. Mined: GET /extended/v1/tx?from_address={sender}&nonce={nonce}. Hiro filters by sender
+ *    and nonce, so the sender's tx is found however many txs it has sent or received since.
+ * 2. Mempool (#410): GET /extended/v1/tx/mempool?sender_address={sender}. A tx that is still
+ *    pending is returned with txStatus "pending" so the caller can verify it and park the
+ *    payment in "mempool" for the healers, instead of failing a payment that may yet settle.
+ *
+ * Never throws: returns null on any error or when no tx is found.
+ */
+async function lookupTxByAddressNonce(
+  env: Env,
+  senderAddress: string,
+  senderNonce: number
+): Promise<{ txId: string; txStatus: string } | null> {
+  const sender = encodeURIComponent(senderAddress);
+  const mined = await findSenderTx(env, `/extended/v1/tx?from_address=${sender}&nonce=${senderNonce}&limit=1`, senderAddress, senderNonce);
+  if (mined) return { txId: mined.tx_id, txStatus: mined.tx_status };
+
+  // A sender has at most a few dozen txs pending (the chaining limit), so one page covers it.
+  const pending = await findSenderTx(env, `/extended/v1/tx/mempool?sender_address=${sender}&limit=50`, senderAddress, senderNonce);
+  if (pending && pending.tx_status === "pending") return { txId: pending.tx_id, txStatus: "pending" };
+  return null;
+}
+
+/**
  * Fetch the raw hex of an on-chain transaction from Hiro.
  *
  * Uses GET /extended/v1/tx/{txId}/raw which returns { raw_tx: "0x..." }.
- * Returns the raw hex string (with or without the leading "0x") on success,
- * null on any error or timeout. Applies the same AbortController timeout as
- * lookupTxByAddressNonce so a slow Hiro response cannot stall the queue consumer.
+ * Works for mempool txs too. Returns the raw hex string (with or without the leading
+ * "0x") on success, null on any error or timeout. Applies the same AbortController
+ * timeout as the sender-nonce lookup so a slow Hiro response cannot stall the consumer.
  *
  * Fail-safe: never throws.
  */
@@ -472,7 +492,7 @@ async function resolveSenderNonceTaken(
   const attempt = message.attempts;
   if (!record.senderAddress || record.senderNonce === undefined) return false;
 
-  // Hiro's address/transactions lists mined txs only — a mempool occupant is not found here.
+  // Mined first, then the sender's mempool: a tx still pending is verified like a mined one.
   const resolved = await lookupTxByAddressNonce(env, record.senderAddress, record.senderNonce);
   if (!resolved) return false;
 
@@ -498,7 +518,7 @@ async function resolveSenderNonceTaken(
     return true;
   };
 
-  if (resolved.txStatus !== "success") {
+  if (resolved.txStatus !== "success" && resolved.txStatus !== "pending") {
     // Mined but aborted: it never settles, so do not park the payment in "mempool".
     return finalize("failed", {
       error: `Sender nonce ${record.senderNonce} was used by a tx that aborted on chain`,
@@ -524,6 +544,20 @@ async function resolveSenderNonceTaken(
       terminalReason: "superseded",
       retryable: false,
     }, "sender_conflict_superseded", { resolvedTxId: resolved.txId });
+  }
+
+  // Another payment may already own this tx: e.g. a sibling at the same sender nonce (a client
+  // retry of the same payment) broadcast it first and wrote txid_map on the happy path. Both
+  // pass verifyPaymentParams when their settle params match. Overwriting the claim would hand
+  // the confirmation to this record and leave the real owner in "mempool" forever (#397).
+  const existingClaim = await kv.get(`txid_map:${resolved.txId}`);
+  if (existingClaim && existingClaim !== paymentId) {
+    return finalize("failed", {
+      error: `Sender nonce ${record.senderNonce} was used by tx ${resolved.txId}, already claimed by payment ${existingClaim}`,
+      errorCode: "SENDER_NONCE_CONFLICT",
+      terminalReason: "sender_nonce_duplicate",
+      retryable: false,
+    }, "sender_conflict_txid_already_claimed", { resolvedTxId: resolved.txId, claimedBy: existingClaim });
   }
 
   // On-chain tx satisfies settle requirements: park in "mempool" with its txid so the
