@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deserializeTransaction,
   getAddressFromPrivateKey,
@@ -363,5 +363,93 @@ describe("SponsorWallet", () => {
     expect(await wallet.findSent(txHex)).toBeNull();
     await wallet.sponsorAndBroadcast({ txHex, sponsorKey, fee: "3000", senderAddress });
     expect(await wallet.findSent(txHex)).toBeNull();
+  });
+});
+
+describe("SponsorWallet nonce cache revalidation (#434)", () => {
+  type SponsorRead = { possible_next_nonce: number; detected_missing_nonces?: number[] };
+
+  /** A wallet whose sponsor-side Hiro read is `read.current` (or throws when null), with a controllable clock. */
+  function setup(first: SponsorRead) {
+    const read: { current: SponsorRead | null } = { current: first };
+    const fetchNonces = vi.fn(async (a: string) => {
+      if (a !== sponsorAddress) return { possible_next_nonce: 0, last_executed_tx_nonce: null, last_mempool_tx_nonce: null };
+      if (!read.current) throw new Error("Hiro nonces responded 503");
+      return read.current;
+    });
+    const used: number[] = [];
+    const broadcast = vi.fn(async (tx): Promise<BroadcastOnlyResult> => {
+      used.push(sponsorNonceOf(tx));
+      return { txid: `tx${used.length}` };
+    });
+    const wallet = new TestWallet(env, logger, broadcast, fetchNonces, memoryBudget());
+    let now = 1_000_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const send = async () => {
+      const key = makeRandomPrivKey();
+      return wallet.sponsorAndBroadcast({
+        txHex: await sponsoredTxHex(key), sponsorKey, fee: "3000", senderAddress: getAddressFromPrivateKey(key, "testnet"),
+      });
+    };
+    const sponsorReads = () => fetchNonces.mock.calls.filter(([a]) => a === sponsorAddress).length;
+    return { read, used, send, sponsorReads, advance: (ms: number) => { now += ms; } };
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("does not re-read the sponsor nonce while the cache is under a minute old", async () => {
+    const t = setup({ possible_next_nonce: 7 });
+    await t.send();
+    t.advance(59_000);
+    await t.send();
+    expect(t.used).toEqual([7, 8]);
+    expect(t.sponsorReads()).toBe(1);
+  });
+
+  it("fills the hole left by an accepted tx that later dropped, then re-reads the chain", async () => {
+    const t = setup({ possible_next_nonce: 7 });
+    await t.send(); await t.send(); await t.send(); // 7, 8, 9 accepted; cache = 10
+    // The tx at 8 was dropped (e.g. replaced by its sender). The node still accepts 10, 11, ...
+    // behind the hole; without a re-check none of them could ever mine.
+    t.read.current = { possible_next_nonce: 10, detected_missing_nonces: [8] };
+    t.advance(61_000);
+
+    expect(await t.send()).toMatchObject({ ok: true, sponsorNonce: 8 });
+    // 9 is still ours and pending: the next call asks the chain instead of counting up from 8.
+    t.read.current = { possible_next_nonce: 10 };
+    expect(await t.send()).toMatchObject({ ok: true, sponsorNonce: 10 });
+    expect(t.used).toEqual([7, 8, 9, 8, 10]);
+  });
+
+  it("ignores a missing nonce we broadcast within the Hiro indexing grace", async () => {
+    const t = setup({ possible_next_nonce: 7 });
+    await t.send(); // 7 at t=0
+    t.advance(50_000);
+    await t.send(); // 8 at t=50s, cache = 9
+    t.read.current = { possible_next_nonce: 9, detected_missing_nonces: [8] }; // Hiro has not indexed 8 yet
+    t.advance(11_000);
+
+    expect(await t.send()).toMatchObject({ ok: true, sponsorNonce: 9 });
+  });
+
+  it("moves up to the chain when it has passed the cached nonce", async () => {
+    const t = setup({ possible_next_nonce: 7 });
+    await t.send(); // cache = 8
+    t.read.current = { possible_next_nonce: 12 };
+    t.advance(61_000);
+
+    expect(await t.send()).toMatchObject({ ok: true, sponsorNonce: 12 });
+  });
+
+  it("keeps using the cache when the re-check cannot reach Hiro, and tries again next call", async () => {
+    const t = setup({ possible_next_nonce: 7 });
+    await t.send(); // cache = 8
+    t.read.current = null;
+    t.advance(61_000);
+
+    expect(await t.send()).toMatchObject({ ok: true, sponsorNonce: 8 });
+    t.read.current = { possible_next_nonce: 9 };
+    await t.send();
+    expect(t.sponsorReads()).toBe(3);
   });
 });
