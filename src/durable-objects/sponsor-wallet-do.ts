@@ -58,6 +58,11 @@ const SENDER_IN_FLIGHT_MS = 10 * 60_000;
 export const NONCE_REVALIDATE_MS = 60_000;
 /** A missing nonce we broadcast this recently may just be one Hiro has not indexed yet. */
 export const HIRO_INDEX_GRACE_MS = 30_000;
+/**
+ * How long a sponsor nonce the node rejected as taken is skipped when Hiro calls it missing.
+ * Hiro can miss a tx the node holds (a ghost); it is not a hole, and later nonces still mine.
+ */
+export const OCCUPIED_NONCE_TTL_MS = 10 * 60_000;
 
 /** How long a sponsored payment's txids are kept so a resubmit of the same tx finds them. */
 export const SENT_TTL_MS = 24 * 60 * 60_000;
@@ -119,6 +124,8 @@ export class SponsorWallet {
   private nonceCheckedAt = 0;
   /** Sponsor nonce → when we broadcast it, for HIRO_INDEX_GRACE_MS. */
   private readonly recentSends = new Map<bigint, number>();
+  /** Sponsor nonce → when the node rejected it as taken, for OCCUPIED_NONCE_TTL_MS. */
+  private readonly occupiedNonces = new Map<bigint, number>();
   private tail: Promise<unknown> = Promise.resolve();
   /** Sender → nonce + time of the last payment sponsored here (covers Hiro mempool lag). */
   private readonly inFlight = new Map<string, { nonce: number; at: number }>();
@@ -248,7 +255,8 @@ export class SponsorWallet {
       // A node rejection (4xx) other than a nonce conflict left this nonce unused: keep it,
       // since Hiro may still lag our last broadcast. Otherwise re-read the chain next time.
       const rejected = result.httpStatus !== undefined && result.httpStatus >= 400 && result.httpStatus < 500;
-      this.nextNonce = rejected && !result.nonceConflict ? nonce : null;
+      // A hole fill that hit a nonce conflict left the cache (still in nextNonce) right: keep it.
+      if (!(filledHole && result.nonceConflict)) this.nextNonce = rejected && !result.nonceConflict ? nonce : null;
       this.logger.warn("sponsor_broadcast_failed", {
         address,
         nonce: Number(nonce),
@@ -260,6 +268,7 @@ export class SponsorWallet {
       });
       // Our nonce was stale (lagging cache or another writer): re-read the chain once.
       const sponsorNonceRejected = result.nonceConflict === true && result.responsible !== "sender";
+      if (sponsorNonceRejected) this.occupiedNonces.set(nonce, Date.now());
       if (!sponsorNonceRejected || attempt >= 2) return { ok: false, ...result };
     }
   }
@@ -341,13 +350,9 @@ export class SponsorWallet {
       return { nonce: cached, filledHole: false };
     }
     this.nonceCheckedAt = now;
-    for (const [n, at] of this.recentSends) if (now - at > HIRO_INDEX_GRACE_MS) this.recentSends.delete(n);
 
-    const holes = (info.detected_missing_nonces ?? [])
-      .map((n) => BigInt(n))
-      .filter((n) => n < cached && !this.recentSends.has(n));
-    if (holes.length > 0) {
-      const hole = holes.reduce((a, b) => (b < a ? b : a));
+    const hole = this.lowestHole(info.detected_missing_nonces);
+    if (hole !== null && hole < cached) {
       this.logger.warn("sponsor_nonce_hole_refilled", { address, cached: Number(cached), hole: Number(hole) });
       return { nonce: hole, filledHole: true };
     }
@@ -363,8 +368,25 @@ export class SponsorWallet {
   private async chainNextNonce(address: string): Promise<bigint> {
     const info = await this.fetchNonces(address);
     this.nonceCheckedAt = Date.now();
-    const missing = info.detected_missing_nonces ?? [];
-    return BigInt(missing.length > 0 ? Math.min(...missing) : info.possible_next_nonce);
+    return this.lowestHole(info.detected_missing_nonces) ?? BigInt(info.possible_next_nonce);
+  }
+
+  /**
+   * The lowest nonce Hiro reports missing that is really free: not one we broadcast in the last
+   * HIRO_INDEX_GRACE_MS (Hiro may not have indexed it), nor one the node rejected as taken in
+   * the last OCCUPIED_NONCE_TTL_MS (a tx Hiro cannot see holds it).
+   */
+  private lowestHole(missing: number[] | undefined): bigint | null {
+    const now = Date.now();
+    for (const [n, at] of this.recentSends) if (now - at > HIRO_INDEX_GRACE_MS) this.recentSends.delete(n);
+    for (const [n, at] of this.occupiedNonces) if (now - at > OCCUPIED_NONCE_TTL_MS) this.occupiedNonces.delete(n);
+    let lowest: bigint | null = null;
+    for (const m of missing ?? []) {
+      const n = BigInt(m);
+      if (this.recentSends.has(n) || this.occupiedNonces.has(n)) continue;
+      if (lowest === null || n < lowest) lowest = n;
+    }
+    return lowest;
   }
 }
 

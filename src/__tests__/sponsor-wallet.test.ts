@@ -392,7 +392,7 @@ describe("SponsorWallet nonce cache revalidation (#434)", () => {
       });
     };
     const sponsorReads = () => fetchNonces.mock.calls.filter(([a]) => a === sponsorAddress).length;
-    return { read, used, send, sponsorReads, advance: (ms: number) => { now += ms; } };
+    return { read, used, send, sponsorReads, broadcast, advance: (ms: number) => { now += ms; } };
   }
 
   afterEach(() => vi.restoreAllMocks());
@@ -430,6 +430,23 @@ describe("SponsorWallet nonce cache revalidation (#434)", () => {
     t.advance(11_000);
 
     expect(await t.send()).toMatchObject({ ok: true, sponsorNonce: 9 });
+  });
+
+  it("treats a 'missing' nonce the node says is taken as a ghost: resumes from the cache and skips it after", async () => {
+    const t = setup({ possible_next_nonce: 7 });
+    const conflict: BroadcastOnlyResult = {
+      error: "ConflictingNonceInMempool", details: "", retryable: true, nonceConflict: true, responsible: "sponsor",
+    } as BroadcastOnlyResult;
+    await t.send(); await t.send(); // 7, 8; cache = 9
+    // Hiro calls 5 missing, but the node holds a tx there that Hiro cannot see.
+    t.read.current = { possible_next_nonce: 9, detected_missing_nonces: [5] };
+    t.advance(61_000);
+    t.broadcast.mockImplementationOnce(async (tx) => { t.used.push(sponsorNonceOf(tx)); return conflict; });
+
+    expect(await t.send()).toMatchObject({ ok: true, sponsorNonce: 9 });
+    t.advance(61_000);
+    expect(await t.send()).toMatchObject({ ok: true, sponsorNonce: 10 });
+    expect(t.used).toEqual([7, 8, 5, 9, 10]);
   });
 
   it("moves up to the chain when it has passed the cached nonce", async () => {
