@@ -165,7 +165,7 @@ describe("queue consumer (payment sponsor via SponsorWalletDO)", () => {
       senderNonceCode: "SENDER_NONCE_STALE", expectedNonce: 94, responsible: "sender", retryable: false, error: "Sender nonce out of order",
     }));
     mocks.fetch
-      .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ tx_id: "0xlanded", tx_status: "success", nonce: 93 }] }) })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ results: [{ tx_id: "0xlanded", tx_status: "success", nonce: 93, sender_address: "SP3TVWSTALE00000000000000000000000000000" }] }) })
       .mockResolvedValueOnce({ ok: true, json: async () => ({ raw_tx: "0xbeef" }) });
     const message = createMessage({
       paymentId: "pay_stale", txHex: "pay_stale_tx", network: "testnet", attempt: 1,

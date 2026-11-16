@@ -90,10 +90,13 @@ function createMessage(body: TestMessageBody, attempts = 1) {
 }
 
 /** Build a minimal Hiro address/transactions API response */
-function hiroTxResponse(txs: Array<{ tx_id: string; tx_status: string; nonce: number }>) {
+function hiroTxResponse(
+  txs: Array<{ tx_id: string; tx_status: string; nonce: number; sender_address?: string }>,
+  sender: string
+) {
   return {
     ok: true,
-    json: async () => ({ results: txs }),
+    json: async () => ({ results: txs.map((tx) => ({ sender_address: sender, ...tx })) }),
   };
 }
 
@@ -162,7 +165,7 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
     // First fetch: Hiro address/transactions lookup returns the confirmed tx
     // Second fetch: Hiro raw-tx fetch returns the on-chain hex
     mocks.fetch
-      .mockResolvedValueOnce(hiroTxResponse([{ tx_id: "0x6084cc29", tx_status: "success", nonce: 93 }]))
+      .mockResolvedValueOnce(hiroTxResponse([{ tx_id: "0x6084cc29", tx_status: "success", nonce: 93 }], "SP3TVW9PM000000000000000000000000000000"))
       .mockResolvedValueOnce(hiroRawTxResponse("deadbeef1234"));
 
     // Settle verification passes — verifyPaymentParams is called with the RAW on-chain hex
@@ -256,7 +259,7 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
     // First fetch: Hiro address/transactions lookup returns a confirmed tx
     // Second fetch: Hiro raw-tx returns the on-chain hex for the resolved txId
     mocks.fetch
-      .mockResolvedValueOnce(hiroTxResponse([{ tx_id: "0xwrongtx00", tx_status: "success", nonce: 93 }]))
+      .mockResolvedValueOnce(hiroTxResponse([{ tx_id: "0xwrongtx00", tx_status: "success", nonce: 93 }], "SP3TVWMISMATCH0000000000000000000000000"))
       .mockResolvedValueOnce(hiroRawTxResponse("wrongtxhex"));
 
     // Settle verification FAILS — different recipient
@@ -395,7 +398,7 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
       hiroTxResponse([
         { tx_id: "0xother", tx_status: "success", nonce: 90 },
         { tx_id: "0xother2", tx_status: "success", nonce: 91 },
-      ])
+      ], "SP3TVWNOTFOUND00000000000000000000000000")
     );
 
     const message = createMessage(
@@ -578,7 +581,7 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
     mocks.fetch
       .mockResolvedValueOnce(hiroTxResponse([
         { tx_id: "0xdifferenttx", tx_status: "success", nonce: 42 },
-      ]))
+      ], "SP3TVWP1REGRESS000000000000000000000000"))
       // Raw-tx fetch succeeds but returns the *different* on-chain tx hex
       .mockResolvedValueOnce(hiroRawTxResponse("different_tx_bytes"));
 
@@ -668,7 +671,7 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
     // (abort_by_response / abort_by_post_condition). The /address/{sender}/transactions
     // endpoint only returns mined txs, so this is an on-chain abortion, not a mempool tx.
     mocks.fetch.mockResolvedValueOnce(
-      hiroTxResponse([{ tx_id: "0xabortedtx99", tx_status: "abort_by_response", nonce: 55 }])
+      hiroTxResponse([{ tx_id: "0xabortedtx99", tx_status: "abort_by_response", nonce: 55 }], "SP3TVWABORTED000000000000000000000000000")
     );
 
     const message = createMessage(
@@ -764,7 +767,7 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
     // First fetch (address/transactions lookup) succeeds — finds a confirmed tx at nonce 77
     // Second fetch (raw-tx) fails — simulates Hiro timeout or 500
     mocks.fetch
-      .mockResolvedValueOnce(hiroTxResponse([{ tx_id: "0xconfirmedtx", tx_status: "success", nonce: 77 }]))
+      .mockResolvedValueOnce(hiroTxResponse([{ tx_id: "0xconfirmedtx", tx_status: "success", nonce: 77 }], "SP3TVWRAWFAIL00000000000000000000000000"))
       .mockRejectedValueOnce(new Error("Hiro raw-tx endpoint timed out"));
 
     const message = createMessage(
@@ -797,5 +800,113 @@ describe("queue consumer: sender-origin nonce conflict resolve-then-verify (#397
     // verifyPaymentParams must NOT be called (raw hex was unavailable)
     expect(mocks.verifyPaymentParams).not.toHaveBeenCalled();
     expect(message.ack).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("queue consumer: sender-nonce lookup filters by sender and checks the mempool (#410)", () => {
+  const SENDER = "SP3TVW410SENDER000000000000000000000000";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.clearInFlight.mockResolvedValue(undefined);
+    mocks.updateSenderNonceOnBroadcast.mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", mocks.fetch);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  type Row = { tx_id: string; tx_status: string; nonce: number; sender_address: string };
+  /** Route Hiro by URL: mined list, mempool list, raw tx. */
+  function hiro(routes: { mined?: Row[]; mempool?: Row[]; raw?: string }) {
+    mocks.fetch.mockImplementation(async (url: string) => {
+      if (url.includes("/extended/v1/tx/mempool?")) return { ok: true, json: async () => ({ results: routes.mempool ?? [] }) };
+      if (url.includes("/extended/v1/tx?")) return { ok: true, json: async () => ({ results: routes.mined ?? [] }) };
+      // The old address/transactions list: every tx involving the address, incoming ones too.
+      if (url.includes("/address/")) return { ok: true, json: async () => ({ results: routes.mined ?? [] }) };
+      if (url.endsWith("/raw")) return routes.raw ? hiroRawTxResponse(routes.raw) : { ok: false, json: async () => ({}) };
+      throw new Error(`unexpected url ${url}`);
+    });
+  }
+
+  async function run(paymentId: string, nonce = 7) {
+    const kv = new MemoryKV();
+    const record = transitionPayment(createPaymentRecord(paymentId, "testnet"), "queued");
+    record.senderNonce = nonce;
+    record.senderAddress = SENDER;
+    await putPaymentRecord(kv, record);
+    mocks.deserializeTransaction.mockReturnValue({ auth: { spendingCondition: { signer: "signer_410" } } });
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false, details: "", responsible: "sender", error: "ConflictingNonceInMempool", nonceConflict: true, retryable: false,
+    });
+    const message = createMessage({ paymentId, txHex: "tx_410", network: "testnet", attempt: 5, settle: DEFAULT_SETTLE }, 5);
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+    return { kv, message, record: await getPaymentRecord(kv, paymentId) };
+  }
+
+  it("asks Hiro for the sender's tx at that nonce, not the address's last 50 txs", async () => {
+    hiro({ mined: [{ tx_id: "0xmined", tx_status: "success", nonce: 7, sender_address: SENDER }], raw: "minedhex" });
+    mocks.verifyPaymentParams.mockReturnValue({ valid: true, data: {} });
+
+    const { record } = await run("pay_410_filter");
+
+    const minedUrl = mocks.fetch.mock.calls.map(([u]) => String(u)).find((u) => u.includes("/extended/v1/tx?"));
+    expect(minedUrl).toContain(`from_address=${SENDER}`);
+    expect(minedUrl).toContain("nonce=7");
+    expect(mocks.fetch.mock.calls.some(([u]) => String(u).includes("/address/"))).toBe(false);
+    expect(record).toMatchObject({ status: "mempool", txid: "0xmined" });
+  });
+
+  it("ignores a tx at the same nonce sent by another account (incoming transfer)", async () => {
+    hiro({
+      mined: [{ tx_id: "0xincoming", tx_status: "success", nonce: 7, sender_address: "SP3SOMEONEELSE0000000000000000000000000" }],
+      raw: "incominghex",
+    });
+    // Someone else's transfer never matches this payment's settle params.
+    mocks.verifyPaymentParams.mockReturnValue({ valid: false, error: "recipient_mismatch", details: "not this payment" });
+
+    const { record } = await run("pay_410_incoming");
+
+    // Not superseded by someone else's tx: the payment falls back to the plain duplicate outcome.
+    expect(record?.status).toBe("failed");
+    expect(record?.terminalReason).toBe("sender_nonce_duplicate");
+    expect(record?.txid).toBeUndefined();
+    expect(mocks.verifyPaymentParams).not.toHaveBeenCalled();
+  });
+
+  it("finds a pending tx in the mempool and parks the payment in mempool when it matches", async () => {
+    hiro({ mempool: [{ tx_id: "0xpending", tx_status: "pending", nonce: 7, sender_address: SENDER }], raw: "pendinghex" });
+    mocks.verifyPaymentParams.mockReturnValue({ valid: true, data: {} });
+
+    const { kv, message, record } = await run("pay_410_mempool_match");
+
+    expect(mocks.verifyPaymentParams).toHaveBeenCalledWith("pendinghex", DEFAULT_SETTLE);
+    expect(record).toMatchObject({ status: "mempool", txid: "0xpending" });
+    expect(await kv.get("txid_map:0xpending")).toBe("pay_410_mempool_match");
+    expect(message.ack).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks superseded when the pending tx does not satisfy settle requirements", async () => {
+    hiro({ mempool: [{ tx_id: "0xpendingother", tx_status: "pending", nonce: 7, sender_address: SENDER }], raw: "otherhex" });
+    mocks.verifyPaymentParams.mockReturnValue({ valid: false, error: "recipient_mismatch", details: "wrong recipient" });
+
+    const { kv, record } = await run("pay_410_mempool_mismatch");
+
+    expect(record?.status).toBe("replaced");
+    expect(record?.terminalReason).toBe("superseded");
+    expect(await kv.get("txid_map:0xpendingother")).toBeNull();
+  });
+
+  it("falls back to sender_nonce_duplicate when neither mined nor mempool has the tx", async () => {
+    hiro({ mempool: [{ tx_id: "0xothernonce", tx_status: "pending", nonce: 8, sender_address: SENDER }] });
+
+    const { record } = await run("pay_410_none");
+
+    expect(record?.status).toBe("failed");
+    expect(record?.terminalReason).toBe("sender_nonce_duplicate");
   });
 });
