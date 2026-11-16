@@ -546,6 +546,20 @@ async function resolveSenderNonceTaken(
     }, "sender_conflict_superseded", { resolvedTxId: resolved.txId });
   }
 
+  // Another payment may already own this tx: e.g. a sibling at the same sender nonce (a client
+  // retry of the same payment) broadcast it first and wrote txid_map on the happy path. Both
+  // pass verifyPaymentParams when their settle params match. Overwriting the claim would hand
+  // the confirmation to this record and leave the real owner in "mempool" forever (#397).
+  const existingClaim = await kv.get(`txid_map:${resolved.txId}`);
+  if (existingClaim && existingClaim !== paymentId) {
+    return finalize("failed", {
+      error: `Sender nonce ${record.senderNonce} was used by tx ${resolved.txId}, already claimed by payment ${existingClaim}`,
+      errorCode: "SENDER_NONCE_CONFLICT",
+      terminalReason: "sender_nonce_duplicate",
+      retryable: false,
+    }, "sender_conflict_txid_already_claimed", { resolvedTxId: resolved.txId, claimedBy: existingClaim });
+  }
+
   // On-chain tx satisfies settle requirements: park in "mempool" with its txid so the
   // chainhook / confirm healers finalize it — do NOT mark confirmed directly.
   const updated = transitionPayment(record, "mempool", { txid: resolved.txId });

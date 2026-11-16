@@ -910,3 +910,76 @@ describe("queue consumer: sender-nonce lookup filters by sender and checks the m
     expect(record?.terminalReason).toBe("sender_nonce_duplicate");
   });
 });
+
+describe("queue consumer: sender-conflict resolve does not steal another payment's txid claim (#397)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.clearInFlight.mockResolvedValue(undefined);
+    mocks.updateSenderNonceOnBroadcast.mockResolvedValue(undefined);
+    vi.stubGlobal("fetch", mocks.fetch);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** p2 hits a sender nonce conflict; the tx holding that nonce matches p2's settle params. */
+  async function runConflict(kv: MemoryKV, paymentId: string) {
+    const record = transitionPayment(createPaymentRecord(paymentId, "testnet"), "queued");
+    record.senderNonce = 93;
+    record.senderAddress = "SP3TVWCLAIM00000000000000000000000000000";
+    await putPaymentRecord(kv, record);
+
+    mocks.deserializeTransaction.mockReturnValue({ auth: { spendingCondition: { signer: "signer_claim" } } });
+    mocks.sponsorAndBroadcast.mockResolvedValue({
+      ok: false, details: "", responsible: "sender", error: "ConflictingNonceInMempool", nonceConflict: true, retryable: false,
+    });
+    mocks.fetch
+      .mockResolvedValueOnce(hiroTxResponse([{ tx_id: "0xT1", tx_status: "success", nonce: 93 }], "SP3TVWCLAIM00000000000000000000000000000"))
+      .mockResolvedValueOnce(hiroRawTxResponse("t1hex"));
+    // Same recipient / amount / token as the sibling: verification alone cannot tell them apart.
+    mocks.verifyPaymentParams.mockReturnValue({
+      valid: true,
+      data: { sender: "signer_claim", recipient: DEFAULT_SETTLE.expectedRecipient, amount: "1000", tokenType: "STX" },
+    });
+
+    const message = createMessage(
+      { paymentId, txHex: "claim_tx", network: "testnet", attempt: 5, settle: DEFAULT_SETTLE },
+      5
+    );
+    await handlePaymentQueue(
+      { messages: [message] } as MessageBatch<never>,
+      { RELAY_KV: kv, STACKS_NETWORK: "testnet" } as never,
+      executionContext
+    );
+    return { message, record: await getPaymentRecord(kv, paymentId) };
+  }
+
+  it("finalizes as a duplicate and keeps the sibling's claim when the tx is already claimed", async () => {
+    const kv = new MemoryKV();
+    // p1 broadcast tx T1 at this sender nonce first and claimed it on the happy path.
+    await kv.put("txid_map:0xT1", "pay_p1");
+
+    const { message, record } = await runConflict(kv, "pay_p2");
+
+    expect(await kv.get("txid_map:0xT1")).toBe("pay_p1");
+    expect(record?.status).toBe("failed");
+    expect(record?.terminalReason).toBe("sender_nonce_duplicate");
+    expect(record?.retryable).toBe(false);
+    expect(record?.txid).toBeUndefined();
+    expect(record?.error).toContain("pay_p1");
+    expect(mocks.updateSenderNonceOnBroadcast).not.toHaveBeenCalled();
+    expect(message.ack).toHaveBeenCalledTimes(1);
+    expect(message.retry).not.toHaveBeenCalled();
+  });
+
+  it("still wires the txid when the existing claim is this same payment", async () => {
+    const kv = new MemoryKV();
+    await kv.put("txid_map:0xT1", "pay_self");
+
+    const { record } = await runConflict(kv, "pay_self");
+
+    expect(record?.status).toBe("mempool");
+    expect(record?.txid).toBe("0xT1");
+    expect(await kv.get("txid_map:0xT1")).toBe("pay_self");
+  });
+});
