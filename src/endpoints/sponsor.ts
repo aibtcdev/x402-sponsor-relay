@@ -288,7 +288,9 @@ export class Sponsor extends BaseEndpoint {
         const sponsorShort = sent.insufficientFundsPayer === "sponsor";
         const isClientError = !sponsorShort && (sent.responsible === "sender" || sent.clientRejection !== undefined);
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError, undefined, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {}));
+        const exhausted = sponsorShort || sent.error === "Daily sponsor budget reached";
+        const failureReason = isClientError ? "invalid_transaction" : exhausted ? "sponsor_exhausted" : "broadcast_failure";
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError, undefined, failureReason).catch(() => {}));
 
         if (sent.senderNonceCode === "SENDER_NONCE_DUPLICATE") {
           return this.clientRejectionResponse(c, "ConflictingNonceInMempool", sent.details);
@@ -319,13 +321,10 @@ export class Sponsor extends BaseEndpoint {
           return this.clientRejectionResponse(c, "TooMuchChaining", sent.details);
         }
         if (sponsorShort) {
-          return this.err(c, {
-            error: "The relay's sponsor wallet cannot cover the fee. Retry later, or send without sponsorship (pay your own fee).",
+          return this.preflightRejectionResponse(c, {
             code: "SPONSOR_EXHAUSTED",
-            status: 503,
-            details: sent.details,
+            error: "The relay's sponsor wallet cannot cover the fee. Retry later, or send without sponsorship (pay your own fee).",
             retryable: true,
-            retryAfter: 300,
           });
         }
         if (sent.clientRejection) {

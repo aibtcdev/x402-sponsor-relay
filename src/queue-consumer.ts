@@ -389,6 +389,8 @@ async function handleSponsorFailure(
     responsible: sent.responsible,
     nonceConflict: sent.nonceConflict,
     tooMuchChaining: sent.tooMuchChaining,
+    clientRejection: sent.clientRejection,
+    insufficientFundsPayer: sent.insufficientFundsPayer,
   });
 
   // Sender's previous tx is still pending (or our own earlier send of this one is unseen yet).
@@ -451,18 +453,23 @@ async function handleSponsorFailure(
   }
 
   // Sponsor-side: daily budget, sponsor congestion, sponsor nonce contention, node/network errors.
-  // NotEnoughFunds on the fee payer: our sponsor wallet is short, like an exhausted budget.
-  const budget = sent.error === "Daily sponsor budget reached" || sent.insufficientFundsPayer === "sponsor";
-  const clientRejection = budget ? undefined : sent.clientRejection;
-  const sponsorReason = budget ? "sponsor_exhausted"
+  const budget = sent.error === "Daily sponsor budget reached";
+  // NotEnoughFunds on the fee payer: our sponsor wallet is short, not the sender. A top-up can
+  // fix it within minutes, so it is retried with backoff (unlike the budget) and only then failed.
+  const sponsorShort = sent.insufficientFundsPayer === "sponsor";
+  const clientRejection = sponsorShort ? undefined : sent.clientRejection;
+  const sponsorReason = budget || sponsorShort ? "sponsor_exhausted"
     : sent.tooMuchChaining ? "sponsor_failure"
     : sent.nonceConflict ? "sponsor_nonce_conflict"
     : clientRejection ? "broadcast_failure"
     : sent.responsible === "sponsor" ? "sponsor_failure"
     : "broadcast_failure";
-  // The daily budget only resets at UTC midnight, and a short wallet needs a top-up:
-  // retrying in seconds cannot help.
-  if (sent.retryable && clientRejection === undefined && !budget && canRetry) {
+  if (sponsorShort && canRetry) {
+    await requeue({ error: `Sponsor wallet short: ${sent.error}` }, "queue_retry_sponsor_short", "sponsor", false, "warn");
+    return;
+  }
+  // The daily budget only resets at UTC midnight — retrying in seconds cannot help.
+  if (sent.retryable && clientRejection === undefined && !budget && !sponsorShort && canRetry) {
     await requeue({ error: `Sponsor contention: ${sent.error}` }, "queue_retry_sponsor_contention", "sponsor", false);
     return;
   }
@@ -470,9 +477,9 @@ async function handleSponsorFailure(
     error: sent.error,
     errorCode: clientRejection
       ? `CLIENT_${clientRejection.toUpperCase()}`
-      : budget ? "SPONSOR_EXHAUSTED" : "BROADCAST_FAILED",
+      : budget || sponsorShort ? "SPONSOR_EXHAUSTED" : "BROADCAST_FAILED",
     terminalReason: sponsorReason,
-    retryable: sent.retryable || budget,
+    retryable: sent.retryable || sponsorShort,
   }, clientRejection ? "broadcast_failed_terminal" : "sponsor_failed_terminal",
   clientRejection || sent.responsible === "sender" ? "sender" : "sponsor");
 }

@@ -262,9 +262,14 @@ describe("queue consumer (payment sponsor via SponsorWalletDO)", () => {
       httpStatus: 400, retryable: false,
     }));
 
-    const message = await run(kv, "pay_sponsor_short", 1);
+    // A top-up can fix it within minutes: retried with backoff first...
+    const first = await run(kv, "pay_sponsor_short", 1);
+    expect(first.retry).toHaveBeenCalledTimes(1);
+    expect(await getPaymentRecord(kv, "pay_sponsor_short")).toEqual(expect.objectContaining({ status: "queued" }));
 
-    expect(message.retry).not.toHaveBeenCalled();
+    // ...then failed as a sponsor-side exhaustion, not a client error, once attempts run out.
+    const last = await run(kv, "pay_sponsor_short", 5);
+    expect(last.retry).not.toHaveBeenCalled();
     expect(await getPaymentRecord(kv, "pay_sponsor_short")).toEqual(expect.objectContaining({
       status: "failed", errorCode: "SPONSOR_EXHAUSTED", terminalReason: "sponsor_exhausted", retryable: true,
     }));

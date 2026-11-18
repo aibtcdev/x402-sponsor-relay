@@ -1023,7 +1023,19 @@ export class SettlementService {
               };
             }
 
-            if (matchedReason) {
+            const insufficientFundsPayer = matchedReason === "NotEnoughFunds"
+              ? notEnoughFundsPayer(transaction, reasonData as Record<string, unknown> | undefined)
+              : undefined;
+            if (insufficientFundsPayer === "sponsor") {
+              this.logger.error("Broadcast rejected: sponsor cannot cover the fee (NotEnoughFunds), not retrying", {
+                status: broadcastResponse.status,
+                details: errorDetails,
+                sponsorNonce: sponsorNonceForLog,
+                expected: reasonData?.expected,
+                actual: reasonData?.actual,
+                nodeUrl: target.baseUrl,
+              });
+            } else if (matchedReason) {
               this.logger.warn("Broadcast rejected by node (client error), not retrying", {
                 status: broadcastResponse.status,
                 error: errorMessage,
@@ -1036,18 +1048,6 @@ export class SettlementService {
                 status: broadcastResponse.status,
                 error: errorMessage,
                 details: errorDetails,
-                nodeUrl: target.baseUrl,
-              });
-            }
-            const insufficientFundsPayer = matchedReason === "NotEnoughFunds"
-              ? notEnoughFundsPayer(transaction, reasonData as Record<string, unknown> | undefined)
-              : undefined;
-            if (insufficientFundsPayer === "sponsor") {
-              this.logger.error("Broadcast rejected: sponsor cannot cover the fee (NotEnoughFunds)", {
-                details: errorDetails,
-                sponsorNonce: sponsorNonceForLog,
-                expected: reasonData?.expected,
-                actual: reasonData?.actual,
                 nodeUrl: target.baseUrl,
               });
             }
