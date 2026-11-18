@@ -7,6 +7,27 @@
 * **nonce:** repair stale-low sender frontiers in the alarm cycle with a 5 minute repair age, 10 minute refresh cooldown, and 15 minute hand expiry
 * **docs:** update agent and ops guidance for held sender queues and stale-sender recovery
 
+## [1.35.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.34.0...x402-sponsor-relay-v1.35.0) (2026-11-18)
+
+
+### Features
+
+* **status:** expose payment-sponsor wallet in /status/sponsor and /wallets ([#484](https://github.com/aibtcdev/x402-sponsor-relay/issues/484)) ([4e6fab8](https://github.com/aibtcdev/x402-sponsor-relay/commit/4e6fab87d8a4f4baa4d5b5094928eaf50f3357f1))
+
+
+### Bug Fixes
+
+* **auth:** renew expired address-provisioned keys instead of 409ing forever ([#440](https://github.com/aibtcdev/x402-sponsor-relay/issues/440)) ([174c0fd](https://github.com/aibtcdev/x402-sponsor-relay/commit/174c0fd38990c326c6a4ad00b20a492b1af2619a))
+* **nonce-do:** retire queued entries on the deserialize errors @stacks/transactions actually throws ([#443](https://github.com/aibtcdev/x402-sponsor-relay/issues/443)) ([1cd3fab](https://github.com/aibtcdev/x402-sponsor-relay/commit/1cd3fabfc6f3297beed0b1a0fb352f956e8a1c31))
+* **queue:** sender-nonce lookup filters by sender and checks the mempool ([#410](https://github.com/aibtcdev/x402-sponsor-relay/issues/410)) ([#490](https://github.com/aibtcdev/x402-sponsor-relay/issues/490)) ([3c909c8](https://github.com/aibtcdev/x402-sponsor-relay/commit/3c909c8d08554955d65f9f64f41ec59ab91aaa4c))
+* **queue:** sponsor submitPayment through the single payment wallet, not the NonceDO pool ([#453](https://github.com/aibtcdev/x402-sponsor-relay/issues/453)) ([e4f0cc2](https://github.com/aibtcdev/x402-sponsor-relay/commit/e4f0cc23359d36427485b04d68b82b27493ad89f))
+* **settle:** check paymentRequirements before tx-hex dedup hit ([#483](https://github.com/aibtcdev/x402-sponsor-relay/issues/483)) ([5d8642c](https://github.com/aibtcdev/x402-sponsor-relay/commit/5d8642c6da816381ff01708e259707e0fbfe2d8e))
+* **sponsor-wallet:** refill a sponsor nonce hole left by a dropped tx ([#434](https://github.com/aibtcdev/x402-sponsor-relay/issues/434)) ([#488](https://github.com/aibtcdev/x402-sponsor-relay/issues/488)) ([4bb2b0b](https://github.com/aibtcdev/x402-sponsor-relay/commit/4bb2b0b7e0c2dc7661a467c80574969a8363795b))
+* **sponsor:** report a landed sponsorship after an unclear broadcast, and return it on resubmit ([#452](https://github.com/aibtcdev/x402-sponsor-relay/issues/452)) ([bd9adc2](https://github.com/aibtcdev/x402-sponsor-relay/commit/bd9adc286d42fdf2079a7e2b894cb559946f40e9))
+* **sponsor:** sponsor /sponsor with the single payment wallet ([#449](https://github.com/aibtcdev/x402-sponsor-relay/issues/449)) ([0329a76](https://github.com/aibtcdev/x402-sponsor-relay/commit/0329a761d55410c8b5829bc4266d50b47922e2e8))
+* **status:** report canSponsor:false when Hiro is unreadable ([#448](https://github.com/aibtcdev/x402-sponsor-relay/issues/448)) ([#480](https://github.com/aibtcdev/x402-sponsor-relay/issues/480)) ([b39c53d](https://github.com/aibtcdev/x402-sponsor-relay/commit/b39c53d07ce5657a04e390165a3bf951279cf94d))
+* **status:** report the x402 payment sponsor in /status/sponsor ([#435](https://github.com/aibtcdev/x402-sponsor-relay/issues/435)) ([#446](https://github.com/aibtcdev/x402-sponsor-relay/issues/446)) ([70dab4a](https://github.com/aibtcdev/x402-sponsor-relay/commit/70dab4a9ee3d9a39fb59fbb3eb7f2ac66b9fda56))
+
 ## [1.34.0](https://github.com/aibtcdev/x402-sponsor-relay/compare/x402-sponsor-relay-v1.33.2...x402-sponsor-relay-v1.34.0) (2026-10-02)
 
 
