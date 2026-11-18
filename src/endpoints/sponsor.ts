@@ -284,9 +284,13 @@ export class Sponsor extends BaseEndpoint {
       const sent = await sponsorService.sponsorAndBroadcast(validation.transaction, "budget:sponsor");
 
       if (!sent.ok) {
-        const isClientError = sent.responsible === "sender" || sent.clientRejection !== undefined;
+        // NotEnoughFunds on the fee payer means our sponsor wallet is short, not the client.
+        const sponsorShort = sent.insufficientFundsPayer === "sponsor";
+        const isClientError = !sponsorShort && (sent.responsible === "sender" || sent.clientRejection !== undefined);
         c.executionCtx.waitUntil(statsService.recordError(isClientError ? "validation" : "sponsoring").catch(() => {}));
-        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError, undefined, isClientError ? "invalid_transaction" : "broadcast_failure").catch(() => {}));
+        const exhausted = sponsorShort || sent.error === "Daily sponsor budget reached";
+        const failureReason = isClientError ? "invalid_transaction" : exhausted ? "sponsor_exhausted" : "broadcast_failure";
+        c.executionCtx.waitUntil(statsService.logFailure("sponsor", isClientError, undefined, failureReason).catch(() => {}));
 
         if (sent.senderNonceCode === "SENDER_NONCE_DUPLICATE") {
           return this.clientRejectionResponse(c, "ConflictingNonceInMempool", sent.details);
@@ -315,6 +319,13 @@ export class Sponsor extends BaseEndpoint {
         }
         if (sent.tooMuchChaining) {
           return this.clientRejectionResponse(c, "TooMuchChaining", sent.details);
+        }
+        if (sponsorShort) {
+          return this.preflightRejectionResponse(c, {
+            code: "SPONSOR_EXHAUSTED",
+            error: "The relay's sponsor wallet cannot cover the fee. Retry later, or send without sponsorship (pay your own fee).",
+            retryable: true,
+          });
         }
         if (sent.clientRejection) {
           return this.clientRejectionResponse(c, sent.clientRejection, sent.details);

@@ -179,14 +179,16 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     const sent = await sponsorService.sponsorAndBroadcast(validation.transaction);
     if (!sent.ok) {
       const senderFault = sent.responsible === "sender" || sent.clientRejection !== undefined;
+      // The node said the fee payer (our sponsor wallet) is short: relay-side, retry later.
+      const sponsorShort = sent.insufficientFundsPayer === "sponsor";
       return {
         success: false,
         code: sent.senderNonceCode ? sent.senderNonceCode
           : sent.nonceConflict && senderFault ? "SENDER_NONCE_CONFLICT"
-          : sent.error === "Daily sponsor budget reached" ? "SPONSOR_EXHAUSTED"
+          : sent.error === "Daily sponsor budget reached" || sponsorShort ? "SPONSOR_EXHAUSTED"
           : "BROADCAST_FAILED",
         error: `${sent.error}: ${sent.details}`,
-        retryable: sent.retryable,
+        retryable: sent.retryable || sponsorShort,
       };
     }
     logger.info("Sponsored payment broadcast", { txid: sent.txid, payer, fee: sent.fee, sponsorNonce: sent.sponsorNonce });
