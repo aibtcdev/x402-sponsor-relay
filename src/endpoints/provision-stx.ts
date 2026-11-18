@@ -1,5 +1,5 @@
 import { BaseEndpoint } from "./BaseEndpoint";
-import { AuthService, DuplicateAddressError, KVNotConfiguredError, StxVerifyService } from "../services";
+import { AuthService, DuplicateAddressError, KVNotConfiguredError, StxVerifyService, STX_MESSAGES } from "../services";
 import type { AppContext, ApiKeyMetadata, ProvisionStxRequest, RelayErrorCode } from "../types";
 import {
   Error400Response,
@@ -210,7 +210,11 @@ export class ProvisionStx extends BaseEndpoint {
       let metadata: ApiKeyMetadata;
 
       try {
-        const result = await authService.provisionKeyByStx(body.stxAddress);
+        const result = await authService.provisionKeyByStx(body.stxAddress, {
+          // Only a fresh timestamped signature may replace an expired key;
+          // the bare registration signature has no freshness and could be replayed.
+          allowRenewal: STX_MESSAGES.SELF_SERVICE_PATTERN.test(body.message),
+        });
         apiKey = result.apiKey;
         metadata = result.metadata;
       } catch (e) {
@@ -221,6 +225,11 @@ export class ProvisionStx extends BaseEndpoint {
             code: "ALREADY_PROVISIONED",
             status: 409,
             retryable: false,
+            ...(e.renewalRequiresTimestamp && {
+              details:
+                "The existing key has expired. To renew it, sign the timestamped message " +
+                "'Bitcoin will be the currency of AIs | {ISO-timestamp}' (within 5 minutes).",
+            }),
           });
         }
 
