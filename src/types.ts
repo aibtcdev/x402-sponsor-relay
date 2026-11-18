@@ -1366,6 +1366,10 @@ export type BroadcastAndConfirmResult =
       /** Matched Stacks node rejection reason (e.g. "NotEnoughFunds") when the 4xx
        *  rejection was caused by the client submitting an invalid transaction. */
       clientRejection?: string;
+      /** On a NotEnoughFunds rejection: whose balance was short (see notEnoughFundsPayer).
+       *  "sponsor" means the fee payer, so the relay, not the client, should be blamed when
+       *  the relay is the sponsor. clientRejection is still set, for /settle. */
+      insufficientFundsPayer?: "sender" | "sponsor";
       nodeUrl?: string;
       httpStatus?: number;
       /**
@@ -1399,6 +1403,10 @@ export type BroadcastOnlyResult =
       tooMuchChaining?: boolean;
       isOriginChaining?: boolean;
       clientRejection?: string;
+      /** On a NotEnoughFunds rejection: whose balance was short (see notEnoughFundsPayer).
+       *  "sponsor" means the fee payer, so the relay, not the client, should be blamed when
+       *  the relay is the sponsor. clientRejection is still set, for /settle. */
+      insufficientFundsPayer?: "sender" | "sponsor";
       nodeUrl?: string;
       httpStatus?: number;
       /** Who is responsible for this broadcast failure (see BroadcastAndConfirmResult). */

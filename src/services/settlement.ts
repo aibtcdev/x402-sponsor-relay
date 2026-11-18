@@ -27,6 +27,7 @@ import { getHiroBaseUrl, getHiroHeaders, getBroadcastTargets, NONCE_CONFLICT_REA
 import type { BroadcastTarget } from "../utils";
 import { parseBroadcastOutcome, decideBroadcastAction } from "../utils/broadcast-outcome";
 import type { RawBroadcastError } from "../utils/broadcast-outcome";
+import { notEnoughFundsPayer } from "../utils/not-enough-funds";
 import {
   SBTC_CONTRACT_MAINNET,
   SBTC_CONTRACT_NAME,
@@ -1038,11 +1039,24 @@ export class SettlementService {
                 nodeUrl: target.baseUrl,
               });
             }
+            const insufficientFundsPayer = matchedReason === "NotEnoughFunds"
+              ? notEnoughFundsPayer(transaction, reasonData as Record<string, unknown> | undefined)
+              : undefined;
+            if (insufficientFundsPayer === "sponsor") {
+              this.logger.error("Broadcast rejected: sponsor cannot cover the fee (NotEnoughFunds)", {
+                details: errorDetails,
+                sponsorNonce: sponsorNonceForLog,
+                expected: reasonData?.expected,
+                actual: reasonData?.actual,
+                nodeUrl: target.baseUrl,
+              });
+            }
             return {
               error: "Broadcast failed",
               details: errorDetails,
               retryable: false,
               clientRejection: matchedReason,
+              ...(insufficientFundsPayer && { insufficientFundsPayer }),
               nodeUrl: target.baseUrl,
               httpStatus: broadcastResponse.status,
             };

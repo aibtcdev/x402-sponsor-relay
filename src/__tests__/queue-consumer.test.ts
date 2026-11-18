@@ -254,6 +254,22 @@ describe("queue consumer (payment sponsor via SponsorWalletDO)", () => {
     }));
   });
 
+  it("fails a sponsor-side NotEnoughFunds as sponsor_exhausted, not a client error (#432)", async () => {
+    const kv = new MemoryKV();
+    await queued(kv, "pay_sponsor_short", { nonce: 3 });
+    mocks.sponsorAndBroadcast.mockResolvedValue(refusal({
+      error: "Broadcast failed", clientRejection: "NotEnoughFunds", insufficientFundsPayer: "sponsor",
+      httpStatus: 400, retryable: false,
+    }));
+
+    const message = await run(kv, "pay_sponsor_short", 1);
+
+    expect(message.retry).not.toHaveBeenCalled();
+    expect(await getPaymentRecord(kv, "pay_sponsor_short")).toEqual(expect.objectContaining({
+      status: "failed", errorCode: "SPONSOR_EXHAUSTED", terminalReason: "sponsor_exhausted", retryable: true,
+    }));
+  });
+
   it("terminalizes a non-terminal payment when retries are exhausted, so it can't be stranded at queued (#398)", async () => {
     const kv = new MemoryKV();
     await queued(kv, "pay_exhaust", { nonce: 42, address: "STEXHAUST00000000000000000000000000000" });

@@ -451,27 +451,30 @@ async function handleSponsorFailure(
   }
 
   // Sponsor-side: daily budget, sponsor congestion, sponsor nonce contention, node/network errors.
-  const budget = sent.error === "Daily sponsor budget reached";
+  // NotEnoughFunds on the fee payer: our sponsor wallet is short, like an exhausted budget.
+  const budget = sent.error === "Daily sponsor budget reached" || sent.insufficientFundsPayer === "sponsor";
+  const clientRejection = budget ? undefined : sent.clientRejection;
   const sponsorReason = budget ? "sponsor_exhausted"
     : sent.tooMuchChaining ? "sponsor_failure"
     : sent.nonceConflict ? "sponsor_nonce_conflict"
-    : sent.clientRejection ? "broadcast_failure"
+    : clientRejection ? "broadcast_failure"
     : sent.responsible === "sponsor" ? "sponsor_failure"
     : "broadcast_failure";
-  // The daily budget only resets at UTC midnight — retrying in seconds cannot help.
-  if (sent.retryable && sent.clientRejection === undefined && !budget && canRetry) {
+  // The daily budget only resets at UTC midnight, and a short wallet needs a top-up:
+  // retrying in seconds cannot help.
+  if (sent.retryable && clientRejection === undefined && !budget && canRetry) {
     await requeue({ error: `Sponsor contention: ${sent.error}` }, "queue_retry_sponsor_contention", "sponsor", false);
     return;
   }
   await terminalize({
     error: sent.error,
-    errorCode: sent.clientRejection
-      ? `CLIENT_${sent.clientRejection.toUpperCase()}`
+    errorCode: clientRejection
+      ? `CLIENT_${clientRejection.toUpperCase()}`
       : budget ? "SPONSOR_EXHAUSTED" : "BROADCAST_FAILED",
     terminalReason: sponsorReason,
-    retryable: sent.retryable,
-  }, sent.clientRejection ? "broadcast_failed_terminal" : "sponsor_failed_terminal",
-  sent.clientRejection || sent.responsible === "sender" ? "sender" : "sponsor");
+    retryable: sent.retryable || budget,
+  }, clientRejection ? "broadcast_failed_terminal" : "sponsor_failed_terminal",
+  clientRejection || sent.responsible === "sender" ? "sender" : "sponsor");
 }
 
 /**
