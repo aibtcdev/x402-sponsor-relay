@@ -19,4 +19,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # worker-configuration.d.ts is gitignored; generate it before tsc (needs no credentials).
+      # https://developers.cloudflare.com/workers/languages/typescript/ (step 5)
+      - run: npx wrangler types
+      - run: npm run check
       - run: npm test
