@@ -305,12 +305,10 @@ export class AuthService {
     const addedVolume = BigInt(data.amount);
     usage.volume[data.tokenType] = (currentVolume + addedVolume).toString();
 
-    // Add fees if provided
-    if (data.fee) {
-      const currentFees = BigInt(usage.feesPaid);
-      const addedFees = BigInt(data.fee);
-      usage.feesPaid = (currentFees + addedFees).toString();
-    }
+    // `feesPaid` is owned by recordFeeSpent(): the /sponsor endpoint calls it
+    // for the fee and then calls this method for the volume counters. Adding
+    // the fee here as well charged every sponsorship twice against the daily
+    // cap (checkSpendingCap reads feesPaid).
 
     // Store with 90-day TTL
     await this.kv.put(dailyKey, JSON.stringify(usage), {
