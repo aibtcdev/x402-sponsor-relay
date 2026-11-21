@@ -262,20 +262,25 @@ function verifyBip137(address: string, message: string, signatureBase64: string)
   const formattedMessage = formatBitcoinMessage(message);
   const messageHash = doubleSha256(formattedMessage);
 
-  // Recover public key from signature
+  // Recover public key from signature.
+  // BIP-137 headers 27-30 commit to the *uncompressed* P2PKH key, so the address
+  // must be derived from the 65-byte encoding; 31-42 all use the compressed key.
+  // Forcing the compressed form here made header-27 signatures validate against
+  // the compressed address and rejected legitimate uncompressed-key wallets.
+  const wantsUncompressed = header >= 27 && header <= 30;
   let recoveredPubKey: Uint8Array;
   try {
     const r = BigInt("0x" + Buffer.from(rBytes).toString("hex"));
     const s = BigInt("0x" + Buffer.from(sBytes).toString("hex"));
     const sig = new secp256k1.Signature(r, s, recoveryId);
     const recoveredPoint = sig.recoverPublicKey(messageHash);
-    recoveredPubKey = recoveredPoint.toBytes(true); // compressed
+    recoveredPubKey = recoveredPoint.toBytes(!wantsUncompressed);
   } catch {
     return false;
   }
 
   // Derive address from recovered pubkey, matching the type indicated by header
-  // 27-30: P2PKH uncompressed  → compressed pubkey still used for address derivation
+  // 27-30: P2PKH uncompressed
   // 31-34: P2PKH compressed
   // 35-38: P2SH-P2WPKH (wrapped SegWit) → p2sh(p2wpkh(...))
   // 39-42: P2WPKH native SegWit
@@ -283,7 +288,7 @@ function verifyBip137(address: string, message: string, signatureBase64: string)
     const network = detectBtcNetwork(address);
     let derivedAddress: string | undefined;
     if (header >= 27 && header <= 34) {
-      // P2PKH
+      // P2PKH — encoding already selected above from the header byte
       derivedAddress = p2pkh(recoveredPubKey, network).address;
     } else if (header >= 35 && header <= 38) {
       // P2SH-P2WPKH (wrapped SegWit)
