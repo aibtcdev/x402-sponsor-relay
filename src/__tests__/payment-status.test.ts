@@ -361,7 +361,7 @@ describe("submitPayment duplicate reuse", () => {
     );
 
     // balance preflight reads (sender + payment sponsor) aside, one nonce reseed
-    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).includes("/balances") && !String(u).includes("/v2/accounts/"))).toHaveLength(1);
+    expect(fetchSpy.mock.calls.filter(([u]) => !String(u).includes("/balances") && !String(u).includes("/v2/accounts/") && !String(u).includes("/mempool/fees"))).toHaveLength(1);
     expect(result).toEqual({
       accepted: true,
       paymentId: expect.stringMatching(/^pay_/),

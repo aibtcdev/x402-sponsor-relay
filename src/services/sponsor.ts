@@ -1200,12 +1200,8 @@ export class SponsorService {
         details: ns ? "Set PAYMENT_SPONSOR_PRIVATE_KEY" : "SPONSOR_WALLET_DO binding missing",
       };
     }
-    const spend = this.paymentSpend(transaction);
-    const estimate = await new FeeService(this.env, this.logger).getFeeForType(
-      spend && spend.asset !== "STX" ? "sip010_transfer" : this.payloadToFeeType(transaction.payload.payloadType)
-    );
     // Nodes reject a fee under 1 µSTX per byte (FeeTooLow); the token_transfer floor sits below that.
-    const fee = Math.max(estimate, transaction.serializeBytes().length);
+    const fee = await this.sponsorFeeFloor(transaction);
     const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/sponsor", {
       method: "POST",
       body: JSON.stringify({
@@ -1270,7 +1266,9 @@ export class SponsorService {
     }
     const known = sponsorBalances.filter((b): b is string => b !== null);
     const depleted = BigInt(SponsorService.DEPLETED_THRESHOLD);
-    if (known.length > 0 && known.length === sponsorBalances.length && known.every((b) => BigInt(b) < depleted)) {
+    const feeFloor = await this.sponsorFeeFloor(transaction);
+    const required = feeFloor > Number(depleted) ? BigInt(feeFloor) : depleted;
+    if (known.length > 0 && known.length === sponsorBalances.length && known.every((b) => BigInt(b) < required)) {
       this.logger.error("All sponsor wallets depleted — refusing to sponsor", { balances: known });
       return {
         code: "SPONSOR_EXHAUSTED",
@@ -1297,6 +1295,15 @@ export class SponsorService {
       error: `Sender ${sender} holds ${balance} ${unit}, needs ${spend.amount}. Top up the wallet and re-sign the payment.`,
       retryable: false,
     };
+  }
+
+  private async sponsorFeeFloor(transaction: StacksTransactionWire): Promise<number> {
+    const spend = this.paymentSpend(transaction);
+    const estimate = await new FeeService(this.env, this.logger).getFeeForType(
+      spend && spend.asset !== "STX" ? "sip010_transfer" : this.payloadToFeeType(transaction.payload.payloadType)
+    );
+    // Nodes reject a fee under 1 µSTX per byte (FeeTooLow); the token_transfer floor sits below that.
+    return Math.max(estimate, transaction.serializeBytes().length);
   }
 
   /** Amount and asset a sponsored payment moves out of the sender, or null for other payloads. */
