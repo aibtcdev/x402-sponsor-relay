@@ -371,12 +371,12 @@ export class Sponsor extends BaseEndpoint {
         }).catch(() => {})
       );
 
-      // Also record usage for the API key (for volume tracking)
+      // Volume tracking only. recordFeeSpent above is the single owner of feesPaid;
+      // passing fee here as well charged the daily cap twice per payment.
       await authService.recordUsage(metadata.keyId, {
         success: true,
         tokenType: txTokenType,
         amount: txAmount,
-        fee,
       });
 
       logger.info("Transaction sponsored and broadcast", {

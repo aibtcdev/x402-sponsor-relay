@@ -65,7 +65,6 @@ export interface UsageData {
   success: boolean;
   tokenType: TokenType;
   amount: string;
-  fee?: string;
 }
 
 /**
@@ -304,13 +303,6 @@ export class AuthService {
     const currentVolume = BigInt(usage.volume[data.tokenType]);
     const addedVolume = BigInt(data.amount);
     usage.volume[data.tokenType] = (currentVolume + addedVolume).toString();
-
-    // Add fees if provided
-    if (data.fee) {
-      const currentFees = BigInt(usage.feesPaid);
-      const addedFees = BigInt(data.fee);
-      usage.feesPaid = (currentFees + addedFees).toString();
-    }
 
     // Store with 90-day TTL
     await this.kv.put(dailyKey, JSON.stringify(usage), {
