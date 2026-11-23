@@ -81,6 +81,9 @@ export interface PaymentRecord {
   sponsorNonce?: number;
   /** Sponsor fee in microSTX */
   sponsorFee?: string;
+  /** Fee floor computed by the balance preflight at submit time (microSTX); the queue
+   *  consumer sponsors with this exact value so the check and the broadcast agree */
+  preflightFeeFloor?: string;
   /** Block height (set on confirmation) */
   blockHeight?: number;
   /** Explorer URL (set after broadcast) */

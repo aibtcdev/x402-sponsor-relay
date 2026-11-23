@@ -172,11 +172,11 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       validation.transaction,
       paymentSponsorKey ? [paymentSponsorKey] : []
     );
-    if (preflight) {
+    if (!preflight.ok) {
       return { success: false, code: preflight.code, error: preflight.error, retryable: preflight.retryable };
     }
 
-    const sent = await sponsorService.sponsorAndBroadcast(validation.transaction);
+    const sent = await sponsorService.sponsorAndBroadcast(validation.transaction, undefined, preflight.feeFloor ?? undefined);
     if (!sent.ok) {
       const senderFault = sent.responsible === "sender" || sent.clientRejection !== undefined;
       return {
@@ -322,9 +322,10 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
       transaction,
       paymentSponsorKey ? [paymentSponsorKey] : []
     );
-    if (preflight) {
+    if (!preflight.ok) {
       return { accepted: false, error: preflight.error, code: preflight.code, retryable: preflight.retryable };
     }
+    const preflightFeeFloor = preflight.feeFloor;
 
     // Extract sender info from spending condition
     const { hashMode, signer, nonce } = transaction.auth.spendingCondition;
@@ -469,6 +470,7 @@ export class RelayRPC extends WorkerEntrypoint<Env> {
     let record = createPaymentRecord(paymentId, network, senderNonceInfo);
     record.senderAddress = senderAddress;
     record.senderNonce = senderNonce;
+    if (preflightFeeFloor !== null) record.preflightFeeFloor = String(preflightFeeFloor);
 
     // Transition to queued
     record = transitionPayment(record, "queued");

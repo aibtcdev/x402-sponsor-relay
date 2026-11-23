@@ -1190,7 +1190,7 @@ export class SponsorService {
    * /sponsor wallets) is a single SponsorWalletDO that signs and broadcasts one transaction at a
    * time with a chain-derived nonce — nothing is reserved, queued or held.
    */
-  async sponsorAndBroadcast(transaction: StacksTransactionWire, budget?: BudgetName): Promise<SponsorWalletResult> {
+  async sponsorAndBroadcast(transaction: StacksTransactionWire, budget?: BudgetName, feeFloor?: number): Promise<SponsorWalletResult> {
     const ns = this.env.SPONSOR_WALLET_DO;
     const sponsorKey = this.env.PAYMENT_SPONSOR_PRIVATE_KEY;
     if (!ns || !sponsorKey) {
@@ -1200,12 +1200,10 @@ export class SponsorService {
         details: ns ? "Set PAYMENT_SPONSOR_PRIVATE_KEY" : "SPONSOR_WALLET_DO binding missing",
       };
     }
-    const spend = this.paymentSpend(transaction);
-    const estimate = await new FeeService(this.env, this.logger).getFeeForType(
-      spend && spend.asset !== "STX" ? "sip010_transfer" : this.payloadToFeeType(transaction.payload.payloadType)
-    );
     // Nodes reject a fee under 1 µSTX per byte (FeeTooLow); the token_transfer floor sits below that.
-    const fee = Math.max(estimate, transaction.serializeBytes().length);
+    // A feeFloor computed by preflightSponsoredPayment is reused so the balance check and the
+    // broadcast agree on the same estimate; otherwise compute it here.
+    const fee = feeFloor ?? await this.sponsorFeeFloor(transaction);
     const res = await ns.get(ns.idFromName("sponsor")).fetch("https://sponsor-wallet/sponsor", {
       method: "POST",
       body: JSON.stringify({
@@ -1242,20 +1240,28 @@ export class SponsorService {
    *  - the sender must hold the transferred amount (STX, or the SIP-010 token it calls
    *    `transfer` on); an underfunded transfer still lands as an abort and the sponsor
    *    pays its fee
-   *  - at least one sponsor wallet must hold more than the depleted threshold
+   *  - at least one sponsor wallet must hold more than the depleted threshold — or more
+   *    than the transaction's fee floor when that is higher (the sponsor pays the fee, so
+   *    a wallet below the floor would broadcast a tx the node rejects as FeeTooLow)
    *
    * Hiro read failures are logged and skipped — the chain still enforces both, and an
-   * outage should not turn into a relay outage. Returns null when the payment may proceed.
+   * outage should not turn into a relay outage. On success returns the fee floor used for
+   * the sponsor-balance check (null when it was not computed, e.g. a partial balance read)
+   * so the caller can pass the same value to sponsorAndBroadcast.
    */
   async preflightSponsoredPayment(
     transaction: StacksTransactionWire,
     /** Keys of the wallets that would pay; defaults to the /sponsor wallets */
     sponsorKeys?: string[]
-  ): Promise<{
-    code: "INSUFFICIENT_FUNDS" | "SPONSOR_EXHAUSTED";
-    error: string;
-    retryable: boolean;
-  } | null> {
+  ): Promise<
+    | { ok: true; feeFloor: number | null }
+    | {
+        ok: false;
+        code: "INSUFFICIENT_FUNDS" | "SPONSOR_EXHAUSTED";
+        error: string;
+        retryable: boolean;
+      }
+  > {
     const network = this.getNetwork();
     const keys = sponsorKeys ?? [];
     if (!sponsorKeys) {
@@ -1270,20 +1276,32 @@ export class SponsorService {
     }
     const known = sponsorBalances.filter((b): b is string => b !== null);
     const depleted = BigInt(SponsorService.DEPLETED_THRESHOLD);
-    if (known.length > 0 && known.length === sponsorBalances.length && known.every((b) => BigInt(b) < depleted)) {
-      this.logger.error("All sponsor wallets depleted — refusing to sponsor", { balances: known });
-      return {
-        code: "SPONSOR_EXHAUSTED",
-        error: "The relay's sponsor wallets are out of STX. Retry later, or send without sponsorship (pay your own fee).",
-        retryable: true,
-      };
+    // Only look up the fee floor when every sponsor balance is known — a partial read fails
+    // open anyway, so the (possibly slow, cold-cache) fee fetch would be wasted work.
+    let feeFloor: number | null = null;
+    if (known.length > 0 && known.length === sponsorBalances.length) {
+      feeFloor = await this.sponsorFeeFloor(transaction);
+      const required = feeFloor > Number(depleted) ? BigInt(feeFloor) : depleted;
+      if (known.every((b) => BigInt(b) < required)) {
+        this.logger.error("All sponsor wallets depleted — refusing to sponsor", {
+          balances: known,
+          required: required.toString(),
+          feeFloor,
+        });
+        return {
+          ok: false,
+          code: "SPONSOR_EXHAUSTED",
+          error: "The relay's sponsor wallets are out of STX. Retry later, or send without sponsorship (pay your own fee).",
+          retryable: true,
+        };
+      }
     }
 
     const spend = this.paymentSpend(transaction);
-    if (!spend) return null;
+    if (!spend) return { ok: true, feeFloor };
     const sender = this.deriveSenderAddress(transaction);
     const balance = await this.fetchSenderBalance(sender, spend.asset);
-    if (balance === null || balance >= spend.amount) return null;
+    if (balance === null || balance >= spend.amount) return { ok: true, feeFloor };
 
     const unit = spend.asset === "STX" ? "µSTX" : `base units of ${spend.asset}`;
     this.logger.info("Sender cannot cover payment — refusing to sponsor", {
@@ -1293,10 +1311,20 @@ export class SponsorService {
       balance: balance.toString(),
     });
     return {
+      ok: false,
       code: "INSUFFICIENT_FUNDS",
       error: `Sender ${sender} holds ${balance} ${unit}, needs ${spend.amount}. Top up the wallet and re-sign the payment.`,
       retryable: false,
     };
+  }
+
+  private async sponsorFeeFloor(transaction: StacksTransactionWire): Promise<number> {
+    const spend = this.paymentSpend(transaction);
+    const estimate = await new FeeService(this.env, this.logger).getFeeForType(
+      spend && spend.asset !== "STX" ? "sip010_transfer" : this.payloadToFeeType(transaction.payload.payloadType)
+    );
+    // Nodes reject a fee under 1 µSTX per byte (FeeTooLow); the token_transfer floor sits below that.
+    return Math.max(estimate, transaction.serializeBytes().length);
   }
 
   /** Amount and asset a sponsored payment moves out of the sender, or null for other payloads. */

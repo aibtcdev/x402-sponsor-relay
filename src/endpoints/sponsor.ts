@@ -210,14 +210,6 @@ export class Sponsor extends BaseEndpoint {
       }
 
       const paymentSponsorKey = c.env.PAYMENT_SPONSOR_PRIVATE_KEY;
-      const preflight = await sponsorService.preflightSponsoredPayment(
-        validation.transaction,
-        paymentSponsorKey ? [paymentSponsorKey] : []
-      );
-      if (preflight) {
-        return this.preflightRejectionResponse(c, preflight);
-      }
-
       const authService = new AuthService(c.env.API_KEYS_KV, logger);
       const metadata = auth.metadata!;
 
@@ -278,10 +270,21 @@ export class Sponsor extends BaseEndpoint {
         });
       }
 
+      // Balance preflight runs after the rate limit and spending cap so a rejected client
+      // cannot trigger Hiro fee fetches, and right before broadcast so the fee floor it
+      // computes is the value actually sponsored.
+      const preflight = await sponsorService.preflightSponsoredPayment(
+        validation.transaction,
+        paymentSponsorKey ? [paymentSponsorKey] : []
+      );
+      if (!preflight.ok) {
+        return this.preflightRejectionResponse(c, preflight);
+      }
+
       // Sponsor with the single payment-sponsor wallet (SponsorWalletDO): it takes the
       // sponsor nonce from the chain at broadcast time, so a failed attempt leaves no gap.
       // /sponsor has its own daily budget so API-key traffic cannot use up the x402 payments' one.
-      const sent = await sponsorService.sponsorAndBroadcast(validation.transaction, "budget:sponsor");
+      const sent = await sponsorService.sponsorAndBroadcast(validation.transaction, "budget:sponsor", preflight.feeFloor ?? undefined);
 
       if (!sent.ok) {
         const isClientError = sent.responsible === "sender" || sent.clientRejection !== undefined;

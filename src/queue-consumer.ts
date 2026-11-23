@@ -255,7 +255,13 @@ async function processPaymentMessage(
   const signerHash = transaction.auth.spendingCondition.signer;
 
   const sponsorService = new SponsorService(env, logger);
-  const sent = await sponsorService.sponsorAndBroadcast(transaction);
+  // Reuse the fee floor the submit-time preflight validated against, so the balance check
+  // and the broadcast agree on one estimate (the queue may run long after acceptance).
+  const sent = await sponsorService.sponsorAndBroadcast(
+    transaction,
+    undefined,
+    record.preflightFeeFloor !== undefined ? Number(record.preflightFeeFloor) : undefined
+  );
 
   if (!sent.ok) {
     await handleSponsorFailure(env, message, logger, record, sent, signerHash);
