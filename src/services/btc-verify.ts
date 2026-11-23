@@ -243,9 +243,15 @@ function isBip137Signature(sigBytes: Uint8Array): boolean {
  * 4. Derive the expected address from the recovered pubkey (type inferred from header)
  * 5. Compare derived address to the provided address
  */
-function verifyBip137(address: string, message: string, signatureBase64: string): boolean {
+function verifyBip137(
+  address: string,
+  message: string,
+  signatureBase64: string
+): { verified: boolean; reason?: string } {
   const sigBytes = new Uint8Array(Buffer.from(signatureBase64, "base64"));
-  if (sigBytes.length !== 65) return false;
+  if (sigBytes.length !== 65) {
+    return { verified: false, reason: `malformed BIP-137 signature: ${sigBytes.length} bytes, expected 65` };
+  }
 
   const header = sigBytes[0];
   const rBytes = sigBytes.slice(1, 33);
@@ -255,7 +261,7 @@ function verifyBip137(address: string, message: string, signatureBase64: string)
   try {
     recoveryId = bip137RecoveryId(header);
   } catch {
-    return false;
+    return { verified: false, reason: `unsupported BIP-137 header byte: ${header}` };
   }
 
   // Compute message hash
@@ -271,31 +277,39 @@ function verifyBip137(address: string, message: string, signatureBase64: string)
     const recoveredPoint = sig.recoverPublicKey(messageHash);
     recoveredPubKey = recoveredPoint.toBytes(true); // compressed
   } catch {
-    return false;
+    return { verified: false, reason: "could not recover public key from signature" };
   }
 
-  // Derive address from recovered pubkey, matching the type indicated by header
-  // 27-30: P2PKH uncompressed  → compressed pubkey still used for address derivation
-  // 31-34: P2PKH compressed
-  // 35-38: P2SH-P2WPKH (wrapped SegWit) → p2sh(p2wpkh(...))
-  // 39-42: P2WPKH native SegWit
+  // The header's address-type bits (27-30/31-34 P2PKH, 35-38 P2SH-P2WPKH,
+  // 39-42 P2WPKH) are advisory only: some signers emit the compressed-P2PKH
+  // header (31-34) for SegWit addresses unless a segwit type is configured
+  // (e.g. bitcoinjs-message). Match the recovered key against every standard
+  // encoding on the address's network instead of trusting the header —
+  // the same acceptance policy as bitcoinjs-message's checkSegwitAlways.
   try {
     const network = detectBtcNetwork(address);
-    let derivedAddress: string | undefined;
-    if (header >= 27 && header <= 34) {
-      // P2PKH
-      derivedAddress = p2pkh(recoveredPubKey, network).address;
-    } else if (header >= 35 && header <= 38) {
-      // P2SH-P2WPKH (wrapped SegWit)
-      const inner = p2wpkh(recoveredPubKey, network);
-      derivedAddress = p2sh(inner, network).address;
-    } else if (header >= 39 && header <= 42) {
-      // P2WPKH (native SegWit)
-      derivedAddress = p2wpkh(recoveredPubKey, network).address;
+    const candidates: Array<[string, string | undefined]> = [
+      ["P2PKH", p2pkh(recoveredPubKey, network).address],
+      ["P2SH-P2WPKH", p2sh(p2wpkh(recoveredPubKey, network), network).address],
+      ["P2WPKH", p2wpkh(recoveredPubKey, network).address],
+    ];
+    for (const [, derived] of candidates) {
+      if (derived === address) return { verified: true };
     }
-    return derivedAddress === address;
-  } catch {
-    return false;
+    if (detectAddressType(address) === "P2TR") {
+      return {
+        verified: false,
+        reason: "BIP-137 cannot verify Taproot (bc1p/tb1p) addresses; sign with BIP-322 instead",
+      };
+    }
+    const derivedList = candidates.map(([type, derived]) => `${type}=${derived}`).join(", ");
+    return {
+      verified: false,
+      reason: `recovered key does not map to ${address} (derived: ${derivedList})`,
+    };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "address derivation failed";
+    return { verified: false, reason };
   }
 }
 
@@ -717,9 +731,8 @@ export class BtcVerifyService {
       const sigBytes = new Uint8Array(Buffer.from(signature, "base64"));
 
       if (isBip137Signature(sigBytes)) {
-        // BIP-137 path: P2PKH (1...) and P2SH-P2WPKH (3...)
-        const verified = verifyBip137(address, message, signature);
-        return { verified };
+        // BIP-137 path: P2PKH (1...), P2SH-P2WPKH (3...), and legacy-signed SegWit
+        return verifyBip137(address, message, signature);
       } else {
         // BIP-322 path: P2WPKH (bc1q...) and P2TR (bc1p...)
         const addressType = detectAddressType(address);
